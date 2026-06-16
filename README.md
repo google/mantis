@@ -641,6 +641,12 @@ token investment:
     in this version it isn't. A `/mantis_reflect` stage after each round might
     sometimes be useful for subsequent planning rounds and improved threat
     models.
+*   **Software Dark Factory:** Integrate this pipeline into an entirely AI
+    driven software development. Instead of vulnerable discovery for action by
+    humans, Mantis would become the autonomous vulnerability research and
+    release gating component of the dark factory. Before the dark factory can
+    push to production, it must have had N hours of adversarial vulnerability
+    research or "red teaming" by a pipeline like Mantis.
 
 --------------------------------------------------------------------------------
 
