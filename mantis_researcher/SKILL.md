@@ -27,9 +27,12 @@ the targeted codebase.
 
 Execute the research stage as follows:
 
-1.  **Load Reviewing Plan:** Read the `plan.json` file to retrieve the target
-    investigations. If `plan.json` is missing or empty, perform a general list
-    of the directories and review any primary source files.
+1.  **Load Reviewing Plan & Context:** Read the `plan.json` file to retrieve the
+    target investigations. If `plan.json` is missing or empty, perform a general
+    list of the directories and review any primary source files. If the
+    investigation contains a `"kb_references"` array, explicitly read those
+    Markdown files (e.g., `workspace/kb/entities/auth.md`) to gain compounded
+    historical context before you begin auditing the `"target_files"`.
 
 2.  **Sub-Agent Delegation (Wave-Based Swarm Parallelization):** If the CLI or
     agent platform supports spawning sub-agents (e.g., using specialized
@@ -79,7 +82,7 @@ Execute the research stage as follows:
     unconstrained sweep or adversarial audit (ignoring existing assumptions):
 
     -   Ignore existing assumptions of safety and documented trust boundaries in
-        `THREAT_MODEL.md`.
+        `workspace/kb/THREAT_MODEL.md`.
     -   Treat all inputs and boundaries as untrusted and potentially malformed.
     -   Analyze implementation from scratch with full freedom and autonomy,
         searching for any bypasses, logic flaws, or memory corruptions

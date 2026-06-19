@@ -27,6 +27,12 @@ for:
 
 *   **Hardware / RTL Reviews**: Auditing Register-Transfer Level (RTL) designs
     (SystemVerilog, VHDL) for security properties or logical bugs.
+*   **Infrastructure-as-Code (IaC)**: Analyzing cloud deployment boundaries,
+    Terraform state, or Kubernetes RBAC configurations for privilege escalation
+    paths.
+*   **Data & ML Pipelines**: Auditing training data ingress, model serialization
+    formats (e.g., Pickle vulnerabilities), or boundary constraints between data
+    science notebooks and production.
 *   **Custom Test Environments**: Replacing the default container reproduction
     stage with isolated VMs, physical hardware testbeds (via USB/serial), or
     custom simulators.
@@ -64,6 +70,7 @@ graph TD
 
     subgraph "Continuous Review Loop"
         Sum["/mantis_summarize (Optional)"]
+        Arch["/mantis_architecture"]
         TM["/mantis_threat_model"]
         Plan["/mantis_plan"]
         Res["/mantis_researcher"]
@@ -73,16 +80,18 @@ graph TD
         Rep["/mantis_reproduce"]
         Pat["/mantis_patch"]
         Cal["/mantis_calibrate"]
+        Ref["/mantis_reflect"]
     end
 
     FileSum[("mantis_summary.md")]
-    FileTM[("THREAT_MODEL.md")]
+    FileKB[/"workspace/kb/ (Markdown KB)"/]
     FilePlan[("plan.json")]
     FileFind[("workspace/findings/*.json")]
     FileLearn[("learnings.jsonl")]
 
     Meta --> Sum
-    Sum --> TM
+    Sum --> Arch
+    Arch --> TM
     TM --> Plan
     Plan --> Res
     Res --> Ded
@@ -91,11 +100,14 @@ graph TD
     Cri --> Rep
     Rep --> Pat
     Pat --> Cal
-    Cal --> Arch[/"Archive Findings"/]
-    Arch -.->|Next Loop Iteration| TM
+    Cal --> Ref
+    Ref -.->|Next Loop Iteration| Arch
 
     Sum -.->|Generates| FileSum
-    TM -.->|Generates| FileTM
+    Arch -.->|Generates| FileKB
+    Arch -.->|Clears| FileLearn
+    TM -.->|Reads/Updates| FileKB
+    Plan -.->|Reads| FileKB
     Plan -.->|Generates| FilePlan
 
     Res -.->|Creates| FileFind
@@ -106,6 +118,7 @@ graph TD
     Pat -.->|Updates| FileFind
     Cal -.->|Updates| FileFind
 
+    Ref -.->|Parses Trajectories & Appends| FileLearn
     Cri -.->|Appends| FileLearn
     Pat -.->|Appends| FileLearn
 ```
@@ -116,41 +129,49 @@ graph TD
 2.  **`/mantis_history` (History Extractor):** An optional pre-processing step
     that analyzes the repository's version control system (VCS) history to
     extract past vulnerabilities, security fixes, and vulnerability patterns,
-    saving findings to `historical_learnings.jsonl` to inform subsequent
-    summarization, threat modeling, and planning.
+    saving findings to `historical_learnings.jsonl`.
 3.  **`/mantis_summarize` (Summarizer):** An optional pre-processing step that
     generates a `mantis_summary.md` for each directory, reading past
     vulnerabilities from `historical_learnings.jsonl` to enrich summaries and
     provide a quick reference map to optimize downstream planning and research.
-4.  **`/mantis_threat_model` (Threat Modeler):** Evaluates `learnings.jsonl` and
-    `historical_learnings.jsonl` against codebase structure to establish or
-    refine a living `THREAT_MODEL.md`.
-5.  **`/mantis_plan` (Strategist):** Scans workspace boundaries, target files
-    (using `mantis_summary.md` maps when available), and `THREAT_MODEL.md` to
-    output a targeted review strategy into `plan.json`.
-6.  **`/mantis_researcher` (Mantis Researcher):** Executes file-by-file triage
+4.  **`/mantis_architecture` (Knowledge Base Architect):** Analyzes the codebase
+    and clears the `learnings.jsonl` inbox to synthesize a permanent,
+    interlinked Markdown Knowledge Base (`workspace/kb/`) detailing entities,
+    data flows, and historical vulnerability classes.
+5.  **`/mantis_threat_model` (Threat Modeler):** Evaluates the entities and
+    architecture defined in the KB to establish or refine a living
+    `workspace/kb/THREAT_MODEL.md`, focusing on trust boundaries and attacker
+    profiles.
+6.  **`/mantis_plan` (Strategist):** Scans workspace boundaries and reads the KB
+    indices to output a targeted review strategy into `plan.json`, injecting
+    specific `kb_references` file paths for context.
+7.  **`/mantis_researcher` (Mantis Researcher):** Executes file-by-file triage
     and deep security flaw reviews, outputting hotspots as individual JSON files
     in `workspace/findings/`.
-7.  **`/mantis_dedupe` (Deduplicator):** Groups index-based duplicate findings,
+8.  **`/mantis_dedupe` (Deduplicator):** Groups index-based duplicate findings,
     merging records and deleting redundancies within `workspace/findings/`.
-8.  **`/mantis_review` (Validator):** Filters out false positives using strict
+9.  **`/mantis_review` (Validator):** Filters out false positives using strict
     pragmatic constraints, updating the status in
     `workspace/findings/<id>.json`.
-9.  **`/mantis_critic` (Critic):** Verifies release-build crash reproducibility
+10. **`/mantis_critic` (Critic):** Verifies release-build crash reproducibility
     (ignoring debug/assert checks), updates production viability in
     `workspace/findings/<id>.json`, and appends false positives/non-viable paths
     to `learnings.jsonl`.
-10. **`/mantis_reproduce` (Proof-of-Concept Developer):** Writes
+11. **`/mantis_reproduce` (Proof-of-Concept Developer):** Writes
     Proof-of-Concept Reproduction Scripts (Repros) or raw payloads, executes
     them in isolated environments such as gVisor or Virtual Machines, and
     updates reproduction status in `workspace/findings/<id>.json`.
-11. **`/mantis_patch` (Patcher):** Generates and applies code fixes, runs
+12. **`/mantis_patch` (Patcher):** Generates and applies code fixes, runs
     post-patch validation tests inside the sandbox, updates patch status in
     `workspace/findings/<id>.json`, and appends logs to `learnings.jsonl`.
-12. **`/mantis_calibrate` (Risk Calibrator):** Calculates a final numerical
+13. **`/mantis_calibrate` (Risk Calibrator):** Calculates a final numerical
     Mantis Risk Score (1-10) for each finding in the workspace directory based
     on impact, evidence, and viability, appending the results directly to each
     `workspace/findings/<id>.json` file.
+14. **`/mantis_reflect` (Reflector):** Parses the execution trajectories of the
+    agents from the current round, extracting false assumptions, tool failures,
+    and successes, and appends these structured insights to the
+    `learnings.jsonl` inbox.
 
 --------------------------------------------------------------------------------
 
@@ -293,34 +314,40 @@ CLI terminal.
     # 1. (Optional) Generate mantis_summary.md directory maps
     /mantis_summarize
 
-    # 2. Iteratively develop the project's living threat model
+    # 2. Synthesize codebase structure and historical learnings into the Markdown Knowledge Base
+    /mantis_architecture
+
+    # 3. Iteratively develop the project's living threat model based on the KB
     /mantis_threat_model
 
-    # 3. Map target external boundary and build scanning roadmap
+    # 4. Map target external boundary and build scanning roadmap, injecting KB references
     /mantis_plan
 
-    # 4. Run multi-threaded/sequential security flaw sweep
+    # 5. Run multi-threaded/sequential security flaw sweep using injected context
     /mantis_researcher
 
-    # 5. Consolidate overlapping files and duplicate bugs
+    # 6. Consolidate overlapping files and duplicate bugs
     /mantis_dedupe
 
-    # 6. Verify code validity & filter false positives
+    # 7. Verify code validity & filter false positives
     /mantis_review
 
-    # 7. Eliminate non-viable production issues
+    # 8. Eliminate non-viable production issues
     /mantis_critic
 
-    # 8. Generate proof-of-concept crash reproducers and run them in sandboxes
+    # 9. Generate proof-of-concept crash reproducers and run them in sandboxes
     /mantis_reproduce
 
-    # 9. Apply minimal fixes and verify they block the crash reproducer
+    # 10. Apply minimal fixes and verify they block the crash reproducer
     /mantis_patch
 
-    # 10. Calculate final matrix risk ratings and append to individual findings
+    # 11. Calculate final matrix risk ratings and append to individual findings
     /mantis_calibrate
 
-    # 11. (Manual Step) Move workspace/findings/ to an archive directory before starting the next loop
+    # 12. Extract insights from execution trajectories and append to the learnings inbox
+    /mantis_reflect
+
+    # 13. (Manual Step) Move workspace/findings/ to an archive directory before starting the next loop
     ```
 
 --------------------------------------------------------------------------------
@@ -380,6 +407,13 @@ environments (via MCP), see the
 *   **Scale:** The pipeline can be decomposed into several pieces, allowing you
     to scale horizontally across a suitably sized fleet during periods of low
     utilization.
+*   **Deterministic Reporting:** While the pipeline relies on machine-readable
+    JSON files (`workspace/findings/*.json`) to safely maintain internal state,
+    a programmatic harness can deterministically translate these JSON findings
+    into human-readable Markdown reports or automatically file them into
+    bug-tracking systems without risking LLM hallucination or state corruption.
+    Only use an LLM for deterministic subsets of this reporting process, such as
+    providing an executive summary if necessary.
 
 ### The Hybrid Approach
 
@@ -501,9 +535,9 @@ to do this, including connecting the pipeline to **Google Cloud Pub/Sub**.
     workspace/findings/<id>.json)"` whenever a security flaw is successfully
     reproduced.
 3.  **Routing:** Subscribe a Google Cloud Function or Cloud Run service to that
-    Pub/Sub topic to route the alert payload directly into your team's Slack,
-    Jira, or PagerDuty. This cleanly decouples the isolated scanning environment
-    from your internal alerting infrastructure.
+    Pub/Sub topic to route the alert payload directly into your team's chat,
+    issue tracker, or paging system. This cleanly decouples the isolated
+    scanning environment from your internal alerting infrastructure.
 
 --------------------------------------------------------------------------------
 
@@ -640,27 +674,18 @@ token investment:
 ## Roadmap / Future Work
 
 *   **Skill Self-Improvement (Meta-Learning):** The current `learnings.jsonl`
-    tracks codebase-specific empirical outcomes to adapt the `THREAT_MODEL.md`.
-    Future iterations of the pipeline could use this historical data to reflect
-    on and automatically rewrite its own `SKILL.md` prompts. For example, if a
-    certain type of hallucination is repeatedly caught by the Critic, a
-    self-improvement meta-agent could update the Researcher's `SKILL.md`
-    instructions to explicitly filter out that specific pattern before it even
-    reaches the Review stage. Crucially, feedback from **human triage** (e.g.,
-    findings rejected by developers during interactive mode) should also be
-    ingested into this learning loop to align the agents with human expectations
-    and risk tolerance. This system should include a decay mechanism to age out
-    past adaptations, preventing the repository from sticking to outdated or
-    incorrect learnings for too long. **Security Note:** Committing automated
-    changes to `SKILL.md` files must always be human-gated to prevent an
-    attacker from using prompt injection (e.g., via a malicious payload in a
-    target file) to trick the meta-agent into ignoring a vulnerability class
-    globally.
-*   **Trajectory Analysis:** It is very useful to review prior conversations and
-    trajectories to learn from them. This should be baked into the pipeline but
-    in this version it isn't. A `/mantis_reflect` stage after each round might
-    sometimes be useful for subsequent planning rounds and improved threat
-    models.
+    and Knowledge Base (KB) architecture tracks codebase-specific empirical
+    outcomes to adapt the `THREAT_MODEL.md` and context pointers. Future
+    iterations of the pipeline could take this a step further and use this
+    historical data to reflect on and automatically rewrite its own `SKILL.md`
+    prompts. For example, if a certain type of hallucination is repeatedly
+    caught by the Critic, a self-improvement meta-agent could update the
+    Researcher's `SKILL.md` instructions to explicitly filter out that specific
+    pattern before it even reaches the Review stage. **Security Note:**
+    Committing automated changes to `SKILL.md` files must always be human-gated
+    to prevent an attacker from using prompt injection (e.g., via a malicious
+    payload in a target file) to trick the meta-agent into ignoring a
+    vulnerability class globally.
 *   **Software Dark Factory:** Integrate this pipeline into an entirely AI
     driven software development. Instead of vulnerable discovery for action by
     humans, Mantis would become the autonomous vulnerability research and
@@ -676,10 +701,11 @@ token investment:
 
 *   **Symptom:** The loop keeps reviewing the same files and reporting identical
     bugs.
-*   **Solution:** Ensure `/mantis_patch` completes successfully and writes its
-    outcome to `learnings.jsonl`. The `/mantis_plan` strategist checks this file
-    to dynamically skip already analyzed areas. Check that file permissions
-    allow appending to `learnings.jsonl`.
+*   **Solution:** Ensure `/mantis_architecture` completes successfully and
+    writes its synthesized knowledge to the `workspace/kb/` directory. The
+    `/mantis_plan` strategist checks this Knowledge Base to dynamically skip
+    already analyzed areas. Check that file permissions allow writing to
+    `workspace/kb/`.
 
 ### 2. Other Issues
 

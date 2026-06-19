@@ -33,8 +33,9 @@ Execute the calibration as follows:
         the pipeline appends data to each finding file at each stage, these
         files provide the complete picture of each finding's journey (including
         its `id`, reproduction status, and production viability).
-    -   Read `THREAT_MODEL.md` from the root workspace directory (if it exists)
-        to evaluate component exposure, trust boundaries, and asset criticality.
+    -   Read `workspace/kb/THREAT_MODEL.md` from the Knowledge Base (if it
+        exists) to evaluate component exposure, trust boundaries, and asset
+        criticality.
     -   **Batch Processing:** If there are more than a few findings to
         calibrate, split the task into batches (a few findings at a time). If
         you have the ability to invoke subagents, delegate each batch to a
@@ -69,7 +70,7 @@ Execute the calibration as follows:
             update its file with calibration data.
         -   If `production_viability` is **VIABLE**:
             -   Check how the affected code paths correlate with the
-                `THREAT_MODEL.md`:
+                `workspace/kb/THREAT_MODEL.md`:
                 -   If the finding resides inside an **Exposed Interface / Trust
                     Boundary** (directly accessible to untrusted inputs):
                     Multiplier = 1.0.
@@ -77,8 +78,8 @@ Execute the calibration as follows:
                     semi-trusted parsed data: Multiplier = 0.8.
                 -   If it is deeply nested inside a **Privileged/Trusted Zone**
                     with multiple verification layers: Multiplier = 0.5.
-            -   If `THREAT_MODEL.md` does not exist or does not mention the
-                components, default the Multiplier to 1.0.
+            -   If `workspace/kb/THREAT_MODEL.md` does not exist or does not
+                mention the components, default the Multiplier to 1.0.
 
     **Final Score (Hazard) = (Impact + Likelihood) * Multiplier** (Capped at
     10.0).

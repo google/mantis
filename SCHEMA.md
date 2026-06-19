@@ -92,6 +92,9 @@ Written by `/mantis_plan`, read by `/mantis_researcher`.
         Review: src/api").
     -   **`target_files`** (Array of Strings): The exact file paths the
         researcher should audit.
+    -   **`kb_references`** (Array of Strings): Target file paths to the
+        Markdown Knowledge Base (e.g., `["workspace/kb/entities/auth.md"]`) to
+        provide exact context for the investigation.
     -   **`question`** (String): Detailed prompting instructions asking the
         researcher to trace specific input pathways or constraints.
 
@@ -99,14 +102,19 @@ Written by `/mantis_plan`, read by `/mantis_researcher`.
 
 ## 3. Historical Learning State (`learnings.jsonl`)
 
-Appended by `/mantis_critic` and `/mantis_patch`. Read by `/mantis_threat_model`
-and `/mantis_plan`.
+Appended by `/mantis_reflect`, `/mantis_critic`, and `/mantis_patch`. Read and
+explicitly cleared by `/mantis_architecture`.
 
-Each line is a JSON object representing a finalized outcome.
+Each line is a JSON object representing a finalized outcome or an insight from a
+trajectory.
 
--   **Format:** `{"title": "[finding_title]", "code_paths": ["[path1:line1]"],
-    "status": "[VIABLE / NON_VIABLE / FALSE_POSITIVE / VERIFIED_SECURE /
-    VERIFICATION_FAILED / ERROR]"}`
+-   **Format:** `{"type": "trajectory_insight", "action": "add | update |
+    remove", "target_entity": "[e.g., auth_module.py]", "insight":
+    "[description]", "source_stage": "[e.g., mantis_researcher]"}`
+-   Alternatively for findings: `{"title": "[finding_title]", "code_paths":
+    ["[path1:line1]"], "status": "[VIABLE / NON_VIABLE / FALSE_POSITIVE /
+    VERIFIED_SECURE / VERIFICATION_FAILED / ERROR]"}`
 
-This file serves as the empirical truth of the codebase, preventing infinite
-loops and guiding the dynamic threat model.
+This file serves as an ephemeral inbox/queue for new learnings. It is
+periodically synthesized into the permanent Markdown Knowledge Base
+(`workspace/kb/`) to prevent infinite loops and token bloat.

@@ -35,39 +35,45 @@ Execute your orchestration duties in a continuous loop:
     subagent as a tool (or using the `@agent_name` syntax if instructed by your
     prompt) with a concise instruction to perform its designated task:
 
-    -   **Stage 0 (Pre-processing History):** Call the `@mantis_history`
-        subagent to analyze repository's version control system (VCS) history
-        and extract past vulnerabilities and security fixes into a
-        `historical_learnings.jsonl` file.
-    -   **Stage 1 (Optional Pre-processing Summaries):** If not already mapped,
-        call the `@mantis_summarize` subagent to generate `mantis_summary.md`
-        files for each directory, reading past vulnerabilities from
-        `historical_learnings.jsonl` to optimize downstream planning and
-        summaries with historical context.
-    -   **Stage 2:** Call the `@mantis_threat_model` subagent to evaluate and
-        update `THREAT_MODEL.md`.
-    -   **Stage 3:** Call the `@mantis_plan` subagent to evaluate boundaries and
-        generate `plan.json`.
-    -   **Stage 4:** Call the `@mantis_researcher` subagent to perform the deep
-        code sweep and populate the `workspace/findings/` directory.
-    -   **Stage 5:** Call the `@mantis_dedupe` subagent to deduplicate files in
-        the `workspace/findings/` directory.
-    -   **Stage 6:** Call the `@mantis_review` subagent to evaluate findings in
-        the `workspace/findings/` directory.
-    -   **Stage 7:** Call the `@mantis_critic` subagent to check production
-        viability of files in the `workspace/findings/` directory, and update
-        `learnings.jsonl`.
-    -   **Stage 8:** Call the `@mantis_reproduce` subagent to develop crash
-        reproducers and update files in the `workspace/findings/` directory.
-    -   **Stage 9:** Call the `@mantis_patch` subagent to verify fixes and
-        update files in the `workspace/findings/` directory, and update
-        `learnings.jsonl`.
-    -   **Stage 10:** Call the `@mantis_calibrate` subagent to read the
-        `workspace/findings/` directory and append final calibration metrics to
-        each finding file.
-    -   **Stage 11:** Archive the `workspace/findings/` directory (e.g., move it
-        to `workspace/archive/findings_pass_N/`) to ensure the next loop
-        iteration starts with a clean slate and does not waste tokens
+    -   **Stage 0 (Optional Pre-processing History):** Call the
+        `@mantis_history` subagent to analyze repository's version control
+        system (VCS) history and extract past vulnerabilities and security fixes
+        into a `historical_learnings.jsonl` file.
+    -   **Stage 1 (Optional Directory Mapping):** If not already mapped, call
+        the `@mantis_summarize` subagent to generate `mantis_summary.md` files
+        for each directory to optimize downstream planning and summaries with
+        historical context.
+    -   **Stage 2 (KB Architecture):** Call the `@mantis_architecture` subagent
+        to synthesize the codebase structure and pending `learnings.jsonl` into
+        the permanent Markdown Knowledge Base (`workspace/kb/`).
+    -   **Stage 3 (Threat Modeling):** Call the `@mantis_threat_model` subagent
+        to read the KB and evaluate/update `workspace/kb/THREAT_MODEL.md`.
+    -   **Stage 4 (Planning):** Call the `@mantis_plan` subagent to evaluate
+        boundaries, read the KB index, and generate `plan.json` with injected
+        context pointers.
+    -   **Stage 5 (Research):** Call the `@mantis_researcher` subagent to
+        perform the deep code sweep using the context in `plan.json` and
+        populate the `workspace/findings/` directory.
+    -   **Stage 6 (Deduplication):** Call the `@mantis_dedupe` subagent to
+        deduplicate files in the `workspace/findings/` directory.
+    -   **Stage 7 (Review):** Call the `@mantis_review` subagent to evaluate
+        findings in the `workspace/findings/` directory.
+    -   **Stage 8 (Critic):** Call the `@mantis_critic` subagent to check
+        production viability of files in the `workspace/findings/` directory.
+    -   **Stage 9 (Reproduce):** Call the `@mantis_reproduce` subagent to
+        develop crash reproducers and update files in the `workspace/findings/`
+        directory.
+    -   **Stage 10 (Patch):** Call the `@mantis_patch` subagent to verify fixes
+        and update files in the `workspace/findings/` directory.
+    -   **Stage 11 (Calibrate):** Call the `@mantis_calibrate` subagent to read
+        the `workspace/findings/` directory and append final calibration metrics
+        to each finding file.
+    -   **Stage 12 (Reflect):** Call the `@mantis_reflect` subagent to parse the
+        execution trajectories of the round and append false assumptions or tool
+        failures to the `learnings.jsonl` inbox.
+    -   **Stage 13 (Archive):** Archive the `workspace/findings/` directory
+        (e.g., move it to `workspace/archive/findings_pass_N/`) to ensure the
+        next loop iteration starts with a clean slate and does not waste tokens
         re-evaluating old findings that have already been finalized.
 
 2.  **Intelligent Supervision & Error Handling:**

@@ -60,7 +60,12 @@ Use the following guidelines as your technical reference when advising the user.
     (`workspace/findings/*.json`) or a database as the single source of truth.
     Skills should read from and write to this store. For horizontal scaling,
     recommend a centralized database.
-3.  **Token Efficiency & Reusable Deterministic Tools:** Structure LLM outputs
+3.  **Deterministic Reporting:** Treat findings as internal state. Minimize use
+    the LLM to convert JSON findings into Markdown reports for human
+    consumption; instead, write deterministic scripts to render the JSON into
+    reports or upload them to bug trackers. Only use an LLM for deterministic
+    subsets of this, such as by providing an executive summary if necessary.
+4.  **Token Efficiency & Reusable Deterministic Tools:** Structure LLM outputs
     to return only the *minimum necessary information* (e.g., UUIDs, status
     codes). Do not force the LLM to write one-off scripts (e.g., Python or bash)
     on the fly for routine tasks like appending JSON fields or merging findings,
@@ -76,6 +81,7 @@ graph TD
     Harness[Programmatic Harness / Orchestrator] <--> DB[(State Store: Disk/DB)]
 
     subgraph Stages [Decomposed Stages]
+        KB[KB Architect]
         TM[Threat Modeler]
         P[Plan]
         R[Researcher]
@@ -85,8 +91,10 @@ graph TD
         Rep[Reproducer]
         Pat[Patcher]
         Cal[Calibrator]
+        Ref[Reflector]
     end
 
+    Harness --> KB
     Harness --> TM
     Harness --> P
     Harness --> R
@@ -96,6 +104,7 @@ graph TD
     Harness --> Rep
     Harness --> Pat
     Harness --> Cal
+    Harness --> Ref
 
     subgraph LLM Pool [Tailored LLMs]
         ModelA[Frontier Model: Deep Reasoning]
@@ -103,6 +112,7 @@ graph TD
         ModelC[Alternative Provider: Diversified Logic]
     end
 
+    KB -.-> ModelA
     TM -.-> ModelB
     P -.-> ModelB
     R -.-> ModelA
@@ -113,6 +123,7 @@ graph TD
     Rep -.-> ModelA
     Pat -.-> ModelA
     Cal -.-> ModelB
+    Ref -.-> ModelB
 ```
 
 --------------------------------------------------------------------------------
