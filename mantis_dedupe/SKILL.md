@@ -27,29 +27,39 @@ the exact same security flaw or adjacent code paths.
 
 Execute your task as follows:
 
-1.  **Load Raw Findings & History:**
+1.  **Load Raw Findings & Current Loop Queue:**
 
     -   List the contents of the directory and read the files in
         `workspace/findings/`. If the directory is empty or does not exist,
         notify the user and exit.
-    -   Check if a `learnings.jsonl` file exists in the workspace. If it does,
-        read its contents to establish a baseline of vulnerabilities that have
-        already been evaluated in previous loops.
+    -   Check if `learnings.jsonl` exists in the workspace. If it does, read its
+        contents. This file represents findings and insights that have already
+        been evaluated by downstream agents (like Reviewer or Patch) *within
+        this current loop iteration* against this specific version of the
+        codebase.
+    -   *Important:* Do NOT read or deduplicate against
+        `historical_learnings.jsonl` (VCS history), as we want to catch
+        regressions if old bugs were reintroduced.
 
-2.  **Filter Historical Duplicates:** Cross-reference the current findings
-    against the `learnings.jsonl` entries (using `code_paths` and `title`
-    similarities). If a current finding exactly matches a flaw that was already
-    recorded in history (regardless of whether the historical status is
-    `FALSE_POSITIVE`, `NON_VIABLE`, or `VERIFIED_SECURE`), you must **delete the
-    new finding file entirely** and drop it from your active list. This prevents
-    the pipeline from getting stuck in a loop re-evaluating the same issues.
+2.  **Filter Loop Duplicates:** Cross-reference the current findings against the
+    `learnings.jsonl` entries (using `code_paths` and `title` similarities). If
+    a current finding exactly matches a flaw that was already processed in this
+    loop (regardless of whether its status was `FALSE_POSITIVE`, `NON_VIABLE`,
+    or `VERIFIED_SECURE`), you must **delete the new finding file entirely** and
+    drop it from your active list. This prevents the pipeline from getting stuck
+    re-evaluating the same issues in the current pass.
 
-3.  **Map/Reduce Chunking Strategy (For Scale):** If there are many finding
+3.  **Filter Duplicate Findings in Current Batch:** Check the current findings
+    against each other to find duplicates (using `code_paths` and `title`
+    similarities). If multiple findings refer to the exact same flaw or highly
+    overlapping code paths, they must be merged.
+
+4.  **Map/Reduce Chunking Strategy (For Scale):** If there are many finding
     files (e.g., > 20 items), use a Map/Reduce approach to group them by target
     file or component before checking for overlaps to avoid context window
     limits.
 
-4.  **Token-Optimized Consolidation and Merging:** To minimize LLM output tokens
+5.  **Token-Optimized Consolidation and Merging:** To minimize LLM output tokens
     and prevent data loss, **do not manually rewrite or output the merged JSON
     files in your response.** Instead, follow this pattern:
 
@@ -75,7 +85,7 @@ Execute your task as follows:
     3.  **Execute the Script:** Run your script to update the primary finding's
         file (`workspace/findings/<primary_id>.json`) on disk.
 
-5.  **Clean Up:** Delete the redundant `.json` files of the duplicate findings
+6.  **Clean Up:** Delete the redundant `.json` files of the duplicate findings
     that were merged to clean up the directory and prevent redundant analysis in
     downstream stages.
 

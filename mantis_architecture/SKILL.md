@@ -91,7 +91,7 @@ Execute the architecture stage as follows:
     -   To prevent infinite loops and token bloat in future rounds, you must
         clear the queue. After all insights from `learnings.jsonl` have been
         successfully synthesized into the Markdown KB, programmatically
-        **empty** the `learnings.jsonl` file (or move its contents to
-        `archived_learnings.jsonl`). The KB is now the single source of truth.
+        **empty** the `learnings.jsonl` file. The KB is now the single source of
+        truth.
 
 When complete, notify the user.

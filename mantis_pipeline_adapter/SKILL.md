@@ -89,6 +89,7 @@ graph TD
         V[Validator/Review]
         C[Critic]
         Rep[Reproducer]
+        Ch[Chainer]
         Pat[Patcher]
         Cal[Calibrator]
         Ref[Reflector]
@@ -102,6 +103,7 @@ graph TD
     Harness --> V
     Harness --> C
     Harness --> Rep
+    Harness --> Ch
     Harness --> Pat
     Pat -.->|Re-attack Bypass Loop| Rep
     Harness --> Cal
@@ -122,6 +124,7 @@ graph TD
     V -.-> ModelB
     C -.-> ModelA
     Rep -.-> ModelA
+    Ch -.-> ModelA
     Pat -.-> ModelA
     Cal -.-> ModelB
     Ref -.-> ModelB

@@ -84,6 +84,7 @@ graph TD
         Rev["/mantis_review"]
         Cri["/mantis_critic"]
         Rep["/mantis_reproduce"]
+        Cha["/mantis_chain"]
         Pat["/mantis_patch"]
         Cal["/mantis_calibrate"]
         Ref["/mantis_reflect"]
@@ -104,7 +105,8 @@ graph TD
     Ded --> Rev
     Rev --> Cri
     Cri --> Rep
-    Rep --> Pat
+    Rep --> Cha
+    Cha --> Pat
     Pat -.->|Re-attack Bypass Loop| Rep
     Pat --> Cal
     Cal --> Ref
@@ -122,6 +124,7 @@ graph TD
     Rev -.->|Updates| FileFind
     Cri -.->|Updates| FileFind
     Rep -.->|Updates| FileFind
+    Cha -.->|Creates| FileFind
     Pat -.->|Updates| FileFind
     Cal -.->|Updates| FileFind
 
@@ -168,14 +171,18 @@ graph TD
     Proof-of-Concept Reproduction Scripts (Repros) or raw payloads, executes
     them in isolated environments such as gVisor or Virtual Machines, and
     updates reproduction status in `workspace/findings/<id>.json`.
-12. **`/mantis_patch` (Patcher):** Generates and applies code fixes, runs
+12. **`/mantis_chain` (Vulnerability Chainer):** Analyzes individual validated
+    findings and knowledge base primitives to identify and construct complex
+    multi-step exploit chains, creating new "Super Findings" in
+    `workspace/findings/`.
+13. **`/mantis_patch` (Patcher):** Generates and applies code fixes, runs
     post-patch validation tests inside the sandbox, updates patch status in
     `workspace/findings/<id>.json`, and appends logs to `learnings.jsonl`.
-13. **`/mantis_calibrate` (Risk Calibrator):** Calculates a final numerical
+14. **`/mantis_calibrate` (Risk Calibrator):** Calculates a final numerical
     Mantis Risk Score (1-10) for each finding in the workspace directory based
     on impact, evidence, and viability, appending the results directly to each
     `workspace/findings/<id>.json` file.
-14. **`/mantis_reflect` (Reflector):** Parses the execution trajectories of the
+15. **`/mantis_reflect` (Reflector):** Parses the execution trajectories of the
     agents from the current round, extracting false assumptions, tool failures,
     and successes, and appends these structured insights to the
     `learnings.jsonl` inbox.
@@ -345,16 +352,19 @@ CLI terminal.
     # 9. Generate proof-of-concept crash reproducers and run them in sandboxes
     /mantis_reproduce
 
-    # 10. Apply minimal fixes and verify they block the crash reproducer
+    # 10. Combine validated individual findings into multi-step exploit chains
+    /mantis_chain
+
+    # 11. Apply minimal fixes and verify they block the crash reproducer
     /mantis_patch
 
-    # 11. Calculate final matrix risk ratings and append to individual findings
+    # 12. Calculate final matrix risk ratings and append to individual findings
     /mantis_calibrate
 
-    # 12. Extract insights from execution trajectories and append to the learnings inbox
+    # 13. Extract insights from execution trajectories and append to the learnings inbox
     /mantis_reflect
 
-    # 13. (Manual Step) Move workspace/findings/ to an archive directory before starting the next loop
+    # 14. (Manual Step) Move workspace/findings/ to an archive directory before starting the next loop
     ```
 
 --------------------------------------------------------------------------------

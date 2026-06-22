@@ -40,7 +40,7 @@ Execute your validation as follows:
 
 3.  **Strict Validation Filtering (Apply the 12 Negative Constraints):**
     Evaluate each finding against these strict criteria. Mark a finding as
-    **FALSE POSITIVE** if it violates any of the following rules:
+    **FALSE_POSITIVE** if it violates any of the following rules:
 
     1.  **Ignore Hypothetical Misuse:** Do not flag security flaws that rely on
         a calling API hypothetically misusing a function, writing bad fallback
@@ -55,13 +55,13 @@ Execute your validation as follows:
         of the code logic.
     4.  **Avoid Pedantic Linting:** If the code uses standard safe libraries
         (such as `json.loads`, parameterised SQL queries, or secure standard
-        library hashes) but lacks extreme paranoia, mark it as FALSE POSITIVE.
+        library hashes) but lacks extreme paranoia, mark it as FALSE_POSITIVE.
     5.  **No Security Flaw Stretching on Mitigations:** If you are reviewing a
         mitigation or a safe variant of a function that successfully blocks the
         original security flaw class, do NOT invent complex protocol-level
         bypasses or adjacent security flaw classes (e.g., SSRF when reviewing
         Command Injection fixes). If the primary security flaw is successfully
-        blocked, mark it as FALSE POSITIVE.
+        blocked, mark it as FALSE_POSITIVE.
     6.  **Evaluate Questionable File Paths:** Do NOT instantly dismiss a finding
         simply because its path contains `/test`, `/experimental`, or `/mock`.
         Code in these paths is sometimes compiled into production targets or
@@ -88,12 +88,12 @@ Execute your validation as follows:
         allocation contract (such as trailing safety padding, like `row_bytes +
         16`). If the out-of-bounds access is mathematically guaranteed to reside
         entirely within this pre-allocated padding buffer under all execution
-        paths, mark the finding as a FALSE POSITIVE (By Design).
+        paths, mark the finding as a FALSE_POSITIVE (By Design).
     12. **Ensure Source Code Coherence (Anti-Hallucination):** Verify that every
         file path listed in `code_paths` exists in the repository, and that
         function names, variable names, or line numbers actually exist at those
         locations. If references are missing or incorrect, immediately mark the
-        finding as a FALSE POSITIVE to prevent downstream agents from wasting
+        finding as a FALSE_POSITIVE to prevent downstream agents from wasting
         resources on hallucinated bugs.
 
 4.  **Construct Reproduction Script Hints:** For every finding marked as
@@ -112,7 +112,7 @@ Execute your validation as follows:
 
     You must append the following to the existing object:
 
-    -   A `"status"` field (either `"VALID"` or `"FALSE POSITIVE"`).
+    -   A `"status"` field (either `"VALID"` or `"FALSE_POSITIVE"`).
     -   A `"reasoning"` field.
     -   A `"repro_hints"` field.
     -   An entry to the `"history"` array:
@@ -121,7 +121,7 @@ Execute your validation as follows:
     {
       "stage": "reviewer",
       "action": "reviewed",
-      "details": "Determined status as [VALID/FALSE POSITIVE] because [reason]"
+      "details": "Determined status as [VALID/FALSE_POSITIVE] because [reason]"
     }
     ```
 

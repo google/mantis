@@ -74,21 +74,30 @@ Execute your orchestration duties in a continuous loop:
     -   **Stage 9 (Reproduce):** Call the `@mantis_reproduce` subagent to
         develop crash reproducers and update files in the `workspace/findings/`
         directory.
-    -   **Stage 10 (Patch & Verify):** Call the `@mantis_patch` subagent to
+    -   **Stage 10 (Chain):** Call the `@mantis_chain` subagent to analyze the
+        current validated findings and the Knowledge Base to construct
+        multi-step exploit chains, outputting "Super Findings" into the
+        `workspace/findings/` directory.
+    -   **Stage 11 (Patch & Verify):** Call the `@mantis_patch` subagent to
         generate fixes, and update files in the `workspace/findings/` directory.
         Instruct it to repeatedly call a fresh `@mantis_reproduce` subagent
         against its patches to attempt a bypass, refining the fix until the
         reproducer can no longer bypass it.
-    -   **Stage 11 (Calibrate):** Call the `@mantis_calibrate` subagent to read
+    -   **Stage 12 (Calibrate):** Call the `@mantis_calibrate` subagent to read
         the `workspace/findings/` directory and append final calibration metrics
         to each finding file.
-    -   **Stage 12 (Reflect):** Call the `@mantis_reflect` subagent to parse the
+    -   **Stage 13 (Reflect):** Call the `@mantis_reflect` subagent to parse the
         execution trajectories of the round and append false assumptions or tool
         failures to the `learnings.jsonl` inbox.
-    -   **Stage 13 (Archive):** Archive the `workspace/findings/` directory
-        (e.g., move it to `workspace/archive/findings_pass_N/`) to ensure the
-        next loop iteration starts with a clean slate and does not waste tokens
-        re-evaluating old findings that have already been finalized.
+    -   **Stage 14 (Archive & KB Verification):** Archive the
+        `workspace/findings/` directory (e.g., move it to
+        `workspace/archive/findings_pass_N/`) to clear the state for the next
+        loop. *Crucially*, you must ensure that before archiving, any finalized
+        findings (especially `FALSE_POSITIVE`, `NON_VIABLE`, or
+        `VERIFIED_SECURE`) were successfully captured by the
+        `@mantis_architecture` subagent and written into the permanent Markdown
+        Knowledge Base (`workspace/kb/`). If they are only archived but not in
+        the KB, the Researcher will just re-find them in the next loop.
 
 2.  **Intelligent Supervision & Error Handling:**
 

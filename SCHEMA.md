@@ -29,7 +29,7 @@ evolves sequentially as different skills process it.
 ### Validation Fields (Written by `/mantis_review`)
 
 -   **`status`** (Enum): The validity of the finding.
-    -   Values: `"VALID"`, `"FALSE POSITIVE"`
+    -   Values: `"VALID"`, `"FALSE_POSITIVE"`
 -   **`reasoning`** (String): The reviewer's independent rationale for the
     status.
 -   **`repro_hints`** (String): Instructions for the reproducer agent on how to
@@ -50,6 +50,18 @@ evolves sequentially as different skills process it.
 -   **`repro_file_path`** (String): Path to the generated PoC script or payload.
 -   **`run_command`** (String): The exact command used to execute the PoC.
 -   **`repro_output`** (String): Standard output and error from the sandbox run.
+
+### Chain / Super Finding Overrides (Written by `/mantis_chain`)
+
+*Note: Chains are written as net-new `UUID.json` files that inherit the Base
+Fields schema, but with the following specific formatting.*
+
+-   **`title`** (String): Must explicitly contain "Exploit Chain" and list the
+    impact and underlying findings.
+-   **`code_paths`** (Array of Strings): The union of all file paths involved in
+    the multi-step chain.
+-   **`history`** (Array of Objects): Must include an entry detailing which
+    underlying UUIDs were chained together.
 
 ### Patch Fields (Written by `/mantis_patch` (incl. re-attack))
 
@@ -105,8 +117,8 @@ Written by `/mantis_plan`, read by `/mantis_researcher`.
 
 ## 3. Historical Learning State (`learnings.jsonl`)
 
-Appended by `/mantis_reflect`, `/mantis_critic`, and `/mantis_patch`. Read and
-explicitly cleared by `/mantis_architecture`.
+Appended by `/mantis_review`, `/mantis_reflect`, `/mantis_critic`, and
+`/mantis_patch`. Read and explicitly cleared by `/mantis_architecture`.
 
 Each line is a JSON object representing a finalized outcome or an insight from a
 trajectory.
