@@ -46,38 +46,55 @@ Execute the calibration as follows:
     components, where **Hazard = Impact + Likelihood**:
 
     -   **Impact (1-5):** Evaluate impact using the CIA triad (Confidentiality,
-        Integrity, Availability).
-        -   5: Complete loss of Confidentiality (full data breach), Integrity
-            (system compromise), or Availability (total outage/safety hazard).
-        -   4: Substantial loss in one or more areas (e.g., major data exposure,
-            denial of service for critical components).
+        Integrity, Availability) while strictly considering **Blast Radius**.
+        -   5: Complete, systemic loss of Confidentiality (full data breach) or
+            Integrity (system compromise, e.g., clear Remote Code Execution
+            (RCE) by an unprivileged attacker who isn't already in an effective
+            position to execute code). MUST NOT be used for attackers who
+            already have execution privileges.
+        -   4: Substantial loss in one or more areas. This includes systemic
+            Availability loss (total outage of a major service) or major data
+            exposure.
         -   3: Moderate loss (e.g., partial data exposure, temporary or partial
             system disruption).
         -   2: Minor loss (e.g., minor information leak, localized disruption).
-        -   1: Negligible impact on CIA, mostly a cosmetic issue.
-    -   **Likelihood (1-5):** Evaluate the probability of occurrence or
-        exploitation.
-        -   5: Verified exploit (`repro_status` == `"reproduced"`), actively
-            exploited.
-        -   4: Highly likely, exploit is straightforward but requires some
-            conditions.
-        -   3: Possible, requires complex setup or specific edge cases.
-        -   2: Unlikely, theoretical risk with no clear exploit path.
-        -   1: Very unlikely, extremely difficult to exploit.
+            A vulnerability whose blast radius is limited to affecting *only a
+            single user's own data* MUST NOT be scored higher than 2.
+        -   1: Negligible impact on CIA, mostly a cosmetic issue. Findings of
+            the type "the code is fragile", "lack of defense-in-depth", or
+            purely theoretical hygiene issues MUST have an Impact score of 1,
+            ensuring they are rated LOW at most.
+    -   **Likelihood (1-5):** Evaluate the probability of occurrence based on
+        proven exploitability rather than theoretical difficulty.
+        -   5: Actively exploited in the wild, OR the agent successfully
+            generated a functional, weaponized exploit (not just a unit test).
+        -   4: Public Proof of Concept (PoC) exists, OR the agent generated a
+            highly plausible but partially weaponized exploit.
+        -   3: No functional exploit, but the attack vector is trivial to
+            automate.
+        -   2: Theoretical and highly complex (requires local access, strict
+            timing).
+        -   1: Strictly theoretical risk with no known exploit path.
     -   **Context Multiplier (0.1 - 1.0):**
         -   If `status` is **FALSE POSITIVE** or `production_viability` is
             **NON_VIABLE**: Drop this finding completely. Do not score it or
             update its file with calibration data.
         -   If `production_viability` is **VIABLE**:
-            -   Check how the affected code paths correlate with the
-                `workspace/kb/THREAT_MODEL.md`:
+            -   **Network/Trust Exposure:**
                 -   If the finding resides inside an **Exposed Interface / Trust
-                    Boundary** (directly accessible to untrusted inputs):
-                    Multiplier = 1.0.
+                    Boundary** (directly accessible to untrusted inputs): 1.0.
                 -   If it resides in an **Internal Component** accepting
-                    semi-trusted parsed data: Multiplier = 0.8.
-                -   If it is deeply nested inside a **Privileged/Trusted Zone**
-                    with multiple verification layers: Multiplier = 0.5.
+                    semi-trusted parsed data: 0.8.
+                -   If deeply nested inside a **Privileged/Trusted Zone**: 0.5.
+            -   **Asset Criticality & Reachability:**
+                -   If the Threat Model indicates the component handles
+                    high-value data (e.g., PII, core secrets), keep the
+                    multiplier high.
+                -   If it affects a low-value target (e.g., internal analytics,
+                    sandboxed test data), reduce the multiplier (e.g., 0.5).
+                -   If static/dynamic analysis proves the vulnerable code is
+                    effectively "dead code" (never called in runtime execution
+                    paths), drastically reduce the multiplier to 0.2.
             -   If `workspace/kb/THREAT_MODEL.md` does not exist or does not
                 mention the components, default the Multiplier to 1.0.
 
@@ -92,12 +109,18 @@ Execute the calibration as follows:
 3.  **Determine Priority:**
 
     -   **CRITICAL (8.0 - 10.0):** Immediate action required. Very high hazard
-        (e.g. high impact and likelihood).
+        (e.g. high impact and likelihood). **Must NOT be used unless it
+        represents a clear RCE (or equivalent total loss) by an unprivileged
+        attacker who is not already in an effective position to compromise the
+        system.**
     -   **HIGH (6.0 - 7.9):** High priority. Significant hazard, needs prompt
         resolution.
     -   **MEDIUM (3.0 - 5.9):** Standard priority. Moderate hazard, can be
         scheduled.
-    -   **LOW (0.1 - 2.9):** Low priority. Minimal hazard.
+    -   **LOW (0.1 - 2.9):** Low priority. Minimal hazard. **Any finding of the
+        type "the code is fragile", purely hygiene/defense-in-depth, or one that
+        exclusively affects a single user's own data MUST be capped at LOW
+        priority regardless of the calculated score.**
 
 4.  **Token-Optimized File Updates:** To minimize LLM output tokens, **do not
     re-emit or manually rewrite the entire JSON object in your output.**
