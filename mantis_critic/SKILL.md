@@ -72,6 +72,11 @@ Execute the critic evaluation as follows:
     -   **Debug-Only Features:** Security flaws that exist inside files or
         sections conditionally compiled with debug flags (e.g. `#ifdef DEBUG`)
         are NON_VIABLE.
+    -   **Blocked by Environmental Controls:** If the exploit path is blocked by
+        standard, non-configurable production environmental controls (e.g.,
+        OS-level permissions, kernel-level sandboxing, read-only filesystems, or
+        hardware-enforced write protections) that cannot be bypassed, mark it
+        NON_VIABLE.
     -   **Harnesses, Mocks, & Examples:** Issues residing in example code, test
         suites, fuzzing harnesses, or validation frameworks are technically not
         deployed to production. However, because developers often copy sample

@@ -116,6 +116,14 @@ Execute your orchestration duties in a continuous loop:
     subagent), or when `@mantis_calibrate` finishes its scoring, you may output
     a brief text summary to the user.
 
+    -   **Do NOT report findings that failed to reproduce (`repro_status:
+        "failed_to_reproduce"`) as confirmed vulnerabilities.**
+    -   **Do NOT report findings that are marked `LOW` priority or are
+        `NON_VIABLE` as confirmed vulnerabilities.** These are considered
+        low-quality, fragile, or non-actionable. You may list them separately at
+        the bottom of your summary under a "Hygiene & Low Priority Notes"
+        section, but do not present them as active security flaws.
+
 4.  **Human-in-the-Loop Steering & Collaboration:** While you are designed for
     autonomy, remain responsive to user input. The user may interrupt the loop
     to ask for progress updates, collaboratively debug environmental issues, or

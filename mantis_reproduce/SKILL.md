@@ -45,14 +45,20 @@ Execute the reproduction stage under these constraints:
 
 3.  **Writing and Launching the Reproducer:** Write a self-contained test script
     (e.g., `poc.py` or a C reproducer file) or write a raw crash input data
-    payload (e.g., `crash.payload`) that triggers the target bug. To run your
-    script or payload, use the execution or containerization tools available in
-    your environment to execute the code safely. Select the most appropriate
-    runtime image and flags for the target. **Execute your reproduction using
-    the appropriate environment:** If the target is firmware, you may write a
-    script to boot it via `qemu`, `unicorn`, or Firmadyne. If it's a binary, you
-    may use dynamic instrumentation or standard execution. Use your best
-    judgment to construct a working harness for the artifact.
+    payload (e.g., `crash.payload`) that triggers the target bug. Analyze the
+    code path and constraints carefully. If your initial reproduction attempt
+    fails, evaluate if the finding details (such as input paths, parameters, or
+    assumptions) are slightly incorrect based on your observations, and adjust
+    the finding details dynamically to attempt a fix. If you cannot find a
+    triggerable path after trying multiple approaches and adjustments, abandon
+    the attempt and mark it as `failed_to_reproduce`. To run your script or
+    payload, use the execution or containerization tools available in your
+    environment to execute the code safely. Select the most appropriate runtime
+    image and flags for the target. **Execute your reproduction using the
+    appropriate environment:** If the target is firmware, you may write a script
+    to boot it via `qemu`, `unicorn`, or Firmadyne. If it's a binary, you may
+    use dynamic instrumentation or standard execution. Use your best judgment to
+    construct a working harness for the artifact.
 
     -   *Optional Parallel Trajectory Search:* If your environment or agent
         framework supports spawning subagents, you can deploy multiple

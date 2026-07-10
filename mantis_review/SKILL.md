@@ -52,7 +52,14 @@ Execute your validation as follows:
         as security flaws.
     3.  **Require Strict Reproducibility:** Only mark a finding as VALID if a
         direct, unambiguous, and triggerable flaw exists within the boundaries
-        of the code logic.
+        of the code logic. If the finding is extremely fragile (e.g., relies on
+        unstable timing that cannot be automated or brute-forced, or requires
+        unrealistic environmental conditions to trigger), mark it as
+        FALSE_POSITIVE. *Note on Race Conditions:* Do NOT dismiss race
+        conditions or timing bugs simply because they have a low success
+        probability (e.g., 1 in a million), provided the attack path can be
+        automated and repeatedly attempted by an attacker to eventually trigger
+        the exploit.
     4.  **Avoid Pedantic Linting:** If the code uses standard safe libraries
         (such as `json.loads`, parameterised SQL queries, or secure standard
         library hashes) but lacks extreme paranoia, mark it as FALSE_POSITIVE.

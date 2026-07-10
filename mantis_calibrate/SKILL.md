@@ -64,6 +64,13 @@ Execute the calibration as follows:
             the type "the code is fragile", "lack of defense-in-depth", or
             purely theoretical hygiene issues MUST have an Impact score of 1,
             ensuring they are rated LOW at most.
+        -   *Note on Internal Admin & Lateral Movement:* If a finding requires
+            pre-existing administrative privileges (internal privilege
+            escalation, e.g., admin to super-admin) or only allows lateral
+            movement/pivoting between internal components from an already
+            compromised state, cap its individual Impact score at 2. Its
+            escalated risk will be captured separately if it is successfully
+            chained into a "Super Finding" by the chainer.
     -   **Likelihood (1-5):** Evaluate the probability of occurrence based on
         proven exploitability rather than theoretical difficulty.
         -   5: Actively exploited in the wild, OR the agent successfully
@@ -114,7 +121,31 @@ Execute the calibration as follows:
     damage, user sentiment fallout) is taken into account. Do *not* include the
     outrage factor in the final numerical score.
 
-3.  **Determine Priority:**
+3.  **Critical Sanity Triage (Downgrading Weak Findings):** Before determining
+    the final priority, perform a second-level sanity check on the quality of
+    the finding and its accumulated evidence. You **MUST** force-downgrade the
+    finding's priority to **LOW** (and cap its final score at **2.0**) if it
+    meets any of the following "weak finding" criteria:
+
+    -   **Speculative Viability on Repro Failure:** The reproduction failed
+        (`repro_status: "failed_to_reproduce"`), and the reasoning for why it is
+        still viable in production is highly speculative, theoretical, or relies
+        on unverified assumptions about downstream systems.
+    -   **Minor Configuration Hygiene:** The issue represents a minor deviation
+        from best-practice configuration (e.g., slightly loose permissions on an
+        internal directory, lack of modern encryption on low-value internal
+        transport) but does not lead to a clear exploit path, privilege
+        escalation, or data exposure.
+    -   **Vague Code Paths / Fragile Assumptions:** The finding's description or
+        reasoning relies on unverified assumptions about caller behavior or
+        adjacent system components that are not documented in the active
+        Knowledge Base.
+    -   **Unreliable/Noisy Triggers:** The finding represents an issue that can
+        technically be triggered but is highly likely to be ignored in practice
+        due to high noise, or is indistinguishable from normal system operations
+        without causing real harm.
+
+4.  **Determine Priority:**
 
     -   **CRITICAL (8.0 - 10.0):** Immediate action required. Very high hazard
         (e.g. high impact and likelihood). **Must NOT be used unless it
@@ -130,7 +161,7 @@ Execute the calibration as follows:
         exclusively affects a single user's own data MUST be capped at LOW
         priority regardless of the calculated score.**
 
-4.  **Token-Optimized File Updates:** To minimize LLM output tokens, **do not
+5.  **Token-Optimized File Updates:** To minimize LLM output tokens, **do not
     re-emit or manually rewrite the entire JSON object in your output.**
     Instead, write a reusable helper script (e.g.,
     `workspace/helpers/append_calibrate.py`) during your first finding update.
