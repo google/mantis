@@ -75,6 +75,7 @@ graph TD
     Meta["/mantis_meta_agent (Supervisor)"]
 
     subgraph "Continuous Review Loop"
+        Hist["/mantis_history (Optional)"]
         Sum["/mantis_summarize (Optional)"]
         Arch["/mantis_architecture"]
         TM["/mantis_threat_model"]
@@ -90,13 +91,15 @@ graph TD
         Ref["/mantis_reflect"]
     end
 
+    FileHist[("historical_learnings.jsonl")]
     FileSum[("mantis_summary.md")]
     FileKB[/"workspace/kb/ (Markdown KB)"/]
     FilePlan[("plan.json")]
     FileFind[("workspace/findings/*.json")]
     FileLearn[("learnings.jsonl")]
 
-    Meta --> Sum
+    Meta --> Hist
+    Hist --> Sum
     Sum --> Arch
     Arch --> TM
     TM --> Plan
@@ -112,18 +115,27 @@ graph TD
     Cal --> Ref
     Ref -.->|Next Loop Iteration| Arch
 
+    Hist -.->|Generates| FileHist
+    Hist -.->|Reads| FileSum
+    Sum -.->|Reads| FileHist
     Sum -.->|Generates| FileSum
+    Arch -.->|Reads| FileHist
     Arch -.->|Generates| FileKB
-    Arch -.->|Clears| FileLearn
+    Arch -.->|Reads/Clears| FileLearn
     TM -.->|Reads/Updates| FileKB
     Plan -.->|Reads| FileKB
+    Plan -.->|Reads| FileSum
     Plan -.->|Generates| FilePlan
 
+    Res -.->|Reads| FilePlan
+    Res -.->|Reads| FileKB
     Res -.->|Creates| FileFind
+    Ded -.->|Reads| FileLearn
     Ded -.->|Merges| FileFind
     Rev -.->|Updates| FileFind
     Cri -.->|Updates| FileFind
     Rep -.->|Updates| FileFind
+    Cha -.->|Reads| FileKB
     Cha -.->|Creates| FileFind
     Pat -.->|Updates| FileFind
     Cal -.->|Updates| FileFind
