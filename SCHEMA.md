@@ -28,6 +28,18 @@ evolves sequentially as different skills process it.
         user-scoped CSRF, auth-bypass to user role).
     -   `"HIGH"`: Administrative / elevated privileges (e.g.,
         admin-to-super-admin escalation, VM escape from root).
+-   **`attacker_position`** (Enum): The starting position of the attacker
+    required to exploit the vulnerability.
+    -   `"EXTERNAL"`: Attacker is on the public internet.
+    -   `"INTERNAL_NETWORK"`: Attacker is inside the corporate/internal VPC.
+    -   `"IN_CLUSTER"`: Attacker is inside the Kubernetes cluster boundary.
+    -   `"LOCAL"`: Attacker has local shell access on the container/host.
+    -   `"HOST_SYSTEM"`: Attacker is the host OS/hypervisor (Confidential
+        Compute threat).
+    -   `"SUPPLY_CHAIN"`: Attacker is in the upstream supply chain.
+    -   `"PHYSICAL_TEMPORARY"`: Attacker has quick, temporary physical access.
+    -   `"PHYSICAL_LONG_TERM"`: Attacker has long-term lab/physical access
+        (fault injection).
 -   **`user_interaction`** (Enum): Whether user interaction is required to
     exploit.
     -   `"NONE"`: Zero-click exploit (most severe).
@@ -102,10 +114,14 @@ Fields schema, but with the following specific formatting.*
 -   **`availability_tier`** (Enum, Optional): The availability criticality of
     the component, if the finding has availability impact.
     -   Values: `"CRITICAL"`, `"STANDARD"`, `"LOW_CRITICALITY"`, `null`
+-   **`inferred_exposure`** (Enum): The resolved network/trust exposure tier.
+    -   Values: `"EXPOSED"`, `"INTERNAL"`, `"PRIVILEGED"`
 -   **`mantis_risk_score`** (Float: 0.1-10.0): The final calculated risk score
     (Hazard).
 -   **`priority`** (String): Qualitative priority bucket (e.g., `"CRITICAL"`,
     `"HIGH"`, `"MEDIUM"`, `"LOW"`).
+-   **`sanity_triage_applied`** (String): Semicolon-separated list of Section 3
+    sanity triage caps and downgrades that fired, most-restrictive first.
 -   **`outrage_commentary`** (String): Reasoning about the outrage factor (e.g.
     reputational damage).
 -   **`executive_summary`** (String): High-level summary of the risk for

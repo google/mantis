@@ -34,8 +34,10 @@ Execute the calibration as follows:
         files provide the complete picture of each finding's journey (including
         its `id`, reproduction status, and production viability).
     -   Read `workspace/kb/THREAT_MODEL.md` from the Knowledge Base (if it
-        exists) to evaluate component exposure, trust boundaries, and asset
-        criticality.
+        exists) to evaluate component exposure, trust boundaries, asset
+        criticality, and any custom **Calibration Overrides** (e.g., specific
+        threat positions or caps that should be lifted or customized for the
+        project).
     -   **Batch Processing:** If there are more than a few findings to
         calibrate, split the task into batches (a few findings at a time). If
         you have the ability to invoke subagents, delegate each batch to a
@@ -47,11 +49,12 @@ Execute the calibration as follows:
 
     -   **Impact (1-5):** Evaluate impact using the CIA triad (Confidentiality,
         Integrity, Availability) while strictly considering **Blast Radius**.
-        -   5: Complete, systemic loss of Confidentiality (full data breach) or
-            Integrity (system compromise, e.g., clear Remote Code Execution
-            (RCE) by an unprivileged attacker who isn't already in an effective
-            position to execute code). MUST NOT be used for attackers who
-            already have execution privileges.
+        -   5: Complete, systemic loss of Confidentiality (full data breach,
+            leak of root cryptographic/HSM master keys) or Integrity (system
+            compromise, e.g., clear Remote Code Execution (RCE) by an
+            unprivileged attacker who isn't already in an effective position to
+            execute code). MUST NOT be used for attackers who already have
+            execution privileges.
         -   4: Substantial loss in one or more areas. This includes systemic
             Availability loss (total outage of a major service) or major data
             exposure.
@@ -80,7 +83,9 @@ Execute the calibration as follows:
                 administrative privileges, admin-to-super-admin escalation) or
                 only allows lateral movement/pivoting between internal
                 components from an already compromised state, cap its individual
-                Impact score at **2**.
+                Impact score at **2**, unless the exploit results in escaping
+                the container boundary (to the host node) or cross-tenant
+                escalation.
             -   If the finding requires **LOW** privileges (e.g., standard
                 authenticated user), cap its individual Impact score at **3**
                 (unless it leads to systemic compromise of other tenants/users,
@@ -119,12 +124,80 @@ Execute the calibration as follows:
                     -   Analyze the file path, imports, and caller hierarchy to
                         infer exposure (e.g., public APIs vs internal helpers).
                     -   Default the Exposure Multiplier to **0.8** (Internal)
-                        unless there is clear evidence of direct external
-                        exposure.
+                        and `inferred_exposure` to `"INTERNAL"` unless there is
+                        clear evidence of direct external exposure (EXPOSED) or
+                        deep nested isolation (PRIVILEGED). Local SUID/LPE
+                        binaries should default to `"INTERNAL"` exposure.
                     -   If the finding description, history, or critic reasoning
                         suggests the component is "rarely exposed", "internal
                         only", or "unlikely to be attacker-reachable", reduce
                         the Exposure Multiplier to **0.5** or lower.
+            -   **Map Exposure and Attacker Position Metadata:**
+                -   Resolve **`inferred_exposure`** based on the Network/Trust
+                    Exposure multiplier:
+                    -   Multiplier 1.0 (Exposed Interface) -> `"EXPOSED"`
+                    -   Multiplier 0.8 (Internal Component) -> `"INTERNAL"`
+                    -   Multiplier 0.5 (Privileged/Trusted Zone) ->
+                        `"PRIVILEGED"`
+                -   **Evaluate Attacker Position (declared in finding):**
+                    -   Read `attacker_position` from the finding JSON.
+                    -   **Normalize Free-text:** If the value is present but is
+                        a free-text string that does not exactly match one of
+                        the valid enum values (e.g. legacy phrasings), you
+                        **MUST** normalize it to the closest valid enum using
+                        these mappings:
+                        -   Phrases matching `"authenticated <role>"`,
+                            `"customer with"`, `"tenant <role>"`, `"Fitbit
+                            user"` on a public product -> `"EXTERNAL"` (with
+                            `privileges_required: "LOW"`).
+                        -   Phrases matching `"local user"`, `"local shell"`,
+                            `"local access"` -> `"LOCAL"`.
+                        -   Phrases matching `"peer <role> in same
+                            job/cluster/pod"`, `"co-tenant"`, `"adjacent
+                            workload"`, `"NCCL peer rank"` -> `"IN_CLUSTER"`.
+                        -   Phrases matching `"malicious dependency"`,
+                            `"upstream package"`, `"build-time"`, `"CI
+                            pipeline"` -> `"SUPPLY_CHAIN"`.
+                        -   Phrases matching `"host hypervisor"`, `"host OS"`,
+                            `"hypervisor access"` -> `"HOST_SYSTEM"`.
+                        -   Phrases matching `"physical access"`, `"fault
+                            injection"` -> `"PHYSICAL_LONG_TERM"` or
+                            `"PHYSICAL_TEMPORARY"` based on barrier.
+                    -   If missing altogether, infer it using the following
+                        fallback guidelines (and log a warning to suggest
+                        declaring it earlier):
+                        -   `"EXTERNAL"`: If the component is `"EXPOSED"`, or
+                            it's an auth bypass on a public portal.
+                        -   `"LOCAL"`: If it's a local privilege escalation
+                            (LPE) or SUID exploit.
+                        -   `"IN_CLUSTER"`: If it targets in-cluster
+                            infrastructure (CSI/CNI) from a pod.
+                        -   `"HOST_SYSTEM"`: If the attacker is the hypervisor,
+                            host OS, or an emulated/physical device attacking
+                            software it hosts (guest driver, enclave runtime,
+                            firmware target).
+                        -   `"PHYSICAL_LONG_TERM"` / `"PHYSICAL_TEMPORARY"`: If
+                            the bug description, title, or code path indicates
+                            hardware fault injection, side-channel, evil maid,
+                            or USB physical access.
+                        -   `"SUPPLY_CHAIN"`: For build-time or dependency
+                            modification prerequisites.
+                        -   `"INTERNAL_NETWORK"`: Default fallback for other
+                            internal components.
+                    -   **Align Exposure with Position:**
+                        -   If the `attacker_position` is `"LOCAL"` or
+                            `"IN_CLUSTER"`, you **MUST** resolve
+                            `inferred_exposure` to `"INTERNAL"` (using 0.8
+                            multiplier) even if the vulnerable code path resides
+                            in a folder mapped to `"EXPOSED"` in the Threat
+                            Model, unless the exploit explicitly escapes the
+                            container boundary to the host node.
+                        -   If the `attacker_position` is `"EXTERNAL"`, you
+                            **MUST** resolve `inferred_exposure` to `"EXPOSED"`
+                            (using 1.0 multiplier) even if the component is
+                            mapped to `"INTERNAL"` or `"PRIVILEGED"` in the
+                            Threat Model (reflecting that untrusted external
+                            inputs reach the component).
             -   **Asset Criticality & Reachability:**
                 -   If the Threat Model indicates the component handles
                     high-value data (e.g., PII, core secrets), keep the
@@ -168,10 +241,23 @@ Execute the calibration as follows:
 
 3.  **Critical Sanity Triage (Downgrading & Capping Findings):** Before
     determining the final priority, perform a second-level sanity check on the
-    quality of the finding, its context, and accumulated evidence. Sanity Triage
-    caps and downgrades override any upgrades calculated in Section 2 (including
-    the Security Control Bypass upgrade). You **MUST** force-downgrade or cap
-    the finding's priority and score if it meets any of the following criteria:
+    quality of the finding, its context, and accumulated evidence. Check if the
+    `THREAT_MODEL.md` defines any `Calibration Overrides` (e.g., `LIFT_CAP:
+    PHYSICAL_LONG_TERM`). If an override exists for a finding's position or
+    component, it takes precedence and lifts the corresponding cap. Otherwise,
+    the caps and downgrades below override any upgrades calculated in Section 2
+    (including the Security Control Bypass upgrade), and you **MUST**
+    force-downgrade or cap the finding's priority and score if it meets any of
+    the following criteria. **Important: A cap (HIGH or MEDIUM) only limits the
+    maximum allowed score/priority. It must NOT upgrade a lower score/priority
+    (e.g., a finding with a score of 5.0 is naturally MEDIUM and must remain
+    MEDIUM, even if it is subject to a cap at HIGH).**
+
+    **Precedence:** Evaluate ALL rules below. If multiple caps apply, the **most
+    restrictive** wins (Force-LOW > cap-MEDIUM > cap-HIGH). Record every rule
+    that fired in `sanity_triage_applied` as a semicolon-separated list, most
+    restrictive first (e.g., `"Local Attack Vector; Internal/Nested"`), so the
+    effective cap is auditable.
 
     *   **Force-Downgrade to LOW (Cap at 2.0 / LOW Priority):**
 
@@ -207,23 +293,49 @@ Execute the calibration as follows:
             low-to-high privilege escalation (e.g., standard user to root),
             which should cap at MEDIUM.
 
+        -   **Physical Long-Term / Laboratory Access:** If the attack requires
+            long-term physical access to the device or specialized laboratory
+            equipment (e.g., fault injection, side-channel analysis, chip
+            decapping). Force-downgrade to **LOW (2.0)** due to the extreme
+            execution barrier and requirement for physical possession.
+
+        -   **Standard Host-to-Guest Attacks:** If the attacker position is
+            `HOST_SYSTEM` (host hypervisor attacking guest) on standard
+            deployments (non-Confidential Computing). Force-downgrade to **LOW
+            (2.0)** (equivalent primitives), as the host OS/hypervisor already
+            possesses total control over the guest by design. **Default
+            assumption:** treat as non-Confidential Computing (this rule fires)
+            UNLESS the Threat Model, code path, or finding description
+            explicitly names Confidential Computing, guest enclaves, TEE, SEV,
+            TDX, SGX, or attestation (in which case apply the CC Host Attacks
+            cap-HIGH rule instead).
+
     *   **Force-Cap to HIGH (Cap at 7.9 / Maximum HIGH Priority):**
 
         -   **Static Confirmation:** Statically confirmed but not empirically
             reproduced (`repro_status: "statically_confirmed"`). Cap
             `likelihood_score` at **3**, apply **0.8** multiplier to Hazard, and
-            MUST NOT be CRITICAL.
+            MUST NOT be CRITICAL. *Exception:* If the finding details
+            (description, history, or reproduction output) include a valid
+            external stack trace, sanitizer trace (e.g. ASan, UBSan, MSan),
+            crash log, or core dump proving the vulnerability was triggered in
+            execution (e.g., in a prior run or by external tools), treat it as
+            empirically reproduced (Likelihood 5) and do not apply this static
+            cap.
         -   **Strict XSS Caps:** All XSS vulnerabilities. Default to MEDIUM or
             LOW; cap at HIGH (7.9) only for stored XSS on critical admin pages
             with zero-click execution for the admin.
         -   **Internal / Nested Components:** Any finding with a Network/Trust
             Exposure multiplier less than 1.0 (i.e., Internal Component or
             Privileged Zone). If the calculated score lands in the CRITICAL
-            range, downgrade the priority to HIGH. *Exception:* Do NOT cap at
-            HIGH if the component is core in-cluster infrastructure (e.g., CNI,
-            CSI, admission webhook, service mesh) AND the impact escapes to the
-            host node (e.g., node-root file R/W) or allows cross-tenant
-            escalation. These remain eligible for CRITICAL.
+            range, cap the score at **7.9** and downgrade the priority to HIGH.
+            *Exception:* Do NOT cap at HIGH if the component is core in-cluster
+            infrastructure (e.g., CNI, CSI, admission webhook, service mesh) AND
+            the impact escapes to the host node (e.g., node-root file R/W) or
+            allows cross-tenant escalation. These remain eligible for CRITICAL.
+            **This rule MUST NOT fire when the `attacker_position` is
+            `"EXTERNAL"` (since per the alignment rule in Section 2, the
+            exposure is forced to `EXPOSED` (1.0), which precludes this cap).**
         -   **Probabilistic LLM Vectors:** Attacks relying on probabilistic LLM
             behavior (e.g., prompt injection, jailbreaking) to trigger a
             vulnerability. Cap at **HIGH** (7.9) and default to **MEDIUM** or
@@ -243,6 +355,14 @@ Execute the calibration as follows:
         -   **Non-Default Configurations:** Findings that are only exploitable
             under non-default configurations. Cap at **HIGH (7.9)** to reflect
             the additional configuration barrier.
+
+        -   **Confidential Computing Host Attacks:** If the attacker position is
+            `HOST_SYSTEM` (the host OS or hypervisor attacking guest enclaves or
+            confidential VMs) in Confidential Computing deployments. Cap at
+            **HIGH (7.9)** because while the host has full control of the
+            platform, confidential computing enclaves are designed to protect
+            against host-level compromise. (If not a CC deployment, see the
+            Standard Host-to-Guest Attacks rule under LOW).
 
     *   **Force-Cap to MEDIUM (Cap at 5.9 / Maximum MEDIUM Priority):**
 
@@ -266,6 +386,17 @@ Execute the calibration as follows:
             diagnostic-only, or strictly non-production. Cap at **MEDIUM
             (5.9)**.
 
+        -   **Physical Temporary Access:** If the attack requires temporary
+            physical access to the device (e.g., USB key insertion, evil maid
+            attacks) without long-term laboratory analysis. Cap at **MEDIUM
+            (5.9)**.
+
+        -   **High-Privilege External Access:** Exploits with
+            `attacker_position: "EXTERNAL"` that require `privileges_required:
+            "HIGH"` (e.g., admin RCE on public portals). Cap at **MEDIUM
+            (5.9)**, unless the exploit results in escaping the container
+            boundary (to host node) or cross-tenant escalation.
+
 4.  **Determine Priority:**
 
     -   **CRITICAL (8.0 - 10.0):** Immediate action required. Very high hazard
@@ -273,7 +404,13 @@ Execute the calibration as follows:
         represents a clear RCE (or equivalent total loss) by an unprivileged
         attacker (where `privileges_required` is **NONE**) who is not already in
         an effective position to compromise the system, AND `user_interaction`
-        is **NONE** (zero-click).**
+        is **NONE** (zero-click). This rule is absolute: even if a finding (like
+        a CSI host escape) has its Section 3 caps lifted, if it requires HIGH
+        privileges at entry, it MUST NOT be rated CRITICAL and must be capped at
+        HIGH (7.9). Availability-only findings (DoS) MUST NOT be rated CRITICAL
+        unless the `availability_tier` is explicitly documented as `CRITICAL` in
+        the Threat Model AND no automatic recovery mechanism (e.g. auto-restart,
+        load balancer failover) mitigates the impact.**
     -   **HIGH (6.0 - 7.9):** High priority. Significant hazard, needs prompt
         resolution.
     -   **MEDIUM (3.0 - 5.9):** Standard priority. Moderate hazard, can be
@@ -298,8 +435,13 @@ Execute the calibration as follows:
     -   `"impact_score"` (1-5)
     -   `"likelihood_score"` (1-5)
     -   `"availability_tier"` (CRITICAL, STANDARD, LOW_CRITICALITY or null)
+    -   `"inferred_exposure"` (EXPOSED, INTERNAL, or PRIVILEGED)
+    -   `"attacker_position"` (preserved from input, or populated from fallback
+        inference if missing)
     -   `"mantis_risk_score"` (the final Hazard score)
     -   `"priority"` (CRITICAL, HIGH, MEDIUM, LOW)
+    -   `"sanity_triage_applied"` (semicolon-separated list of Section 3 rules
+        that fired, most-restrictive first, or null)
     -   `"outrage_commentary"` (your reasoning about the outrage factor)
     -   `"executive_summary"`
 
