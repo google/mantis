@@ -68,6 +68,13 @@ Execute the calibration as follows:
             the type "the code is fragile", "lack of defense-in-depth", or
             purely theoretical hygiene issues MUST have an Impact score of 1,
             ensuring they are rated LOW at most.
+        -   **Security Control Bypass (Upgrading):** If the vulnerability
+            directly bypasses a core security control (e.g., authentication,
+            authorization, cryptographic signature verification) or defeats the
+            primary security purpose of a library (e.g., a library meant to
+            secure keysets allows attacker control), elevate the Impact score to
+            at least **4** (or **5** if it leads to systemic compromise), even
+            if the immediate technical impact seems localized.
         -   *Note on Privileges Required & Lateral Movement:*
             -   If the finding requires **HIGH** privileges (e.g.,
                 administrative privileges, admin-to-super-admin escalation) or
@@ -77,6 +84,7 @@ Execute the calibration as follows:
             -   If the finding requires **LOW** privileges (e.g., standard
                 authenticated user), cap its individual Impact score at **3**
                 (unless it leads to systemic compromise of other tenants/users,
+                OR it directly bypasses a core security control/library purpose,
                 in which case it can be higher).
             -   These caps apply to *individual* findings. If successfully
                 chained into an Exploit Chain (Super Finding) by the chainer,
@@ -105,6 +113,18 @@ Execute the calibration as follows:
                 -   If it resides in an **Internal Component** accepting
                     semi-trusted parsed data: 0.8.
                 -   If deeply nested inside a **Privileged/Trusted Zone**: 0.5.
+                -   **Inference when Threat Model is Missing/Incomplete:** If
+                    `workspace/kb/THREAT_MODEL.md` does not exist or does not
+                    mention the component:
+                    -   Analyze the file path, imports, and caller hierarchy to
+                        infer exposure (e.g., public APIs vs internal helpers).
+                    -   Default the Exposure Multiplier to **0.8** (Internal)
+                        unless there is clear evidence of direct external
+                        exposure.
+                    -   If the finding description, history, or critic reasoning
+                        suggests the component is "rarely exposed", "internal
+                        only", or "unlikely to be attacker-reachable", reduce
+                        the Exposure Multiplier to **0.5** or lower.
             -   **Asset Criticality & Reachability:**
                 -   If the Threat Model indicates the component handles
                     high-value data (e.g., PII, core secrets), keep the
@@ -113,7 +133,8 @@ Execute the calibration as follows:
                     sandboxed test data), reduce the multiplier (e.g., 0.5).
                 -   **Availability-Specific Context:** If the finding is
                     availability-only (DoS), check the component's
-                    `availability_tier` in the Threat Model:
+                    `availability_tier` in the Threat Model (if missing, default
+                    to STANDARD):
                     -   `LOW_CRITICALITY`: Reduce multiplier to **0.5**.
                     -   `STANDARD`: Reduce multiplier to **0.8**.
                     -   `CRITICAL`: Keep multiplier at **1.0**.
@@ -128,8 +149,6 @@ Execute the calibration as follows:
                     required, the combined multiplier is 0.8 * 0.7 = 0.56). This
                     ensures these findings are capped below the CRITICAL
                     threshold.
-            -   If `workspace/kb/THREAT_MODEL.md` does not exist or does not
-                mention the components, default the Multiplier to 1.0.
         -   If `production_viability` is **SAMPLE_OR_TEST**:
             -   Set the Context Multiplier to a reduced value (e.g. `0.4`) so
                 that severe bugs in sample code typically land in the MEDIUM
@@ -147,41 +166,105 @@ Execute the calibration as follows:
     damage, user sentiment fallout) is taken into account. Do *not* include the
     outrage factor in the final numerical score.
 
-3.  **Critical Sanity Triage (Downgrading Weak Findings):** Before determining
-    the final priority, perform a second-level sanity check on the quality of
-    the finding and its accumulated evidence. You **MUST** force-downgrade the
-    finding's priority to **LOW** (and cap its final score at **2.0**) if it
-    meets any of the following "weak finding" criteria:
+3.  **Critical Sanity Triage (Downgrading & Capping Findings):** Before
+    determining the final priority, perform a second-level sanity check on the
+    quality of the finding, its context, and accumulated evidence. Sanity Triage
+    caps and downgrades override any upgrades calculated in Section 2 (including
+    the Security Control Bypass upgrade). You **MUST** force-downgrade or cap
+    the finding's priority and score if it meets any of the following criteria:
 
-    -   **Reproduction Failure or Not Attempted:** The reproduction failed
-        (`repro_status: "failed_to_reproduce"`) or was not attempted
-        (`repro_status: "not_attempted"`). If the agent did not successfully
-        reproduce the vulnerability, it MUST be force-downgraded to **LOW**
-        priority (and cap its final score at **2.0**) regardless of any
-        theoretical arguments for production viability.
-    -   **Static Confirmation:** The vulnerability was statically confirmed but
-        not empirically reproduced (`repro_status: "statically_confirmed"`). To
-        account for the lack of empirical proof:
-        -   Force-cap the `likelihood_score` at **3** (or keep it lower if
-            appropriate).
-        -   Apply an additional **0.8** multiplier to the final calculated score
-            (Hazard).
-        -   The finding **MUST NOT** be classified as **CRITICAL** priority (if
-            the score lands in the CRITICAL range, downgrade the priority to
-            **HIGH**).
-    -   **Minor Configuration Hygiene:** The issue represents a minor deviation
-        from best-practice configuration (e.g., slightly loose permissions on an
-        internal directory, lack of modern encryption on low-value internal
-        transport) but does not lead to a clear exploit path, privilege
-        escalation, or data exposure.
-    -   **Vague Code Paths / Fragile Assumptions:** The finding's description or
-        reasoning relies on unverified assumptions about caller behavior or
-        adjacent system components that are not documented in the active
-        Knowledge Base.
-    -   **Unreliable/Noisy Triggers:** The finding represents an issue that can
-        technically be triggered but is highly likely to be ignored in practice
-        due to high noise, or is indistinguishable from normal system operations
-        without causing real harm.
+    *   **Force-Downgrade to LOW (Cap at 2.0 / LOW Priority):**
+
+        -   **Reproduction Failure or Not Attempted:** The reproduction failed
+            (`repro_status: "failed_to_reproduce"`) or was not attempted
+            (`repro_status: "not_attempted"`). Regardless of theoretical
+            production viability.
+        -   **Unreachable / Uncontrolled Inputs:** The finding relies on inputs
+            that are documented as highly unlikely to be user-controlled, and no
+            path from a trust boundary is proven.
+        -   **Third-Party / Supply Chain Reachability:** Vulnerabilities in
+            third-party libraries (dependency CVEs) where a reachable path from
+            application input to the vulnerable function has not been actively
+            demonstrated.
+        -   **Minor Configuration Hygiene:** Minor deviations from best practice
+            (e.g., slightly loose permissions on internal dirs, lack of modern
+            encryption on low-value internal transport) without a clear exploit
+            path.
+        -   **Non-Security Critical Components:** The finding affects a
+            component or data with no security sensitivity (e.g., public info,
+            signatures on non-security payloads, cosmetic outputs).
+        -   **Vague Code Paths / Fragile Assumptions:** Relying on unverified
+            assumptions about caller behavior or adjacent system components.
+        -   **Unreliable/Noisy Triggers:** Triggers that are likely to be
+            ignored in practice or indistinguishable from normal operations.
+        -   **Prerequisite Shell Access (Equivalent Primitives):** The attacker
+            already possesses local shell access on the target container or host
+            with the **same or higher** privilege level than the exploit
+            provides, rendering the gained access redundant (e.g., exploiting a
+            bug to get a standard user shell when already logged in as a
+            standard user, or exploiting a local buffer overflow to run commands
+            as root when already running as root). This does NOT apply to
+            low-to-high privilege escalation (e.g., standard user to root),
+            which should cap at MEDIUM.
+
+    *   **Force-Cap to HIGH (Cap at 7.9 / Maximum HIGH Priority):**
+
+        -   **Static Confirmation:** Statically confirmed but not empirically
+            reproduced (`repro_status: "statically_confirmed"`). Cap
+            `likelihood_score` at **3**, apply **0.8** multiplier to Hazard, and
+            MUST NOT be CRITICAL.
+        -   **Strict XSS Caps:** All XSS vulnerabilities. Default to MEDIUM or
+            LOW; cap at HIGH (7.9) only for stored XSS on critical admin pages
+            with zero-click execution for the admin.
+        -   **Internal / Nested Components:** Any finding with a Network/Trust
+            Exposure multiplier less than 1.0 (i.e., Internal Component or
+            Privileged Zone). If the calculated score lands in the CRITICAL
+            range, downgrade the priority to HIGH. *Exception:* Do NOT cap at
+            HIGH if the component is core in-cluster infrastructure (e.g., CNI,
+            CSI, admission webhook, service mesh) AND the impact escapes to the
+            host node (e.g., node-root file R/W) or allows cross-tenant
+            escalation. These remain eligible for CRITICAL.
+        -   **Probabilistic LLM Vectors:** Attacks relying on probabilistic LLM
+            behavior (e.g., prompt injection, jailbreaking) to trigger a
+            vulnerability. Cap at **HIGH** (7.9) and default to **MEDIUM** or
+            **LOW**. *Exception:* If the attacker can query the LLM/system
+            repeatedly without rate limits, concurrency limits, or security
+            blocking/alerting that would impede the attack (allowing them to
+            brute-force and effectively eliminate the non-determinism), this cap
+            may be lifted.
+        -   **Supply-Chain / Build-Time Prerequisites:** If the exploit requires
+            the attacker to already possess a supply-chain position (e.g.,
+            ability to poison dependencies, modify upstream source) or write
+            access to the build pipeline to trigger the vulnerability. Cap at
+            **HIGH (7.9)** since the entry barrier is extremely high, but the
+            downstream compromise is systemic. (Force-downgrade to LOW/2.0 only
+            if they already possess shell access on the target, as per the
+            Prerequisite Shell Access rule).
+        -   **Non-Default Configurations:** Findings that are only exploitable
+            under non-default configurations. Cap at **HIGH (7.9)** to reflect
+            the additional configuration barrier.
+
+    *   **Force-Cap to MEDIUM (Cap at 5.9 / Maximum MEDIUM Priority):**
+
+        -   **Local Attack Vector:** Vulnerabilities requiring local shell
+            access (e.g., local privilege escalation, SUID exploitation) without
+            VM escape. (Downgrade to LOW/2.0 if it only affects a single user's
+            isolated data).
+        -   **Intra-Customer / Same-Tenant:** Attacks restricted to the same
+            tenant boundary the attacker already controls, with no cross-tenant
+            escalation or host compromise.
+        -   **Rarely Exposed Components:** Findings in components documented as
+            'rarely exposed' or 'unlikely to be user controlled'.
+        -   **Equivalent Primitives (No Boundary Breach):** The attacker profile
+            capable of triggering the vulnerability already possesses equivalent
+            access, privileges, or capabilities (primitives) through standard
+            system features (e.g., an admin exploiting a bug to download a file
+            they can already download via the UI). Cap at **MEDIUM (5.9)** to
+            maintain visibility for defense-in-depth cleanup.
+        -   **Documented Insecure Configurations:** Non-default configurations
+            that are explicitly documented in public manuals as insecure,
+            diagnostic-only, or strictly non-production. Cap at **MEDIUM
+            (5.9)**.
 
 4.  **Determine Priority:**
 
