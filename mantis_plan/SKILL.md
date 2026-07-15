@@ -82,23 +82,31 @@ Execute the planning stage as follows:
 
             1.  Findings marked `"NEEDS_RESEARCH"` (to gather missing context
                 and resolve them to `"VALID"` or `"FALSE_POSITIVE"`).
-            2.  Findings marked `"PROVISIONALLY_VALID"` where the reproduction
-                status (`repro_status`) is `"not_attempted"`, or findings where
+            2.  Findings marked `"VALID"` or `"PROVISIONALLY_VALID"` where the
+                reproduction status (`repro_status`) is `"not_attempted"` (or
+                the `repro_status` key is missing entirely), or findings where
                 reproduction previously failed (`"failed_to_reproduce"`) but
                 have had **fewer than 2 total reproduction attempts**.
-                -   To check the attempt count efficiently: Normalize the
-                    finding's `"title"` (lowercase, strip non-alphanumeric and
-                    whitespace) to generate a key, and look up its integer
-                    attempt value in the
+                -   To check the attempt count efficiently: Look up the
+                    finding's `stable_key` in the
                     `workspace/archive/.repro_attempts.json` cache (treating it
                     as 0 if the file is missing or the key is not found).
+                    -   Compute `stable_key` as `normalized_title + "@" +
+                        primary_file_path`.
+                    -   `normalized_title` is the finding's title converted to
+                        lowercase with all non-alphanumeric characters removed.
+                    -   `primary_file_path` is the first entry in `code_paths`
+                        with any line number suffixes removed (e.g. `src/auth.c`
+                        from `src/auth.c:120`).
                 -   This retry mechanism provides resilience against transient
                     environment issues or suboptimal initial prompts. Do **not**
-                    reschedule findings that are already resolved (`"VALID"`,
-                    `"FALSE_POSITIVE"`, `"VERIFIED_SECURE"`), or those that have
+                    reschedule findings where `"status"` is `"FALSE_POSITIVE"`,
+                    or `"patch_status"` is `"VERIFIED_SECURE"`, or
+                    `"repro_status"` is `"reproduced"`, or those that have
                     reached the 2-attempt limit in the cache, unless the target
                     file has been modified in the current loop (VCS diff shows
-                    changes).
+                    changes, or file modification timestamps/hashes have
+                    changed).
 
         -   **Context Injection (`kb_references`):** For each investigation you
             plan, you must determine which files in the `workspace/kb/`

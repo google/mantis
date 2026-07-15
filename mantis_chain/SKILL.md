@@ -68,6 +68,9 @@ Execute the chaining stage as follows:
         chain starts with an unauthenticated exploit (NONE) that leads to admin
         access, which is then used to trigger RCE, the chain's
         `privileges_required` must be set to `NONE`.
+    -   **Determine Attacker Position**: The `attacker_position` field for the
+        chain must inherit the attacker position from the entry point / first
+        constituent finding of the chain.
     -   **Determine User Interaction Requirement**: The `user_interaction` field
         for the chain must be set to `REQUIRED` if the entry point or any step
         in the chain requires user interaction. It should only be set to `NONE`
@@ -81,9 +84,11 @@ Execute the chaining stage as follows:
         -   If any constituent has a `repro_status` of `"failed_to_reproduce"`
             or `"not_attempted"`, set to `"not_attempted"`.
         -   Otherwise, if all constituents have a `repro_status` of
-            `"reproduced"`, set to `"reproduced"`.
-        -   Otherwise (some are `"statically_confirmed"` and others are
-            `"reproduced"`), set to `"statically_confirmed"`.
+            `"reproduced"` or `"statically_confirmed"`, set to
+            `"statically_confirmed"`.
+        -   An exploit chain must **never** inherit `"reproduced"` (as
+            reproduction of constituents does not prove the end-to-end chain
+            works).
 
     ### Chain Findings Schema Format (Per File)
 
@@ -100,10 +105,11 @@ Execute the chaining stage as follows:
         "relative/file/path_A.c:line_number",
         "relative/file/path_B.c:line_number"
       ],
+      "attacker_position": "EXTERNAL / LOCAL / etc. (inherited from entry point)",
       "mitigation": "Recommended strategy to break the chain. Usually involves fixing at least one, if not all, of the underlying links.",
       "status": "VALID",
       "production_viability": "VIABLE / SAMPLE_OR_TEST / CONDITIONAL_VIABLE",
-      "repro_status": "reproduced / statically_confirmed / not_attempted",
+      "repro_status": "statically_confirmed / not_attempted",
       "history": [
         {
           "stage": "chainer",

@@ -106,7 +106,9 @@ Execute the research stage as follows:
   "impact": "Exploit outcome (e.g., Privilege escalation, Memory corruption, Data exfiltration).",
   "severity": "CRITICAL / HIGH / MEDIUM / LOW / INFO",
   "privileges_required": "NONE / LOW / HIGH",
+  "attacker_position": "EXTERNAL / INTERNAL_NETWORK / IN_CLUSTER / LOCAL / HOST_SYSTEM / SUPPLY_CHAIN / PHYSICAL_TEMPORARY / PHYSICAL_LONG_TERM",
   "user_interaction": "NONE / REQUIRED",
+  "status": "PROVISIONALLY_VALID",
   "code_paths": ["relative/file/path.c:line_number"],
   "mitigation": "Recommended corrective modification.",
   "history": [

@@ -1,7 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Mantis Pipeline State Contract",
-  "description": "Canonical schemas for all inter-stage state contracts in the Mantis pipeline.\n\n### Non-JSON Contracts:\n#### Threat Model (workspace/kb/THREAT_MODEL.md)\nWhile the threat model is a Markdown document, it serves as a contract. It must contain:\n- **System Overview Summary**: High-level design.\n- **Deployment Intent**: Must state 'Intent: PRODUCTION' or 'Intent: SAMPLE_OR_TEST_ONLY'.\n- **Trust Boundaries**: Zone definitions and entry points.\n- **Threat Actors & Vectors**: Attacker profiles.\n- **High-Risk Assets & Criticality**: Asset definitions. For DoS targets, must specify Availability Tier: 'CRITICAL' (24/7 immediate impact), 'STANDARD' (short disruptions tolerable), or 'LOW_CRITICALITY' (non-blocking).",
+  "description": "Canonical schemas for all inter-stage state contracts in the Mantis pipeline.\n\n### Validation Guidelines:\n- Harness authors and pipeline orchestrators should validate specific state files against their corresponding sub-schemas:\n  - Validate individual finding files (`workspace/findings/<uuid>.json`) against `#/$defs/finding`.\n  - Validate plan files (`plan.json`) against `#/$defs/plan`.\n  - Validate learning entry lines (`learnings.jsonl` / `historical_learnings.jsonl`) against `#/$defs/learning_entry`.\n\n### Non-JSON Contracts:\n#### Threat Model (workspace/kb/THREAT_MODEL.md)\nWhile the threat model is a Markdown document, it serves as a contract. It must contain:\n- **System Overview Summary**: High-level design.\n- **Deployment Intent**: Must state 'Intent: PRODUCTION' or 'Intent: SAMPLE_OR_TEST_ONLY'.\n- **Trust Boundaries**: Zone definitions and entry points.\n- **Threat Actors & Vectors**: Attacker profiles.\n- **High-Risk Assets & Criticality**: Asset definitions. For DoS targets, must specify Availability Tier: 'CRITICAL' (24/7 immediate impact), 'STANDARD' (short disruptions tolerable), or 'LOW_CRITICALITY' (non-blocking).\n",
   "type": "object",
   "properties": {
     "finding": {
@@ -93,6 +93,10 @@
           "type": "string",
           "enum": ["VALID", "FALSE_POSITIVE", "PROVISIONALLY_VALID", "NEEDS_RESEARCH", "DUPLICATE"],
           "description": "The validity of the finding.\n- 'VALID': Confirmed vulnerability.\n- 'FALSE_POSITIVE': Not a bug or invalid.\n- 'PROVISIONALLY_VALID': Potential issue requiring dynamic validation.\n- 'NEEDS_RESEARCH': Inconclusive, requires deeper review.\n- 'DUPLICATE': The finding is a duplicate of another finding."
+        },
+        "duplicate_of": {
+          "type": ["string", "null"],
+          "description": "If status is DUPLICATE, the UUID of the primary finding this is a duplicate of."
         },
         "reasoning": {
           "type": "string",
@@ -188,7 +192,7 @@
           "description": "Qualitative priority bucket."
         },
         "sanity_triage_applied": {
-          "type": "string",
+          "type": ["string", "null"],
           "description": "Semicolon-separated list of sanity triage caps and downgrades that fired."
         },
         "outrage_commentary": {
@@ -208,7 +212,60 @@
         "impact",
         "severity",
         "mitigation",
-        "history"
+        "history",
+        "attacker_position",
+        "privileges_required",
+        "user_interaction",
+        "status"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "repro_status": { "const": "reproduced" }
+            },
+            "required": ["repro_status"]
+          },
+          "then": {
+            "required": ["repro_file_path", "run_command", "repro_output"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "patch_status": { "const": "VERIFIED_SECURE" }
+            },
+            "required": ["patch_status"],
+            "not": {
+              "properties": {
+                "history": {
+                  "type": "array",
+                  "contains": {
+                    "type": "object",
+                    "properties": {
+                      "stage": { "const": "chainer" }
+                    },
+                    "required": ["stage"]
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": ["patch_diff"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "DUPLICATE" }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "required": ["duplicate_of"]
+          }
+        }
       ]
     },
     "plan": {

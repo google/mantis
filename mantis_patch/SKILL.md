@@ -1,7 +1,7 @@
 ---
 name: mantis_patch
 description: >-
-  Generates minimal security fixes using transactional isolation (VCS branches or file backups), applies patches, and verifies them.
+  Generates minimal security fixes using transactional isolation (shadow directories or file backups), applies patches, and verifies them.
   Use when security findings are successfully reproduced and need patches applied and verified.
   Don't use for initial vulnerability research or reproduction payload generation.
 ---
@@ -18,8 +18,8 @@ logs to long-term memory.
 
 -   **Command:** `/mantis_patch`
 -   **Description:** Generates minimal security fixes using transactional
-    isolation (VCS branches or file backups), applies patches, and verifies
-    them.
+    isolation (shadow directories or file backups), applies patches, and
+    verifies them.
 
 ## Instructions
 
@@ -28,9 +28,12 @@ behavior.
 
 Execute the patching and verification stage as follows:
 
-1.  **Load Reproduction Results:** Read the JSON files in the
-    `workspace/findings/` directory. Filter for entries where `repro_status` is
-    `"reproduced"`. If none exist, notify the user.
+1.  **Load Findings to Patch:** Read the JSON files in the `workspace/findings/`
+    directory. Filter for findings where `patch_status` is NOT
+    `"VERIFIED_SECURE"` AND (either `repro_status` is `"reproduced"` OR the
+    finding is an exploit chain, e.g., the title starts with `"Exploit Chain:"`
+    or history has an entry from the `"chainer"` stage). If none exist, notify
+    the user.
 
 2.  **Generate and Apply Minimal Patches:** For each reproduced security flaw:
 
@@ -48,11 +51,14 @@ Execute the patching and verification stage as follows:
         `"Exploit Chain:"` in the title or history details indicating it was
         constructed by chaining), do **not** generate a code patch or diff.
         Instead, monitor the patch status of its constituent findings (listed in
-        its history). Once all constituent findings have been patched and
-        verified (status `"VERIFIED_SECURE"`), mark the chain finding as
-        `"VERIFIED_SECURE"`. If any constituent patch fails, mark the chain as
-        `"VERIFICATION_FAILED"`. Skip branch isolation, testing, and re-attack
-        steps for the chain finding itself.
+        its history). **Important:** You must defer evaluating exploit chains
+        until all individual findings in the batch have been processed, so that
+        the latest patch statuses of their constituents are available on disk.
+        Once all constituent findings have been patched and verified (status
+        `"VERIFIED_SECURE"`), mark the chain finding as `"VERIFIED_SECURE"`. If
+        any constituent patch fails, mark the chain as `"VERIFICATION_FAILED"`.
+        Skip branch isolation, testing, and re-attack steps for the chain
+        finding itself.
 
     -   *Optional Parallel Trajectory Search:* If your framework supports
         subagents, you may spawn multiple concurrent subagents to design diverse
@@ -68,35 +74,56 @@ Execute the patching and verification stage as follows:
         adding bound checks, validating sizes, inserting NUL-terminators)
         without breaking other features.
 
-    -   **Transactional Isolation:** Before modifying any source code, evaluate
-        the workspace and repository environment (e.g., Git, Mercurial, other
-        VCS, or unversioned).
+    -   **Transactional Isolation (VCS-Agnostic & Safe):** To ensure safety,
+        reliability, and VCS-agnosticism, do NOT use VCS-based branch operations
+        (such as `git branch`, `git checkout`, or `git stash`).
 
-        -   **Warning on Shared Workspaces:** If multiple parallel workers share
-            the same repository clone or working directory, using global
-            commands like `git stash`, `git checkout`, or global branch
-            switching will conflict. In such environments, avoid those commands.
-            Instead, prefer working in completely isolated workspace
-            clones/directories if supported by the host, or isolate edits using
-            file-level backups.
-        -   **VCS-Based Isolation (e.g., Git, Mercurial):** If in a dedicated,
-            isolated Git repository clone, verify the working tree is clean.
-            Stash or discard local changes only if safe to do so. Create and
-            check out a temporary development branch (e.g., `git checkout -B
-            mantis/tx-[finding_id]` from the base branch). Perform all edits,
-            compilation, and testing exclusively on this branch.
-        -   **Non-VCS/Unversioned Isolation:** If the repository is unversioned
-            or shared without branch isolation, create backup copies of the
-            original files (e.g., `cp target.c target.c.orig-[finding_id]`)
-            before editing.
-        -   Apply the generated patched code directly to the target file. If
-            using a dedicated VCS branch, commit the changes to the branch
-            (e.g., `git add -A && git commit -m "Apply patch for
-            [finding_id]"`). If the commit command fails due to missing user
-            configuration, configure local credentials first (e.g., `git config
-            --local user.email "mantis@agent.local" && git config --local
-            user.name "Mantis Patcher"`). This isolates your edits and prevents
-            working tree pollution.
+        You must ensure transactional isolation using a method appropriate for
+        the operating environment. You may choose **Option A: Temporary
+        Directory Shadowing** (recommended), **Option B: File-Level Backups**,
+        or design/implement **Option C: Alternative Isolation** (e.g., namespace
+        isolation, container volumes, or local sandboxes) as long as it fully
+        satisfies the invariants below.
+
+        Whichever method you choose, you must guarantee these invariants:
+
+        1.  **Zero Workspace Pollution**: No backup or intermediate build files
+            left in the original source tree.
+        2.  **Concurrency Safety**: Isolation methods must not conflict with
+            other concurrent agents.
+        3.  **Guaranteed Rollback**: Wrap all actions in error traps or
+            `try...finally` blocks to restore the original state on failure.
+
+        *   **Option A: Temporary Directory Shadowing (Recommended)**
+
+            -   **Warning/Resource constraint:** For source trees larger than a
+                few hundred MB, or when many parallel patch workers share the
+                host, prefer **Option B** (which touches only the modified
+                files) to avoid exhausting `/tmp` or memory.
+            -   Copy the target directory or relevant source tree to a temporary
+                location (e.g., `/tmp/mantis-shadow-[finding_id]/`).
+            -   Perform all edits, compilation, and reproduction testing inside
+                this temporary shadow directory.
+            -   Generate the unified patch diff by comparing the original source
+                files in the workspace with the modified files in the shadow
+                directory.
+            -   Delete the temporary shadow directory completely when finished.
+
+        *   **Option B: File-Level Backups (Fallback)**
+
+            -   **Pre-execution Check:** Prior to editing, scan the workspace
+                for pre-existing backup files matching the current finding's ID
+                (e.g., `*.bak-[current_finding_id]`). If found, restore and
+                delete them.
+            -   **Create Backups:** For every source file you intend to modify,
+                create a copy with a unique suffix (e.g., `cp target.c
+                target.c.bak-[finding_id]`).
+            -   **Net-New Files:** Track any newly created files to delete them
+                on rollback.
+            -   **Apply Modifications:** Edit original target files directly.
+            -   **Generate Unified Diff:** Compare backup against modified file
+                using labels to normalize headers (e.g., `diff -u --label
+                target.c --label target.c target.c.bak-[finding_id] target.c`).
 
 3.  **Post-Patch Verification Run:** *(Skip this step for binary-only targets
     where no code patch was applied)*. To confirm the patch works, re-run the
@@ -123,33 +150,35 @@ Execute the patching and verification stage as follows:
     final outcome (either `VERIFIED_SECURE` or you have exhausted your retries):
 
     -   If successful, generate a unified diff representing your exact changes
-        and save it to the `"patch_diff"` field. Use a generic diff command
-        comparing the modified code to the unmodified base/development version
-        (e.g., for Git, compare to the base branch, or use `git diff` against
-        the base commit; for unversioned code, use `diff -u original_file
-        patched_file`). Do not assume the base branch is named `main` or that
-        Git is always used.
+        and save it to the `"patch_diff"` field:
+        -   If using **Option A (Shadowing)**, generate this diff by comparing
+            the original files in the workspace with the modified files in the
+            shadow directory.
+        -   If using **Option B (Backups)**, generate this diff by comparing the
+            backup file to the modified file, explicitly labeling the headers to
+            prevent the backup suffix from appearing (e.g., `diff -u --label
+            target.c --label target.c target.c.bak-[finding_id] target.c`).
+        -   If using **Option C (Alternative)**, generate a clean, VCS-agnostic
+            unified diff comparing the unmodified baseline files to the final
+            patched files.
+        -   If multiple files were modified, generate individual unified diffs
+            and concatenate them cleanly into the single `"patch_diff"` string.
+            Do NOT use VCS-specific diff commands.
     -   **Transactional Clean Up / Rollback**: Restore the codebase to its
-        original state so that it is not left in a modified/broken state.
-        -   If using Git branches (dedicated-clone mode only): Prior to checking
-            out the base branch, ensure the working tree is clean. If there are
-            uncommitted changes (e.g., temporary debug modifications or edits
-            from verification trials), either commit them on the temporary
-            branch first (if you want to preserve them) or discard them entirely
-            (by running `git reset --hard` and `git clean -fd`; **do NOT run
-            these destructive commands if sharing a clone with other parallel
-            workers** as they will nuke concurrent edits) to prevent checkout
-            failures or base branch contamination. Once the working tree is
-            clean, checkout the base branch. If the patch was successful, you
-            may delete the temporary branch (e.g., `git branch -D
-            mantis/tx-[finding_id]`). If the patch failed, do not delete it;
-            instead, rename it to include a unique Unix epoch suffix (e.g., `git
-            branch -m mantis/tx-[finding_id]
-            mantis/tx-[finding_id]-failed-$(date +%s)`) to preserve the failed
-            changes for inspection without causing branch name collisions on
-            retry.
-        -   If using file backups or copies: Restore the original files from the
-            backups, or delete the temporary workspace directories.
+        original state.
+        -   If using **Option A (Shadowing)**, delete the temporary shadow
+            directory completely (`rm -rf /tmp/mantis-shadow-[finding_id]`).
+            Since the original codebase was never modified, no further
+            restoration is needed.
+        -   If using **Option B (Backups)**, restore the original files by
+            copying the backup files back onto the target files (e.g., `cp
+            target.c.bak-[finding_id] target.c`), delete the backup copies (`rm
+            target.c.bak-[finding_id]`), and delete any net-new files created
+            during the patching process.
+        -   If using **Option C (Alternative)**, execute the corresponding
+            teardown or rollback steps to fully purge all modification
+            artifacts, delete any temporary resources, and ensure the original
+            workspace is left in its clean baseline state.
 
 5.  **Append to Long-Term Memory (Continuous Reviewing Link):** For each
     security flaw processed, append a single structured JSON line to a workspace

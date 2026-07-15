@@ -122,20 +122,53 @@ Execute the reproduction stage under these constraints:
     planner track attempts efficiently:
 
     -   Maintain a JSON cache file at `workspace/archive/.repro_attempts.json`.
-    -   Run a short python script (or use `jq`) to load this file (creating it
-        as `{}` if missing).
-    -   Generate a key by normalizing the current finding's `"title"` (e.g.,
-        lowercase, strip all non-alphanumeric characters and whitespace).
-    -   Increment the integer value for this key by 1.
-    -   Save the updated cache back to `workspace/archive/.repro_attempts.json`.
+        Ensure the parent directory `workspace/archive/` exists (e.g., `mkdir -p
+        workspace/archive/`) before creating, reading, or locking the cache
+        file.
+    -   Key the cache by a stable identifier that persists across loop runs even
+        if UUIDs are regenerated. Use a combination of the finding's normalized
+        title and its primary file path: `stable_key = normalized_title + "@" +
+        primary_file_path`.
+        -   Compute `normalized_title` by converting the title to lowercase and
+            removing all non-alphanumeric characters.
+        -   Compute `primary_file_path` by taking the first entry in
+            `code_paths` and stripping any line number suffixes (e.g.,
+            converting `src/auth.c:120` to `src/auth.c`).
+    -   To prevent race conditions during concurrent executions (including
+        locking bypasses caused by atomic file replacement) and protect lockless
+        readers:
+        -   Use a separate dedicated lock file
+            `workspace/archive/.repro_attempts.lock` which is never deleted or
+            replaced.
+        -   Perform updates atomically using Python's `fcntl.flock` on this lock
+            file:
+            1.  Open the lock file `workspace/archive/.repro_attempts.lock`
+                (creating it if missing) and acquire an exclusive lock
+                (`fcntl.flock` with `fcntl.LOCK_EX`) inside a context manager
+                (`with` statement).
+            2.  Read the current contents of the cache file
+                `workspace/archive/.repro_attempts.json` (treating it as `{}` if
+                missing or empty).
+            3.  Increment the integer value for this finding's `stable_key`
+                by 1.
+            4.  Write the updated JSON to a temporary file in the same directory
+                (e.g., `workspace/archive/.repro_attempts.json.tmp`).
+            5.  Atomically replace the target cache file with the temporary file
+                (e.g., `os.replace` in Python) to ensure readers never see a
+                truncated or incomplete file.
+            6.  Close the lock file descriptor to release the lock
+                (automatically handled by exiting the `with` context manager).
 
-    You must append the following to the existing object:
+    You must append or update the following on the existing object:
 
     -   `"repro_status"` (`"reproduced"`, `"statically_confirmed"`,
         `"not_attempted"`, or `"failed_to_reproduce"`).
     -   `"repro_file_path"`
     -   `"run_command"`
     -   `"repro_output"`
+    -   If reproduction succeeds (`repro_status` is evaluated as `"reproduced"`
+        or `"statically_confirmed"`) and the finding's current `"status"` is
+        `"PROVISIONALLY_VALID"`, you **must** update `"status"` to `"VALID"`.
     -   An entry to the `"history"` array:
 
     ```json
