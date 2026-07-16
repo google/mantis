@@ -229,6 +229,11 @@ skill performance, see the [Agent Reference Guide](README_AGENTS.md).
 
 ## Roadmap / Future Work
 
+*   **Continuous Pipeline:** The current pipeline is designed to be run as a
+    point-in-time review of a codebase, and not as something that is intended to
+    regularly sync with upstream changes mid-run. It should be straightforward
+    (if a little tricky) to tweak the pipeline to better support this, but it
+    probably will not work today.
 *   **Skill Self-Improvement (Meta-Learning):** The current
     `workspace/learnings.jsonl` and Knowledge Base (KB) architecture tracks
     codebase-specific empirical outcomes to adapt the `THREAT_MODEL.md` and

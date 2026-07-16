@@ -42,6 +42,15 @@ The Mantis Skills suite is designed as a modular, decoupled set of tools that
 can be executed sequentially or in parallel. Each stage reads and writes to a
 shared state stored on disk.
 
+> [!IMPORTANT] **Static Codebase Assumption:** The pipeline is designed to run
+> against a **single, static version (snapshot) of the codebase** at a time. It
+> is not designed as a continuous process that watches a live codebase or
+> handles concurrent modifications to the source code files by external
+> processes during execution. If the source files are modified during a run, it
+> may lead to inconsistent findings, broken line references, or failed patch
+> applications. Rescans should be initiated as separate, distinct runs (e.g.,
+> triggered by a new commit or changelist).
+
 ```mermaid
 graph TD
     subgraph CoreStages [Pipeline Execution Loop]
@@ -260,6 +269,45 @@ deterministic execution, you can build a pipeline that:
     deterministic versions of `/mantis-reproduce` and `/mantis-patch` to *only
     generate* the patch or script file, leaving the actual execution and grading
     to your harness in a strictly controlled sandbox.
+
+--------------------------------------------------------------------------------
+
+## Exploit Chains and Reproduction Limits
+
+The Mantis pipeline supports identifying complex, multi-step exploit chains (via
+`/mantis-chain`), but **it does not attempt to programmatically write or execute
+end-to-end reproduction scripts for these chains**.
+
+*   **Constituent Reproduction Only:** The pipeline only reproduces the
+    individual, constituent findings.
+*   **Static Confirmation:** An exploit chain finding is marked as
+    `statically_confirmed` if all its constituent findings have been
+    successfully reproduced individually.
+*   **Simplification Decision:** This is an intentional design decision to limit
+    complexity, as automated multi-stage exploit orchestration is highly
+    environment-dependent. Users wishing to verify end-to-end chains must write
+    custom orchestrators or manually verify the combined flow.
+
+--------------------------------------------------------------------------------
+
+## Patch Verification and Re-attack Constraints
+
+The `schema.json` contract defines validation rules for findings that have been
+patched. While `/mantis-patch` is designed to verify patches using a re-attack
+step (confirming `reattack_status`), the schema **does not strictly require
+re-attack fields** (`reattack_status`, etc.) even when `patch_status` is
+`VERIFIED_SECURE`.
+
+This is an intentional design decision to support:
+
+*   **Binary-only targets:** Compiled binaries or firmware blobs skip code
+    modification and re-attack testing, instead providing a high-level
+    mitigation recommendation in the `patch_diff` field. These may still be
+    marked as resolved/secure without undergoing a functional re-attack.
+*   **Verification Fallbacks:** If the re-attack tool execution fails (due to
+    timeouts or sandbox infrastructure issues), the pipeline can still output
+    the generated patch that passed the initial post-patch verification run,
+    rather than failing validation entirely.
 
 --------------------------------------------------------------------------------
 

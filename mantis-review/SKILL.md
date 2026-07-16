@@ -27,7 +27,7 @@ to verify validity and filter out noise and false positives.
     -   Target source code files (at paths/lines in `code_paths`).
 -   **Writes**:
     -   Updates findings on disk in-place (sets `"status"`, `"reasoning"`,
-        `"repro_hints"`, and appends history).
+        `"repro_hints"`, `"triage_checklist"`, and appends history).
     -   Writes helper script `workspace/helpers/append_review.py`.
 -   **Preconditions**:
     -   `workspace/findings/` exists with finding files.
@@ -124,6 +124,7 @@ Execute your validation as follows:
         resources on hallucinated bugs.
 
     -   **Status Resolution:**
+
         -   Mark as **FALSE_POSITIVE** if it violates any of the 12 rules above.
         -   Mark as **VALID** if it passes all rules and has a clear,
             triggerable flaw.
@@ -132,6 +133,15 @@ Execute your validation as follows:
             requires complex heap grooming or precise timing).
         -   Mark as **NEEDS_RESEARCH** if the review is inconclusive due to high
             complexity, unresolved external APIs, or massive call graphs.
+
+    -   **Checklist Construction:**
+
+        -   Construct the `triage_checklist` object evaluating all 12 negative
+            constraints. For each rule, set `passes` to `true` if the finding
+            satisfies the constraint (i.e. it does not violate the rule, meaning
+            the bug remains potentially valid under that rule), or `false` if
+            the finding violates the rule (which requires it to be marked as
+            `FALSE_POSITIVE`).
 
 4.  **Construct Reproduction Script Hints:** For every finding marked as
     **VALID** or **PROVISIONALLY_VALID**, provide high-signal `"repro_hints"`
@@ -155,6 +165,32 @@ Execute your validation as follows:
     -   A `"reasoning"` field.
     -   A `"repro_hints"` field (optional for `"NEEDS_RESEARCH"` or
         `"FALSE_POSITIVE"`).
+    -   A `"triage_checklist"` object containing evaluations for all 12 negative
+        constraints (each key in the object maps to the constraint of the
+        matching name from Section 3 above):
+
+        ```json
+        {
+          "ignore_hypothetical_misuse": { "passes": <bool>, "reason": "<string>" },
+          "ignore_missing_hygiene": { "passes": <bool>, "reason": "<string>" },
+          "require_strict_reproducibility": { "passes": <bool>, "reason": "<string>" },
+          "avoid_pedantic_linting": { "passes": <bool>, "reason": "<string>" },
+          "no_security_flaw_stretching": { "passes": <bool>, "reason": "<string>" },
+          "evaluate_questionable_file_paths": { "passes": <bool>, "reason": "<string>" },
+          "ignore_resource_exhaustion_dos": { "passes": <bool>, "reason": "<string>" },
+          "intrinsic_security_flaws": { "passes": <bool>, "reason": "<string>" },
+          "verify_mitigations_pragmatically": { "passes": <bool>, "reason": "<string>" },
+          "refine_code_paths_strictly": { "passes": <bool>, "reason": "<string>" },
+          "ignore_simd_vector_padding": { "passes": <bool>, "reason": "<string>" },
+          "ensure_source_code_coherence": { "passes": <bool>, "reason": "<string>" }
+        }
+        ```
+
+        For each rule, `passes` must be `true` if the finding satisfies the
+        validity constraint (i.e. it is NOT ruled out by the constraint), or
+        `false` if it violates the constraint (ruling it out). The `reason` must
+        describe the evaluation.
+
     -   An entry to the `"history"` array:
 
     ```json

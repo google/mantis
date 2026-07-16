@@ -32,8 +32,8 @@ produce a final risk score (1-10).
     -   Updates finding files in-place with scoring/calibration fields
         (`impact_score`, `likelihood_score`, `availability_tier`,
         `inferred_exposure`, `attacker_position`, `mantis_risk_score`,
-        `priority`, `sanity_triage_applied`, `outrage_commentary`,
-        `executive_summary`).
+        `priority`, `sanity_triage_applied`, `calibration_checklist`,
+        `outrage_commentary`, `executive_summary`).
     -   Reusable helper script `workspace/helpers/append_calibrate.py`.
 -   **Preconditions**:
     -   Confirmed or raw findings must exist in `workspace/findings/`.
@@ -607,8 +607,50 @@ Execute the calibration as follows:
     -   `"priority"` (CRITICAL, HIGH, MEDIUM, LOW)
     -   `"sanity_triage_applied"` (semicolon-separated list of Section 3 rules
         that fired, most-restrictive first, or null)
+    -   `"calibration_checklist"` object containing evaluations for all 27
+        sanity caps (each key in the object maps to the sanity cap rule of the
+        matching name from Section 3 above):
+
+        ```json
+        {
+          "repro_failure": { "fires": <bool>, "reason": "<string>" },
+          "unreachable_inputs": { "fires": <bool>, "reason": "<string>" },
+          "third_party_reachability": { "fires": <bool>, "reason": "<string>" },
+          "minor_config_hygiene": { "fires": <bool>, "reason": "<string>" },
+          "non_security_critical": { "fires": <bool>, "reason": "<string>" },
+          "vague_code_paths": { "fires": <bool>, "reason": "<string>" },
+          "unreliable_triggers": { "fires": <bool>, "reason": "<string>" },
+          "prerequisite_shell": { "fires": <bool>, "reason": "<string>" },
+          "physical_long_term": { "fires": <bool>, "reason": "<string>" },
+          "trusted_controller_zero_delta": { "fires": <bool>, "reason": "<string>" },
+          "standard_host_attacks": { "fires": <bool>, "reason": "<string>" },
+          "static_confirmation": { "fires": <bool>, "reason": "<string>" },
+          "strict_xss": { "fires": <bool>, "reason": "<string>" },
+          "internal_nested": { "fires": <bool>, "reason": "<string>" },
+          "probabilistic_llm": { "fires": <bool>, "reason": "<string>" },
+          "supply_chain_prerequisites": { "fires": <bool>, "reason": "<string>" },
+          "non_default_config": { "fires": <bool>, "reason": "<string>" },
+          "confidential_computing_host": { "fires": <bool>, "reason": "<string>" },
+          "trusted_controller_critical_bypass": { "fires": <bool>, "reason": "<string>" },
+          "local_attack_vector": { "fires": <bool>, "reason": "<string>" },
+          "self_contained_blast": { "fires": <bool>, "reason": "<string>" },
+          "rarely_exposed": { "fires": <bool>, "reason": "<string>" },
+          "equivalent_primitives": { "fires": <bool>, "reason": "<string>" },
+          "documented_insecure_config": { "fires": <bool>, "reason": "<string>" },
+          "physical_temporary": { "fires": <bool>, "reason": "<string>" },
+          "high_privilege_external": { "fires": <bool>, "reason": "<string>" },
+          "trusted_controller_standard_bypass": { "fires": <bool>, "reason": "<string>" }
+        }
+        ```
+
+        For each rule, `fires` must be `true` if the sanity cap rule applies
+        (fires) to this finding, capping or downgrading its score/priority, or
+        `false` if it does not apply. The `reason` must describe the evaluation.
+
     -   `"outrage_commentary"` (your reasoning about the outrage factor)
+
     -   `"executive_summary"`
+
     -   An entry to the `"history"` array:
 
         ```json

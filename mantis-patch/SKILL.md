@@ -133,6 +133,14 @@ Execute the patching and verification stage as follows:
                 location (e.g., `/tmp/mantis-shadow-[finding_id]/`).
             -   Perform all edits, compilation, and reproduction testing inside
                 this temporary shadow directory.
+            -   **Critical Guard (Path and Working Directory Safety):** You must
+                ensure that every command executed (compilation, testing,
+                verification) runs with its working directory (`Cwd`) explicitly
+                set to the shadow directory. If the finding's `run_command`
+                contains absolute paths to the original workspace, you must
+                rewrite them to point to the corresponding paths in the shadow
+                directory before execution. Do not execute any modification or
+                verification commands against the original workspace.
             -   Generate the unified patch diff by comparing the original source
                 files in the workspace with the modified files in the shadow
                 directory.
@@ -160,6 +168,11 @@ Execute the patching and verification stage as follows:
     `"repro_file_path"` and `"run_command"` from the reproduction entry to
     verify the patch.
 
+    *   **Cwd Enforcement:** You must execute the reproducer script with the
+        working directory (`Cwd`) set to the shadow directory (if using Option
+        A). Ensure the command targets the copy in the shadow directory, not the
+        original workspace.
+
     -   **VERIFIED SECURE:** If the post-patch sandbox run fails to reproduce
         the bug, the initial patch holds. However, you must now perform a
         **Re-attack**: assume the patch is flawed and explicitly attempt to
@@ -167,11 +180,14 @@ Execute the patching and verification stage as follows:
         same root cause. Only if the re-attack also fails to bypass the fix
         should you mark the patch as fully successful! To ensure true
         independence, launch a fresh `@mantis-reproduce --reattack` subagent
-        against the patched code directory to perform this re-attack. The
+        against the patched code directory to perform this re-attack.
+        **Important:** Ensure you explicitly pass the shadow directory path (not
+        the original workspace) as the target directory for the subagent. The
         reproducer agent running with `--reattack` will write its outcomes
         directly into the primary finding's `reattack_status`,
         `reattack_file_path`, `reattack_run_command`, and `reattack_output`
         fields on disk, keeping the initial `repro_*` fields untouched.
+
     -   **VERIFICATION FAILED:** If the sandbox execution still triggers the
         bug, or if your re-attack successfully bypasses your patch, the patch is
         insufficient. Re-evaluate and adapt your fix.

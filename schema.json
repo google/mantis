@@ -15,6 +15,24 @@
     },
     "state": {
       "$ref": "#/$defs/state"
+    },
+    "kb_index": {
+      "$ref": "#/$defs/kb_index"
+    },
+    "threat_model": {
+      "$ref": "#/$defs/threat_model"
+    },
+    "tx_log_entry": {
+      "$ref": "#/$defs/tx_log_entry"
+    },
+    "repro_attempts": {
+      "$ref": "#/$defs/repro_attempts"
+    },
+    "report_summary": {
+      "$ref": "#/$defs/report_summary"
+    },
+    "execution_log_entry": {
+      "$ref": "#/$defs/execution_log_entry"
     }
   },
   "$defs": {
@@ -97,10 +115,7 @@
           "description": "The validity of the finding.\n- 'VALID': Confirmed vulnerability.\n- 'FALSE_POSITIVE': Not a bug or invalid.\n- 'PROVISIONALLY_VALID': Potential issue requiring dynamic validation.\n- 'NEEDS_RESEARCH': Inconclusive, requires deeper review.\n- 'DUPLICATE': The finding is a duplicate of another finding."
         },
         "duplicate_of": {
-          "oneOf": [
-            { "$ref": "#/$defs/uuid" },
-            { "type": "null" }
-          ],
+          "$ref": "#/$defs/uuid",
           "description": "If status is DUPLICATE, the UUID of the primary finding this is a duplicate of."
         },
         "reasoning": {
@@ -200,6 +215,12 @@
           "type": ["string", "null"],
           "description": "Semicolon-separated list of sanity triage caps and downgrades that fired."
         },
+        "triage_checklist": {
+          "$ref": "#/$defs/triage_checklist"
+        },
+        "calibration_checklist": {
+          "$ref": "#/$defs/calibration_checklist"
+        },
         "outrage_commentary": {
           "type": "string",
           "description": "Reasoning about the outrage factor (Risk = Hazard + Outrage)."
@@ -250,21 +271,24 @@
             "required": ["patch_status"],
             "not": {
               "properties": {
-                "history": {
+                "constituent_findings": {
                   "type": "array",
-                  "contains": {
-                    "type": "object",
-                    "properties": {
-                      "stage": { "const": "chainer" }
-                    },
-                    "required": ["stage"]
-                  }
+                  "minItems": 1
                 }
-              }
+              },
+              "required": ["constituent_findings"]
             }
           },
           "then": {
             "required": ["patch_diff"]
+          }
+        },
+        {
+          "if": {
+            "required": ["reattack_status"]
+          },
+          "then": {
+            "required": ["reattack_file_path", "reattack_run_command", "reattack_output"]
           }
         },
         {
@@ -462,6 +486,283 @@
         }
       },
       "required": ["stage", "action", "details", "pass_number", "timestamp"]
+    },
+    "triage_rule_evaluation": {
+      "type": "object",
+      "properties": {
+        "passes": {
+          "type": "boolean",
+          "description": "True if the finding satisfies this validity constraint (i.e., it is NOT ruled out by this rule)."
+        },
+        "reason": {
+          "type": "string",
+          "description": "The reasoning for the evaluation."
+        }
+      },
+      "required": ["passes", "reason"],
+      "additionalProperties": false
+    },
+    "triage_checklist": {
+      "type": "object",
+      "title": "Triage Checklist (12 Negative Constraints)",
+      "properties": {
+        "ignore_hypothetical_misuse": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "ignore_missing_hygiene": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "require_strict_reproducibility": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "avoid_pedantic_linting": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "no_security_flaw_stretching": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "evaluate_questionable_file_paths": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "ignore_resource_exhaustion_dos": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "intrinsic_security_flaws": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "verify_mitigations_pragmatically": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "refine_code_paths_strictly": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "ignore_simd_vector_padding": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "ensure_source_code_coherence": { "$ref": "#/$defs/triage_rule_evaluation" }
+      },
+      "required": [
+        "ignore_hypothetical_misuse",
+        "ignore_missing_hygiene",
+        "require_strict_reproducibility",
+        "avoid_pedantic_linting",
+        "no_security_flaw_stretching",
+        "evaluate_questionable_file_paths",
+        "ignore_resource_exhaustion_dos",
+        "intrinsic_security_flaws",
+        "verify_mitigations_pragmatically",
+        "refine_code_paths_strictly",
+        "ignore_simd_vector_padding",
+        "ensure_source_code_coherence"
+      ],
+      "additionalProperties": false
+    },
+    "calibration_rule_evaluation": {
+      "type": "object",
+      "properties": {
+        "fires": {
+          "type": "boolean",
+          "description": "True if this sanity cap rule applies (fires) to this finding, capping or downgrading its score/priority."
+        },
+        "reason": {
+          "type": "string",
+          "description": "The reasoning for why this cap applies or does not apply."
+        }
+      },
+      "required": ["fires", "reason"],
+      "additionalProperties": false
+    },
+    "calibration_checklist": {
+      "type": "object",
+      "title": "Calibration Checklist (Sanity Caps)",
+      "properties": {
+        "repro_failure": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "unreachable_inputs": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "third_party_reachability": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "minor_config_hygiene": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "non_security_critical": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "vague_code_paths": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "unreliable_triggers": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "prerequisite_shell": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "physical_long_term": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "trusted_controller_zero_delta": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "standard_host_attacks": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "static_confirmation": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "strict_xss": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "internal_nested": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "probabilistic_llm": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "supply_chain_prerequisites": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "non_default_config": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "confidential_computing_host": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "trusted_controller_critical_bypass": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "local_attack_vector": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "self_contained_blast": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "rarely_exposed": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "equivalent_primitives": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "documented_insecure_config": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "physical_temporary": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "high_privilege_external": { "$ref": "#/$defs/calibration_rule_evaluation" },
+        "trusted_controller_standard_bypass": { "$ref": "#/$defs/calibration_rule_evaluation" }
+      },
+      "required": [
+        "repro_failure",
+        "unreachable_inputs",
+        "third_party_reachability",
+        "minor_config_hygiene",
+        "non_security_critical",
+        "vague_code_paths",
+        "unreliable_triggers",
+        "prerequisite_shell",
+        "physical_long_term",
+        "trusted_controller_zero_delta",
+        "standard_host_attacks",
+        "static_confirmation",
+        "strict_xss",
+        "internal_nested",
+        "probabilistic_llm",
+        "supply_chain_prerequisites",
+        "non_default_config",
+        "confidential_computing_host",
+        "trusted_controller_critical_bypass",
+        "local_attack_vector",
+        "self_contained_blast",
+        "rarely_exposed",
+        "equivalent_primitives",
+        "documented_insecure_config",
+        "physical_temporary",
+        "high_privilege_external",
+        "trusted_controller_standard_bypass"
+      ],
+      "additionalProperties": false
+    },
+    "kb_index": {
+      "type": "object",
+      "title": "KB Index Schema",
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "path": { "type": "string" },
+              "summary": { "type": "string" }
+            },
+            "required": ["name", "path"]
+          }
+        },
+        "vulnerabilities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "path": { "type": "string" },
+              "summary": { "type": "string" }
+            },
+            "required": ["name", "path"]
+          }
+        }
+      },
+      "required": ["entities", "vulnerabilities"]
+    },
+    "threat_model": {
+      "type": "object",
+      "title": "Threat Model Schema",
+      "properties": {
+        "system_overview_summary": { "type": "string" },
+        "deployment_intent": {
+          "type": "string",
+          "enum": ["PRODUCTION", "SAMPLE_OR_TEST_ONLY"]
+        },
+        "trust_boundaries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "zone": { "type": "string" },
+              "entry_points": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "required": ["zone", "entry_points"]
+          }
+        },
+        "threat_actors_and_vectors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "actor": { "type": "string" },
+              "vectors": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "required": ["actor", "vectors"]
+          }
+        },
+        "high_risk_assets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "asset": { "type": "string" },
+              "criticality": { "type": "string" },
+              "availability_tier": {
+                "type": "string",
+                "enum": ["CRITICAL", "STANDARD", "LOW_CRITICALITY"]
+              }
+            },
+            "required": ["asset", "criticality"]
+          }
+        }
+      },
+      "required": ["system_overview_summary", "deployment_intent", "trust_boundaries", "threat_actors_and_vectors", "high_risk_assets"]
+    },
+    "tx_log_entry": {
+      "type": "object",
+      "title": "Deduplicator Transaction Log Entry Schema",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "action": {
+          "type": "string"
+        },
+        "primary_uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "moved_uuid": {
+          "$ref": "#/$defs/uuid"
+        }
+      },
+      "required": ["timestamp", "action", "primary_uuid", "moved_uuid"]
+    },
+    "repro_attempts": {
+      "type": "object",
+      "title": "Reproduction Attempts Cache Schema",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "description": "A map of stable finding keys to their reproduction attempt counts."
+    },
+    "report_summary": {
+      "type": "object",
+      "title": "Report Summary Schema",
+      "properties": {
+        "verified_findings_count": { "type": "integer", "minimum": 0 },
+        "proposed_findings_count": { "type": "integer", "minimum": 0 },
+        "unpatched_findings_count": { "type": "integer", "minimum": 0 },
+        "total_findings_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["verified_findings_count", "proposed_findings_count", "unpatched_findings_count", "total_findings_count"]
+    },
+    "execution_log_entry": {
+      "type": "object",
+      "title": "Execution Log Entry Schema",
+      "properties": {
+        "step_index": { "type": "integer" },
+        "source": { "type": "string" },
+        "type": { "type": "string" },
+        "status": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "thinking": { "type": "string" },
+        "content": { "type": "string" },
+        "tool_calls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "args": { "type": "object" }
+            },
+            "required": ["name", "args"]
+          }
+        }
+      },
+      "required": ["step_index", "source", "type", "status"]
     }
   }
 }
