@@ -246,7 +246,12 @@ Execute the calibration as follows:
                         -   `"HOST_SYSTEM"`: If the attacker is the hypervisor,
                             host OS, or an emulated/physical device attacking
                             software it hosts (guest driver, enclave runtime,
-                            firmware target).
+                            firmware target). This enum is strictly for the
+                            outer-to-inner direction. The reverse direction —
+                            guest-to-host (VM escape), sandbox-to-outside,
+                            enclave-to-host, or contained-process-to-container —
+                            must be classified as `"LOCAL"` (or `"IN_CLUSTER"`
+                            for pod-to-node), never `"HOST_SYSTEM"`.
                         -   `"PHYSICAL_LONG_TERM"` / `"PHYSICAL_TEMPORARY"`: If
                             the bug description, title, or code path indicates
                             hardware fault injection, side-channel, evil maid,
