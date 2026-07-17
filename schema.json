@@ -646,7 +646,29 @@
             "revision": { "type": "string", "description": "The revision identifier (e.g., manifest revision for multi-VCS)." },
             "dirty": { "type": "boolean", "description": "True if there are uncommitted changes in the target repository." }
           },
-          "required": ["vcs_type"]
+          "required": ["vcs_type"],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "vcs_type": { "enum": ["git", "hg"] }
+                }
+              },
+              "then": {
+                "required": ["commit_hash", "branch", "dirty"]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "vcs_type": { "const": "multi-vcs" }
+                }
+              },
+              "then": {
+                "required": ["revision", "dirty"]
+              }
+            }
+          ]
         }
       },
       "required": ["pass_number", "last_updated"]
