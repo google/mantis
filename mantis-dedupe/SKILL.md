@@ -16,33 +16,33 @@ records.
 
 ## Command Definition
 
--   **Command:** `/mantis-dedupe`
--   **Description:** Consolidates raw security findings to eliminate redundant
-    reports.
+- **Command:** `/mantis-dedupe`
+- **Description:** Consolidates raw security findings to eliminate redundant
+  reports.
 
 ## Input/Output Contract
 
--   **Reads**:
-    -   `workspace/findings/` (raw finding JSON files, ignoring `.trash/`).
-    -   `workspace/archive/findings_pass_*/*.json` and
-        `workspace/archive/loop*_findings/*.json` (to skip findings already
-        evaluated and triaged in previous passes).
-    -   `workspace/.mantis_state.json` (to track current loop pass).
--   **Writes**:
-    -   Moves duplicate findings to `workspace/findings/.trash/` after setting
-        `"status": "DUPLICATE"` and `"duplicate_of"`.
-    -   Appends transaction logs to `workspace/.tx_log.jsonl`.
-    -   Generates/executes merging script `workspace/helpers/merge_findings.py`.
-    -   Updates primary finding `workspace/findings/<primary_id>.json` (merges
-        fields and history).
--   **Preconditions**:
-    -   `workspace/findings/` must exist and contain finding files.
--   **Idempotency Guarantee**:
-    -   Cross-references against archived findings in `workspace/archive/` to
-        filter out any findings already processed in previous passes of this run
-        (regardless of status or viability). Logs transactions to
-        `workspace/.tx_log.jsonl` to support tracking and potential rollbacks.
-        Deterministic merging rules implemented in `merge_findings.py`.
+- **Reads**:
+  - `workspace/findings/` (raw finding JSON files, ignoring `.trash/`).
+  - `workspace/archive/findings_pass_*/*.json` and
+    `workspace/archive/loop*_findings/*.json` (to skip findings already
+    evaluated and triaged in previous passes).
+  - `workspace/.mantis_state.json` (to track current loop pass).
+- **Writes**:
+  - Moves duplicate findings to `workspace/findings/.trash/` after setting
+    `"status": "DUPLICATE"` and `"duplicate_of"`.
+  - Appends transaction logs to `workspace/.tx_log.jsonl`.
+  - Generates/executes merging script `workspace/helpers/merge_findings.py`.
+  - Updates primary finding `workspace/findings/<primary_id>.json` (merges
+    fields and history).
+- **Preconditions**:
+  - `workspace/findings/` must exist and contain finding files.
+- **Idempotency Guarantee**:
+  - Cross-references against archived findings in `workspace/archive/` to filter
+    out any findings already processed in previous passes of this run
+    (regardless of status or viability). Logs transactions to
+    `workspace/.tx_log.jsonl` to support tracking and potential rollbacks.
+    Deterministic merging rules implemented in `merge_findings.py`.
 
 ## Instructions
 
@@ -51,104 +51,101 @@ the exact same security flaw or adjacent code paths.
 
 Execute your task as follows:
 
-1.  **Load Raw Findings & Archived Findings Queue:**
+1. **Load Raw Findings & Archived Findings Queue:**
 
-    -   List the contents of the directory and read the files in
-        `workspace/findings/`. If the directory is empty or does not exist,
-        notify the user and exit.
-    -   *Important:* Ignore hidden files and directories (such as the `.trash/`
-        subdirectory) when listing or processing findings.
-    -   Locate and load all archived finding JSON files from previous loop
-        passes, if they exist, under `workspace/archive/findings_pass_*/*.json`
-        and `workspace/archive/loop*_findings/*.json`. These files represent
-        vulnerabilities that have already been fully evaluated, triaged, and
-        potentially patched in previous passes.
-    -   *Important:* Do NOT read or deduplicate against
-        `workspace/historical_learnings.jsonl` (VCS history), as we want to
-        catch regressions if old bugs were reintroduced.
+   - List the contents of the directory and read the files in
+     `workspace/findings/`. If the directory is empty or does not exist, notify
+     the user and exit.
+   - *Important:* Ignore hidden files and directories (such as the `.trash/`
+     subdirectory) when listing or processing findings.
+   - Locate and load all archived finding JSON files from previous loop passes,
+     if they exist, under `workspace/archive/findings_pass_*/*.json` and
+     `workspace/archive/loop*_findings/*.json`. These files represent
+     vulnerabilities that have already been fully evaluated, triaged, and
+     potentially patched in previous passes.
+   - *Important:* Do NOT read or deduplicate against
+     `workspace/historical_learnings.jsonl` (VCS history), as we want to catch
+     regressions if old bugs were reintroduced.
 
-2.  **Filter Loop Duplicates (Previously Processed Findings):** Cross-reference
-    the current findings against the loaded archived findings (using
-    `code_paths` and `title` similarities). If a current finding matches any
-    archived finding from a previous pass (regardless of its status or
-    viability), you must **soft-delete the new finding file** by ensuring the
-    trash directory exists (e.g., `mkdir -p workspace/findings/.trash/`).
-    **Exception:** If the current finding has the **exact same UUID** as the
-    matching archived finding, do not filter it out; this indicates the finding
-    was intentionally copied back to `workspace/findings/` for a retry (e.g.,
-    re-reproduction or re-patching). Before moving a duplicate file (different
-    UUID), update the duplicate finding file to set `"status": "DUPLICATE"` and
-    `"duplicate_of": "<archived_uuid>"` (where archived_uuid is the UUID of the
-    matching finding from the archive). Then, move it to the trash staging
-    directory (`workspace/findings/.trash/`), log the transaction in
-    `workspace/.tx_log.jsonl` (action: `"loop_filter"`), and drop it from your
-    active list. This prevents the pipeline from getting stuck re-evaluating the
-    same issues.
+2. **Filter Loop Duplicates (Previously Processed Findings):** Cross-reference
+   the current findings against the loaded archived findings (using `code_paths`
+   and `title` similarities). If a current finding matches any archived finding
+   from a previous pass (regardless of its status or viability), you must
+   **soft-delete the new finding file** by ensuring the trash directory exists
+   (e.g., `mkdir -p workspace/findings/.trash/`). **Exception:** If the current
+   finding has the **exact same UUID** as the matching archived finding, do not
+   filter it out; this indicates the finding was intentionally copied back to
+   `workspace/findings/` for a retry (e.g., re-reproduction or re-patching).
+   Before moving a duplicate file (different UUID), update the duplicate finding
+   file to set `"status": "DUPLICATE"` and `"duplicate_of": "<archived_uuid>"`
+   (where archived_uuid is the UUID of the matching finding from the archive).
+   Then, move it to the trash staging directory (`workspace/findings/.trash/`),
+   log the transaction in `workspace/.tx_log.jsonl` (action: `"loop_filter"`),
+   and drop it from your active list. This prevents the pipeline from getting
+   stuck re-evaluating the same issues.
 
-3.  **Filter Duplicate Findings in Current Batch:** Check the current findings
-    against each other to find duplicates (using `code_paths` and `title`
-    similarities). If multiple findings refer to the exact same flaw or highly
-    overlapping code paths, they must be merged.
+3. **Filter Duplicate Findings in Current Batch:** Check the current findings
+   against each other to find duplicates (using `code_paths` and `title`
+   similarities). If multiple findings refer to the exact same flaw or highly
+   overlapping code paths, they must be merged.
 
-4.  **Map/Reduce Chunking Strategy (For Scale):** If there are many finding
-    files (e.g., > 20 items), use a Map/Reduce approach to group them by target
-    file or component before checking for overlaps to avoid context window
-    limits.
+4. **Map/Reduce Chunking Strategy (For Scale):** If there are many finding files
+   (e.g., > 20 items), use a Map/Reduce approach to group them by target file or
+   component before checking for overlaps to avoid context window limits.
 
-5.  **Token-Optimized Consolidation and Merging:** To minimize LLM output tokens
-    and prevent data loss, **do not manually rewrite or output the merged JSON
-    files in your response.** Instead, follow this pattern:
+5. **Token-Optimized Consolidation and Merging:** To minimize LLM output tokens
+   and prevent data loss, **do not manually rewrite or output the merged JSON
+   files in your response.** Instead, follow this pattern:
 
-    1.  **Identify Duplicates:** Internally map which findings are duplicates of
-        a primary finding.
-    2.  **Reusable Deterministic Scripting:** Write a reusable helper script
-        (e.g., `workspace/helpers/merge_findings.py`) during your first merge
-        action. For all subsequent merges, do not regenerate the script; simply
-        execute the existing helper script with the new finding IDs. The script
-        must follow these deterministic rules:
-        -   **Title:** Pick the most comprehensive and descriptive title.
-        -   **ID:** Preserve the unique `"id"` of the primary finding being
-            kept.
-        -   **Severity:** Pick the highest severity level specified among the
-            merged items.
-        -   **Privileges Required:** Inherit the most severe privilege
-            requirement (priority: `NONE` > `LOW` > `HIGH`).
-        -   **Attacker Position:** Inherit the most critical position
-            requirement (priority: `EXTERNAL` > `INTERNAL_NETWORK` >
-            `IN_CLUSTER` > `LOCAL` > `HOST_SYSTEM` > `SUPPLY_CHAIN` >
-            `PHYSICAL_TEMPORARY` > `PHYSICAL_LONG_TERM`).
-        -   **User Interaction:** Inherit the most severe user interaction
-            requirement (priority: `NONE` > `REQUIRED`).
-        -   **Code Paths:** Collect and deduplicate all file paths and line
-            numbers into a single unique array.
-        -   **Description, Mitigation, & Impact:** Concatenate cleanly.
-        -   **History:** Concatenate and preserve all `"history"` entries from
-            the merged findings. Append a new entry to the `"history"` array for
-            this merge action conforming to the schema (containing `"stage":
-            "dedupe"`, `"action": "merge"`, `"details": "Merged duplicate
-            findings: [comma-separated-ids]"`, `"pass_number":
-            <current_pass_number>`, and `"timestamp":
-            "<current_iso8601_timestamp>"`).
-    3.  **Execute the Script:** Run your script to update the primary finding's
-        file (`workspace/findings/<primary_id>.json`) on disk.
+   1. **Identify Duplicates:** Internally map which findings are duplicates of a
+      primary finding.
+   2. **Reusable Deterministic Scripting:** Write a reusable helper script
+      (e.g., `workspace/helpers/merge_findings.py`) during your first merge
+      action. For all subsequent merges, do not regenerate the script; simply
+      execute the existing helper script with the new finding IDs. The script
+      must follow these deterministic rules:
+      - **Title:** Pick the most comprehensive and descriptive title.
+      - **ID:** Preserve the unique `"id"` of the primary finding being kept.
+      - **Severity:** Pick the highest severity level specified among the merged
+        items.
+      - **Privileges Required:** Inherit the most severe privilege requirement
+        (priority: `NONE` > `LOW` > `HIGH`).
+      - **Attacker Position:** Inherit the most critical position requirement
+        (priority: `EXTERNAL` > `INTERNAL_NETWORK` > `IN_CLUSTER` > `LOCAL` >
+        `HOST_SYSTEM` > `SUPPLY_CHAIN` > `PHYSICAL_TEMPORARY` >
+        `PHYSICAL_LONG_TERM`).
+      - **User Interaction:** Inherit the most severe user interaction
+        requirement (priority: `NONE` > `REQUIRED`).
+      - **Code Paths:** Collect and deduplicate all file paths and line numbers
+        into a single unique array.
+      - **Description, Mitigation, & Impact:** Concatenate cleanly.
+      - **History:** Concatenate and preserve all `"history"` entries from the
+        merged findings. Append a new entry to the `"history"` array for this
+        merge action conforming to the schema (containing `"stage": "dedupe"`,
+        `"action": "merge"`,
+        `"details": "Merged duplicate findings: [comma-separated-ids]"`,
+        `"pass_number": <current_pass_number>`, and
+        `"timestamp": "<current_iso8601_timestamp>"`).
+   3. **Execute the Script:** Run your script to update the primary finding's
+      file (`workspace/findings/<primary_id>.json`) on disk.
 
-6.  **Transactional Staged Clean Up:** Do not permanently delete redundant
-    files. Ensure the trash directory exists (e.g., `mkdir -p
-    workspace/findings/.trash/`). Before moving, the script must update the
-    duplicate finding files, setting `"status": "DUPLICATE"` and
-    `"duplicate_of": "<primary_uuid>"`. Move the merged duplicate `.json` files
-    to the trash staging directory (`workspace/findings/.trash/`). For every
-    file moved, append a transaction record to `workspace/.tx_log.jsonl`.
+6. **Transactional Staged Clean Up:** Do not permanently delete redundant files.
+   Ensure the trash directory exists (e.g.,
+   `mkdir -p workspace/findings/.trash/`). Before moving, the script must update
+   the duplicate finding files, setting `"status": "DUPLICATE"` and
+   `"duplicate_of": "<primary_uuid>"`. Move the merged duplicate `.json` files
+   to the trash staging directory (`workspace/findings/.trash/`). For every file
+   moved, append a transaction record to `workspace/.tx_log.jsonl`.
 
-    ### Transaction Log Schema Format (`workspace/.tx_log.jsonl`)
+   ### Transaction Log Schema Format (`workspace/.tx_log.jsonl`)
 
-    Each line must be a self-contained JSON object documenting the transaction:
+   Each line must be a self-contained JSON object documenting the transaction:
 
-    ```json
-    {"timestamp": "2026-07-14T15:13:00Z", "action": "loop_filter | dedupe_merge", "primary_uuid": "[UUID] (or null for loop_filter)", "moved_uuid": "[UUID]"}
-    ```
+   ```json
+   {"timestamp": "2026-07-14T15:13:00Z", "action": "loop_filter | dedupe_merge", "primary_uuid": "[UUID] (or null for loop_filter)", "moved_uuid": "[UUID]"}
+   ```
 
-    This cleans up the directory for downstream stages while preserving rollback
-    capability.
+   This cleans up the directory for downstream stages while preserving rollback
+   capability.
 
 When complete, notify the user.

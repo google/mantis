@@ -17,32 +17,32 @@ mistakes.
 
 ## Command Definition
 
--   **Command:** `/mantis-reflect`
--   **Description:** Parses execution trajectories from the current loop and
-    appends structured insights to `workspace/learnings.jsonl`.
+- **Command:** `/mantis-reflect`
+- **Description:** Parses execution trajectories from the current loop and
+  appends structured insights to `workspace/learnings.jsonl`.
 
 ## Input/Output Contract
 
--   **Reads**:
-    -   `workspace/.mantis_state.json` (to track current loop pass).
-    -   Subagent execution logs (`transcript.jsonl` files). The schema
-        `execution_log_entry` defined in `schema.json` is the normalized
-        representation. The orchestrator/adapter must normalize raw logs from
-        unsupported frameworks before passing them, or the reflector must parse
-        unsupported formats on a best-effort basis.
-    -   **Locating Logs:** The orchestrator must pass the list of absolute file
-        paths to the execution log files (e.g. `transcript.jsonl` files) for the
-        subagents executed during this round. Use these paths directly to read
-        the logs.
--   **Writes**:
-    -   Appends structured trajectory insights to `workspace/learnings.jsonl`.
--   **Preconditions**:
-    -   Execution logs for the current round must exist and contain entries.
--   **Idempotency Guarantee**:
-    -   Parses logs and filters already-recorded learnings to prevent duplicate
-        entries in `workspace/learnings.jsonl`. It should check existing lines
-        in `workspace/learnings.jsonl` to ensure it doesn't duplicate the same
-        insight if retried.
+- **Reads**:
+  - `workspace/.mantis_state.json` (to track current loop pass).
+  - Subagent execution logs (`transcript.jsonl` files). The schema
+    `execution_log_entry` defined in `schema.json` is the normalized
+    representation. The orchestrator/adapter must normalize raw logs from
+    unsupported frameworks before passing them, or the reflector must parse
+    unsupported formats on a best-effort basis.
+  - **Locating Logs:** The orchestrator must pass the list of absolute file
+    paths to the execution log files (e.g. `transcript.jsonl` files) for the
+    subagents executed during this round. Use these paths directly to read the
+    logs.
+- **Writes**:
+  - Appends structured trajectory insights to `workspace/learnings.jsonl`.
+- **Preconditions**:
+  - Execution logs for the current round must exist and contain entries.
+- **Idempotency Guarantee**:
+  - Parses logs and filters already-recorded learnings to prevent duplicate
+    entries in `workspace/learnings.jsonl`. It should check existing lines in
+    `workspace/learnings.jsonl` to ensure it doesn't duplicate the same insight
+    if retried.
 
 ## Instructions
 
@@ -53,38 +53,37 @@ distill what went right and what went wrong.
 
 Execute the reflection stage as follows:
 
-1.  **Extract Trajectories (Token Optimization):**
+1. **Extract Trajectories (Token Optimization):**
 
-    -   Do not attempt to read the entire, raw `transcript.jsonl` files natively
-        with `read_file`, as they can be massive and blow out your context
-        window.
-    -   Use the absolute log file paths passed to you by the orchestrator to
-        access the log files.
-    -   Instead of reading the full files, use your bash/command execution tools
-        to parse and filter the logs. For example, write a short Python script
-        or use `jq`/`grep` to extract key events (which should conform to the
-        `execution_log_entry` schema; if raw logs from different frameworks are
-        provided, parse them on a best-effort basis): tool error messages, final
-        agent summaries, instances where an agent "gave up", or messages
-        indicating a trust boundary assumption was incorrect.
+   - Do not attempt to read the entire, raw `transcript.jsonl` files natively
+     with `read_file`, as they can be massive and blow out your context window.
+   - Use the absolute log file paths passed to you by the orchestrator to access
+     the log files.
+   - Instead of reading the full files, use your bash/command execution tools to
+     parse and filter the logs. For example, write a short Python script or use
+     `jq`/`grep` to extract key events (which should conform to the
+     `execution_log_entry` schema; if raw logs from different frameworks are
+     provided, parse them on a best-effort basis): tool error messages, final
+     agent summaries, instances where an agent "gave up", or messages indicating
+     a trust boundary assumption was incorrect.
 
-1.  **Synthesize Insights:** Review the extracted events. Look for:
+2. **Synthesize Insights:** Review the extracted events. Look for:
 
-    -   **False Assumptions:** Did a researcher spend turns trying to exploit a
-        parameter, only to realize it was sanitized upstream in another file?
-    -   **Tool Failures:** Did the reproducer fail consistently because of a
-        missing library in the sandbox?
-    -   **Successful Strategies:** Did a patcher successfully fix a bug using a
-        specific idiomatic pattern that should be reused?
+   - **False Assumptions:** Did a researcher spend turns trying to exploit a
+     parameter, only to realize it was sanitized upstream in another file?
+   - **Tool Failures:** Did the reproducer fail consistently because of a
+     missing library in the sandbox?
+   - **Successful Strategies:** Did a patcher successfully fix a bug using a
+     specific idiomatic pattern that should be reused?
 
-1.  **Append to the Inbox (`workspace/learnings.jsonl`):** For each distinct
-    insight, append a structured JSON object to `workspace/learnings.jsonl`.
+3. **Append to the Inbox (`workspace/learnings.jsonl`):** For each distinct
+   insight, append a structured JSON object to `workspace/learnings.jsonl`.
 
-    ### Reflection Schema Format (`workspace/learnings.jsonl`)
+   ### Reflection Schema Format (`workspace/learnings.jsonl`)
 
-    ```json
-    {"type": "trajectory_insight", "action": "add | update | remove", "target_entity": "[e.g., auth_module.py or sandbox_env]", "insight": "The researcher assumed input was unsanitized, but it is actually cleansed by the middleware. Do not attempt XSS on this parameter.", "source_stage": "mantis-researcher"}
-    ```
+   ```json
+   {"type": "trajectory_insight", "action": "add | update | remove", "target_entity": "[e.g., auth_module.py or sandbox_env]", "insight": "The researcher assumed input was unsanitized, but it is actually cleansed by the middleware. Do not attempt XSS on this parameter.", "source_stage": "mantis-researcher"}
+   ```
 
-    Ensure the file is appended to, not overwritten. When complete, notify the
-    user.
+   Ensure the file is appended to, not overwritten. When complete, notify the
+   user.
