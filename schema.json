@@ -728,7 +728,7 @@
     },
     "triage_checklist": {
       "type": "object",
-      "title": "Triage Checklist (12 Negative Constraints)",
+      "title": "Triage Checklist (13 Negative Constraints)",
       "properties": {
         "ignore_hypothetical_misuse": { "$ref": "#/$defs/triage_rule_evaluation" },
         "ignore_missing_hygiene": { "$ref": "#/$defs/triage_rule_evaluation" },
@@ -741,7 +741,8 @@
         "verify_mitigations_pragmatically": { "$ref": "#/$defs/triage_rule_evaluation" },
         "refine_code_paths_strictly": { "$ref": "#/$defs/triage_rule_evaluation" },
         "ignore_simd_vector_padding": { "$ref": "#/$defs/triage_rule_evaluation" },
-        "ensure_source_code_coherence": { "$ref": "#/$defs/triage_rule_evaluation" }
+        "ensure_source_code_coherence": { "$ref": "#/$defs/triage_rule_evaluation" },
+        "verify_attacker_control_of_source": { "$ref": "#/$defs/triage_rule_evaluation" }
       },
       "required": [
         "ignore_hypothetical_misuse",
@@ -755,7 +756,8 @@
         "verify_mitigations_pragmatically",
         "refine_code_paths_strictly",
         "ignore_simd_vector_padding",
-        "ensure_source_code_coherence"
+        "ensure_source_code_coherence",
+        "verify_attacker_control_of_source"
       ],
       "additionalProperties": false
     },

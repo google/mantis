@@ -57,7 +57,7 @@ Execute your validation as follows:
    grounded in the actual codebase state. Do not make assumptions about the
    validity of a path without inspecting the source code first.
 
-3. **Strict Validation Filtering (Apply the 12 Negative Constraints):** Evaluate
+3. **Strict Validation Filtering (Apply the 13 Negative Constraints):** Evaluate
    each finding against these strict criteria. Mark a finding as
    **FALSE_POSITIVE** if it violates any of the following rules:
 
@@ -120,10 +120,26 @@ Execute your validation as follows:
        locations. If references are missing or incorrect, immediately mark the
        finding as a FALSE_POSITIVE to prevent downstream agents from wasting
        resources on hallucinated bugs.
+   13. **Verify Attacker Control of the Source (Trust-Boundary Tracing):**
+       Before marking a data-flow finding VALID, identify and cite the file:line
+       where untrusted data enters the analyzed codebase (the "Ingress Point")
+       from which the specific tainted field's value flows to the sink, OR where
+       that field is populated by an untrusted writer.
+       - If you have access to the untrusted-side code (e.g. Guest/Client in a
+         multi-component repo), cite the writer.
+       - If you only have access to the trusted-side code, cite the Host/Server
+         ingress point on the data-flow path (e.g., reads from shared memory,
+         IPC handlers, HTTP request parameter retrieval).
+       - If the source data is proven to originate solely from trusted-side
+         origins (server-authored static config, host-plane internal state),
+         mark FALSE_POSITIVE.
+       - Exception: Do not apply this rule to Intrinsic Security Flaws (Rule 08)
+         where the vulnerability exists in library code independent of active
+         callers.
 
    - **Status Resolution:**
 
-     - Mark as **FALSE_POSITIVE** if it violates any of the 12 rules above.
+     - Mark as **FALSE_POSITIVE** if it violates any of the 13 rules above.
      - Mark as **VALID** if it passes all rules and has a clear, triggerable
        flaw.
      - Mark as **PROVISIONALLY_VALID** if it passes the rules, but you are
@@ -134,7 +150,7 @@ Execute your validation as follows:
 
    - **Checklist Construction:**
 
-     - Construct the `triage_checklist` object evaluating all 12 negative
+     - Construct the `triage_checklist` object evaluating all 13 negative
        constraints. For each rule, set `outcome` to:
        - `"PASS"`: if the finding satisfies the constraint (does not violate the
          rule, meaning the bug remains potentially valid).
@@ -168,7 +184,7 @@ Execute your validation as follows:
    - A `"repro_hints"` field (optional for `"NEEDS_RESEARCH"` or
      `"FALSE_POSITIVE"`).
 
-   - A `"triage_checklist"` object containing evaluations for all 12 negative
+   - A `"triage_checklist"` object containing evaluations for all 13 negative
      constraints (each key in the object maps to the constraint of the matching
      name from Section 3 above):
 
@@ -185,7 +201,8 @@ Execute your validation as follows:
        "verify_mitigations_pragmatically": { "outcome": "PASS" },
        "refine_code_paths_strictly": { "outcome": "PASS" },
        "ignore_simd_vector_padding": { "outcome": "PASS" },
-       "ensure_source_code_coherence": { "outcome": "PASS" }
+       "ensure_source_code_coherence": { "outcome": "PASS" },
+       "verify_attacker_control_of_source": { "outcome": "PASS" }
      }
      ```
 
