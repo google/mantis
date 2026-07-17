@@ -81,6 +81,12 @@ locally to a specific workspace. You can also ask your coding agent for help.
 Clone this repo then tell your coding agent you want to use these skills to
 review your codebase!
 
+To install the skills via CLI:
+
+```shell
+npx skills add google/mantis
+```
+
 --------------------------------------------------------------------------------
 
 ## Beginner's Guide & Best Practices
