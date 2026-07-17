@@ -371,11 +371,23 @@ Execute the calibration as follows:
     naturally MEDIUM and must remain MEDIUM, even if it is subject to a cap at
     HIGH).**
 
-    **Precedence:** Evaluate ALL rules. If multiple caps apply, the **most
-    restrictive** wins (Force-LOW > cap-MEDIUM > cap-HIGH). Record every rule
-    that fired in `sanity_triage_applied` as a semicolon-separated list, most
-    restrictive first (e.g., `"Local Attack Vector; Internal/Nested"`), so the
-    effective cap is auditable.
+    **Precedence & UNKNOWN Rules Policy:**
+
+    -   Evaluate ALL rules. If multiple caps apply, the **most restrictive**
+        wins (Force-LOW > cap-MEDIUM > cap-HIGH).
+    -   **Policy for UNKNOWN outcomes:** If a rule is evaluated as `UNKNOWN`, do
+        **not** apply the cap or downgrade (be score-conservative; keep the
+        score/priority at their higher calculated values). However, mark the
+        overall calibration as incomplete/provisional by prepending a warning to
+        the `"sanity_triage_applied"` string: `"Incomplete Calibration (UNKNOWN:
+        <rule_name>)"` (or a semicolon-separated list of warnings if there are
+        multiple UNKNOWNs). This signals that manual review is required to
+        resolve the rule status.
+    -   Record every rule that successfully fired/applied in
+        `sanity_triage_applied` as a semicolon-separated list, most restrictive
+        first (e.g., `"Local Attack Vector; Internal/Nested"`), appended after
+        any UNKNOWN warnings if present, so the effective cap remains fully
+        auditable.
 
 4.  **Determine Priority:**
 

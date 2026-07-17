@@ -15,13 +15,15 @@ inside isolated sandbox environments to empirically verify bugs.
 
 ## Command Definition
 
--   **Command:** `/mantis-reproduce [--reattack] [--target_root=<path>]
-    [--state_root=<path>]`
+-   **Command:** `/mantis-reproduce [--reattack] [--finding_id=<uuid>]
+    [--target_root=<path>] [--state_root=<path>]`
 -   **Description:** Generates and runs crash reproducers to verify security
     flaws.
 -   **Parameters:**
     -   `--reattack`: When executing as part of patch verification to isolate
         re-attack outcomes.
+    -   `--finding_id`: The specific finding UUID to reproduce. **Must** be
+        provided and is required when `--reattack` is specified.
     -   `--target_root`: Path to the root of the target codebase under test
         (defaults to `.`).
     -   `--state_root`: Path to the root of the Mantis state directory
@@ -64,11 +66,19 @@ that reproduces a confirmed security flaw.
 
 Execute the reproduction stage under these constraints:
 
-1.  **Load Viable Findings:** Read the JSON files in the
-    `state_root/workspace/findings/` directory. Filter for findings where
-    `production_viability` is `"VIABLE"`, `"SAMPLE_OR_TEST"`, or
-    `"CONDITIONAL_VIABLE"` (or skip the filter if you're not checking
-    viability). If no applicable findings exist, notify the user.
+1.  **Load Viable Findings:**
+
+    -   If `--finding_id` is supplied: load only that finding's file
+        (`state_root/workspace/findings/<uuid>.json`). Exit if it does not
+        exist.
+    -   If `--finding_id` is not supplied: read the JSON files in the
+        `state_root/workspace/findings/` directory. Filter for findings where
+        `production_viability` is `"VIABLE"`, `"SAMPLE_OR_TEST"`, or
+        `"CONDITIONAL_VIABLE"` (or skip the filter if you're not checking
+        viability). If no applicable findings exist, notify the user.
+    -   **Constraint:** Enforce that `--finding_id` is strictly required if
+        `--reattack` is specified, preventing re-attacks from running against
+        unrelated findings.
 
 2.  **Strict Host Isolation Constraint:**
 

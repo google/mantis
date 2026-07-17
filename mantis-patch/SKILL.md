@@ -56,11 +56,11 @@ Execute the patching and verification stage as follows:
 
 1.  **Load Findings to Patch:** Read the JSON files in the `workspace/findings/`
     directory. Filter for findings where `patch_status` is NOT one of
-    `["VERIFIED_SECURE", "MITIGATION_PROPOSED", "VERIFICATION_INCOMPLETE"]` AND
-    (either `repro_status` is `"reproduced"` OR the finding is an exploit chain,
-    e.g., the title starts with `"Exploit Chain:"`, or history has an entry from
-    the `"chainer"` stage, or the `"constituent_findings"` property is present
-    and non-empty). If none exist, notify the user.
+    `["VERIFIED_SECURE", "MITIGATION_PROPOSED"]` AND (either `repro_status` is
+    `"reproduced"` OR the finding is an exploit chain, e.g., the title starts
+    with `"Exploit Chain:"`, or history has an entry from the `"chainer"` stage,
+    or the `"constituent_findings"` property is present and non-empty). If none
+    exist, notify the user.
 
 2.  **Generate and Apply Minimal Patches:** For each reproduced security flaw:
 
@@ -90,10 +90,15 @@ Execute the patching and verification stage as follows:
         (evaluated in order):
 
         1.  **Validity Check:** Read the validity `"status"` of each constituent
-            finding. If any constituent's `"status"` is `"FALSE_POSITIVE"` or
-            `"DUPLICATE"`, update the exploit chain finding's `"status"` to
-            match it (e.g. `"FALSE_POSITIVE"`) and immediately skip any further
-            patching/verification for the chain.
+            finding. If any constituent's `"status"` is `"FALSE_POSITIVE"`,
+            update the exploit chain finding's `"status"` to match it (e.g.
+            `"FALSE_POSITIVE"`) and immediately skip any further
+            patching/verification for the chain. If any constituent's `"status"`
+            is `"DUPLICATE"`, resolve it to its canonical finding by recursively
+            reading the finding specified in its `"duplicate_of"` property,
+            using that canonical finding's status and patch status for all
+            downstream checks and propagation, instead of updating the exploit
+            chain finding itself to `"DUPLICATE"`.
         2.  **Missing Files:** If any constituent finding's JSON file is missing
             from the disk, set the chain's `"patch_status"` to `"ERROR"`.
         3.  **Constituent Unset (Pending):** If any constituent's
@@ -189,6 +194,19 @@ Execute the patching and verification stage as follows:
 
         *   **Option B: File-Level Backups (Fallback)**
 
+            -   **Concurrency & Exclusivity Warning:** Because Option B modifies
+                files directly in the original workspace, it is
+                concurrency-unsafe when run in parallel with other
+                workspace-modifying agents. Sequential execution must be
+                strictly enforced via locking.
+            -   **Exclusive Workspace Lock:** Before performing backups or
+                edits, the agent **must** acquire an exclusive lock on
+                `workspace/.workspace_edit.lock` (using `fcntl.flock` with
+                `fcntl.LOCK_EX` in Python, or a similar system-level lock). The
+                agent **must** hold this lock continuously throughout the entire
+                patching, verification, re-attack, and restoration lifecycle for
+                the finding, releasing it only when final baseline files are
+                restored or finalized.
             -   **Pre-execution Check:** Prior to editing, scan the workspace
                 for pre-existing backup files matching the current finding's ID
                 (e.g., `*.bak-[current_finding_id]`). If found, restore and

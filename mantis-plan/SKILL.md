@@ -126,8 +126,9 @@ Execute the planning stage as follows:
                     has had **fewer than 2 total reproduction attempts** (check
                     attempt count in `workspace/archive/.repro_attempts.json`
                     using the `stable_key`), OR
-                -   Patch verification failed (`patch_status` is
-                    `"VERIFICATION_FAILED"` or `"ERROR"`).
+                -   Patch verification failed or was incomplete (`patch_status`
+                    is `"VERIFICATION_FAILED"`, `"ERROR"`, or
+                    `"VERIFICATION_INCOMPLETE"`).
                 -   *Note:* Do **not** retry/copy findings where `"status"` is
                     `"FALSE_POSITIVE"`, or `"patch_status"` is
                     `"VERIFIED_SECURE"`, or `"repro_status"` is `"reproduced"`
