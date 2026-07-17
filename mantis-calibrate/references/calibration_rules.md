@@ -5,10 +5,10 @@ downgrades) used to calculate the final severity and priority of findings.
 
 ## Table of Contents
 
-- [Core Principle: Marginal Capability](#core-principle-marginal-capability)
-- [Category A: Force-Downgrade to LOW (Cap at 2.0 / LOW Priority)](#category-a-force-downgrade-to-low-cap-at-20--low-priority)
-- [Category B: Force-Cap to HIGH (Cap at 7.9 / Maximum HIGH Priority)](#category-b-force-cap-to-high-cap-at-79--maximum-high-priority)
-- [Category C: Force-Cap to MEDIUM (Cap at 5.9 / Maximum MEDIUM Priority)](#category-c-force-cap-to-medium-cap-at-59--maximum-medium-priority)
+-   [Core Principle: Marginal Capability](#core-principle-marginal-capability)
+-   [Category A: Force-Downgrade to LOW (Cap at 2.0 / LOW Priority)](#category-a-force-downgrade-to-low-cap-at-20--low-priority)
+-   [Category B: Force-Cap to HIGH (Cap at 7.9 / Maximum HIGH Priority)](#category-b-force-cap-to-high-cap-at-79--maximum-high-priority)
+-   [Category C: Force-Cap to MEDIUM (Cap at 5.9 / Maximum MEDIUM Priority)](#category-c-force-cap-to-medium-cap-at-59--maximum-medium-priority)
 
 ## Core Principle: Marginal Capability
 

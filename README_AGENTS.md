@@ -222,9 +222,9 @@ prompt design, and the model class used.
 By treating the individual skills (like `/mantis-researcher`, `/mantis-review`,
 and `/mantis-reproduce`) as microservices that read and write JSON state in the
 `workspace/findings/` directory, you can build a rigid orchestrator that
-provides absolute reliability and strict security guarantees. Better yet, you
-should use more durable and resilient databases instead of json files on a
-single machine.
+provides stronger reliability and security guarantees. Better yet, you should
+use more durable and resilient databases instead of json files on a single
+machine.
 
 **Before building your harness, strictly adhere to the inter-stage data
 contracts defined in [schema.json](schema.json).**

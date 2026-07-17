@@ -72,27 +72,26 @@ Execute your orchestration duties in a continuous loop:
 
         1.  Check for Git: run `git rev-parse --is-inside-work-tree`. If this
             command succeeds (returns exit code 0 and output is `true`), a Git
-            repository is active. Extract:
-        2.  `commit_hash` (via `git rev-parse HEAD`)
-        3.  `branch` (via `git branch --show-current` or `git rev-parse
-            --abbrev-ref HEAD`)
-        4.  `dirty` status (check if `git status --porcelain` is non-empty) Set
-            `vcs_type` to `"git"`.
-        5.  Check for Mercurial: check if `.hg` directory exists or run `hg
-            root` (if Mercurial is installed). If found, extract:
-        6.  `commit_hash` (via `hg id -i`)
-        7.  `branch` (via `hg branch`)
-        8.  `dirty` status (check if `hg status` is non-empty) Set `vcs_type` to
-            `"hg"`.
-        9.  Check for Multi-VCS systems: check if `.repo` directory exists or
+            repository is active. Set `vcs_type` to `"git"` and extract:
+            -   `commit_hash` (via `git rev-parse HEAD`)
+            -   `branch` (via `git branch --show-current` or `git rev-parse
+                --abbrev-ref HEAD`)
+            -   `dirty` status (check if `git status --porcelain` is non-empty)
+        2.  Check for Mercurial: check if `.hg` directory exists or run `hg
+            root` (if Mercurial is installed). If found, set `vcs_type` to
+            `"hg"` and extract:
+            -   `commit_hash` (via `hg id -i`)
+            -   `branch` (via `hg branch`)
+            -   `dirty` status (check if `hg status` is non-empty)
+        3.  Check for Multi-VCS systems: check if `.repo` directory exists or
             look for other multi-VCS markers. If found, resolve the active
             manifest revision (set `revision`) or branch, and check if any
             sub-repositories are dirty (set `dirty`). Set `vcs_type` to
             `"multi-vcs"`.
-        10. If you confirm that no VCS is active in the repository (e.g., the
+        4.  If you confirm that no VCS is active in the repository (e.g., the
             directory is a plain folder with no repository files or metadata),
             set `vcs_type` to `"none"`.
-        11. If detection commands fail due to errors, missing tool executables
+        5.  If detection commands fail due to errors, missing tool executables
             (e.g. `git` not found), or other unhandled exceptions during checks,
             set `vcs_type` to `"unknown"`.
 

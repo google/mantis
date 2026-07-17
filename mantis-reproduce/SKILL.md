@@ -75,22 +75,23 @@ Execute the reproduction stage under these constraints:
             exist.
         -   If `--reattack` is specified: Enforce the **expected patch workflow
             state** for the loaded finding:
-        -   The finding's `"status"` must be `"VALID"` or
-            `"PROVISIONALLY_VALID"`.
-        -   The finding's `"repro_status"` must be `"reproduced"`.
-        -   The finding's `"patch_status"` must NOT be `"VERIFIED_SECURE"` or
-            `"MITIGATION_PROPOSED"`.
-        -   Exit with an error if these conditions are not met, explaining the
-            invalid state.
-        -   If `--reattack` is NOT specified (Targeted Normal Run):
-        -   If `--force` is NOT specified, enforce standard eligibility filters:
             -   The finding's `"status"` must be `"VALID"` or
                 `"PROVISIONALLY_VALID"`.
-            -   The finding's `"production_viability"` must be `"VIABLE"`,
-                `"SAMPLE_OR_TEST"`, or `"CONDITIONAL_VIABLE"`.
+            -   The finding's `"repro_status"` must be `"reproduced"`.
+            -   The finding's `"patch_status"` must NOT be `"VERIFIED_SECURE"`
+                or `"MITIGATION_PROPOSED"`.
             -   Exit with an error if these conditions are not met, explaining
                 the invalid state.
-        -   If `--force` is specified, bypass these eligibility checks.
+        -   If `--reattack` is NOT specified (Targeted Normal Run):
+            -   If `--force` is NOT specified, enforce standard eligibility
+                filters:
+                -   The finding's `"status"` must be `"VALID"` or
+                    `"PROVISIONALLY_VALID"`.
+                -   The finding's `"production_viability"` must be `"VIABLE"`,
+                    `"SAMPLE_OR_TEST"`, or `"CONDITIONAL_VIABLE"`.
+                -   Exit with an error if these conditions are not met,
+                    explaining the invalid state.
+            -   If `--force` is specified, bypass these eligibility checks.
     -   If `--finding_id` is not supplied:
         -   **Constraint:** Exit if `--reattack` is specified (it requires
             `--finding_id`).
@@ -98,10 +99,10 @@ Execute the reproduction stage under these constraints:
             directory.
         -   **Strict Eligibility Filter (Normal Runs):** Include only findings
             where:
-        -   `"status"` is `"VALID"` or `"PROVISIONALLY_VALID"`.
-        -   `"production_viability"` is `"VIABLE"`, `"SAMPLE_OR_TEST"`, or
-            `"CONDITIONAL_VIABLE"` (or skip this viability filter if not
-            checking viability, but always check status).
+            -   `"status"` is `"VALID"` or `"PROVISIONALLY_VALID"`.
+            -   `"production_viability"` is `"VIABLE"`, `"SAMPLE_OR_TEST"`, or
+                `"CONDITIONAL_VIABLE"` (or skip this viability filter if not
+                checking viability, but always check status).
         -   If no applicable findings exist, notify the user and exit.
 
 1.  **Strict Host Isolation Constraint:**

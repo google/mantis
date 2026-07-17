@@ -25,8 +25,11 @@ mistakes.
 
 -   **Reads**:
     -   `workspace/.mantis_state.json` (to track current loop pass).
-    -   Subagent execution logs (`transcript.jsonl` files), conforming to the
-        `execution_log_entry` schema defined in `schema.json`.
+    -   Subagent execution logs (`transcript.jsonl` files). The schema
+        `execution_log_entry` defined in `schema.json` is the normalized
+        representation. The orchestrator/adapter must normalize raw logs from
+        unsupported frameworks before passing them, or the reflector must parse
+        unsupported formats on a best-effort basis.
     -   **Locating Logs:** The orchestrator must pass the list of absolute file
         paths to the execution log files (e.g. `transcript.jsonl` files) for the
         subagents executed during this round. Use these paths directly to read
@@ -59,10 +62,11 @@ Execute the reflection stage as follows:
         access the log files.
     -   Instead of reading the full files, use your bash/command execution tools
         to parse and filter the logs. For example, write a short Python script
-        or use `jq`/`grep` to extract key events (which conform to
-        `execution_log_entry` schema): tool error messages, final agent
-        summaries, instances where an agent "gave up", or messages indicating a
-        trust boundary assumption was incorrect.
+        or use `jq`/`grep` to extract key events (which should conform to the
+        `execution_log_entry` schema; if raw logs from different frameworks are
+        provided, parse them on a best-effort basis): tool error messages, final
+        agent summaries, instances where an agent "gave up", or messages
+        indicating a trust boundary assumption was incorrect.
 
 1.  **Synthesize Insights:** Review the extracted events. Look for:
 
