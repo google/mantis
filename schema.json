@@ -331,6 +331,7 @@
           }
         },
         {
+          "$comment": "chain-exempt: reviewer runs before the chainer, so exploit chains have no reviewer history. Do NOT mirror this onto calibration_checklist - calibrate runs after the chainer and chains ARE calibrated.",
           "if": {
             "allOf": [
               {
@@ -364,6 +365,7 @@
           }
         },
         {
+          "$comment": "No chain exemption (intentional): calibrate runs after the chainer, so chains are calibrated and must carry a calibration_checklist. The asymmetry with triage_checklist is deliberate.",
           "if": {
             "properties": {
               "history": {
