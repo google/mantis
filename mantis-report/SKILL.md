@@ -94,6 +94,20 @@ Execute the reporting stage as follows:
 
 3.  **Generate Review Packet:**
 
+    -   **Report Header / Target Version:** At the very top of the report
+        (before the Executive Summary), include a section displaying the target
+        codebase version information read from `"vcs_info"` in
+        `workspace/.mantis_state.json`:
+
+        -   If `"vcs_type"` is `"git"`, show: `Target Version: Git branch
+            [branch] at commit [commit_hash] [(dirty) if dirty is true]`.
+        -   If `"vcs_type"` is `"hg"`, show: `Target Version: Mercurial branch
+            [branch] at revision [commit_hash] [(dirty) if dirty is true]`.
+        -   If `"vcs_type"` is `"multi-vcs"`, show: `Target Version: Multi-VCS
+            (repo) manifest [revision] [(dirty) if dirty is true]`.
+        -   If `"vcs_type"` is `"none"`, or if `vcs_info` is missing, show:
+            `Target Version: Untracked / Unknown`.
+
     -   **Grouping by Patch Status (Exclusivity):** Organize the Executive
         Summary table and the main body of the report by grouping findings.
         **Exploit chains MUST be excluded from these main groups and reported

@@ -196,8 +196,25 @@ graph TD
 
 While the `/mantis-meta-agent` provides dynamic steering for exploratory
 security research, we highly recommend wrapping the Mantis Skills in a
-**deterministic programmatic pipeline** (e.g., Python, Bash, Rust, or CI/CD
-workflow) for use in enterprise or production settings.
+**deterministic programmatic pipeline** for use in enterprise or production
+settings.
+
+We particularly recommend using **Rust** for writing these deterministic
+pipelines or custom helper scripts. Rust is highly suited for agent-generated
+code because:
+
+-   **Strict Compiler Guarantees:** Rust's strong static typing and borrow
+    checker catch most memory safety and logic bugs at compile time. If the
+    LLM-generated script compiles, it is significantly more likely to run
+    successfully and safely without runtime crashes.
+-   **Structured Compiler Feedback:** The Rust compiler provides detailed,
+    actionable error messages and suggestions. LLMs are exceptionally good at
+    using this feedback to iteratively self-correct and resolve build issues.
+-   **Performance and Predictability:** Rust provides native performance and
+    predictability, making it ideal for high-throughput pipeline coordination.
+
+While Python, Bash, or CI/CD workflows are also supported, Rust tends to yield
+the highest LLM success rates for complex programmatic orchestrations.
 
 By treating the individual skills (like `/mantis-researcher`, `/mantis-review`,
 and `/mantis-reproduce`) as microservices that read and write JSON state in the

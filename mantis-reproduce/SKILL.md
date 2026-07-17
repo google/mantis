@@ -68,17 +68,31 @@ Execute the reproduction stage under these constraints:
 
 1.  **Load Viable Findings:**
 
-    -   If `--finding_id` is supplied: load only that finding's file
-        (`state_root/workspace/findings/<uuid>.json`). Exit if it does not
-        exist.
-    -   If `--finding_id` is not supplied: read the JSON files in the
-        `state_root/workspace/findings/` directory. Filter for findings where
-        `production_viability` is `"VIABLE"`, `"SAMPLE_OR_TEST"`, or
-        `"CONDITIONAL_VIABLE"` (or skip the filter if you're not checking
-        viability). If no applicable findings exist, notify the user.
-    -   **Constraint:** Enforce that `--finding_id` is strictly required if
-        `--reattack` is specified, preventing re-attacks from running against
-        unrelated findings.
+    -   If `--finding_id` is supplied:
+        -   Load only that finding's file
+            (`state_root/workspace/findings/<uuid>.json`). Exit if it does not
+            exist.
+        -   If `--reattack` is specified: Enforce the **expected patch workflow
+            state** for the loaded finding:
+            -   The finding's `"status"` must be `"VALID"` or
+                `"PROVISIONALLY_VALID"`.
+            -   The finding's `"repro_status"` must be `"reproduced"`.
+            -   The finding's `"patch_status"` must NOT be `"VERIFIED_SECURE"`
+                or `"MITIGATION_PROPOSED"`.
+            -   Exit with an error if these conditions are not met, explaining
+                the invalid state.
+    -   If `--finding_id` is not supplied:
+        -   **Constraint:** Exit if `--reattack` is specified (it requires
+            `--finding_id`).
+        -   Read the JSON files in the `state_root/workspace/findings/`
+            directory.
+        -   **Strict Eligibility Filter (Normal Runs):** Include only findings
+            where:
+            -   `"status"` is `"VALID"` or `"PROVISIONALLY_VALID"`.
+            -   `"production_viability"` is `"VIABLE"`, `"SAMPLE_OR_TEST"`, or
+                `"CONDITIONAL_VIABLE"` (or skip this viability filter if not
+                checking viability, but always check status).
+        -   If no applicable findings exist, notify the user and exit.
 
 2.  **Strict Host Isolation Constraint:**
 

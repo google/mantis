@@ -635,6 +635,18 @@
           "type": "string",
           "format": "date-time",
           "description": "ISO 8601 timestamp of when the state was last updated."
+        },
+        "vcs_info": {
+          "type": "object",
+          "description": "Information about the target version control system state.",
+          "properties": {
+            "vcs_type": { "type": "string", "enum": ["git", "hg", "multi-vcs", "none", "unknown"] },
+            "commit_hash": { "type": "string", "description": "The current commit hash or revision ID." },
+            "branch": { "type": "string", "description": "The active branch name." },
+            "revision": { "type": "string", "description": "The revision identifier (e.g., manifest revision for multi-VCS)." },
+            "dirty": { "type": "boolean", "description": "True if there are uncommitted changes in the target repository." }
+          },
+          "required": ["vcs_type"]
         }
       },
       "required": ["pass_number", "last_updated"]
@@ -675,7 +687,7 @@
           "description": "The reasoning for the evaluation."
         }
       },
-      "anyOf": [
+      "oneOf": [
         { "required": ["outcome"] },
         { "required": ["passes"] }
       ],
@@ -742,7 +754,7 @@
           "type": "string"
         }
       },
-      "anyOf": [
+      "oneOf": [
         { "required": ["outcome"] },
         { "required": ["fires"] }
       ],

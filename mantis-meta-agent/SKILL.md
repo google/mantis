@@ -66,13 +66,35 @@ Execute your orchestration duties in a continuous loop:
         `workspace/archive/` for folders matching `findings_pass_N` or
         `loopN_findings` and resolve `N` to `max_found + 1` (defaulting to 1 if
         no archives exist).
-    -   **State Maintenance:** Once determined, write the current pass `N` and
-        the current timestamp to `"pass_number"` and `"last_updated"` in
-        `workspace/.mantis_state.json` (conforming to the state schema).
-        Delegate the workload sequentially to the specialized subagents. Call
-        each subagent as a tool (or using the `@agent_name` syntax if instructed
-        by your prompt) with a concise instruction to perform its designated
-        task:
+
+        **VCS Detection & Recording (VCS Agnostic):** Detect the version control
+        system (VCS) used by the target codebase:
+
+        1.  Check for Git (e.g., `.git` directory exists). If found, extract:
+            -   `commit_hash` (via `git rev-parse HEAD`)
+            -   `branch` (via `git branch --show-current` or `git rev-parse
+                --abbrev-ref HEAD`)
+            -   `dirty` status (check if `git status --porcelain` is non-empty)
+                Set `vcs_type` to `"git"`.
+        2.  Check for Mercurial (e.g., `.hg` directory exists). If found,
+            extract:
+            -   `commit_hash` (via `hg id -i`)
+            -   `branch` (via `hg branch`)
+            -   `dirty` status (check if `hg status` is non-empty) Set
+                `vcs_type` to `"hg"`.
+        3.  Check for Multi-VCS systems (e.g., `.repo` directory exists). If
+            found, resolve the active manifest revision or branch, and check if
+            any sub-repositories are dirty. Set `vcs_type` to `"multi-vcs"`.
+        4.  If no VCS is detected or command execution fails, set `vcs_type` to
+            `"none"`.
+
+    -   **State Maintenance:** Once determined, write the current pass `N`, the
+        current timestamp, and the detected `vcs_info` object (conforming to the
+        state schema) to `"pass_number"`, `"last_updated"`, and `"vcs_info"` in
+        `workspace/.mantis_state.json`. Delegate the workload sequentially to
+        the specialized subagents. Call each subagent as a tool (or using the
+        `@agent_name` syntax if instructed by your prompt) with a concise
+        instruction to perform its designated task:
 
     -   **Stage 0 (Optional Pre-processing History):** Call the
         `@mantis-history` subagent to analyze repository's version control
@@ -130,7 +152,11 @@ Execute your orchestration duties in a continuous loop:
 
     -   **Stage 13 (Reflect):** Call the `@mantis-reflect` subagent to parse the
         execution trajectories of the round and append false assumptions or tool
-        failures to the `workspace/learnings.jsonl` inbox.
+        failures to the `workspace/learnings.jsonl` inbox. **Important:** You
+        must pass the conversation IDs of all subagents successfully executed
+        during this round (Stage 5 through Stage 12, specifically researcher,
+        critic, reproduce, chain, patcher, calibrate) to the `@mantis-reflect`
+        subagent so it knows which execution logs to retrieve.
 
     -   **Stage 14 (Report):** Call the `@mantis-report` subagent to generate
         the human-readable review packet

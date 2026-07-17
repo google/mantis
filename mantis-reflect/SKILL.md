@@ -25,8 +25,14 @@ mistakes.
 
 -   **Reads**:
     -   `workspace/.mantis_state.json` (to track current loop pass).
-    -   `transcript.jsonl` or `conversation.jsonl` (execution logs from the
-        current round's subagents).
+    -   Subagent execution logs (`transcript.jsonl` files), conforming to the
+        `execution_log_entry` schema defined in `schema.json`.
+        -   **Locating Logs:** The orchestrator must pass the list of
+            `<conversation_id>`s for the subagents executed during this round.
+        -   For each provided `<conversation_id>`, locate its execution log at:
+            `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`
+        -   The `<appDataDir>` can be retrieved from your app metadata or system
+            environment configuration.
 -   **Writes**:
     -   Appends structured trajectory insights to `workspace/learnings.jsonl`.
 -   **Preconditions**:
@@ -47,14 +53,17 @@ Execute the reflection stage as follows:
 
 1.  **Extract Trajectories (Token Optimization):**
 
-    -   Do not attempt to read the entire, raw `transcript.jsonl` or
-        `conversation.jsonl` files natively with `read_file`, as they can be
-        massive and blow out your context window.
-    -   Instead, use your bash/command execution tools to parse and filter the
-        logs. For example, write a short Python script or use `jq`/`grep` to
-        extract key events: tool error messages, final agent summaries,
-        instances where an agent "gave up", or messages indicating a trust
-        boundary assumption was incorrect.
+    -   Do not attempt to read the entire, raw `transcript.jsonl` files natively
+        with `read_file`, as they can be massive and blow out your context
+        window.
+    -   Use the conversation IDs passed to you by the orchestrator to locate the
+        correct log files.
+    -   Instead of reading the full files, use your bash/command execution tools
+        to parse and filter the logs. For example, write a short Python script
+        or use `jq`/`grep` to extract key events (which conform to
+        `execution_log_entry` schema): tool error messages, final agent
+        summaries, instances where an agent "gave up", or messages indicating a
+        trust boundary assumption was incorrect.
 
 2.  **Synthesize Insights:** Review the extracted events. Look for:
 

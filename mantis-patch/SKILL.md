@@ -25,7 +25,7 @@ logs to long-term memory.
 
 -   **Reads**:
     -   `workspace/findings/` (reproduced finding JSON files where
-        `patch_status` is not `"VERIFIED_SECURE"`).
+        `patch_status` is not `"VERIFIED_SECURE"` or `"MITIGATION_PROPOSED"`).
     -   `workspace/.mantis_state.json` (to track current loop pass).
     -   Target source code files.
     -   Reproducer script path (`repro_file_path`) and command (`run_command`)
@@ -40,9 +40,10 @@ logs to long-term memory.
 -   **Preconditions**:
     -   Findings must exist in `workspace/findings/`.
 -   **Idempotency Guarantee**:
-    -   Skips findings where `patch_status` is already `"VERIFIED_SECURE"`.
-    -   Transactional isolation: modifies code inside shadow directories
-        (`/tmp/mantis-shadow-[id]/`) or creates temporary file backups
+    -   Skips findings where `patch_status` is already `"VERIFIED_SECURE"` or
+        `"MITIGATION_PROPOSED"`.
+    -   Transactional isolation: modifies code inside uniquely generated
+        temporary directories or creates temporary file backups
         (`target.c.bak-[id]`), restoring baseline state upon completion (using
         `try...finally` rollback mechanisms).
     -   Reuses the existing `append_patch.py` script once created.
@@ -95,25 +96,52 @@ Execute the patching and verification stage as follows:
             `"FALSE_POSITIVE"`) and immediately skip any further
             patching/verification for the chain. If any constituent's `"status"`
             is `"DUPLICATE"`, resolve it to its canonical finding by recursively
-            reading the finding specified in its `"duplicate_of"` property,
-            using that canonical finding's status and patch status for all
-            downstream checks and propagation, instead of updating the exploit
-            chain finding itself to `"DUPLICATE"`.
+            following its `"duplicate_of"` property.
+
+            **Duplicate Resolution Process:**
+
+            1.  **Locate the Finding File:** The finding file for the duplicate
+                (or any parent in the duplicate chain) may have been moved.
+                Search for `<uuid>.json` in the following locations in order:
+                -   `workspace/findings/<uuid>.json` (active findings)
+                -   `workspace/findings/.trash/<uuid>.json` (de-duplicated
+                    trash)
+                -   `workspace/archive/findings_pass_*/<uuid>.json` or
+                    `workspace/archive/loop*_findings/<uuid>.json` (archives
+                    from previous passes) If the file cannot be found in any of
+                    these locations, treat it as a missing file error.
+            2.  **Cycle Detection:** Maintain a set of visited finding UUIDs
+                during the resolution. If you encounter a UUID that has already
+                been visited in the current resolution chain, raise a validation
+                error (cycle detected).
+            3.  **Maximum Depth:** Limit the recursion depth to a maximum of 5
+                steps. If the chain is deeper, abort and report an error.
+            4.  **Extract Status:** Once you resolve to the canonical finding
+                (one whose `"status"` is not `"DUPLICATE"` or does not have
+                `"duplicate_of"`), use that canonical finding's `"status"` and
+                `"patch_status"` for all downstream checks and propagation. Do
+                not update the exploit chain finding itself to `"DUPLICATE"`.
+
         2.  **Missing Files:** If any constituent finding's JSON file is missing
             from the disk, set the chain's `"patch_status"` to `"ERROR"`.
+
         3.  **Constituent Unset (Pending):** If any constituent's
             `"patch_status"` is unset (null or missing, indicating it has not
             yet been reproduced/processed), the chain's `"patch_status"` must
             remain unset (null or missing) and we must defer/suspend further
             evaluation of the chain.
+
         4.  **Constituent Errors:** If any constituent's `"patch_status"` is
             `"ERROR"`, set the chain's `"patch_status"` to `"ERROR"`.
+
         5.  **Constituent Failures:** If any constituent's `"patch_status"` is
             `"VERIFICATION_FAILED"`, set the chain's `"patch_status"` to
             `"VERIFICATION_FAILED"`.
+
         6.  **Successful Propagation:** If all constituents have finished
             verification (each is in `{"VERIFIED_SECURE", "MITIGATION_PROPOSED",
             "VERIFICATION_INCOMPLETE"}`):
+
             -   If any constituent is `"MITIGATION_PROPOSED"`, set the chain's
                 `"patch_status"` to `"MITIGATION_PROPOSED"`.
             -   If no constituent is `"MITIGATION_PROPOSED"` and any constituent
@@ -165,8 +193,9 @@ Execute the patching and verification stage as follows:
                 few hundred MB, or when many parallel patch workers share the
                 host, prefer **Option B** (which touches only the modified
                 files) to avoid exhausting `/tmp` or memory.
-            -   Copy the target directory or relevant source tree to a temporary
-                location (e.g., `/tmp/mantis-shadow-[finding_id]/`).
+            -   Copy the target directory or relevant source tree to a uniquely
+                generated temporary directory (e.g., using `mktemp -d` or
+                `tempfile.mkdtemp()`).
             -   Perform all edits, compilation, and reproduction testing inside
                 this temporary shadow directory.
             -   **Critical Guard (Path and Working Directory Safety):** You must
@@ -238,17 +267,20 @@ Execute the patching and verification stage as follows:
         write a new reproducer variant that bypasses your patch to reach the
         same root cause. Only if the re-attack also fails to bypass the fix
         should you mark the patch as fully successful! To ensure true
-        independence, launch a fresh `@mantis-reproduce --reattack` subagent
-        against the patched code directory to perform this re-attack.
+        independence, launch a fresh `@mantis-reproduce --reattack
+        --finding_id=[finding_id]` subagent against the patched code directory
+        to perform this re-attack.
 
         **Important:** When calling the `@mantis-reproduce` subagent:
 
-        -   If using **Option A (Shadowing)**, pass `--target_root=<shadow>`
-            (e.g. `/tmp/mantis-shadow-[id]/`) and
+        -   If using **Option A (Shadowing)**, pass
+            `--target_root=<shadow_directory>` (where `<shadow_directory>` is
+            the unique temporary directory you created) and
             `--state_root=<original_workspace>` (your active workspace path).
+            Also pass `--finding_id=[finding_id]` of the finding being verified.
         -   If using **Option B (Backups)** or **Option C (Alternative)**, pass
             both roots pointing to the original workspace (or leave them default
-            `.`).
+            `.`), and pass `--finding_id=[finding_id]`.
 
         The reproducer agent running with `--reattack` will write its outcomes
         directly into the primary finding's `reattack_status`,
@@ -288,9 +320,9 @@ Execute the patching and verification stage as follows:
     -   **Transactional Clean Up / Rollback**: Restore the codebase to its
         original state.
         -   If using **Option A (Shadowing)**, delete the temporary shadow
-            directory completely (`rm -rf /tmp/mantis-shadow-[finding_id]`).
-            Since the original codebase was never modified, no further
-            restoration is needed.
+            directory completely (e.g., `rm -rf <shadow_directory>`). Since the
+            original codebase was never modified, no further restoration is
+            needed.
         -   If using **Option B (Backups)**, restore the original files by
             copying the backup files back onto the target files (e.g., `cp
             target.c.bak-[finding_id] target.c`), delete the backup copies (`rm
