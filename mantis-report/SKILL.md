@@ -1,7 +1,7 @@
 ---
 name: mantis-report
 description: >-
-  Generates a human-readable security review packet compiled from reproduced findings.
+  Generates a human-readable security review packet compiled from confirmed findings and exploit chains.
   Use at the end of a review cycle to produce stakeholder-facing documentation.
   Don't use for auditing code or verifying patches directly.
 ---
@@ -17,7 +17,7 @@ high-quality, human-readable review packet for developers and stakeholders.
 
 -   **Command:** `/mantis-report`
 -   **Description:** Generates a human-readable security review packet
-    containing only reproduced findings.
+    containing confirmed findings and exploit chains.
 
 ## Input/Output Contract
 
@@ -38,8 +38,8 @@ high-quality, human-readable review packet for developers and stakeholders.
 
 ## Instructions
 
-Compile a professional Markdown report detailing only the verified and
-reproduced vulnerabilities.
+Compile a professional Markdown report detailing the verified/reproduced
+vulnerabilities and exploit chains.
 
 Execute the reporting stage as follows:
 
@@ -94,16 +94,31 @@ Execute the reporting stage as follows:
 
 3.  **Generate Review Packet:**
 
-    -   **Grouping by Patch Status:** Organize the Executive Summary table and
-        the main body of the report by grouping findings into three distinct
-        sections based on their remediation status:
-        1.  **Patch Independently Verified:** Findings where `patch_status` is
-            `"VERIFIED_SECURE"` (meaning the patch was successfully verified and
-            passed variant re-attack checks).
-        2.  **Patch Proposed:** Findings that contain a `patch_diff` but
-            `patch_status` is NOT `"VERIFIED_SECURE"`.
-        3.  **Unpatched:** Findings with no `patch_diff` present, or where
-            `patch_status` is `"VERIFICATION_FAILED"` or `"ERROR"`.
+    -   **Grouping by Patch Status (Exclusivity):** Organize the Executive
+        Summary table and the main body of the report by grouping findings.
+        **Exploit chains MUST be excluded from these main groups and reported
+        ONLY in their dedicated "Exploit Chains (Not End-to-End Reproduced)"
+        section.** For standard (non-chain) findings, group them into three
+        distinct categories based on their remediation status (strictly mutually
+        exclusive):
+
+        1.  **Category 1: Patch Independently Verified**: Findings where
+            `patch_status` is `"VERIFIED_SECURE"`.
+        2.  **Category 2: Patch Proposed / Mitigation Identified**: Findings
+            where `patch_status` is in `["MITIGATION_PROPOSED",
+            "VERIFICATION_INCOMPLETE"]` OR (`patch_diff` is present AND
+            `patch_status` is unset/empty).
+        3.  **Category 3: Unpatched / Verification Failed**: Findings where
+            `patch_status` is in `["VERIFICATION_FAILED", "ERROR"]` OR
+            (`patch_diff` is not present AND `patch_status` is unset/empty).
+
+    -   **Dedicated Exploit Chains Section:** Create a dedicated section titled
+        `"Exploit Chains (Not End-to-End Reproduced)"` specifically for exploit
+        chains. Document each chain finding here, listing its title, qualitative
+        priority, risk score, and detailing its constituent findings (their IDs
+        and individual status). Do not mix exploit chains with standard findings
+        in Categories 1, 2, or 3.
+
     -   **Pass-Numbered Output:** Do not overwrite the same `review_packet.md`
         file on every execution. Instead, determine the current run/pass number
         `N` of the pipeline (resolved from `"pass_number"` in
@@ -113,12 +128,15 @@ Execute the reporting stage as follows:
         no archives exist). Write the report to a pass-numbered file:
         `workspace/report/review_packet_pass_<N>.md` (where `<N>` is the
         sequential pass number, e.g., `review_packet_pass_1.md`).
+
     -   **Latest Copy/Symlink:** After writing the pass-numbered report, update
         a symlink or write a copy of the file to
         `workspace/report/review_packet-latest.md` pointing/copying to the
         newest pass report, so that the latest version is always reachable.
+
     -   Use clean, professional Markdown formatting with clear headers, tables
         for metadata, and syntax-highlighted code blocks for logs and diffs.
+
     -   Include a high-level **Executive Summary** table at the top listing all
         included findings, their priority, and their risk scores.
 

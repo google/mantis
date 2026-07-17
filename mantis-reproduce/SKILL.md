@@ -15,35 +15,47 @@ inside isolated sandbox environments to empirically verify bugs.
 
 ## Command Definition
 
--   **Command:** `/mantis-reproduce [--reattack]`
+-   **Command:** `/mantis-reproduce [--reattack] [--target_root=<path>]
+    [--state_root=<path>]`
 -   **Description:** Generates and runs crash reproducers to verify security
-    flaws. Use `--reattack` when executing as part of patch verification to
-    isolate re-attack outcomes.
+    flaws.
+-   **Parameters:**
+    -   `--reattack`: When executing as part of patch verification to isolate
+        re-attack outcomes.
+    -   `--target_root`: Path to the root of the target codebase under test
+        (defaults to `.`).
+    -   `--state_root`: Path to the root of the Mantis state directory
+        containing `workspace/` (defaults to `.`).
 
 ## Input/Output Contract
 
 -   **Reads**:
-    -   `workspace/findings/` (viable/conditional findings).
-    -   Repository source files (to analyze trigger paths).
-    -   `workspace/archive/.repro_attempts.json`.
-    -   `workspace/.mantis_state.json` (to track current loop pass).
+    -   `state_root/workspace/findings/` (viable/conditional findings).
+    -   `target_root/` (Repository source files to analyze trigger paths).
+    -   `state_root/workspace/archive/.repro_attempts.json`.
+    -   `state_root/workspace/.mantis_state.json` (to track current loop pass).
 -   **Writes**:
-    -   PoC reproduction files (e.g. `poc.py`, `crash.payload`).
-    -   If run normally: updates findings in-place (sets `"repro_status"`,
+    -   PoC reproduction files (e.g. `poc_[uuid].py` or `crash_[uuid].payload`
+        inside `state_root/workspace/reproducers/`).
+    -   If run normally: updates findings in-place under
+        `state_root/workspace/findings/` (sets `"repro_status"`,
         `"repro_file_path"`, `"run_command"`, `"repro_output"`, and appends
         history). Updates status to `"VALID"` if provisionally valid.
-    -   If run with `--reattack`: updates findings in-place (sets
-        `"reattack_status"`, `"reattack_file_path"`, `"reattack_run_command"`,
-        `"reattack_output"`, and appends history with stage `"reattack"`). Does
-        not modify `"repro_*"` fields or `"status"`.
-    -   Updates `workspace/archive/.repro_attempts.json` atomically.
+    -   If run with `--reattack`: updates findings in-place under
+        `state_root/workspace/findings/` (sets `"reattack_status"`,
+        `"reattack_file_path"`, `"reattack_run_command"`, `"reattack_output"`,
+        and appends history with stage `"reattack"`). Does not modify
+        `"repro_*"` fields or `"status"`.
+    -   Updates `state_root/workspace/archive/.repro_attempts.json` atomically.
 -   **Preconditions**:
-    -   Findings must exist in `workspace/findings/`.
+    -   Findings must exist in `state_root/workspace/findings/`.
     -   Sandbox/container runtime environment must be available.
 -   **Idempotency Guarantee**:
-    -   Updates findings in place. Uses `.repro_attempts.lock` file locking and
-        atomic temporary file swaps (`os.replace` on `.repro_attempts.json.tmp`)
-        to guarantee concurrency safety and retry stability.
+    -   Updates findings in place. Uses
+        `state_root/workspace/archive/.repro_attempts.lock` file locking and
+        atomic temporary file swaps (`os.replace` on
+        `state_root/workspace/archive/.repro_attempts.json.tmp`) to guarantee
+        concurrency safety and retry stability.
 
 ## Instructions
 
@@ -52,10 +64,11 @@ that reproduces a confirmed security flaw.
 
 Execute the reproduction stage under these constraints:
 
-1.  **Load Viable Findings:** Read the JSON files in the `workspace/findings/`
-    directory. Filter for findings where `production_viability` is `"VIABLE"`,
-    `"SAMPLE_OR_TEST"`, or `"CONDITIONAL_VIABLE"` (or skip the filter if you're
-    not checking viability). If no applicable findings exist, notify the user.
+1.  **Load Viable Findings:** Read the JSON files in the
+    `state_root/workspace/findings/` directory. Filter for findings where
+    `production_viability` is `"VIABLE"`, `"SAMPLE_OR_TEST"`, or
+    `"CONDITIONAL_VIABLE"` (or skip the filter if you're not checking
+    viability). If no applicable findings exist, notify the user.
 
 2.  **Strict Host Isolation Constraint:**
 
@@ -70,21 +83,34 @@ Execute the reproduction stage under these constraints:
         internet.
 
 3.  **Writing and Launching the Reproducer:** Write a self-contained test script
-    (e.g., `poc.py` or a C reproducer file) or write a raw crash input data
-    payload (e.g., `crash.payload`) that triggers the target bug. Analyze the
-    code path and constraints carefully. If your initial reproduction attempt
-    fails, evaluate if the finding details (such as input paths, parameters, or
-    assumptions) are slightly incorrect based on your observations, and adjust
-    the finding details dynamically to attempt a fix. If you cannot find a
-    triggerable path after trying multiple approaches and adjustments, abandon
-    the attempt and mark it as `failed_to_reproduce`. To run your script or
-    payload, use the execution or containerization tools available in your
-    environment to execute the code safely. Select the most appropriate runtime
-    image and flags for the target. **Execute your reproduction using the
-    appropriate environment:** If the target is firmware, you may write a script
-    to boot it via `qemu`, `unicorn`, or Firmadyne. If it's a binary, you may
-    use dynamic instrumentation or standard execution. Use your best judgment to
-    construct a working harness for the artifact.
+    (e.g., `poc_[uuid].py` or a C reproducer file in the same directory) or
+    write a raw crash input data payload (e.g., `crash_[uuid].payload`) that
+    triggers the target bug. **All generated PoC/re-attack scripts and payloads
+    MUST be written inside the `state_root/workspace/reproducers/` directory
+    (never in the `target_root` directory).** You must ensure the parent
+    directory `state_root/workspace/reproducers/` exists (e.g. using `mkdir -p`)
+    before writing any files. Analyze the code path and constraints carefully.
+    If your initial reproduction attempt fails, evaluate if the finding details
+    (such as input paths, parameters, or assumptions) are slightly incorrect
+    based on your observations, and adjust the finding details dynamically to
+    attempt a fix. If you cannot find a triggerable path after trying multiple
+    approaches and adjustments, abandon the attempt and mark it as
+    `failed_to_reproduce`.
+
+    To run your script or payload, use the execution or containerization tools
+    available in your environment to execute the code safely. Select the most
+    appropriate runtime image and flags for the target. **All compilation and
+    test execution commands MUST be run with current working directory (Cwd) set
+    to `target_root`.** Resolve and use the absolute path of the generated POC
+    file (e.g. using python's `os.path.abspath` on
+    `state_root/workspace/reproducers/poc_[uuid].py`) when generating and
+    storing the `"run_command"` or `"reattack_run_command"`.
+
+    **Execute your reproduction using the appropriate environment:** If the
+    target is firmware, you may write a script to boot it via `qemu`, `unicorn`,
+    or Firmadyne. If it's a binary, you may use dynamic instrumentation or
+    standard execution. Use your best judgment to construct a working harness
+    for the artifact.
 
     -   *Optional Parallel Trajectory Search:* If your environment or agent
         framework supports spawning subagents, you can deploy multiple
@@ -142,15 +168,16 @@ Execute the reproduction stage under these constraints:
     re-emit or manually rewrite the entire JSON object in your output.**
     Instead, use in-place editing tools (like a short script in your preferred
     language, or `jq`) to programmatically append the new fields to the existing
-    `workspace/findings/<id>.json` file.
+    `state_root/workspace/findings/<id>.json` file.
 
     Additionally, you must **Update the Reproduction Attempt Cache** to help the
     planner track attempts efficiently:
 
-    -   Maintain a JSON cache file at `workspace/archive/.repro_attempts.json`.
-        Ensure the parent directory `workspace/archive/` exists (e.g., `mkdir -p
-        workspace/archive/`) before creating, reading, or locking the cache
-        file.
+    -   Maintain a JSON cache file at
+        `state_root/workspace/archive/.repro_attempts.json`. Ensure the parent
+        directory `state_root/workspace/archive/` exists (e.g., `mkdir -p
+        state_root/workspace/archive/`) before creating, reading, or locking the
+        cache file.
     -   Key the cache by a stable identifier that persists across loop runs even
         if UUIDs are regenerated. Use a combination of the finding's normalized
         title and its primary file path: `stable_key = normalized_title + "@" +
@@ -164,21 +191,21 @@ Execute the reproduction stage under these constraints:
         locking bypasses caused by atomic file replacement) and protect lockless
         readers:
         -   Use a separate dedicated lock file
-            `workspace/archive/.repro_attempts.lock` which is never deleted or
-            replaced.
+            `state_root/workspace/archive/.repro_attempts.lock` which is never
+            deleted or replaced.
         -   Perform updates atomically using Python's `fcntl.flock` on this lock
             file:
-            1.  Open the lock file `workspace/archive/.repro_attempts.lock`
-                (creating it if missing) and acquire an exclusive lock
-                (`fcntl.flock` with `fcntl.LOCK_EX`) inside a context manager
-                (`with` statement).
+            1.  Open the lock file
+                `state_root/workspace/archive/.repro_attempts.lock` (creating it
+                if missing) and acquire an exclusive lock (`fcntl.flock` with
+                `fcntl.LOCK_EX`) inside a context manager (`with` statement).
             2.  Read the current contents of the cache file
-                `workspace/archive/.repro_attempts.json` (treating it as `{}` if
-                missing or empty).
+                `state_root/workspace/archive/.repro_attempts.json` (treating it
+                as `{}` if missing or empty).
             3.  Increment the integer value for this finding's `stable_key`
                 by 1.
             4.  Write the updated JSON to a temporary file in the same directory
-                (e.g., `workspace/archive/.repro_attempts.json.tmp`).
+                (e.g., `state_root/workspace/archive/.repro_attempts.json.tmp`).
             5.  Atomically replace the target cache file with the temporary file
                 (e.g., `os.replace` in Python) to ensure readers never see a
                 truncated or incomplete file.

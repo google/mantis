@@ -224,8 +224,9 @@ Execute the calibration as follows:
                         -   Phrases matching `"local user"`, `"local shell"`,
                             `"local access"` -> `"LOCAL"`.
                         -   Phrases matching `"peer <role> in same
-                            job/cluster/pod"`, `"co-tenant"`, `"adjacent
-                            workload"`, `"NCCL peer rank"` -> `"IN_CLUSTER"`.
+                            job/cluster/pod"`, `"co-tenant"`, `"in-cluster
+                            (Kubernetes/container-orchestrator) workload"`,
+                            `"NCCL peer rank"` -> `"IN_CLUSTER"`.
                         -   Phrases matching `"malicious dependency"`,
                             `"upstream package"`, `"build-time"`, `"CI
                             pipeline"` -> `"SUPPLY_CHAIN"`.
@@ -251,7 +252,9 @@ Execute the calibration as follows:
                             guest-to-host (VM escape), sandbox-to-outside,
                             enclave-to-host, or contained-process-to-container —
                             must be classified as `"LOCAL"` (or `"IN_CLUSTER"`
-                            for pod-to-node), never `"HOST_SYSTEM"`.
+                            for Kubernetes pod-to-node; a KVM/hypervisor guest
+                            attacking its host is "LOCAL"), never
+                            `"HOST_SYSTEM"`.
                         -   `"PHYSICAL_LONG_TERM"` / `"PHYSICAL_TEMPORARY"`: If
                             the bug description, title, or code path indicates
                             hardware fault injection, side-channel, evil maid,
@@ -348,219 +351,31 @@ Execute the calibration as follows:
     attacker over their prerequisite position. If the exploit does not grant the
     attacker significant new control, access, or capabilities beyond what is
     already inherent to their starting position (or already possessed via
-    legitimate means), the finding must be capped or downgraded. **This
-    principle applies generally to all findings; the specific rules listed below
-    are common applications of this principle but are not exhaustive.**
+    legitimate means), the finding must be capped or downgraded.
+
+    The complete, detailed definitions of the 27 calibration sanity rules are
+    stored in the reference catalogue at
+    [Calibration Rules](references/calibration_rules.md). You MUST evaluate each
+    finding against the 27 rules listed there.
 
     Check if the `THREAT_MODEL.md` defines any `Calibration Overrides` (e.g.,
     `LIFT_CAP: PHYSICAL_LONG_TERM`). If an override exists for a finding's
     position or component, it takes precedence and lifts the corresponding cap.
-    Otherwise, the caps and downgrades below (and general applications of the
-    Marginal Capability principle) override any upgrades calculated in Section 2
-    (including the Security Control Bypass upgrade). You **MUST** apply the
-    specific caps and downgrades below, and should also apply the general
-    principle to cap or downgrade other findings that offer low marginal
-    capability. **Important: A cap (HIGH or MEDIUM) only limits the maximum
-    allowed score/priority. It must NOT upgrade a lower score/priority (e.g., a
-    finding with a score of 5.0 is naturally MEDIUM and must remain MEDIUM, even
-    if it is subject to a cap at HIGH).**
+    Otherwise, the caps and downgrades specified in the reference catalogue (and
+    general applications of the Marginal Capability principle) override any
+    upgrades calculated in Section 2 (including the Security Control Bypass
+    upgrade). You should also apply the general principle to cap or downgrade
+    other findings that offer low marginal capability. **Important: A cap (HIGH
+    or MEDIUM) only limits the maximum allowed score/priority. It must NOT
+    upgrade a lower score/priority (e.g., a finding with a score of 5.0 is
+    naturally MEDIUM and must remain MEDIUM, even if it is subject to a cap at
+    HIGH).**
 
-    **Precedence:** Evaluate ALL rules below. If multiple caps apply, the **most
+    **Precedence:** Evaluate ALL rules. If multiple caps apply, the **most
     restrictive** wins (Force-LOW > cap-MEDIUM > cap-HIGH). Record every rule
     that fired in `sanity_triage_applied` as a semicolon-separated list, most
     restrictive first (e.g., `"Local Attack Vector; Internal/Nested"`), so the
     effective cap is auditable.
-
-    *   **Force-Downgrade to LOW (Cap at 2.0 / LOW Priority):**
-
-        -   **Reproduction Failure or Not Attempted:** The reproduction failed
-            (`repro_status: "failed_to_reproduce"`), was not attempted
-            (`repro_status: "not_attempted"`), or the `repro_status` field was
-            missing (treated as `"not_attempted"`). Regardless of theoretical
-            production viability.
-        -   **Unreachable / Uncontrolled Inputs:** The finding relies on inputs
-            that are documented as highly unlikely to be user-controlled, and no
-            path from a trust boundary is proven.
-        -   **Third-Party / Supply Chain Reachability:** Vulnerabilities in
-            third-party libraries (dependency CVEs) where a reachable path from
-            application input to the vulnerable function has not been actively
-            demonstrated.
-        -   **Minor Configuration Hygiene:** Minor deviations from best practice
-            (e.g., slightly loose permissions on internal dirs, lack of modern
-            encryption on low-value internal transport) without a clear exploit
-            path.
-        -   **Non-Security Critical Components:** The finding affects a
-            component or data with no security sensitivity (e.g., public info,
-            signatures on non-security payloads, cosmetic outputs).
-        -   **Vague Code Paths / Fragile Assumptions:** Relying on unverified
-            assumptions about caller behavior or adjacent system components.
-        -   **Unreliable/Noisy Triggers:** Triggers that are likely to be
-            ignored in practice or indistinguishable from normal operations.
-        -   **Prerequisite Shell Access (Equivalent Primitives):** The attacker
-            already possesses local shell access on the target container or host
-            with the **same or higher** privilege level than the exploit
-            provides, rendering the gained access redundant under the Principle
-            of Marginal Capability (e.g., exploiting a bug to get a standard
-            user shell when already logged in as a standard user, or exploiting
-            a local buffer overflow to run commands as root when already running
-            as root). This does NOT apply to low-to-high privilege escalation
-            (e.g., standard user to root), which should cap at MEDIUM.
-
-        -   **Physical Long-Term / Laboratory Access:** If the attack requires
-            long-term physical access to the device or specialized laboratory
-            equipment (e.g., fault injection, side-channel analysis, chip
-            decapping). Force-downgrade to **LOW (2.0)** due to the extreme
-            execution barrier and requirement for physical possession.
-
-        -   **Trusted-Controller-Mediated Interface (Zero Delta):** If the
-            vulnerable interface is reachable only from a component that holds
-            designed-in authoritative control over the target (e.g.,
-            orchestrator->worker, driver->device firmware, protocol
-            master->slave, hypervisor->guest, management plane->data plane
-            node), and the exploit grants **zero marginal capability** (i.e.,
-            the controller could already achieve the identical effect or level
-            of compromise via its standard, legitimate interface),
-            force-downgrade to **LOW (2.0)**. (This generalizes the *Standard
-            Host-to-Guest Attacks* rule below).
-
-        -   **Standard Host-to-Guest Attacks:** If the attacker position is
-            `HOST_SYSTEM` (host hypervisor attacking guest) on standard
-            deployments (non-Confidential Computing). Force-downgrade to **LOW
-            (2.0)** as the host OS/hypervisor already possesses total control
-            over the guest by design, meaning the exploit offers zero marginal
-            capability over the prerequisite position (equivalent primitives).
-            **Default assumption:** treat as non-Confidential Computing (this
-            rule fires) UNLESS the Threat Model, code path, or finding
-            description explicitly names Confidential Computing, guest enclaves,
-            TEE, SEV, TDX, SGX, or attestation (in which case apply the CC Host
-            Attacks cap-HIGH rule instead).
-
-    *   **Force-Cap to HIGH (Cap at 7.9 / Maximum HIGH Priority):**
-
-        -   **Static Confirmation:** Statically confirmed but not empirically
-            reproduced (`repro_status: "statically_confirmed"`). Cap
-            `likelihood_score` at **3**, apply **0.8** multiplier to Hazard, and
-            MUST NOT be CRITICAL. *Exception:* If the finding details
-            (description, history, or reproduction output) include a valid
-            external stack trace, sanitizer trace (e.g. ASan, UBSan, MSan),
-            crash log, or core dump proving the vulnerability was triggered in
-            execution (e.g., in a prior run or by external tools), treat it as
-            empirically reproduced (Likelihood 5) and do not apply this static
-            cap.
-        -   **Strict XSS Caps:** All XSS vulnerabilities. Default to MEDIUM or
-            LOW; cap at HIGH (7.9) only for stored XSS on critical admin pages
-            with zero-click execution for the admin.
-        -   **Internal / Nested Components:** Any finding with a Network/Trust
-            Exposure multiplier less than 1.0 (i.e., Internal Component or
-            Privileged Zone). If the calculated score lands in the CRITICAL
-            range, cap the score at **7.9** and downgrade the priority to HIGH.
-            *Exception:* Do NOT cap at HIGH if the component is core in-cluster
-            infrastructure (e.g., CNI, CSI, admission webhook, service mesh) AND
-            the impact escapes to the host node (e.g., node-root file R/W) or
-            allows cross-tenant escalation. These remain eligible for CRITICAL.
-            **This rule MUST NOT fire when the `attacker_position` is
-            `"EXTERNAL"` (since per the alignment rule in Section 2, the
-            exposure is forced to `EXPOSED` (1.0), which precludes this cap).**
-        -   **Probabilistic LLM Vectors:** Attacks relying on probabilistic LLM
-            behavior (e.g., prompt injection, jailbreaking) to trigger a
-            vulnerability. Cap at **HIGH** (7.9) and default to **MEDIUM** or
-            **LOW**. *Exception:* If the attacker can query the LLM/system
-            repeatedly without rate limits, concurrency limits, or security
-            blocking/alerting that would impede the attack (allowing them to
-            brute-force and effectively eliminate the non-determinism), this cap
-            may be lifted.
-        -   **Supply-Chain / Build-Time Prerequisites:** If the exploit requires
-            the attacker to already possess a supply-chain position (e.g.,
-            ability to poison dependencies, modify upstream source) or write
-            access to the build pipeline to trigger the vulnerability. Cap at
-            **HIGH (7.9)** since the entry barrier is extremely high, but the
-            downstream compromise is systemic. (Force-downgrade to LOW/2.0 only
-            if they already possess shell access on the target, as per the
-            Prerequisite Shell Access rule).
-        -   **Non-Default Configurations:** Findings that are only exploitable
-            under non-default configurations. Cap at **HIGH (7.9)** to reflect
-            the additional configuration barrier.
-
-        -   **Confidential Computing Host Attacks:** If the attacker position is
-            `HOST_SYSTEM` (the host OS or hypervisor attacking guest enclaves or
-            confidential VMs) in Confidential Computing deployments. Cap at
-            **HIGH (7.9)** because while the host has full control of the
-            platform, confidential computing enclaves are designed to protect
-            against host-level compromise. (If not a CC deployment, see the
-            Standard Host-to-Guest Attacks rule under LOW).
-
-        -   **Trusted-Controller-Mediated Interface (Critical Bypass):** If the
-            vulnerable interface is reachable only from a designed-in
-            authoritative controller, and the exploit allows that controller to
-            bypass target-side **documented security controls** or
-            **safety-of-life limits** it was designed to respect, cap at **HIGH
-            (7.9)**. (If the exploit allows lateral reach into a different trust
-            domain or achieves persistence surviving controller re-provisioning,
-            do not cap).
-
-    *   **Force-Cap to MEDIUM (Cap at 5.9 / Maximum MEDIUM Priority):**
-
-        -   **Local Attack Vector:** Vulnerabilities requiring local shell
-            access (e.g., local privilege escalation, SUID exploitation) without
-            VM escape. (Downgrade to LOW/2.0 if it only affects a single user's
-            isolated data).
-        -   **Self-Contained Blast Radius:** If the maximum impact of the
-            exploit is confined to resources, data, or execution contexts that
-            the triggering principal already owns or has full designed-in
-            authority over — their own account, tenant, project, namespace,
-            container, VM, device, or single-user installation — and does not
-            cross any isolation boundary between mutually-distrusting
-            principals, cap at **MEDIUM (5.9)**.
-            -   The exploit may grant genuinely new capability within that
-                domain (e.g., API-user -> shell in their own container), but the
-                deployment's core isolation guarantees to other parties still
-                hold. This is a blast-radius bound, distinct from the Marginal
-                Capability principle (which bounds by new capability; this
-                bounds by who is affected).
-            -   Do **NOT** apply this cap if the exploit:
-                -   reaches another principal's resources (cross-tenant,
-                    cross-user, cross-account),
-                -   touches shared or multi-party infrastructure (shared cache,
-                    shared filesystem, operator control plane, co-tenant
-                    side-channel),
-                -   places the attacker's domain upstream of others (build node,
-                    CI runner, package registry, model-serving host — i.e., a
-                    supply-chain position), or
-                -   persists in a way that survives the principal's own resource
-                    lifecycle and could later affect a different principal
-                    reusing that slot.
-        -   **Rarely Exposed Components:** Findings in components documented as
-            'rarely exposed' or 'unlikely to be user controlled'.
-        -   **Equivalent Primitives (No Boundary Breach):** The attacker profile
-            capable of triggering the vulnerability already possesses equivalent
-            access, privileges, or capabilities (primitives) through standard
-            system features (e.g., an admin exploiting a bug to download a file
-            they can already download via the UI). Because this offers low
-            marginal capability over their prerequisite position, cap at
-            **MEDIUM (5.9)** to maintain visibility for defense-in-depth
-            cleanup.
-        -   **Documented Insecure Configurations:** Non-default configurations
-            that are explicitly documented in public manuals as insecure,
-            diagnostic-only, or strictly non-production. Cap at **MEDIUM
-            (5.9)**.
-
-        -   **Physical Temporary Access:** If the attack requires temporary
-            physical access to the device (e.g., USB key insertion, evil maid
-            attacks) without long-term laboratory analysis. Cap at **MEDIUM
-            (5.9)**.
-
-        -   **High-Privilege External Access:** Exploits with
-            `attacker_position: "EXTERNAL"` that require `privileges_required:
-            "HIGH"` (e.g., admin RCE on public portals). Cap at **MEDIUM
-            (5.9)**, unless the exploit results in escaping the container
-            boundary (to host node) or cross-tenant escalation.
-
-        -   **Trusted-Controller-Mediated Interface (Standard Bypass):** If the
-            vulnerable interface is reachable only from a designed-in
-            authoritative controller, and the exploit allows that controller to
-            bypass target-side **standard safety or sanity limits** (but not
-            critical safety-of-life or documented security controls) it was
-            expected to respect, cap at **MEDIUM (5.9)**.
 
 4.  **Determine Priority:**
 
@@ -608,44 +423,55 @@ Execute the calibration as follows:
     -   `"sanity_triage_applied"` (semicolon-separated list of Section 3 rules
         that fired, most-restrictive first, or null)
     -   `"calibration_checklist"` object containing evaluations for all 27
-        sanity caps (each key in the object maps to the sanity cap rule of the
-        matching name from Section 3 above):
+        sanity caps. Each key in the object maps to the sanity cap rule of the
+        matching name:
 
         ```json
         {
-          "repro_failure": { "fires": <bool>, "reason": "<string>" },
-          "unreachable_inputs": { "fires": <bool>, "reason": "<string>" },
-          "third_party_reachability": { "fires": <bool>, "reason": "<string>" },
-          "minor_config_hygiene": { "fires": <bool>, "reason": "<string>" },
-          "non_security_critical": { "fires": <bool>, "reason": "<string>" },
-          "vague_code_paths": { "fires": <bool>, "reason": "<string>" },
-          "unreliable_triggers": { "fires": <bool>, "reason": "<string>" },
-          "prerequisite_shell": { "fires": <bool>, "reason": "<string>" },
-          "physical_long_term": { "fires": <bool>, "reason": "<string>" },
-          "trusted_controller_zero_delta": { "fires": <bool>, "reason": "<string>" },
-          "standard_host_attacks": { "fires": <bool>, "reason": "<string>" },
-          "static_confirmation": { "fires": <bool>, "reason": "<string>" },
-          "strict_xss": { "fires": <bool>, "reason": "<string>" },
-          "internal_nested": { "fires": <bool>, "reason": "<string>" },
-          "probabilistic_llm": { "fires": <bool>, "reason": "<string>" },
-          "supply_chain_prerequisites": { "fires": <bool>, "reason": "<string>" },
-          "non_default_config": { "fires": <bool>, "reason": "<string>" },
-          "confidential_computing_host": { "fires": <bool>, "reason": "<string>" },
-          "trusted_controller_critical_bypass": { "fires": <bool>, "reason": "<string>" },
-          "local_attack_vector": { "fires": <bool>, "reason": "<string>" },
-          "self_contained_blast": { "fires": <bool>, "reason": "<string>" },
-          "rarely_exposed": { "fires": <bool>, "reason": "<string>" },
-          "equivalent_primitives": { "fires": <bool>, "reason": "<string>" },
-          "documented_insecure_config": { "fires": <bool>, "reason": "<string>" },
-          "physical_temporary": { "fires": <bool>, "reason": "<string>" },
-          "high_privilege_external": { "fires": <bool>, "reason": "<string>" },
-          "trusted_controller_standard_bypass": { "fires": <bool>, "reason": "<string>" }
+          "repro_failure": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "unreachable_inputs": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "third_party_reachability": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "minor_config_hygiene": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "non_security_critical": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "vague_code_paths": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "unreliable_triggers": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "prerequisite_shell": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "physical_long_term": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "trusted_controller_zero_delta": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "standard_host_attacks": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "static_confirmation": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "strict_xss": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "internal_nested": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "probabilistic_llm": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "supply_chain_prerequisites": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "non_default_config": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "confidential_computing_host": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "trusted_controller_critical_bypass": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "local_attack_vector": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "self_contained_blast": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "rarely_exposed": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "equivalent_primitives": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "documented_insecure_config": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "physical_temporary": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "high_privilege_external": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" },
+          "trusted_controller_standard_bypass": { "outcome": "APPLIES" | "DOES_NOT_APPLY" | "UNKNOWN", "reason": "<string>" }
         }
         ```
 
-        For each rule, `fires` must be `true` if the sanity cap rule applies
-        (fires) to this finding, capping or downgrading its score/priority, or
-        `false` if it does not apply. The `reason` must describe the evaluation.
+        For each rule, `outcome` must be set to:
+
+        -   `"APPLIES"`: if the sanity cap rule applies (fires) to this finding,
+            capping or downgrading its score/priority. A detailed `reason`
+            string is **required**.
+        -   `"DOES_NOT_APPLY"`: if the sanity cap rule does not apply. The
+            `reason` field is **optional** and may be omitted to optimize
+            tokens.
+        -   `"UNKNOWN"`: if it is unresolved. A detailed `reason` string is
+            **required**.
+
+        For backward compatibility, the schema also permits `"fires": <bool>`
+        (with `reason` required only if `fires` is `true`), but the new
+        `"outcome"` format is preferred.
 
     -   `"outrage_commentary"` (your reasoning about the outrage factor)
 

@@ -55,12 +55,12 @@ behavior.
 Execute the patching and verification stage as follows:
 
 1.  **Load Findings to Patch:** Read the JSON files in the `workspace/findings/`
-    directory. Filter for findings where `patch_status` is NOT
-    `"VERIFIED_SECURE"` AND (either `repro_status` is `"reproduced"` OR the
-    finding is an exploit chain, e.g., the title starts with `"Exploit Chain:"`,
-    or history has an entry from the `"chainer"` stage, or the
-    `"constituent_findings"` property is present and non-empty). If none exist,
-    notify the user.
+    directory. Filter for findings where `patch_status` is NOT one of
+    `["VERIFIED_SECURE", "MITIGATION_PROPOSED", "VERIFICATION_INCOMPLETE"]` AND
+    (either `repro_status` is `"reproduced"` OR the finding is an exploit chain,
+    e.g., the title starts with `"Exploit Chain:"`, or history has an entry from
+    the `"chainer"` stage, or the `"constituent_findings"` property is present
+    and non-empty). If none exist, notify the user.
 
 2.  **Generate and Apply Minimal Patches:** For each reproduced security flaw:
 
@@ -72,7 +72,8 @@ Execute the patching and verification stage as follows:
         isolation/modification/diff steps and generate a general, high-level
         recommendation for how this issue could be mitigated in a production
         environment without requiring deep technical depth. Output this
-        mitigation string in place of the `patch_diff` field.
+        mitigation string in place of the `patch_diff` field, and set
+        `"patch_status"` to `"MITIGATION_PROPOSED"`.
 
     -   **Exploit Chains:** If the finding is an exploit chain (identified by
         `"Exploit Chain:"` in the title, or history details, or if the
@@ -80,14 +81,44 @@ Execute the patching and verification stage as follows:
         generate a code patch or diff. Instead, identify its sub-findings by
         reading the `"constituent_findings"` array of UUIDs. Monitor the patch
         status of these constituent findings (listed on disk as
-        `workspace/findings/<uuid>.json`). **Important:** You must defer
-        evaluating exploit chains until all individual findings in the batch
-        have been processed, so that the latest patch statuses of their
-        constituents are available on disk. Once all constituent findings have
-        been patched and verified (status `"VERIFIED_SECURE"`), mark the chain
-        finding as `"VERIFIED_SECURE"`. If any constituent patch fails, mark the
-        chain as `"VERIFICATION_FAILED"`. Skip branch isolation, testing, and
-        re-attack steps for the chain finding itself.
+        `workspace/findings/<uuid>.json`). **Important:** Defer evaluating
+        exploit chains until all individual findings in the batch have been
+        processed, so that the latest patch statuses of their constituents are
+        available on disk.
+
+        Evaluate the exploit chain status using these propagation rules
+        (evaluated in order):
+
+        1.  **Validity Check:** Read the validity `"status"` of each constituent
+            finding. If any constituent's `"status"` is `"FALSE_POSITIVE"` or
+            `"DUPLICATE"`, update the exploit chain finding's `"status"` to
+            match it (e.g. `"FALSE_POSITIVE"`) and immediately skip any further
+            patching/verification for the chain.
+        2.  **Missing Files:** If any constituent finding's JSON file is missing
+            from the disk, set the chain's `"patch_status"` to `"ERROR"`.
+        3.  **Constituent Unset (Pending):** If any constituent's
+            `"patch_status"` is unset (null or missing, indicating it has not
+            yet been reproduced/processed), the chain's `"patch_status"` must
+            remain unset (null or missing) and we must defer/suspend further
+            evaluation of the chain.
+        4.  **Constituent Errors:** If any constituent's `"patch_status"` is
+            `"ERROR"`, set the chain's `"patch_status"` to `"ERROR"`.
+        5.  **Constituent Failures:** If any constituent's `"patch_status"` is
+            `"VERIFICATION_FAILED"`, set the chain's `"patch_status"` to
+            `"VERIFICATION_FAILED"`.
+        6.  **Successful Propagation:** If all constituents have finished
+            verification (each is in `{"VERIFIED_SECURE", "MITIGATION_PROPOSED",
+            "VERIFICATION_INCOMPLETE"}`):
+            -   If any constituent is `"MITIGATION_PROPOSED"`, set the chain's
+                `"patch_status"` to `"MITIGATION_PROPOSED"`.
+            -   If no constituent is `"MITIGATION_PROPOSED"` and any constituent
+                is `"VERIFICATION_INCOMPLETE"`, set the chain's `"patch_status"`
+                to `"VERIFICATION_INCOMPLETE"`.
+            -   If all constituents are `"VERIFIED_SECURE"`, set the chain's
+                `"patch_status"` to `"VERIFIED_SECURE"`.
+
+        Skip branch isolation, testing, and re-attack steps for the chain
+        finding itself.
 
     -   *Optional Parallel Trajectory Search:* If your framework supports
         subagents, you may spawn multiple concurrent subagents to design diverse
@@ -139,11 +170,21 @@ Execute the patching and verification stage as follows:
                 set to the shadow directory. If the finding's `run_command`
                 contains absolute paths to the original workspace, you must
                 rewrite them to point to the corresponding paths in the shadow
-                directory before execution. Do not execute any modification or
-                verification commands against the original workspace.
+                directory before execution.
+
+                **Guard Check:** When performing path rewriting, only rewrite
+                paths that represent the target codebase files. If a path starts
+                with or contains `<original_workspace>/workspace/` (where the
+                Mantis state and findings are stored), do NOT replace its prefix
+                with the shadow directory path (as findings/states must remain
+                in the authoritative original workspace). Do not execute any
+                modification or verification commands against the original
+                workspace.
+
             -   Generate the unified patch diff by comparing the original source
                 files in the workspace with the modified files in the shadow
                 directory.
+
             -   Delete the temporary shadow directory completely when finished.
 
         *   **Option B: File-Level Backups (Fallback)**
@@ -181,16 +222,31 @@ Execute the patching and verification stage as follows:
         should you mark the patch as fully successful! To ensure true
         independence, launch a fresh `@mantis-reproduce --reattack` subagent
         against the patched code directory to perform this re-attack.
-        **Important:** Ensure you explicitly pass the shadow directory path (not
-        the original workspace) as the target directory for the subagent. The
-        reproducer agent running with `--reattack` will write its outcomes
+
+        **Important:** When calling the `@mantis-reproduce` subagent:
+
+        -   If using **Option A (Shadowing)**, pass `--target_root=<shadow>`
+            (e.g. `/tmp/mantis-shadow-[id]/`) and
+            `--state_root=<original_workspace>` (your active workspace path).
+        -   If using **Option B (Backups)** or **Option C (Alternative)**, pass
+            both roots pointing to the original workspace (or leave them default
+            `.`).
+
+        The reproducer agent running with `--reattack` will write its outcomes
         directly into the primary finding's `reattack_status`,
         `reattack_file_path`, `reattack_run_command`, and `reattack_output`
-        fields on disk, keeping the initial `repro_*` fields untouched.
+        fields inside the original workspace findings
+        (`state_root/workspace/findings/`), keeping the initial `repro_*` fields
+        untouched.
 
     -   **VERIFICATION FAILED:** If the sandbox execution still triggers the
         bug, or if your re-attack successfully bypasses your patch, the patch is
         insufficient. Re-evaluate and adapt your fix.
+
+    -   **VERIFICATION INCOMPLETE:** If the initial post-patch verification run
+        passed but the subsequent re-attack checks failed/timed out due to
+        sandbox infrastructure errors, environment timeouts, or platform
+        restrictions, set `"patch_status"` to `"VERIFICATION_INCOMPLETE"`.
 
 4.  **Extract Patch and Rollback Transaction:** *(Skip this step for binary-only
     targets)*. Do not leave the codebase in an altered state. Once you have a
@@ -221,7 +277,11 @@ Execute the patching and verification stage as follows:
             copying the backup files back onto the target files (e.g., `cp
             target.c.bak-[finding_id] target.c`), delete the backup copies (`rm
             target.c.bak-[finding_id]`), and delete any net-new files created
-            during the patching process.
+            during the patching process. **Do NOT delete any re-attack/PoC
+            script files written inside the `workspace/reproducers/` directory,
+            any helper scripts written inside the `workspace/helpers/`
+            directory, or the memory database file `workspace/learnings.jsonl`;
+            these must be explicitly preserved.**
         -   If using **Option C (Alternative)**, execute the corresponding
             teardown or rollback steps to fully purge all modification
             artifacts, delete any temporary resources, and ensure the original
@@ -235,7 +295,8 @@ Execute the patching and verification stage as follows:
 
     -   **Memory Entry Format:** `{"title": "[security_flaw_title]",
         "code_paths": ["[path1:line1]"], "status": "[VERIFIED_SECURE /
-        VERIFICATION_FAILED / ERROR]"}`
+        MITIGATION_PROPOSED / VERIFICATION_INCOMPLETE / VERIFICATION_FAILED /
+        ERROR]"}`
 
 6.  **Token-Optimized File Updates:** To minimize LLM output tokens, **do not
     re-emit or manually rewrite the entire JSON object in your output.**
@@ -247,7 +308,8 @@ Execute the patching and verification stage as follows:
 
     You must append the following to the existing object:
 
-    -   A `"patch_status"` field (e.g., `"VERIFIED_SECURE"`,
+    -   A `"patch_status"` field (one of `"VERIFIED_SECURE"`,
+        `"MITIGATION_PROPOSED"`, `"VERIFICATION_INCOMPLETE"`,
         `"VERIFICATION_FAILED"`, or `"ERROR"`).
     -   If a patch was successful, a `"patch_diff"` field containing the unified
         diff.
@@ -260,7 +322,7 @@ Execute the patching and verification stage as follows:
     {
       "stage": "patch",
       "action": "patched",
-      "details": "Patch status evaluated as [VERIFIED_SECURE/VERIFICATION_FAILED/ERROR]",
+      "details": "Patch status evaluated as [VERIFIED_SECURE/MITIGATION_PROPOSED/VERIFICATION_INCOMPLETE/VERIFICATION_FAILED/ERROR]",
       "pass_number": <current_pass_number>,
       "timestamp": "<current_iso8601_timestamp>"
     }

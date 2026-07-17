@@ -282,7 +282,7 @@ end-to-end reproduction scripts for these chains**.
     individual, constituent findings.
 *   **Static Confirmation:** An exploit chain finding is marked as
     `statically_confirmed` if all its constituent findings have been
-    successfully reproduced individually.
+    individually confirmed (either reproduced or statically confirmed).
 *   **Simplification Decision:** This is an intentional design decision to limit
     complexity, as automated multi-stage exploit orchestration is highly
     environment-dependent. Users wishing to verify end-to-end chains must write
@@ -294,20 +294,22 @@ end-to-end reproduction scripts for these chains**.
 
 The `schema.json` contract defines validation rules for findings that have been
 patched. While `/mantis-patch` is designed to verify patches using a re-attack
-step (confirming `reattack_status`), the schema **does not strictly require
-re-attack fields** (`reattack_status`, etc.) even when `patch_status` is
-`VERIFIED_SECURE`.
+step (confirming `reattack_status`), the schema supports several distinct
+verification outcome statuses:
 
-This is an intentional design decision to support:
+*   **`VERIFIED_SECURE`**: Completed verification, meaning the post-patch run
+    passed AND a successful variant re-attack check was executed to confirm the
+    fix cannot be bypassed.
+*   **`MITIGATION_PROPOSED`**: Set for binary targets where code patching is not
+    possible but a functional or architectural mitigation is proposed in
+    `patch_diff`. These may bypass code modification and re-attack checks.
+*   **`VERIFICATION_INCOMPLETE`**: Set when the initial post-patch verification
+    run passed but the subsequent re-attack checks were interrupted or failed
+    due to environment timeouts, infrastructure errors, or sandbox limits.
 
-*   **Binary-only targets:** Compiled binaries or firmware blobs skip code
-    modification and re-attack testing, instead providing a high-level
-    mitigation recommendation in the `patch_diff` field. These may still be
-    marked as resolved/secure without undergoing a functional re-attack.
-*   **Verification Fallbacks:** If the re-attack tool execution fails (due to
-    timeouts or sandbox infrastructure issues), the pipeline can still output
-    the generated patch that passed the initial post-patch verification run,
-    rather than failing validation entirely.
+Re-attack fields (`reattack_status`, etc.) are strictly required only when
+`patch_status` is `VERIFIED_SECURE`. This is an intentional design decision to
+support binary-only targets and verification fallbacks.
 
 --------------------------------------------------------------------------------
 

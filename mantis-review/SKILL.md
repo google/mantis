@@ -137,11 +137,15 @@ Execute your validation as follows:
     -   **Checklist Construction:**
 
         -   Construct the `triage_checklist` object evaluating all 12 negative
-            constraints. For each rule, set `passes` to `true` if the finding
-            satisfies the constraint (i.e. it does not violate the rule, meaning
-            the bug remains potentially valid under that rule), or `false` if
-            the finding violates the rule (which requires it to be marked as
-            `FALSE_POSITIVE`).
+            constraints. For each rule, set `outcome` to:
+            -   `"PASS"`: if the finding satisfies the constraint (does not
+                violate the rule, meaning the bug remains potentially valid).
+            -   `"FAIL"`: if the finding violates the rule (which requires the
+                finding status to be marked as `FALSE_POSITIVE`).
+            -   `"UNKNOWN"`: if the rule applicability is unresolved/needs
+                research.
+            -   `"NOT_APPLICABLE"`: if this rule is entirely irrelevant to this
+                class of bug.
 
 4.  **Construct Reproduction Script Hints:** For every finding marked as
     **VALID** or **PROVISIONALLY_VALID**, provide high-signal `"repro_hints"`
@@ -171,25 +175,26 @@ Execute your validation as follows:
 
         ```json
         {
-          "ignore_hypothetical_misuse": { "passes": <bool>, "reason": "<string>" },
-          "ignore_missing_hygiene": { "passes": <bool>, "reason": "<string>" },
-          "require_strict_reproducibility": { "passes": <bool>, "reason": "<string>" },
-          "avoid_pedantic_linting": { "passes": <bool>, "reason": "<string>" },
-          "no_security_flaw_stretching": { "passes": <bool>, "reason": "<string>" },
-          "evaluate_questionable_file_paths": { "passes": <bool>, "reason": "<string>" },
-          "ignore_resource_exhaustion_dos": { "passes": <bool>, "reason": "<string>" },
-          "intrinsic_security_flaws": { "passes": <bool>, "reason": "<string>" },
-          "verify_mitigations_pragmatically": { "passes": <bool>, "reason": "<string>" },
-          "refine_code_paths_strictly": { "passes": <bool>, "reason": "<string>" },
-          "ignore_simd_vector_padding": { "passes": <bool>, "reason": "<string>" },
-          "ensure_source_code_coherence": { "passes": <bool>, "reason": "<string>" }
+          "ignore_hypothetical_misuse": { "outcome": "PASS" },
+          "ignore_missing_hygiene": { "outcome": "PASS" },
+          "require_strict_reproducibility": { "outcome": "FAIL", "reason": "Requires unstable 1-in-a-million race condition that cannot be automated." },
+          "avoid_pedantic_linting": { "outcome": "PASS" },
+          "no_security_flaw_stretching": { "outcome": "PASS" },
+          "evaluate_questionable_file_paths": { "outcome": "PASS" },
+          "ignore_resource_exhaustion_dos": { "outcome": "PASS" },
+          "intrinsic_security_flaws": { "outcome": "PASS" },
+          "verify_mitigations_pragmatically": { "outcome": "PASS" },
+          "refine_code_paths_strictly": { "outcome": "PASS" },
+          "ignore_simd_vector_padding": { "outcome": "PASS" },
+          "ensure_source_code_coherence": { "outcome": "PASS" }
         }
         ```
 
-        For each rule, `passes` must be `true` if the finding satisfies the
-        validity constraint (i.e. it is NOT ruled out by the constraint), or
-        `false` if it violates the constraint (ruling it out). The `reason` must
-        describe the evaluation.
+        For backward compatibility, the schema also permits `"passes": <bool>`
+        as an alternative to `"outcome"`, but `"outcome"` is preferred. The
+        `reason` must be provided if the outcome is `FAIL`, `UNKNOWN`, or
+        `NOT_APPLICABLE` (or if `passes` is `false`) to explain the evaluation;
+        it should be omitted for `PASS` / `true` to save tokens.
 
     -   An entry to the `"history"` array:
 
