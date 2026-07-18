@@ -95,15 +95,16 @@ Execute the research stage as follows:
 
 4. **Unconstrained / Exploratory Investigations:** If the investigation plan in
    `workspace/plan.json` contains instructions or a question explicitly asking
-   for an unconstrained sweep or adversarial audit (ignoring existing
-   assumptions):
+   for an unconstrained sweep, adversarial audit, or random exploration:
 
    - Ignore existing assumptions of safety and documented trust boundaries in
      `workspace/kb/THREAT_MODEL.md`.
    - Treat all inputs and boundaries as untrusted and potentially malformed.
-   - Analyze implementation from scratch with full freedom and autonomy,
-     searching for any bypasses, logic flaws, or memory corruptions regardless
-     of whether the component is thought to be safe or out of scope.
+   - Analyze implementation from scratch with full freedom and autonomy.
+   - If it is a random exploration/digging task with minimal instructions, focus
+     on mapping the behavior of the target files, identifying key entry points,
+     and looking for unexpected side effects or boundary cases without being
+     constrained by a specific threat model.
 
 5. **Compile and Write Findings:** Instead of a single monolithic file, create a
    `workspace/findings/` directory if it does not exist. For each potential

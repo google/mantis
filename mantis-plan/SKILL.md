@@ -139,20 +139,26 @@ Execute the planning stage as follows:
        the `"kb_references"` array for that investigation. This shifts the
        burden of context-gathering off the researcher.
 
-     - **Exploratory/Unconstrained Investigations (Low Probability):** With a
-       low probability (e.g., a 15-20% chance per planning pass), include an
-       exploratory investigation in the plan. Select a component or directory
-       that the threat model currently marks as safe, low-risk, or out of scope,
-       or a component that has not received recent scrutiny. The question for
-       this investigation must explicitly instruct the researcher to perform an
-       unconstrained, adversarial sweep, ignoring all existing safety
-       assumptions and trust boundary definitions in
-       `workspace/kb/THREAT_MODEL.md`. It should instruct the agent to assume
-       boundaries can be violated and hunt for novel bypasses, logic flaws, or
-       memory corruptions from scratch. **Token Optimization:** Whether using a
-       script (Mode A) or your file-writing tools (Mode B), write the plan
-       directly to disk and do not print the JSON contents in your chat
-       response.
+     - **Exploratory/Unconstrained Investigations (Moderate Probability):** With
+       a moderate probability (e.g., a 25-50% chance per planning pass), include
+       either an unconstrained adversarial sweep or a random exploration in the
+       plan:
+
+       1. **Adversarial Sweep:** Select a component or directory that the threat
+          model currently marks as safe, low-risk, or out of scope. Instruct the
+          researcher to perform an unconstrained sweep, ignoring safety
+          assumptions in `workspace/kb/THREAT_MODEL.md`.
+
+       2. **Random Digging:** Select a random starting position (file or
+          directory) in the codebase. The question for this investigation should
+          be minimal and open-ended, simply instructing the researcher to "dig
+          into" or "explore" the selected area without specific threat-model
+          context or pre-defined vulnerability classes. Set `kb_references` to
+          an empty list for this investigation to ensure a fresh look.
+
+       **Token Optimization:** Whether using a script (Mode A) or your
+       file-writing tools (Mode B), write the plan directly to disk and do not
+       print the JSON contents in your chat response.
 
 3. **Schema Enforcement:** Regardless of the mode, the final
    `workspace/plan.json` file written to disk should match the following schema
