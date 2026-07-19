@@ -208,8 +208,6 @@ Drift `triage_checklist` (paste verbatim; all 13 keys, all `UNKNOWN`):
 }
 ```
 
-````
-
 Findings finalized as drift `NEEDS_RESEARCH` in Step 0c are DONE — do not
 process them again in steps 2-5. Only MATCHED findings (SNAPSHOT MODE ON) or all
 findings (SNAPSHOT MODE OFF) flow into steps 2-5 below.
@@ -437,4 +435,3 @@ findings (SNAPSHOT MODE OFF) flow into steps 2-5 below.
    so this extra field validates unchanged.
 
 When complete, notify the user.
-````
