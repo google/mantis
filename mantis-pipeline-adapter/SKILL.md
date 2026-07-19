@@ -25,6 +25,10 @@ custom environment integration.
 
 - **Reads**:
   - `workspace/.mantis_state.json` (to track current loop pass).
+  - `workspace/.mantis_state.json` fields `active_snapshot`, `snapshot_history`,
+    and `vcs_info.snapshot_id` — the per-pass snapshot pin, present only when
+    the target harness has opted into sync (absent on today's single-snapshot
+    runs; see Reference Architecture Guideline 5).
   - `schema.json` (as the canonical pipeline specification reference).
   - `workspace/findings/*.json` (as the State Store).
   - `workspace/learnings.jsonl` (to understand memory rotation).
@@ -67,10 +71,20 @@ Follow these guidelines during the consultation:
 5. **Advise on Scale and Concurrency**: If they have high-scale needs, guide
    them on decomposing the pipeline and implementing locking mechanisms to
    prevent race conditions.
-6. **Suggest Evaluations**: Remind them to perform empirical evaluations when
+6. **Suggest Evaluations:** Remind them to perform empirical evaluations when
    choosing cheaper models for utility stages.
+7. **Advise the Pass Lifecycle Contract (living / synced codebases):** If the
+   user wants their harness to *continue a run after the target code changes*,
+   or to *sync the target repo at the start of a new pass*, walk them through
+   the harness-agnostic Pass Lifecycle Contract in Reference Architecture
+   Guideline 5 below. Emphasize that this support is **opt-in**: a harness that
+   does not implement the contract MUST leave `snapshot_pinned` unset, which
+   preserves today's single-snapshot behavior byte-for-byte. When `--sync` is
+   requested, the harness PINs in the PIN step and passes
+   `--snapshot_root`/`--snapshot_id` normally; Block A (Locator Resolution) is
+   universal across all code-reading stages.
 
-______________________________________________________________________
+---
 
 ## Reference Architecture Guidelines
 
@@ -165,7 +179,7 @@ graph TD
     Ref -.-> ModelB
 ```
 
-______________________________________________________________________
+---
 
 ### 1. UUID-Based Referencing Pattern
 
@@ -222,7 +236,7 @@ them back, use the following pattern:
 - **Harness Action (Deterministic):** Programmatically update the
   `workspace/findings/<UUID>.json` file with the validation status and reason.
 
-______________________________________________________________________
+---
 
 ### 2. Adaptable Reproducers via Custom MCP
 
@@ -241,7 +255,7 @@ to expose a clean, restricted API.
   manually register these tools in the API's schema format and handle
   dispatching tool calls to the MCP server.
 
-______________________________________________________________________
+---
 
 ### 3. Decomposition & Multi-Model Strategy
 
@@ -275,7 +289,7 @@ Emphasize that using cheaper models for utility stages (like deduplication or
 calibration) must be validated with empirical evaluations against a benchmark
 dataset to ensure quality is not degraded.
 
-______________________________________________________________________
+---
 
 ### 4. The Planning Stage and workspace/plan.json
 
@@ -287,3 +301,73 @@ startup to guide its sweep. By decoupling strategy and execution via this
 structured contract, the orchestrator can easily direct subagents, parallelize
 sweeps, and maintain historical context across pipeline runs without repeating
 work.
+
+---
+
+### 5. The Pass Lifecycle Contract (Living / Synced Codebases)
+
+A custom orchestrator (a bespoke CLI, an ADK agent, an MCP-native pipeline, or
+any deterministic harness) does **not** inherit the living-project lifecycle
+that `mantis-meta-agent` implements. To support *continue-after-edits* and
+*opt-in boundary sync* **without producing silent wrong results** (false
+`VERIFIED_SECURE`, false `failed_to_reproduce`, dropped regressions), the
+harness must implement the following harness-agnostic contract. This is the same
+contract recorded in [schema.json](../schema.json) under **Non-JSON Contracts**;
+the `Block A`–`Block G` and `SNAPSHOT_ID` references below name mechanisms each
+Mantis stage already carries in its own `SKILL.md`.
+
+Mantis runs under multiple harnesses (various CLIs, ADK, custom deterministic
+pipelines), so the lifecycle must not live only in `mantis-meta-agent`. Any
+harness is **conformant** iff, per pass, it:
+
+1. **SYNCs first** (Block C) — the very first action; never mid-pass.
+2. **Detects `vcs_info` + computes `SNAPSHOT_ID`** (Block D steps 1-5) — only
+   after sync.
+3. **PINs** the immutable copy + writes the sentinel + **appends**
+   `snapshot_history` (Block D step 5, not RECORD).
+4. **Records** `vcs_info` (incl. `snapshot_id`) + `active_snapshot`. Never
+   record an id or pin before syncing.
+5. **Runs every stage** with
+   `--snapshot_root=<SNAPSHOT_ROOT> --snapshot_id=<SNAPSHOT_ID> --state_root=<workspace parent>`.
+6. **Archives & increments** (existing Stage 15); retried findings keep their
+   **original** `discovery_commit`.
+
+A harness that does not implement the contract MUST leave `snapshot_pinned`
+unset → today's behavior. When `--sync` is requested, the harness PINs in the
+PIN step and passes `--snapshot_root`/ `--snapshot_id` normally; Block A
+(Locator Resolution) is universal across all code-reading stages.
+
+#### Advisory notes when helping a builder implement this contract
+
+- **Opt-in, default off.** Sync/pinning is a feature the builder turns on. A
+  harness that never sets `snapshot_pinned` behaves exactly like today (one live
+  snapshot per run). Downstream stages treat an absent
+  `active_snapshot`/`discovery_commit` as the conservative branch, so an
+  un-upgraded harness is always safe — just not living-project-aware. Do **not**
+  advise treating these absent fields as an error.
+- **Store snapshots OUTSIDE `workspace/`.** The pinned copy (`SNAPSHOT_ROOT`)
+  must live under `<state_root>/.mantis_snapshots/pass_<N>` (or a clean-VCS
+  worktree/archive), and its path **must not** contain the segment `/workspace/`
+  — otherwise `mantis-patch`'s state-vs-code path guard misfires. Keep the last
+  2 snapshots and garbage-collect older ones with the matching teardown
+  (`rm -rf` for copies, `git worktree remove/prune` for worktrees).
+- **Non-destructive sync only.** Sync is the **first** action of a pass,
+  **never** mid-pass, and must be **skipped** when the tree is dirty, ahead of
+  upstream, detached, or has no upstream. The harness must **never** run
+  `git reset --hard`, `git checkout -- .`, `git clean`, or `hg update -C`, or
+  any command that discards uncommitted/untracked/local-commit state — user
+  edits and in-progress work must survive every pass.
+- **Full-fidelity `SNAPSHOT_ID`s, including dirty / no-VCS.** Compute the id
+  over the **whole** pinned copy: clean git/hg → `commit_hash`; dirty git/hg →
+  `commit_hash + ":" + content_hash`; multi-vcs →
+  `revision + ":" + content_hash`; no-VCS / unknown copyable tree →
+  `"content:" + content_hash`. The embedded content hash is exactly what lets an
+  **unchanged dirty or no-VCS tree MATCH across passes** and still receive
+  verification + dedup — and what makes a `repo sync` that advances commits
+  under an unchanged manifest `revision` compare **unequal**. Never trust a bare
+  branch name or manifest revision string as an identity.
+- **Pass the three roots to EVERY stage.** Include the findings-only stages
+  (report, calibrate, reflect): they do not read target code, but they still
+  read `active_snapshot` for provenance/annotation. When the harness archives
+  and increments, retried findings must keep their **original**
+  `discovery_commit`.

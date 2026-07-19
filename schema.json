@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Mantis Pipeline State Contract",
-  "description": "Canonical schemas for all inter-stage state contracts in the Mantis pipeline.\n\n### Validation Guidelines:\n- Harness authors and pipeline orchestrators should validate specific state files against their corresponding sub-schemas:\n  - Validate individual finding files (`workspace/findings/<uuid>.json`) against `#/$defs/finding`.\n  - Validate plan files (`workspace/plan.json`) against `#/$defs/plan`.\n  - Validate learning entry lines (`workspace/learnings.jsonl` / `workspace/historical_learnings.jsonl`) against `#/$defs/learning_entry`.\n  - Validate the orchestrator state file (`workspace/.mantis_state.json`) against `#/$defs/state`.\n  - Validate trajectory/conversation transcript lines (e.g., in `transcript.jsonl` log files) against `#/$defs/execution_log_entry`.\n\n### Non-JSON Contracts:\n#### Threat Model (workspace/kb/THREAT_MODEL.md)\nWhile the threat model is a Markdown document, it serves as a contract. It must contain:\n- **System Overview Summary**: High-level design.\n- **Deployment Intent**: Must state 'Intent: PRODUCTION' or 'Intent: SAMPLE_OR_TEST_ONLY'.\n- **Trust Boundaries**: Zone definitions and entry points.\n- **Threat Actors & Vectors**: Attacker profiles.\n- **High-Risk Assets & Criticality**: Asset definitions. For DoS targets, must specify Availability Tier: 'CRITICAL' (24/7 immediate impact), 'STANDARD' (short disruptions tolerable), or 'LOW_CRITICALITY' (non-blocking).\n",
+  "description": "Canonical schemas for all inter-stage state contracts in the Mantis pipeline.\n\n### Validation Guidelines:\n- Harness authors and pipeline orchestrators should validate specific state files against their corresponding sub-schemas:\n  - Validate individual finding files (`workspace/findings/<uuid>.json`) against `#/$defs/finding`.\n  - Validate plan files (`workspace/plan.json`) against `#/$defs/plan`.\n  - Validate learning entry lines (`workspace/learnings.jsonl` / `workspace/historical_learnings.jsonl`) against `#/$defs/learning_entry`.\n  - Validate the orchestrator state file (`workspace/.mantis_state.json`) against `#/$defs/state`.\n  - Validate trajectory/conversation transcript lines (e.g., in `transcript.jsonl` log files) against `#/$defs/execution_log_entry`.\n\n### Non-JSON Contracts:\n#### Threat Model (workspace/kb/THREAT_MODEL.md)\nWhile the threat model is a Markdown document, it serves as a contract. It must contain:\n- **System Overview Summary**: High-level design.\n- **Deployment Intent**: Must state 'Intent: PRODUCTION' or 'Intent: SAMPLE_OR_TEST_ONLY'.\n- **Trust Boundaries**: Zone definitions and entry points.\n- **Threat Actors & Vectors**: Attacker profiles.\n- **High-Risk Assets & Criticality**: Asset definitions. For DoS targets, must specify Availability Tier: 'CRITICAL' (24/7 immediate impact), 'STANDARD' (short disruptions tolerable), or 'LOW_CRITICALITY' (non-blocking).\n\n#### Pass Lifecycle Contract (harness-agnostic; taught by mantis-pipeline-adapter)\nMantis runs under multiple harnesses (various CLIs, ADK, custom deterministic pipelines), so the snapshot lifecycle is a CONTRACT, not a property of one orchestrator. A harness is CONFORMANT iff, per pass, it: (1) SYNCs first (non-destructive, opt-in) as the very first action, never mid-pass; (2) detects vcs_info and computes SNAPSHOT_ID only AFTER sync; (3) PINs an immutable snapshot copy, writes the sentinel file <SNAPSHOT_ROOT>/.mantis_snapshot_id containing SNAPSHOT_ID, and APPENDS exactly one snapshot_history entry (the append belongs to the Pin step / Block D step 5, not RECORD); (4) records vcs_info (including snapshot_id) and active_snapshot (never records an id or pins before syncing, never overwrites prior snapshot_history entries); (5) runs every stage with --snapshot_root=<SNAPSHOT_ROOT> --snapshot_id=<SNAPSHOT_ID> --state_root=<workspace parent>; (6) archives and increments the pass, keeping each retried finding's ORIGINAL discovery_commit. A harness that does not implement this contract MUST leave active_snapshot/snapshot_pinned unset, which reproduces today's single-static-snapshot behavior byte-for-byte (sync is opt-in, default off).\n\n#### SNAPSHOT_ID ladder (computed once per pass by the orchestrator, then only read)\nSNAPSHOT_ID identifies the exact bytes a pass analyzed. It is assigned by this ladder:\n- clean git/hg: commit_hash\n- dirty git/hg: commit_hash + ':' + content_hash\n- multi-vcs (.repo): revision + ':' + content_hash (a bare manifest revision is a branch/ref name and MUST NEVER be trusted for equality)\n- none/unknown, copyable tree: 'content:' + content_hash\n- single binary/firmware: 'sha256:' + artifact_hash\n- live endpoint / uncopyable / copy failed: 'live:' + ISO8601 timestamp, with snapshot_pinned=false\ncontent_hash is a sha256 over EVERY file in the pinned copy (never a partial hash). The dirty / no-VCS / multi-vcs tiers embed content_hash specifically so an unchanged dirty or no-VCS tree compares EQUAL across passes (and gets verification + dedup), while a cross-pass bare-commit id, or a multi-vcs commit advanced under an unchanged revision string, compares UNEQUAL.\n\n#### Global backward-compat rule (applies to every field added for the snapshot model)\nEvery snapshot field added to this schema is OPTIONAL. There is intentionally NO new required entry and NO new allOf gate, so pre-existing findings/states/workspaces validate UNCHANGED. Absent/empty/null always routes the consumer to the SAFE branch: finding.discovery_commit absent -> Snapshot Match Check NOT_MATCHED (re-research/re-verify, never a trusting DUPLICATE/FALSE_POSITIVE/NON_VIABLE/VERIFIED_SECURE); state.snapshot_history previous entry absent -> Changed-Files diff UNKNOWN -> treat all files CHANGED; reached-sink evidence absent -> repro_status not_attempted / not VERIFIED_SECURE; state.active_snapshot absent → MODE-OFF (byte-for-byte today); present with snapshot_pinned=false → HALT (conservative degradation, no authoritative verdicts); present with snapshot_pinned=true → PINNED (full gating). This is safe because the finding and state objects have NO additionalProperties:false, so new keys cannot fail validation. The triage_checklist, calibration_checklist, triage_rule_evaluation, and calibration_rule_evaluation objects DO set additionalProperties:false and MUST NOT gain any snapshot field; the VERIFIED_SECURE -> reattack_status=failed_to_bypass allOf MUST remain unchanged. finding.signature/lineage_id absent -> consumers fall back to today's UUID-based behavior exactly (same untrusted-if-absent pattern as discovery_commit, but for finding-identity rather than snapshot-identity).\n",
   "type": "object",
   "properties": {
     "finding": {
@@ -129,7 +129,7 @@
         "repro_status": {
           "type": "string",
           "enum": ["reproduced", "statically_confirmed", "not_attempted", "failed_to_reproduce"],
-          "description": "The outcome of the reproduction attempt."
+          "description": "The outcome of the reproduction attempt. Enum is UNCHANGED. Reached-Sink Evidence Gate: record 'reproduced' or 'statically_confirmed' ONLY when reached-sink evidence is PRESENT; when evidence is ABSENT (including ANY build/compile nonzero exit, exit 127 command-not-found, or an exit-2 'No such file' error) record 'not_attempted' (retry-eligible), NEVER 'failed_to_reproduce'. 'failed_to_reproduce' means a valid harness reached the sink but the bug did not trigger."
         },
         "repro_file_path": {
           "type": "string",
@@ -154,8 +154,8 @@
         },
         "reattack_status": {
           "type": "string",
-          "enum": ["bypassed_patch", "failed_to_bypass"],
-          "description": "The outcome of the variant-hunting re-attack."
+          "enum": ["bypassed_patch", "failed_to_bypass", "inconclusive_baseline_changed"],
+          "description": "The outcome of the variant-hunting re-attack. `inconclusive_baseline_changed` means the unpatched baseline no longer triggers on the current snapshot; it is mutually exclusive with `VERIFIED_SECURE` (the reproduce skill forces ERROR or VERIFICATION_INCOMPLETE when the baseline no longer triggers)."
         },
         "reattack_file_path": {
           "type": "string",
@@ -226,6 +226,38 @@
             "$ref": "#/$defs/uuid"
           },
           "description": "Array of finding UUIDs that constitute this exploit chain finding."
+        },
+        "discovery_commit": {
+          "type": ["string", "null"],
+          "description": "The SNAPSHOT_ID (see the SNAPSHOT_ID ladder in the top-level description) of the snapshot this finding was FIRST discovered against; written once at creation by mantis-researcher and preserved verbatim across every retry/archival (including exploit-chain retries). This is the trust anchor for the Snapshot Match Check: a consumer trusts a prior verdict on this finding ONLY when discovery_commit is present and EXACTLY equals the current pass SNAPSHOT_ID (no fuzzy compare). Optional and backward-compatible, but UNTRUSTED-IF-ABSENT: absent / empty / null (legacy findings, or unpinned/degraded passes) is treated as NOT_MATCHED -> re-research / re-verify, and is NEVER defaulted-and-trusted. The literal string 'MIXED' (set by mantis-chain when constituents span different snapshots) is likewise treated as NOT_MATCHED."
+        },
+        "repro_snapshot_id": {
+          "type": "string",
+          "description": "The SNAPSHOT_ID the reproduction attempt (repro_status / repro_file_path / repro_output) was executed against. Optional; absent -> reproduction provenance is unknown and downstream reproduce/patch must re-verify rather than trust repro_status."
+        },
+        "reattack_snapshot_id": {
+          "type": "string",
+          "description": "The SNAPSHOT_ID the re-attack (reattack_status / reattack_output) was executed against (the base snapshot of the patched shadow). Optional; absent -> unknown provenance, re-verify."
+        },
+        "patch_base_snapshot": {
+          "type": "string",
+          "description": "The SNAPSHOT_ID of the snapshot the patch_diff was generated and verified against (the unpatched baseline of the Unpatched-Baseline + Benign-Control gate). Optional; absent -> the patch's base is unknown and VERIFIED_SECURE must not be trusted across a snapshot change."
+        },
+        "possible_duplicate_of": {
+          "$ref": "#/$defs/uuid",
+          "description": "UUID of a finding this one MIGHT duplicate but which could NOT be confirmed as a hard DUPLICATE because the two were discovered against different (or unknown) snapshots (Snapshot Match Check NOT_MATCHED). Unlike duplicate_of, this is a NON-destructive advisory pointer: the finding stays active and is NOT filtered. Optional; used by mantis-dedupe to avoid dropping a possible regression."
+        },
+        "cwe": {
+          "type": ["string", "null"],
+          "description": "CWE identifier for this vulnerability (e.g. 'CWE-787'). Optional and backward-compatible: absent -> signature computation falls back to title + primary target symbol. Additive; NOT added to required."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Deterministic stable signature of this finding's content identity, computed once at creation by mantis-researcher (and preserved verbatim across retries/archival, like discovery_commit). Computed as: first 16 hex chars of sha256(normalized_title + '|' + cwe_part + '|' + primary_target), where normalized_title = lowercase(title) with all non-alphanumeric characters stripped (removes spaces too), cwe_part = cwe field if present and non-null else empty string, primary_target = first code_paths entry with trailing :line stripped (path-only); if the first entry is a non-source LOCATOR (URL containing '://', or a non-file symbol/offset per Block A step 3), or code_paths is empty, primary_target is empty and the fallback is sorted(code_paths).join(','). Never fuzzy-compare; byte-for-byte equality only. Optional and backward-compatible: absent -> consumers fall back to today's UUID-based behavior exactly (dedupe by code_paths+title+snapshot gate, chain by constituent UUID sequence, report fold by id, repro-cap by computed stable_key). UNTRUSTED-IF-ABSENT routing is the safe branch."
+        },
+        "lineage_id": {
+          "type": "string",
+          "description": "Lineage identifier linking findings that represent the same underlying bug across passes/snapshots. Set by mantis-researcher at creation: if an archived finding with the SAME signature exists in workspace/archive/findings_pass_*/ or workspace/archive/loop*_findings/, copy that ancestor's lineage_id; otherwise mint a fresh UUIDv4. Optional and backward-compatible: absent -> consumers fall back to UUID-based fold/dedupe (today's behavior). Consumers that key on lineage MUST fall back to id (UUID) when lineage_id is absent."
         }
       },
       "required": [
@@ -541,7 +573,8 @@
             "source_stage": {
               "type": "string",
               "description": "Stage that produced the insight."
-            }
+            },
+            "snapshot": { "type": "string", "description": "The SNAPSHOT_ID (SNAPSHOT_ID ladder) this insight was observed against; stamped by mantis-reflect. Optional; absent -> snapshot-agnostic/legacy insight. Additive: NOT added to required." }
           },
           "required": ["type", "action", "target_entity", "insight", "source_stage"]
         },
@@ -646,7 +679,8 @@
             "commit_hash": { "type": "string", "description": "The current commit hash or revision ID." },
             "branch": { "type": "string", "description": "The active branch name." },
             "revision": { "type": "string", "description": "The revision identifier (e.g., manifest revision for multi-VCS)." },
-            "dirty": { "type": "boolean", "description": "True if there are uncommitted changes in the target repository." }
+            "dirty": { "type": "boolean", "description": "True if there are uncommitted changes in the target repository." },
+            "snapshot_id": { "type": "string", "description": "The SNAPSHOT_ID computed for this pass per the SNAPSHOT_ID ladder (top-level description), assigned AFTER sync. For clean git/hg this equals commit_hash; for dirty / no-VCS / multi-vcs it embeds a whole-tree content_hash so an unchanged tree compares equal across passes. Optional; absent -> pass ran unpinned/legacy (degraded)." }
           },
           "required": ["vcs_type"],
           "allOf": [
@@ -671,6 +705,41 @@
               }
             }
           ]
+        },
+        "active_snapshot": {
+          "type": "object",
+          "description": "The immutable pinned snapshot the CURRENT pass reads through. Written by the orchestrator/harness during Pin (see the Pass Lifecycle Contract in the top-level description) AFTER sync, and read by every stage's Locator Resolution to resolve CODE_ROOT and the sentinel. Optional and backward-compatible: absent (legacy state, or a harness that does not implement the Pass Lifecycle Contract) -> every stage runs DEGRADED with snapshot_pinned treated as false, i.e. today's single-static-snapshot behavior.",
+          "properties": {
+            "root": { "type": "string", "description": "Absolute path to the pinned snapshot root (SNAPSHOT_ROOT); stages read target code under this root. When snapshot_pinned is false this may point at the live tree." },
+            "snapshot_id": { "type": "string", "description": "SNAPSHOT_ID of the pinned snapshot (SNAPSHOT_ID ladder). Passed to stages as --snapshot_id and compared by the Snapshot Match Check." },
+            "snapshot_pinned": { "type": "boolean", "description": "True iff an immutable copy was successfully pinned and its sentinel written. False -> HALT/degraded mode: authoritative verdicts (VERIFIED_SECURE, failed_to_reproduce, DUPLICATE, FALSE_POSITIVE, NON_VIABLE) are forbidden this pass and every Snapshot Match Check returns NOT_MATCHED." },
+            "pass": { "type": "integer", "description": "The pass_number this snapshot was pinned for; used by crash-resume (on re-entry, equal pass -> reuse the existing snapshot dir, never re-pin)." },
+            "vcs_type": { "type": "string", "enum": ["git", "hg", "multi-vcs", "none", "unknown"], "description": "The detected VCS type of the target for this pass." }
+          }
+        },
+        "snapshot_history": {
+          "type": "array",
+          "description": "APPEND-ONLY log of one entry per pinned pass, in pass order. The orchestrator appends exactly one entry per pass during Pin and NEVER overwrites prior entries. The Changed-Files diff reads the entry BEFORE the current pass as PREV; if that entry is missing (first pinned pass or legacy state) the diff degrades to UNKNOWN and every file is treated as CHANGED. Optional; absent -> no cross-pass diff, conservative full re-scan.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pass": { "type": "integer", "description": "The pass_number this entry records." },
+              "snapshot_id": { "type": "string", "description": "The SNAPSHOT_ID pinned for that pass." },
+              "snapshot_pinned": { "type": "boolean", "description": "Whether that pass was pinned (false -> that pass ran degraded)." },
+              "timestamp": { "type": "string", "format": "date-time", "description": "ISO 8601 timestamp when the entry was appended." }
+            }
+          }
+        },
+        "kb_snapshot_id": { "type": "string", "description": "The SNAPSHOT_ID the knowledge base (workspace/kb: architecture, threat model, summaries) was last built/refreshed against. Consumers compare it to the current pass SNAPSHOT_ID to decide whether the KB is stale and must be force-refreshed after a sync. Optional; absent -> KB provenance unknown -> treat as stale (rebuild/refresh)." },
+        "changed_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Efficiency HINT only: repo-relative paths that changed between the previous pinned snapshot and the current one (from the Changed-Files diff, run in the live root). NEVER used to drop or skip a finding; only to prioritize/broaden re-research. Meaningful only when changed_files_status is COMPUTED. Optional; absent -> treat as UNKNOWN (all files potentially changed)."
+        },
+        "changed_files_status": {
+          "type": "string",
+          "enum": ["COMPUTED", "UNKNOWN"],
+          "description": "Whether changed_files is a trustworthy diff (COMPUTED) or could not be computed (UNKNOWN: no PREV entry, unpinned, vcs_type none/unknown, a content:/live:/+content_hash fallback id on either end, or a diff error). UNKNOWN MUST be treated as 'every file changed' -> never drop, never skip. Optional; absent -> UNKNOWN."
         }
       },
       "required": ["pass_number", "last_updated"]
@@ -690,7 +759,8 @@
           "type": "string",
           "format": "date-time",
           "description": "ISO 8601 timestamp of when the history entry was recorded."
-        }
+        },
+        "snapshot": { "type": "string", "description": "The SNAPSHOT_ID (SNAPSHOT_ID ladder, top-level description) this history action was performed against. Optional; absent -> legacy/unpinned action, provenance unknown. Additive: NOT added to this object's required." }
       },
       "required": ["stage", "action", "details", "pass_number", "timestamp"]
     },
@@ -886,10 +956,19 @@
       "type": "object",
       "title": "Reproduction Attempts Cache Schema",
       "additionalProperties": {
-        "type": "integer",
-        "minimum": 0
+        "oneOf": [
+          { "type": "integer", "minimum": 0 },
+          {
+            "type": "object",
+            "properties": {
+              "count": { "type": "integer", "minimum": 0, "description": "Number of reproduction attempts recorded for this key." },
+              "last_snapshot": { "type": "string", "description": "SNAPSHOT_ID (see the SNAPSHOT_ID ladder in the top-level description) of the snapshot the most recent attempt ran against; lets consumers reset the attempt cap when the snapshot changed." }
+            },
+            "required": ["count"]
+          }
+        ]
       },
-      "description": "A map of stable finding keys to their reproduction attempt counts."
+      "description": "A map of stable finding keys to reproduction attempt counts. Each value is EITHER a bare integer (legacy form: count only, last_snapshot UNKNOWN) OR an object {count, last_snapshot} recording which SNAPSHOT_ID the attempts ran against so the cap can reset when the snapshot changes. Read rule for consumers (mantis-plan, mantis-reproduce): integer V -> {count: V, last_snapshot: UNKNOWN}; object V -> {count: V.count, last_snapshot: V.last_snapshot or UNKNOWN}. The bare-integer form stays legal for backward compatibility."
     },
     "execution_log_entry": {
       "type": "object",

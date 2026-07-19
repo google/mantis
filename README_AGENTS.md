@@ -8,7 +8,7 @@ run and extend the pipeline.
 As an agent, you must adhere to the contracts, file paths, and execution
 patterns defined in this document.
 
-______________________________________________________________________
+---
 
 ## Adaptability & Specialized Domains
 
@@ -34,7 +34,7 @@ they can be adapted for:
   stage with isolated VMs, physical hardware testbeds (via USB/serial), or
   custom simulators.
 
-______________________________________________________________________
+---
 
 ## Architecture and Sequential Flow
 
@@ -42,14 +42,17 @@ The Mantis Skills suite is designed as a modular, decoupled set of tools that
 can be executed sequentially or in parallel. Each stage reads and writes to a
 shared state stored on disk.
 
-> [!IMPORTANT] **Static Codebase Assumption:** The pipeline is designed to run
-> against a **single, static version (snapshot) of the codebase** at a time. It
-> is not designed as a continuous process that watches a live codebase or
-> handles concurrent modifications to the source code files by external
-> processes during execution. If the source files are modified during a run, it
-> may lead to inconsistent findings, broken line references, or failed patch
-> applications. Rescans should be initiated as separate, distinct runs (e.g.,
-> triggered by a new commit or changelist).
+> [!IMPORTANT] **Snapshot Model (opt-in living/synced support):** By default the
+> pipeline reviews a **single, static snapshot** of the target and does not sync
+> or watch a live codebase — this is the unchanged, default behavior. When the
+> **opt-in** snapshot model is enabled (`--sync` / snapshot arguments), each
+> pass pins its own **immutable** copy of the target, every stage reads that
+> pinned copy (so edits made mid-pass are ignored), every finding is stamped
+> with the snapshot it was discovered against, and the target is synced only
+> **non-destructively, at a pass boundary**. Run WITHOUT these arguments and
+> each stage degrades to an **unpinned, non-authoritative** review of the
+> current directory rather than stopping. See
+> [The Snapshot Model](#the-snapshot-model) for the full contract.
 
 ```mermaid
 graph TD
@@ -190,7 +193,114 @@ graph TD
     and patch information at `workspace/report/review_packet-latest.md` (and
     archives to `review_packet_pass_<N>.md`).
 
-______________________________________________________________________
+---
+
+## The Snapshot Model
+
+Mantis can review **living / synced codebases** through a **snapshot-per-pass**
+model. It is **opt-in and default off**: with no `--sync` flag and no snapshot
+arguments, a run behaves byte-for-byte as before — a single, point-in-time
+review of whatever is on disk (see *Degraded / unpinned mode*, below). Enabling
+it makes long-running, continuous reviews of a changing codebase correct instead
+of silently wrong.
+
+**Opt-in, default off.** Passing `--sync` (or instructing `/mantis-meta-agent`
+to sync) enables the model. Without it, `snapshot_pinned` is never set and every
+snapshot-aware check falls through to its pre-existing behavior.
+
+**Each pass pins one immutable snapshot.** At the very start of a pass the
+orchestrator materializes an isolated, read-only copy of the target — a
+`git worktree` / `hg archive` when the tree is clean, a full copy otherwise —
+under `.mantis_snapshots/` (never under `workspace/`). It writes a sentinel file
+`.mantis_snapshot_id` into that copy and records the snapshot in state. Every
+stage then reads target code through this pinned root (`--snapshot_root`),
+identified by a `SNAPSHOT_ID` (`--snapshot_id`).
+
+**How `SNAPSHOT_ID` is computed (the ladder).** The id is computed once per
+pass:
+
+- clean git / hg → `commit_hash`
+- dirty git / hg → `commit_hash:content_hash`
+- multi-vcs (`.repo`) → `revision:content_hash` (a bare manifest revision is a
+  branch name and is never trusted for equality on its own)
+- no VCS / unknown, copyable → `content:<content_hash>`
+- single binary / firmware → `sha256:<artifact_hash>`
+- live endpoint / uncopyable / copy failed → `live:<ISO8601>`, and the pass runs
+  **unpinned**
+
+`content_hash` is a SHA-256 over **every** file in the pinned copy. Because the
+dirty / no-VCS / multi-vcs tiers embed that content hash, an **unchanged dirty
+or no-VCS tree still matches across passes** and receives full verification and
+deduplication, while a tree that actually changed does not.
+
+**Findings are pinned to their discovery snapshot.** Each finding records a
+`discovery_commit` — the `SNAPSHOT_ID` it was found against. Trusting decisions
+(dedupe filtering, false-positive / non-viable verdicts, reproduction, patching,
+chaining) proceed only when a finding's `discovery_commit` **exactly equals**
+the current `SNAPSHOT_ID`. A finding discovered against a different or absent
+snapshot is re-researched / re-verified — never silently filtered, dropped, or
+marked secure.
+
+**Edits made mid-pass are ignored.** Because every stage reads the pinned copy,
+changes to the live tree *during* a pass cannot shift line numbers, break
+reproducers, or corrupt patches within that pass. Builds and generated artifacts
+are written to a private temporary shadow, never under the pinned root. New code
+is picked up at the **next** pass boundary.
+
+**Boundary sync is non-destructive and only at a pass boundary.** When enabled,
+sync is the first action of a pass and runs only when `workspace/findings/` is
+empty (the previous pass's findings have been archived), so no in-flight finding
+is stranded across a code change. Sync is strictly non-destructive: it is
+skipped entirely if the tree is dirty, ahead of upstream, on a detached HEAD, or
+has no upstream, and it never runs `git reset --hard`, `git checkout -- .`,
+`git clean`, `hg update -C`, or anything else that discards local work. When it
+does run it is fast-forward only (`git fetch && git merge --ff-only`,
+`hg pull && hg update --check`, `repo sync -c`); any failure keeps the current
+tree and proceeds. After a successful sync the code has changed, so the
+Knowledge Base and directory summaries from the previous snapshot are stale and
+must be **force-refreshed** (re-run `/mantis-architecture`) before planning the
+new pass.
+
+**Degraded / unpinned mode (never deadlocks).** If a stage is run WITHOUT
+`--snapshot_root` / `--snapshot_id` and with no readable `active_snapshot` in
+state (plain interactive / manual use, or an orchestrator that does not
+implement the lifecycle), it does **not** stop. It falls back to the current
+directory with `snapshot_pinned = false` and runs **degraded**: results are
+non-authoritative, every snapshot match check reports "not matched," and no
+authoritative `VERIFIED_SECURE` / `failed_to_reproduce` verdict is emitted.
+Live-endpoint or uncopyable targets run in this same unpinned mode by design.
+
+**Absent → conservative (backward compatible).** Every new field is optional.
+Any absent / empty / null new field routes to the safe branch: absent
+`discovery_commit` → re-research; absent `snapshot_history` predecessor → treat
+all files as changed; absent reached-sink evidence → `not_attempted` (never a
+negative verdict); absent `active_snapshot` → degraded / unpinned. No new
+`required` field or `allOf` gate is added, so existing workspaces and
+pre-upgrade findings validate and run unchanged.
+
+**New optional state/finding fields and stage flags.**
+
+- **State** (`workspace/.mantis_state.json`): `active_snapshot`
+  `{root, snapshot_id, snapshot_pinned, pass, vcs_type}`; append-only
+  `snapshot_history` (one `{pass, snapshot_id, snapshot_pinned, timestamp}`
+  entry per pass, never overwritten); `vcs_info` continues to record `vcs_type`
+  / `commit_hash` / `revision` / `dirty`.
+- **Finding**: `discovery_commit` — the `SNAPSHOT_ID` the finding was discovered
+  against.
+- **Flags every stage accepts**: `--snapshot_root=<pinned copy>`,
+  `--snapshot_id=<SNAPSHOT_ID>`, `--state_root=<workspace parent>`, and
+  (orchestrator only) `--sync` to enable boundary sync. `--target_root`
+  overrides all of these when a caller hands a stage a prepared tree (for
+  example, a patched shadow during re-attack verification).
+
+Any conformant harness (CLI, ADK, or a custom deterministic pipeline) implements
+this per pass: sync first, detect VCS and compute `SNAPSHOT_ID`, pin the
+immutable copy and write the sentinel, record `active_snapshot` / append
+`snapshot_history`, run every stage with `--snapshot_root` / `--snapshot_id` /
+`--state_root`, then archive findings and increment the pass. A harness that
+does not implement it leaves `snapshot_pinned` unset and gets today's behavior.
+
+---
 
 ## Building Deterministic Pipelines (Production-Grade)
 
@@ -288,7 +398,7 @@ deterministic execution, you can build a pipeline that:
    generate* the patch or script file, leaving the actual execution and grading
    to your harness in a strictly controlled sandbox.
 
-______________________________________________________________________
+---
 
 ## Exploit Chains and Reproduction Limits
 
@@ -306,7 +416,7 @@ end-to-end reproduction scripts for these chains**.
   environment-dependent. Users wishing to verify end-to-end chains must write
   custom orchestrators or manually verify the combined flow.
 
-______________________________________________________________________
+---
 
 ## Patch Verification and Re-attack Constraints
 
@@ -329,7 +439,7 @@ Re-attack fields (`reattack_status`, etc.) are strictly required only when
 `patch_status` is `VERIFIED_SECURE`. This is an intentional design decision to
 support binary-only targets and verification fallbacks.
 
-______________________________________________________________________
+---
 
 ## The Reality of Non-Determinism
 
@@ -366,7 +476,7 @@ rescan, such as when new models with greater capabilities are made available or
 when a codebase has received sufficiently large changes to warrant a complete
 rescan instead of just an analysis of a given diff or changelist.
 
-______________________________________________________________________
+---
 
 ## Meta-Agent Orchestration Pattern
 
@@ -398,7 +508,7 @@ session) is responsible for driving the entire reviewing pipeline.
 This pattern transforms the suite from a set of disjointed tools into a
 continuous, self-driving security research operation.
 
-______________________________________________________________________
+---
 
 ## Model Selection & Efficiency Guidelines
 
@@ -428,7 +538,7 @@ need to use the heaviest, most advanced frontier models for every stage:
 Try different tiers of models in different parts of your pipeline to see what
 works well and what does not.
 
-______________________________________________________________________
+---
 
 ## Understanding False Positives (The "Negative Filter" Rule)
 
@@ -453,7 +563,7 @@ doesn't, then adapt.
   potential vulnerabilities might work, but in our experience is unlikely to be
   the most successful way to adopt this new technology.
 
-______________________________________________________________________
+---
 
 ## Evaluating and Optimizing Mantis Skills
 
@@ -545,7 +655,7 @@ token investment:
   tokens. Conversely, if parallel patchers consistently produce a much cleaner,
   more idiomatic fix than a single agent, the compute cost can be justified.
 
-______________________________________________________________________
+---
 
 ## Code Style & Formatting
 
@@ -577,15 +687,35 @@ If you want to run the formatter manually:
   ```bash
   pre-commit run --all-files
   ```
-- **Via `mdformat` directly:** If you install `mdformat` manually, make sure to
-  install the required plugins and use the `--number` and `--wrap 80` flags to
-  match repository standards:
+
+  This is the **only** fully safe method. It creates an isolated venv with
+  the correct `mdformat` version (0.7.21) and the required plugins
+  (`mdformat-gfm`, `mdformat-frontmatter`), and preserves YAML frontmatter.
+
+- **Via `mdformat` directly (NOT recommended):** If you install `mdformat`
+  manually, you **must** install the required plugins and use the `--number`
+  and `--wrap 80` flags to match repository standards:
   ```bash
-  pip install mdformat mdformat-gfm mdformat-frontmatter
+  pip install mdformat==0.7.21 mdformat-gfm mdformat-frontmatter
   mdformat --number --wrap 80 .
   ```
 
-______________________________________________________________________
+  > [!WARNING]
+  > Running bare `mdformat` without `mdformat-frontmatter` will **destroy
+  > YAML frontmatter** in all SKILL.md files (replacing `---` delimiters with
+  > underscores and collapsing the YAML into a markdown heading). Never run
+  > `mdformat` directly unless you have installed the plugins above. If you
+  > see `pip show mdformat-frontmatter` return "not found", do NOT run
+  > `mdformat`.
+
+> [!CAUTION]
+> **Verbatim blocks (Block A/B/C/D/E/F/G) are not inside code fences in most
+> SKILL.md files.** `mdformat` (even via pre-commit) will rewrap their
+> content to fit the 80-column wrap, which breaks block fidelity. The blocks
+> must remain character-identical across all skills. If you run `mdformat`,
+> **verify with `git diff` that no verbatim block content was rewrapped**
+> before committing. If you see rewrapping, revert those files and
+> hand-format only the non-block prose around them.
 
 ## Advanced / Unattended Cloud Deployment (GCE)
 

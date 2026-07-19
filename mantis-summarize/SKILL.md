@@ -20,6 +20,10 @@ and research stages.
 - **Description:** Pre-processes the repository by generating security-focused
   summaries (`mantis-summary.md`) for each directory to make planning and
   research more efficient.
+- **Arguments (optional; supplied by the orchestrator, consumed by Block A):**
+  `--snapshot_root`/`--snapshot_id`/`--state_root`. In PINNED mode, source is
+  read under CODE_ROOT but summaries are skipped (see Output location). All
+  absent → MODE-OFF (in-tree summaries, as today).
 
 ## Input/Output Contract
 
@@ -31,7 +35,8 @@ and research stages.
   - `workspace/historical_learnings.jsonl` (optional, to enrich summaries).
 - **Writes**:
   - Traversal script to workspace.
-  - `mantis-summary.md` file in each directory containing source code.
+  - MODE-OFF: `mantis-summary.md` in each source directory (as today). PINNED:
+    skipped (see Output location).
 - **Preconditions**:
   - Source files and directory structure must be present.
 - **Idempotency Guarantee**:
@@ -39,6 +44,70 @@ and research stages.
     with updated rollups.
 
 ## Instructions
+
+### Step 0: Locator Resolution + output location (run first)
+
+```
+LOCATOR RESOLUTION (before reading ANY target code or artifact):
+0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
+   you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
+   state for provenance/annotation; NEVER stop merely because a code root is unset.
+1. Determine CODE_ROOT, in this priority order:
+   a. If --target_root is passed on THIS invocation, CODE_ROOT = --target_root.
+      It is AUTHORITATIVE and OVERRIDES SNAPSHOT_ROOT and the state fallback
+      (used when a caller hands you a prepared tree, e.g. a patched shadow).
+   b. Else if --snapshot_root (or SNAPSHOT_ROOT) is passed, use it.
+   c. Else read state_root/workspace/.mantis_state.json (state_root from
+      --state_root if passed, else ./workspace/... relative to the current dir)
+      -> active_snapshot.root / .snapshot_id / .snapshot_pinned.
+   d. Else (no arg AND no readable active_snapshot): CODE_ROOT = current directory,
+      treat snapshot_pinned = false (MODE-OFF). Do NOT stop.
+2. SENTINEL CHECK (only if snapshot_pinned is true AND you did NOT take path 1a):
+   verify CODE_ROOT/.mantis_snapshot_id exists and equals SNAPSHOT_ID. If missing
+   or different -> STOP "snapshot sentinel mismatch". (A --target_root tree (1a) is
+   deliberately mutated and is sentinel-EXEMPT.)
+3. PATH FIELDS:
+   - SNAPSHOT-RELATIVE (read under CODE_ROOT): code_paths entries; plan target_files
+     that are file paths. Strip ONLY a trailing ":<digits>". A code_paths entry
+     containing "://" is a URL/endpoint, NOT a file read. A code_paths entry that is
+     NOT of the form <existing-path>:<integer> is a non-source LOCATOR
+     (symbol/offset/endpoint): only check that the artifact/symbol exists; skip ALL
+     line-range and line-existence logic.
+   - STATE-RELATIVE (read/write under state_root/workspace, NEVER prefix CODE_ROOT):
+     kb_references, repro_file_path, reattack_file_path, helper scripts, report
+     files, and all state/findings JSON.
+4. Never WRITE under CODE_ROOT when snapshot_pinned is true. Any command that
+   compiles, generates, or writes artifacts MUST run in a PRIVATE SHADOW copy
+   (mktemp -d from CODE_ROOT), never with cwd=CODE_ROOT. Read-only inspection may
+   cd into CODE_ROOT.
+5. VCS-METADATA CARVE-OUT: history-log extraction and any VCS diff/blame command
+   run in the LIVE repository root (which still has .git/.hg/.repo), NOT CODE_ROOT
+   (the snapshot copy strips VCS metadata). Do NOT stop merely because CODE_ROOT
+   lacks .git/.hg/.repo.
+6. Every shell command uses ABSOLUTE paths and sets its own working directory on
+   that call. Do NOT assume the working directory persists between calls.
+```
+
+Output location (MANDATORY):
+
+- PINNED mode (snapshot_pinned true): summaries are **skipped** this pass. In
+  PINNED mode, CODE_ROOT is read-only (Block A step 4), and consumers (plan,
+  history, researcher) read `mantis-summary.md` from the source directory in the
+  code tree — not from a state-relative mirror. Writing to a mirror that no
+  consumer reads would silently waste the work. Do NOT write any
+  `mantis-summary.md` files in PINNED mode. (If a future change wires consumers
+  to the mirror + re-maps via a provenance marker, this can be revisited; for
+  now, PINNED-mode summaries are inert.)
+- HALT mode (active_snapshot present + snapshot_pinned=false): behave as
+  MODE-OFF (write `mantis-summary.md` into each source directory). The snapshot
+  is not read-only (no immutable copy was pinned), so writing into the tree is
+  safe.
+- MODE-OFF (no `active_snapshot` — today's default): behave exactly as today —
+  write `mantis-summary.md` into each source directory.
+- In all modes except PINNED, `mantis-summary.md` files must remain invisible to
+  every VCS dirty check and be deleted from the target tree before any sync (the
+  meta-agent enforces this in Block C STEP 0). Never let a summary make the tree
+  look dirty.
 
 Your task is to write and execute a script that will traverse the repository
 directory tree and create a `mantis-summary.md` file in each directory
@@ -94,11 +163,14 @@ Execute the summarize stage as follows:
    The summary must be a reasonable size to incorporate into work on larger
    problems, so aim for several thousand words or fewer.
 
-3. **Output to `mantis-summary.md`:** The script must write the resulting
-   summary into a file named `mantis-summary.md` inside the corresponding
-   directory. Overwrite it if it already exists.
+3. **Output to `mantis-summary.md`:** In MODE-OFF (or HALT), write
+   `mantis-summary.md` into the corresponding source directory (overwrite if
+   present). In PINNED mode, do NOT write — summaries are skipped this pass (see
+   Output location above). Never write into the read-only snapshot.
 
 4. **Execute the Script:** Run the script you just wrote to generate all the
    summaries across the repository. Wait for it to finish successfully.
+
+5. **Complete:** Summaries are now generated. Notify the user.
 
 When complete, notify the user.

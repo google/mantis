@@ -19,6 +19,20 @@ complex, multi-step exploit chains.
 - **Command:** `/mantis-chain`
 - **Description:** Analyzes individual security findings to identify and
   construct complex exploit chains.
+- **Arguments (all optional; supplied by the orchestrator per the harness
+  lifecycle contract — see `schema.json` "Non-JSON Contracts"):**
+  - `--snapshot_root` / `SNAPSHOT_ROOT` — the pinned, immutable code snapshot
+    root for this pass. Consumed by Block A.
+  - `--snapshot_id` / `SNAPSHOT_ID` — the snapshot identity string for this
+    pass. Consumed by Block A (sentinel) and Block B (match check).
+  - `--state_root` — parent directory of `workspace/`. When absent, defaults to
+    the current directory (Block A step 1c/1d).
+  - `--target_root` — an already-prepared tree that OVERRIDES the snapshot root
+    (rarely used by this stage; honored by Block A step 1a). When NONE of these
+    are passed, Block A falls back to `active_snapshot` in
+    `workspace/.mantis_state.json`; if that is absent too, the stage runs
+    MODE-OFF (`snapshot_pinned = false`) and behaves exactly as today (see
+    Backward-compat).
 
 ## Input/Output Contract
 
@@ -36,11 +50,113 @@ complex, multi-step exploit chains.
   - Validated or viable findings must exist in `workspace/findings/`.
 - **Idempotency Guarantee**:
   - Before writing a new exploit chain finding, the skill must check existing
-    exploit chain findings in `workspace/findings/` by comparing the constituent
-    finding UUIDs. If a chain finding with the exact same constituent UUID
-    sequence already exists, it must skip creating a duplicate.
+    exploit chain findings by comparing the constituent finding sequence. Scan
+    BOTH the current `workspace/findings/` directory AND every archived pass
+    under `workspace/archive/findings_pass_*/` (all STATE-RELATIVE — never
+    prefix `CODE_ROOT`). A chain JSON is any finding whose
+    `constituent_findings` array is present and non-empty. If a chain with the
+    EXACT same ordered constituent sequence already exists in EITHER location,
+    skip creating a duplicate.
+  - **Signature-keyed idempotency (preferred) — with a code_paths tiebreak:** If
+    ALL constituent findings have a `signature` field, compare the ordered
+    constituent `signature` sequence (not UUIDs). Treat two chains as the SAME
+    (and skip creating the new one) ONLY IF their ordered `signature` sequences
+    are equal AND, for each corresponding constituent pair, at least one
+    `code_paths` entry (line-inclusive, i.e. compared WITH its trailing `:line`)
+    is identical. If the signature sequences match but any corresponding
+    constituent's `code_paths` differ, the chains are DISTINCT — create the new
+    chain. (Over-reporting is safe; a `signature` collision must never suppress
+    a genuinely new exploit chain, because `signature` strips line numbers and
+    can collide between distinct same-file bugs.)
+  - **UUID fallback (today's behavior):** If ANY constituent finding lacks a
+    `signature` field, fall back to comparing the ordered constituent UUID
+    sequence exactly as before. This preserves today's behavior for legacy /
+    un-upgraded findings.
+  - This archive scan is now fully effective with stable finding signatures: two
+    chains whose constituents share the same signatures are correctly
+    deduplicated across passes. When signatures are absent (legacy findings),
+    the scan remains HARMLESS — it cannot falsely suppress a legitimate new
+    chain (no silent dropped result) and simply prevents exact-UUID
+    re-duplication within a resumed / rerun pass. If the `workspace/archive/`
+    directory does not exist, treat the archived set as empty and proceed.
 
 ## Instructions
+
+### Locator Resolution (run first — all stages)
+
+```
+LOCATOR RESOLUTION (before reading ANY target code or artifact):
+0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
+   you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
+   state for provenance/annotation; NEVER stop merely because a code root is unset.
+1. Determine CODE_ROOT, in this priority order:
+   a. If --target_root is passed on THIS invocation, CODE_ROOT = --target_root.
+      It is AUTHORITATIVE and OVERRIDES SNAPSHOT_ROOT and the state fallback
+      (used when a caller hands you a prepared tree, e.g. a patched shadow).
+   b. Else if --snapshot_root (or SNAPSHOT_ROOT) is passed, use it.
+   c. Else read state_root/workspace/.mantis_state.json (state_root from
+      --state_root if passed, else ./workspace/... relative to the current dir)
+      -> active_snapshot.root / .snapshot_id / .snapshot_pinned.
+   d. Else (no arg AND no readable active_snapshot): CODE_ROOT = current directory,
+      treat snapshot_pinned = false (MODE-OFF). Do NOT stop.
+2. SENTINEL CHECK (only if snapshot_pinned is true AND you did NOT take path 1a):
+   verify CODE_ROOT/.mantis_snapshot_id exists and equals SNAPSHOT_ID. If missing
+   or different -> STOP "snapshot sentinel mismatch". (A --target_root tree (1a) is
+   deliberately mutated and is sentinel-EXEMPT.)
+3. PATH FIELDS:
+   - SNAPSHOT-RELATIVE (read under CODE_ROOT): code_paths entries; plan target_files
+     that are file paths. Strip ONLY a trailing ":<digits>". A code_paths entry
+     containing "://" is a URL/endpoint, NOT a file read. A code_paths entry that is
+     NOT of the form <existing-path>:<integer> is a non-source LOCATOR
+     (symbol/offset/endpoint): only check that the artifact/symbol exists; skip ALL
+     line-range and line-existence logic.
+   - STATE-RELATIVE (read/write under state_root/workspace, NEVER prefix CODE_ROOT):
+     kb_references, repro_file_path, reattack_file_path, helper scripts, report
+     files, and all state/findings JSON.
+4. Never WRITE under CODE_ROOT when snapshot_pinned is true. Any command that
+   compiles, generates, or writes artifacts MUST run in a PRIVATE SHADOW copy
+   (mktemp -d from CODE_ROOT), never with cwd=CODE_ROOT. Read-only inspection may
+   cd into CODE_ROOT.
+5. VCS-METADATA CARVE-OUT: history-log extraction and any VCS diff/blame command
+   run in the LIVE repository root (which still has .git/.hg/.repo), NOT CODE_ROOT
+   (the snapshot copy strips VCS metadata). Do NOT stop merely because CODE_ROOT
+   lacks .git/.hg/.repo.
+6. Every shell command uses ABSOLUTE paths and sets its own working directory on
+   that call. Do NOT assume the working directory persists between calls.
+```
+
+Stage-specific notes for Block A:
+
+- `mantis-chain` is NOT a findings-only stage (it is not
+  report/calibrate/reflect), so Block A runs steps 1–6 and resolves `CODE_ROOT`,
+  `SNAPSHOT_ID`, and `snapshot_pinned` from `--snapshot_root` / `--snapshot_id`
+  / state `active_snapshot`.
+- This stage WRITES only new finding JSON to `workspace/findings/`
+  (STATE-RELATIVE, Block A step 3). It never writes under `CODE_ROOT`, so Block
+  A step 4 is satisfied trivially. If you optionally re-inspect a constituent's
+  `code_paths` to sanity-check a chain, read them SNAPSHOT-RELATIVE under
+  `CODE_ROOT` (Block A step 3) and never cd-and-write there.
+- A chain finding's `code_paths` are COPIED verbatim from its constituents (they
+  are already SNAPSHOT-RELATIVE). Do not re-prefix, re-resolve, or renumber
+  them.
+
+### Snapshot Match Check (used to select constituents)
+
+SNAPSHOT MATCH CHECK for finding F (decides MATCHED vs NOT_MATCHED):
+
+1. If snapshot_pinned is false -> NOT_MATCHED. Stop.
+2. Read F.discovery_commit:
+   - missing OR empty OR the literal "MIXED" -> NOT_MATCHED.
+   - not exactly equal to SNAPSHOT_ID -> NOT_MATCHED.
+   - exactly equal to SNAPSHOT_ID -> MATCHED. There is no other route to
+     MATCHED; never fuzzy-compare. The global "default the field and proceed"
+     backward-compat rule does NOT apply to discovery_commit: absent =
+     NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's SNAPSHOT_ID
+     already embeds the working-tree content hash, so within-pass findings MATCH
+     and cross-pass bare-commit findings do not.)
+
+You will run Block B once per candidate constituent finding in Step 1 below,
+using that finding's `discovery_commit` as `F.discovery_commit`.
 
 Read the current batch of validated findings and explore whether multiple
 seemingly low-severity or disparate vulnerabilities can be sequentially combined
@@ -53,6 +169,35 @@ Execute the chaining stage as follows:
    - Read the JSON files in the `workspace/findings/` directory. Filter for
      findings that have passed validation (e.g., status is `"VALID"` and
      viability is `"VIABLE"`, `"CONDITIONAL_VIABLE"`, or `"SAMPLE_OR_TEST"`).
+   - **Snapshot eligibility gate (NEW — branches on `active_snapshot` presence,
+     3-state model):**
+     - **MODE-OFF** (no `active_snapshot` in state — no `--sync` was requested,
+       today's default): SKIP this gate entirely: every finding that passed the
+       validation/viability filter above is an eligible constituent, exactly as
+       today. Build chains normally.
+     - **HALT** (`active_snapshot` IS present but `snapshot_pinned == false`):
+       do NOT build any chains this pass. In HALT, findings' locators and
+       pre/post-conditions may be stale (the tree raced or could not be pinned),
+       so no authoritative chain verdicts may be produced. Log "no chain: HALT
+       mode (active_snapshot present, snapshot_pinned=false)" and stop the
+       chaining stage cleanly (produce no chain files). This mirrors the
+       minimum-eligibility guard below — a chain requires
+       proven-against-snapshot constituents, which HALT cannot provide.
+     - **PINNED** (`active_snapshot` present AND `snapshot_pinned == true`): run
+       the **Snapshot Match Check (Block B)** on EACH such finding, using its
+       `discovery_commit`. Keep ONLY findings that return **MATCHED** as
+       eligible constituents. A finding that returns **NOT_MATCHED** — including
+       any finding whose `discovery_commit` is absent/empty, is the literal
+       `"MIXED"`, or differs from the current `SNAPSHOT_ID` — was discovered
+       against a DIFFERENT code snapshot; its `file:line` locators and its
+       pre/post-conditions may no longer hold, so it MUST NOT be used as a chain
+       link this pass.
+   - **Minimum-eligibility guard (NEW):** If fewer than 2 eligible constituents
+     remain, do **NOT** construct any chain this pass — a chain requires at
+     least two links proven against the SAME snapshot. Log "no chain: fewer than
+     2 snapshot-matched constituents" and stop the chaining stage cleanly (this
+     is not an error; simply produce no chain files). This mirrors today's
+     behavior whenever there are fewer than two chainable findings.
    - Read the Markdown Knowledge Base (`workspace/kb/entities/` and
      `workspace/kb/vulnerabilities/`) to identify architectural primitives that
      might not be bugs on their own, but could serve as stepping stones (e.g.,
@@ -79,12 +224,39 @@ Execute the chaining stage as follows:
 
    - If a viable exploit chain is discovered, do **NOT** modify or delete the
      original isolated findings. They still need to be patched individually.
+   - **Idempotency check (run BEFORE minting a UUID):** Apply the Idempotency
+     Guarantee above — scan current `workspace/findings/` AND
+     `workspace/archive/findings_pass_*/` for a chain whose constituent sequence
+     equals this chain's ordered constituent sequence. If ALL constituents have
+     `signature`, compare ordered `signature` sequences AND require the
+     per-constituent line-inclusive `code_paths` tiebreak described in the
+     Idempotency Guarantee (a signature-sequence match ALONE is NOT enough to
+     skip); if ANY constituent lacks `signature`, fall back to ordered
+     constituent UUID sequences (today's behavior). Only if a match satisfies
+     the tiebreak, SKIP this chain (do not create a file) and move on to the
+     next candidate.
    - Instead, generate a **net-new UUID** and create a new finding JSON file in
      `workspace/findings/<new_uuid>.json`.
    - **Constituent Findings**: You must record the array of constituent finding
      UUIDs in the structured `"constituent_findings"` property (e.g.,
      `["UUID_A", "UUID_B"]`). This clearly documents the links of the exploit
      chain.
+   - **Determine Discovery Snapshot (`discovery_commit`)**: Set the chain
+     finding's `discovery_commit` from its ELIGIBLE constituents (the ones you
+     kept in Step 1):
+     - If ALL eligible constituents have the SAME non-empty `discovery_commit`
+       value, set the chain's `discovery_commit` to that exact string.
+     - If the constituents' `discovery_commit` values DIFFER from one another,
+       OR any eligible constituent has a missing/empty `discovery_commit`, set
+       the chain's `discovery_commit` to the literal string `"MIXED"`. Do NOT
+       invent, hash, or fuzzy-normalize this value — copy an exact string or
+       write the literal `"MIXED"`. Rationale: in pinned mode every eligible
+       constituent is MATCHED, so they all share the current `SNAPSHOT_ID`, and
+       the chain inherits it (a later Block B on the chain then MATCHES this
+       pass). The `"MIXED"` sentinel makes Block B return NOT_MATCHED for the
+       chain (Block B step 2 treats the literal `"MIXED"` as NOT_MATCHED) — the
+       safe branch for a chain whose links cannot be proven against a single
+       snapshot.
    - **Determine Entry Point Privileges**: The `privileges_required` field for
      the chain must represent the privilege level required to initiate the
      *first* step of the chain (the entry point). For example, if the chain
@@ -132,6 +304,7 @@ Execute the chaining stage as follows:
      "production_viability": "VIABLE / SAMPLE_OR_TEST / CONDITIONAL_VIABLE",
      "repro_status": "statically_confirmed / not_attempted",
      "constituent_findings": ["UUID_A", "UUID_B"],
+     "discovery_commit": "The SNAPSHOT_ID shared by all constituents, or the literal \"MIXED\" if they differ / are missing. Absent on legacy/unpinned runs.",
      "history": [
        {
          "stage": "chainer",

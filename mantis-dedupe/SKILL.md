@@ -19,6 +19,9 @@ records.
 - **Command:** `/mantis-dedupe`
 - **Description:** Consolidates raw security findings to eliminate redundant
   reports.
+- **Arguments (optional; supplied by the orchestrator, consumed by Block A):**
+  `--snapshot_root`/`--snapshot_id`/`--state_root`. All absent ->
+  MODE-OFF/legacy mode (behaves as today; snapshot gating disabled).
 
 ## Input/Output Contract
 
@@ -31,6 +34,9 @@ records.
 - **Writes**:
   - Moves duplicate findings to `workspace/findings/.trash/` after setting
     `"status": "DUPLICATE"` and `"duplicate_of"`.
+  - Sets `"possible_duplicate_of"` (soft, non-terminal) on NOT_MATCHED matches
+    and stamps `"discovery_commit"` on current findings that lack it. Reads
+    `active_snapshot`/`snapshot_pinned` from `.mantis_state.json`.
   - Appends transaction logs to `workspace/.tx_log.jsonl`.
   - Generates/executes merging script `workspace/helpers/merge_findings.py`.
   - Updates primary finding `workspace/findings/<primary_id>.json` (merges
@@ -39,12 +45,61 @@ records.
   - `workspace/findings/` must exist and contain finding files.
 - **Idempotency Guarantee**:
   - Cross-references against archived findings in `workspace/archive/` to filter
-    out any findings already processed in previous passes of this run
-    (regardless of status or viability). Logs transactions to
-    `workspace/.tx_log.jsonl` to support tracking and potential rollbacks.
+    out any findings already processed in previous passes of this run.
+    Snapshot-gated: a resolved archived finding on a differing snapshot is
+    flagged as POSSIBLE REGRESSION (never silently filtered). Logs transactions
+    to `workspace/.tx_log.jsonl` to support tracking and potential rollbacks.
     Deterministic merging rules implemented in `merge_findings.py`.
 
 ## Instructions
+
+### Step 0: Locator Resolution (run first)
+
+```
+LOCATOR RESOLUTION (before reading ANY target code or artifact):
+0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
+   you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
+   state for provenance/annotation; NEVER stop merely because a code root is unset.
+1. Determine CODE_ROOT, in this priority order:
+   a. If --target_root is passed on THIS invocation, CODE_ROOT = --target_root.
+      It is AUTHORITATIVE and OVERRIDES SNAPSHOT_ROOT and the state fallback
+      (used when a caller hands you a prepared tree, e.g. a patched shadow).
+   b. Else if --snapshot_root (or SNAPSHOT_ROOT) is passed, use it.
+   c. Else read state_root/workspace/.mantis_state.json (state_root from
+      --state_root if passed, else ./workspace/... relative to the current dir)
+      -> active_snapshot.root / .snapshot_id / .snapshot_pinned.
+   d. Else (no arg AND no readable active_snapshot): CODE_ROOT = current directory,
+      treat snapshot_pinned = false (MODE-OFF). Do NOT stop.
+2. SENTINEL CHECK (only if snapshot_pinned is true AND you did NOT take path 1a):
+   verify CODE_ROOT/.mantis_snapshot_id exists and equals SNAPSHOT_ID. If missing
+   or different -> STOP "snapshot sentinel mismatch". (A --target_root tree (1a) is
+   deliberately mutated and is sentinel-EXEMPT.)
+3. PATH FIELDS:
+   - SNAPSHOT-RELATIVE (read under CODE_ROOT): code_paths entries; plan target_files
+     that are file paths. Strip ONLY a trailing ":<digits>". A code_paths entry
+     containing "://" is a URL/endpoint, NOT a file read. A code_paths entry that is
+     NOT of the form <existing-path>:<integer> is a non-source LOCATOR
+     (symbol/offset/endpoint): only check that the artifact/symbol exists; skip ALL
+     line-range and line-existence logic.
+   - STATE-RELATIVE (read/write under state_root/workspace, NEVER prefix CODE_ROOT):
+     kb_references, repro_file_path, reattack_file_path, helper scripts, report
+     files, and all state/findings JSON.
+4. Never WRITE under CODE_ROOT when snapshot_pinned is true. Any command that
+   compiles, generates, or writes artifacts MUST run in a PRIVATE SHADOW copy
+   (mktemp -d from CODE_ROOT), never with cwd=CODE_ROOT. Read-only inspection may
+   cd into CODE_ROOT.
+5. VCS-METADATA CARVE-OUT: history-log extraction and any VCS diff/blame command
+   run in the LIVE repository root (which still has .git/.hg/.repo), NOT CODE_ROOT
+   (the snapshot copy strips VCS metadata). Do NOT stop merely because CODE_ROOT
+   lacks .git/.hg/.repo.
+6. Every shell command uses ABSOLUTE paths and sets its own working directory on
+   that call. Do NOT assume the working directory persists between calls.
+```
+
+Notes: `workspace/findings/`, `workspace/archive/`, `workspace/.tx_log.jsonl`,
+`workspace/helpers/` and `.mantis_state.json` are STATE-RELATIVE (under
+--state_root). Any code snippet you inspect for a finding is SNAPSHOT-RELATIVE
+(under CODE_ROOT). Never write under CODE_ROOT.
 
 Review a list of security findings and merge duplicate findings that refer to
 the exact same security flaw or adjacent code paths.
@@ -67,22 +122,95 @@ Execute your task as follows:
      `workspace/historical_learnings.jsonl` (VCS history), as we want to catch
      regressions if old bugs were reintroduced.
 
-2. **Filter Loop Duplicates (Previously Processed Findings):** Cross-reference
-   the current findings against the loaded archived findings (using `code_paths`
-   and `title` similarities). If a current finding matches any archived finding
-   from a previous pass (regardless of its status or viability), you must
-   **soft-delete the new finding file** by ensuring the trash directory exists
-   (e.g., `mkdir -p workspace/findings/.trash/`). **Exception:** If the current
-   finding has the **exact same UUID** as the matching archived finding, do not
-   filter it out; this indicates the finding was intentionally copied back to
-   `workspace/findings/` for a retry (e.g., re-reproduction or re-patching).
-   Before moving a duplicate file (different UUID), update the duplicate finding
-   file to set `"status": "DUPLICATE"` and `"duplicate_of": "<archived_uuid>"`
-   (where archived_uuid is the UUID of the matching finding from the archive).
-   Then, move it to the trash staging directory (`workspace/findings/.trash/`),
-   log the transaction in `workspace/.tx_log.jsonl` (action: `"loop_filter"`),
-   and drop it from your active list. This prevents the pipeline from getting
-   stuck re-evaluating the same issues.
+2. **Filter Loop Duplicates (snapshot-gated).** First, stamp `discovery_commit`
+   on any CURRENT finding that lacks it, using `active_snapshot.snapshot_id`
+   from `.mantis_state.json` (skip when unpinned). Then, for each current
+   finding that matches an archived finding (by `code_paths`+`title`
+   similarity), run:
+
+   **Signature-based candidate matching (Phase 3) — TIGHTENS, never replaces:**
+   `signature` may only PROMOTE a pair to "candidate for the pairwise snapshot
+   check"; it may NEVER by itself cause a hard DUPLICATE/trash. A pair is
+   eligible for hard-DUPLICATE treatment ONLY if it satisfies BOTH:
+
+   - it matches under today's `code_paths` + `title` similarity, comparing
+     `code_paths` entries line-inclusively (WITH their trailing `:line`); AND
+   - (when both findings have a `signature`) their `signature` fields are equal.
+     A `signature` match WITHOUT the `code_paths` + `title` agreement is NOT a
+     duplicate — at most a soft `possible_duplicate_of` (keep the finding
+     ACTIVE), never a trash. Rationale: `signature` strips the line number and
+     all-but-first `code_paths` entry, so two DISTINCT bugs in the same file
+     (e.g. `parser.c:100` vs `parser.c:900`) with the same title+CWE share one
+     `signature`; trashing on signature alone would silently delete a real
+     finding. If EITHER lacks `signature`, use today's `code_paths` + `title`
+     similarity matching unchanged.
+
+   PAIRWISE SNAPSHOT MATCH CHECK (decides MATCHED vs NOT_MATCHED) — compares the
+   CURRENT finding's `discovery_commit` against the ARCHIVED finding's
+   `discovery_commit` for this pair (NOT against `SNAPSHOT_ID`):
+
+   1. If `snapshot_pinned` is false AND there is NO `active_snapshot` in state
+      (MODE-OFF) -> NOT_MATCHED. Stop. (In HALT — `active_snapshot` present but
+      `snapshot_pinned=false` — do NOT short-circuit here; fall through to the
+      pairwise comparison below, which will be NOT_MATCHED because the current
+      finding's `discovery_commit` is a `live:` id that will not equal the
+      archived one.)
+   2. Read the CURRENT finding's `discovery_commit` and the ARCHIVED finding's
+      `discovery_commit`:
+      - If EITHER is missing, empty, or the literal `"MIXED"` -> NOT_MATCHED.
+      - If they are NOT byte-for-byte equal to each other -> NOT_MATCHED.
+      - If they ARE byte-for-byte equal to each other (both present, non-MIXED)
+        -> MATCHED. There is no other route to MATCHED; never fuzzy-compare. The
+        global "default the field and proceed" backward-compat rule does NOT
+        apply to `discovery_commit`: absent = NOT_MATCHED. (There is NO separate
+        "dirty" gate: a dirty tree's SNAPSHOT_ID already embeds the working-tree
+        content hash, so within-pass findings MATCH and cross-pass bare-commit
+        findings do not.) Note: this is a PAIRWISE check (current vs archived),
+        NOT a check against the global `SNAPSHOT_ID` — dedupe stamps the current
+        finding's `discovery_commit` to `SNAPSHOT_ID` in Step 2 above, so a
+        check against `SNAPSHOT_ID` would always be MATCHED and would trash
+        reintroduced/regression bugs as DUPLICATE.
+
+   Then, using the idempotency rule (Input/Output Contract → Idempotency
+   Guarantee) to avoid double-writes, decide mechanically:
+
+   - **MATCHED** (both present and equal): soft-delete the current finding as a
+     loop-duplicate exactly as before — set `"status": "DUPLICATE"` and
+     `"duplicate_of": "<archived_uuid>"`, ensure
+     `mkdir -p workspace/findings/.trash/`, move it there, and log a
+     `loop_filter` transaction in `workspace/.tx_log.jsonl`. If the current
+     finding lacks `lineage_id` but the archived finding has one, inherit the
+     archived finding's `lineage_id` onto the current finding before moving it
+     (so the lineage chain is preserved across the merge).
+   - **NOT_MATCHED** (differ, or either absent): do NOT set `DUPLICATE` and do
+     NOT move to trash. Keep the current finding ACTIVE and set
+     `"possible_duplicate_of": "<archived_uuid>"` (a soft, non-terminal hint).
+     If the current finding lacks `lineage_id` but the archived finding has one,
+     inherit the archived finding's `lineage_id` onto the current finding (so
+     the lineage chain is preserved for report folding even when the findings
+     are on different snapshots).
+   - **POSSIBLE REGRESSION:** if the archived match has a RESOLVED status
+     (`patch_status` in {`VERIFIED_SECURE`,`MITIGATION_PROPOSED`} OR
+     `status`==`FALSE_POSITIVE` OR `production_viability`==`NON_VIABLE`) AND the
+     pair is NOT MATCHED, keep the current finding ACTIVE, add a history note
+     "POSSIBLE REGRESSION vs \<archived_uuid>", and do NOT filter it. (A
+     reverted fix re-discovered on new code must never be trashed.)
+   - **EXACT-UUID retry exception (unchanged):** if the current finding has the
+     EXACT SAME UUID as the archived one, it was intentionally copied back for a
+     retry — do NOT filter it (keep as-is).
+   - **Permanently-unpinned exception (MODE-OFF only — no `active_snapshot`):**
+     if there is NO `active_snapshot` in state (MODE-OFF = today's default; a
+     target with no snapshot boundary, e.g. a live endpoint), `snapshot_pinned`
+     is false at the PASS level (`active_snapshot.snapshot_pinned` — it is NOT a
+     per-finding field) and Block B is uninformative — fall back to today's
+     dedup by `signature` if present, else `stable_key` = normalized_title +
+     first `code_paths` entry (path only). This preserves dedup for targets that
+     can never MATCH. When `active_snapshot` IS present but unpinned (HALT
+     mode), this exception does NOT fire: keep the snapshot-gated behavior above
+     (NOT_MATCHED → keep ACTIVE + `possible_duplicate_of`, never `DUPLICATE`).
+     **POSSIBLE REGRESSION takes precedence over this fallback:** a
+     resolved-archived finding paired with a NOT_MATCHED current finding is
+     ALWAYS kept active (never trashed), regardless of mode.
 
 3. **Filter Duplicate Findings in Current Batch:** Check the current findings
    against each other to find duplicates (using `code_paths` and `title`
@@ -99,11 +227,13 @@ Execute your task as follows:
 
    1. **Identify Duplicates:** Internally map which findings are duplicates of a
       primary finding.
-   2. **Reusable Deterministic Scripting:** Write a reusable helper script
-      (e.g., `workspace/helpers/merge_findings.py`) during your first merge
-      action. For all subsequent merges, do not regenerate the script; simply
-      execute the existing helper script with the new finding IDs. The script
-      must follow these deterministic rules:
+   2. **Reusable Deterministic Scripting (versioned):** Write a reusable helper
+      script (e.g. `workspace/helpers/merge_findings.py`) whose FIRST LINE is
+      exactly `MANTIS_HELPER_VERSION = 2`. Before reusing an existing helper,
+      grep its first lines for `MANTIS_HELPER_VERSION = 2`; if that marker is
+      absent or a different integer (a helper left by an older pipeline
+      version), REGENERATE the helper. Only reuse it when the marker matches.
+      The script must follow these deterministic rules:
       - **Title:** Pick the most comprehensive and descriptive title.
       - **ID:** Preserve the unique `"id"` of the primary finding being kept.
       - **Severity:** Pick the highest severity level specified among the merged
@@ -126,6 +256,14 @@ Execute your task as follows:
         `"details": "Merged duplicate findings: [comma-separated-ids]"`,
         `"pass_number": <current_pass_number>`, and
         `"timestamp": "<current_iso8601_timestamp>"`).
+      - **Unknown keys & provenance (MANDATORY):** The script MUST copy through
+        EVERY key it does not explicitly handle (including `discovery_commit`,
+        `repro_snapshot_id`, `patch_base_snapshot`, `possible_duplicate_of`,
+        `signature`, `lineage_id`, `cwe`) from the primary finding onto the
+        merged object — never drop unknown fields. It MUST REFUSE to merge two
+        findings whose `discovery_commit` values differ (they describe different
+        code versions); leave them separate and log the refusal. When merging
+        findings that all share one `discovery_commit`, preserve it unchanged.
    3. **Execute the Script:** Run your script to update the primary finding's
       file (`workspace/findings/<primary_id>.json`) on disk.
 

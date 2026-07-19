@@ -21,6 +21,11 @@ downstream skills.
 - **Description:** Analyzes repository's version control system (VCS) history to
   extract past vulnerabilities and fixes, producing a structured historical
   learnings file (`workspace/historical_learnings.jsonl`).
+- **Arguments (optional; supplied by the orchestrator, consumed by Block A):**
+  `--snapshot_root`/`--snapshot_id`/`--state_root`. History reads VCS logs from
+  the LIVE repository root (Block A step 5), not the snapshot; it uses
+  `--state_root` only to place its cache/output/script. All absent -> DEGRADED
+  (behaves as today, live cwd).
 
 ## Input/Output Contract
 
@@ -34,13 +39,69 @@ downstream skills.
   - VCS extraction script (written on-the-fly to workspace).
   - `workspace/historical_learnings.jsonl`.
   - Internal history analysis cache.
+  - All under `--state_root/workspace/` (cache, `historical_learnings.jsonl`,
+    extraction script): kept outside the target tree. Optional `history_status`
+    marker (`UNSUPPORTED_VCS` / `PARTIAL_SHALLOW`).
 - **Preconditions**:
   - Target repository and VCS logs must be accessible.
 - **Idempotency Guarantee**:
-  - The extraction script maintains a local cache of analyzed `revision_id`s,
-    skipping any already processed commits.
+  - The cache is the source of truth: the output DB is rebuilt from it every run
+    and is never truncated to empty while the cache is non-empty. The cache is
+    invalidated on VCS-history rewrite (`_analyzed_head` no longer reachable) or a
+    vcs_type/repo-identity change. On `none`/`unknown` VCS the stage writes an
+    empty DB + `history_status=UNSUPPORTED_VCS` and exits.
 
 ## Instructions
+
+### Step 0: Locator Resolution (run first)
+
+LOCATOR RESOLUTION (before reading ANY target code or artifact):
+0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
+   you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
+   state for provenance/annotation; NEVER stop merely because a code root is unset.
+1. Determine CODE_ROOT, in this priority order:
+   a. If --target_root is passed on THIS invocation, CODE_ROOT = --target_root.
+      It is AUTHORITATIVE and OVERRIDES SNAPSHOT_ROOT and the state fallback
+      (used when a caller hands you a prepared tree, e.g. a patched shadow).
+   b. Else if --snapshot_root (or SNAPSHOT_ROOT) is passed, use it.
+   c. Else read state_root/workspace/.mantis_state.json (state_root from
+      --state_root if passed, else ./workspace/... relative to the current dir)
+      -> active_snapshot.root / .snapshot_id / .snapshot_pinned.
+   d. Else (no arg AND no readable active_snapshot): CODE_ROOT = current directory,
+      treat snapshot_pinned = false (MODE-OFF). Do NOT stop.
+2. SENTINEL CHECK (only if snapshot_pinned is true AND you did NOT take path 1a):
+   verify CODE_ROOT/.mantis_snapshot_id exists and equals SNAPSHOT_ID. If missing
+   or different -> STOP "snapshot sentinel mismatch". (A --target_root tree (1a) is
+   deliberately mutated and is sentinel-EXEMPT.)
+3. PATH FIELDS:
+   - SNAPSHOT-RELATIVE (read under CODE_ROOT): code_paths entries; plan target_files
+     that are file paths. Strip ONLY a trailing ":<digits>". A code_paths entry
+     containing "://" is a URL/endpoint, NOT a file read. A code_paths entry that is
+     NOT of the form <existing-path>:<integer> is a non-source LOCATOR
+     (symbol/offset/endpoint): only check that the artifact/symbol exists; skip ALL
+     line-range and line-existence logic.
+   - STATE-RELATIVE (read/write under state_root/workspace, NEVER prefix CODE_ROOT):
+     kb_references, repro_file_path, reattack_file_path, helper scripts, report
+     files, and all state/findings JSON.
+4. Never WRITE under CODE_ROOT when snapshot_pinned is true. Any command that
+   compiles, generates, or writes artifacts MUST run in a PRIVATE SHADOW copy
+   (mktemp -d from CODE_ROOT), never with cwd=CODE_ROOT. Read-only inspection may
+   cd into CODE_ROOT.
+5. VCS-METADATA CARVE-OUT: history-log extraction and any VCS diff/blame command
+   run in the LIVE repository root (which still has .git/.hg/.repo), NOT CODE_ROOT
+   (the snapshot copy strips VCS metadata). Do NOT stop merely because CODE_ROOT
+   lacks .git/.hg/.repo.
+6. Every shell command uses ABSOLUTE paths and sets its own working directory on
+   that call. Do NOT assume the working directory persists between calls.
+
+CRITICAL for history: the pinned snapshot copy STRIPS `.git`/`.hg`/`.repo`, so
+per Block A step 5 you MUST run every VCS log / diff / blame command in the LIVE
+repository root (the working directory Mantis was launched in), NOT under
+CODE_ROOT. Do NOT stop because CODE_ROOT lacks VCS metadata. Write the cache,
+`workspace/historical_learnings.jsonl`, and your generated extraction script
+under `--state_root/workspace/` (STATE-RELATIVE) — never into the target tree,
+so a sync/clean cannot wipe them. Record `active_snapshot.snapshot_id` on entries
+only for provenance.
 
 Your task is to analyze the codebase architecture, determine what constitutes
 security-relevant history, and write a script on-the-fly to extract and document
@@ -59,6 +120,18 @@ Execute the history analysis stage as follows:
      targeted.
 
 2. **Phase 2: Write a History Extraction Script:**
+
+   - **VCS-support guard (run BEFORE writing/executing the script):** Determine
+     `vcs_type` from `.mantis_state.json` `vcs_info` (or detect it in the LIVE
+     root). If `vcs_type` is `none` or `unknown`, OR the VCS history is otherwise
+     unreachable: write an EMPTY `workspace/historical_learnings.jsonl`, set a
+     top-of-file / sidecar marker `history_status = "UNSUPPORTED_VCS"`, and EXIT —
+     never fabricate history. For `multi-vcs` (.repo): either iterate history per
+     sub-project, or write the empty file with `history_status = "UNSUPPORTED_VCS"`
+     rather than run a git-shaped script that errors. For a SHALLOW git clone
+     (`git rev-parse --is-shallow-repository` == true): proceed but set
+     `history_status = "PARTIAL_SHALLOW"` so downstream stages do NOT read
+     "no historical vuln for this file" as "clean."
 
    - Read the active pass number from the state file
      `workspace/.mantis_state.json` and resolve the current ISO 8601 timestamp.
@@ -83,10 +156,21 @@ Execute the history analysis stage as follows:
        Skip commits with excessively large diffs (e.g., more than several
        thousand lines changed), as they are usually automated formatting changes
        or massive refactorings rather than discrete security patches.
-     - **Caching Results:** The script should maintain a local cache (e.g., in a
-       JSON or SQLite file) mapping `revision_id` to whether it was analyzed. If
-       a revision has already been processed and cached, skip it. This makes
-       repeated historical analyses instant and zero-cost.
+     - **Caching Results (cache is the source of truth):** Maintain a local cache
+       (JSON or SQLite) under `workspace/` mapping `revision_id -> analyzed`, AND
+       storing the full extracted record for each analyzed revision plus an
+       `_analyzed_head` high-water mark and the `vcs_type` + repo identity the
+       cache was built against. On each run, REBUILD
+       `workspace/historical_learnings.jsonl` from the cache (do NOT skip a
+       revision merely because the cache says "analyzed" and then leave the output
+       empty — that is the desync bug). NEVER truncate a non-empty output DB to
+       empty. Only analyze revisions NEWER than `_analyzed_head`.
+       **Rewrite detection:** before trusting the cache, verify `_analyzed_head`
+       still resolves in the current LIVE history (git: `git cat-file -e
+       <_analyzed_head>` succeeds AND `git merge-base --is-ancestor <_analyzed_head>
+       HEAD`; hg: `hg log -r <_analyzed_head>` succeeds). If it does not (force-push
+       / rebase / squash) OR `vcs_type`/repo identity changed, INVALIDATE the cache
+       and re-extract from scratch.
      - **Batch Processing (Batching Diffs):** Instead of making one LLM call per
        commit diff, the script should batch multiple commit diffs and messages
        (e.g. 3 to 5 commits) into a single LLM call. Ask the LLM to analyze all
