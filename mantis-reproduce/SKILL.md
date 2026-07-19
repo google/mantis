@@ -172,14 +172,20 @@ Execute the reproduction stage under these constraints:
          (`VERIFIED_SECURE` IS allowed: C5 below handles the case where the
          snapshot changed since the patch was verified secure, and downgrades
          `VERIFIED_SECURE` → `VERIFICATION_INCOMPLETE` in the same atomic write
-         as setting `reattack_status=inconclusive_baseline_changed`, precisely
-         to avoid persisting the schema-invalid combination
-         `patch_status=VERIFIED_SECURE` +
-         `reattack_status=inconclusive_baseline_changed` that would violate the
-         `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass` allOf gate.
-         `MITIGATION_PROPOSED` remains forbidden because C5's downgrade clause
-         only handles `VERIFIED_SECURE`; a separate change would be needed to
-         add C5 handling for `MITIGATION_PROPOSED`.)
+         as setting `reattack_status=inconclusive_baseline_changed` (C5 step 2),
+         and `VERIFIED_SECURE` → `VERIFICATION_FAILED` in the same atomic write
+         as setting `reattack_status=bypassed_patch` (C5 step 3, and the general
+         `bypassed_patch` write rule below), precisely to avoid persisting the
+         schema-invalid combinations of `patch_status=VERIFIED_SECURE` plus
+         `reattack_status=inconclusive_baseline_changed`, or
+         `patch_status=VERIFIED_SECURE` plus `reattack_status=bypassed_patch`,
+         each of which would violate the
+         `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass` allOf gate. A
+         `bypassed_patch` outcome is a definitive defeat of the patch, so
+         `VERIFICATION_FAILED` (not `VERIFICATION_INCOMPLETE`) is the correct
+         downgrade there. `MITIGATION_PROPOSED` remains forbidden because C5's
+         downgrade clauses only handle `VERIFIED_SECURE`; a separate change
+         would be needed to add C5 handling for `MITIGATION_PROPOSED`.)
        - Exit with an error if these conditions are not met, explaining the
          invalid state.
      - If `--reattack` is NOT specified (Targeted Normal Run):
@@ -480,7 +486,21 @@ Execute the reproduction stage under these constraints:
        `"inconclusive_baseline_changed"`).
 
      - `"bypassed_patch"`: The new/modified PoC successfully bypassed the patch
-       and triggered the bug.
+       and triggered the bug. **If the finding's current `patch_status` is
+       `VERIFIED_SECURE`, you MUST set `patch_status = "VERIFICATION_FAILED"` in
+       the SAME atomic write (with a history note).** This prevents persisting
+       the schema-invalid combination of `patch_status=VERIFIED_SECURE` plus
+       `reattack_status=bypassed_patch` (the allOf gate requires
+       `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass`); a bypass means the
+       patch was just defeated, so `VERIFIED_SECURE` would over-claim security.
+       This is an explicit exception to "do not touch status" and applies to
+       BOTH the C5 step-3 path and the same-snapshot attack run — a standalone
+       `/mantis-reproduce --reattack` (or cross-pass re-verify) that bypasses a
+       previously-verified patch must not leave `VERIFIED_SECURE` behind. The
+       patcher normally overwrites `patch_status` afterward, but without this
+       same-write downgrade a standalone or cross-pass run persists the invalid
+       state. (`failed_to_bypass` needs NO downgrade — it is the exact value the
+       allOf gate requires for `VERIFIED_SECURE`.)
 
      - `"failed_to_bypass"`: The PoC was run but failed to bypass the patch.
 
@@ -539,6 +559,18 @@ Execute the reproduction stage under these constraints:
           simply pre-empts the patcher's later downgrade.
        3. If the unpatched baseline DOES trigger: proceed with the attack on the
           patched build as normal (`bypassed_patch` or `failed_to_bypass`).
+          **Additionally, if the outcome is `bypassed_patch` and the finding's
+          current `patch_status` is `VERIFIED_SECURE`, set
+          `patch_status = "VERIFICATION_FAILED"` in the SAME atomic write (with
+          a history note).** This mirrors step 2's downgrade and prevents the
+          finding from ever persisting the schema-invalid combination
+          `patch_status=VERIFIED_SECURE` + `reattack_status=bypassed_patch` (the
+          allOf gate requires
+          `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass`); a bypass means
+          the patch was just defeated, so `VERIFIED_SECURE` would over-claim
+          security. (`failed_to_bypass` needs NO downgrade — it is the exact
+          value the allOf gate requires for `VERIFIED_SECURE`.) This is an
+          explicit exception to "do not touch status", matching step 2.
 
        - **HALT-mode guardrail (detect HALT by the PASS's snapshot id, NOT the
          `--target_root` flag):** HALT means the ORIGINAL pass could not pin a
