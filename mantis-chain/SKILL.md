@@ -52,11 +52,11 @@ complex, multi-step exploit chains.
   - Before writing a new exploit chain finding, the skill must check existing
     exploit chain findings by comparing the constituent finding sequence. Scan
     BOTH the current `workspace/findings/` directory AND every archived pass
-    under `workspace/archive/findings_pass_*/` (all STATE-RELATIVE — never
-    prefix `CODE_ROOT`). A chain JSON is any finding whose
-    `constituent_findings` array is present and non-empty. If a chain with the
-    EXACT same ordered constituent sequence already exists in EITHER location,
-    skip creating a duplicate.
+    under `workspace/archive/findings_pass_*/` AND legacy
+    `workspace/archive/loop*_findings/` (all STATE-RELATIVE — never prefix
+    `CODE_ROOT`). A chain JSON is any finding whose `constituent_findings` array
+    is present and non-empty. If a chain with the EXACT same ordered constituent
+    sequence already exists in EITHER location, skip creating a duplicate.
   - **Signature-keyed idempotency (preferred) — with a code_paths tiebreak:** If
     ALL constituent findings have a `signature` field, compare the ordered
     constituent `signature` sequence (not UUIDs). Treat two chains as the SAME
@@ -125,6 +125,17 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    that call. Do NOT assume the working directory persists between calls.
 ```
 
+> [!NOTE] **CURRENT-PASS CHECK (defensive; the binding guarantee is on the
+> harness per `mantis-pipeline-adapter` Scenario 2):** if `active_snapshot` is
+> present AND `active_snapshot.pass != state.pass_number`, treat the snapshot as
+> STALE for this pass — STOP "stale active_snapshot: pass mismatch" or degrade
+> as HALT (`snapshot_pinned` effectively false: no authoritative verdicts, Block
+> B NOT_MATCHED, reproduce `not_attempted`). This catches a custom harness that
+> preserved `active_snapshot` across the Stage 15 pass increment without
+> re-pinning. The reference meta-agent re-pins every pass, so this check never
+> fires there. Block B itself cannot detect this (it is `snapshot_id`-only, not
+> `pass`-aware).
+
 Stage-specific notes for Block A:
 
 - `mantis-chain` is NOT a findings-only stage (it is not
@@ -142,18 +153,19 @@ Stage-specific notes for Block A:
 
 ### Snapshot Match Check (used to select constituents)
 
+```
 SNAPSHOT MATCH CHECK for finding F (decides MATCHED vs NOT_MATCHED):
-
 1. If snapshot_pinned is false -> NOT_MATCHED. Stop.
 2. Read F.discovery_commit:
    - missing OR empty OR the literal "MIXED" -> NOT_MATCHED.
-   - not exactly equal to SNAPSHOT_ID -> NOT_MATCHED.
-   - exactly equal to SNAPSHOT_ID -> MATCHED. There is no other route to
-     MATCHED; never fuzzy-compare. The global "default the field and proceed"
-     backward-compat rule does NOT apply to discovery_commit: absent =
-     NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's SNAPSHOT_ID
-     already embeds the working-tree content hash, so within-pass findings MATCH
-     and cross-pass bare-commit findings do not.)
+   - not exactly equal to SNAPSHOT_ID          -> NOT_MATCHED.
+   - exactly equal to SNAPSHOT_ID              -> MATCHED.
+There is no other route to MATCHED; never fuzzy-compare. The global "default the
+field and proceed" backward-compat rule does NOT apply to discovery_commit:
+absent = NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's
+SNAPSHOT_ID already embeds the working-tree content hash, so within-pass findings
+MATCH and cross-pass bare-commit findings do not.)
+```
 
 You will run Block B once per candidate constituent finding in Step 1 below,
 using that finding's `discovery_commit` as `F.discovery_commit`.
@@ -226,7 +238,8 @@ Execute the chaining stage as follows:
      original isolated findings. They still need to be patched individually.
    - **Idempotency check (run BEFORE minting a UUID):** Apply the Idempotency
      Guarantee above — scan current `workspace/findings/` AND
-     `workspace/archive/findings_pass_*/` for a chain whose constituent sequence
+     `workspace/archive/findings_pass_*/` AND legacy
+     `workspace/archive/loop*_findings/` for a chain whose constituent sequence
      equals this chain's ordered constituent sequence. If ALL constituents have
      `signature`, compare ordered `signature` sequences AND require the
      per-constituent line-inclusive `code_paths` tiebreak described in the
@@ -244,19 +257,73 @@ Execute the chaining stage as follows:
    - **Determine Discovery Snapshot (`discovery_commit`)**: Set the chain
      finding's `discovery_commit` from its ELIGIBLE constituents (the ones you
      kept in Step 1):
+     - **MODE-OFF short-circuit (3-state rule):** if `active_snapshot` is ABSENT
+       in state (MODE-OFF — no `--sync` was requested), OMIT `discovery_commit`
+       on the chain finding entirely. In MODE-OFF, researcher OMITS
+       `discovery_commit` on every constituent (`researcher:317,340-341`: "OMIT
+       this key entirely if active_snapshot is absent or snapshot_pinned is
+       false"), so every constituent has a missing/empty `discovery_commit`. The
+       SAME/MIXED logic below would thus write the literal `"MIXED"` on every
+       chain — a snapshot-era artifact that did not exist in Phase 1 and
+       violates MODE-OFF's "byte-for-byte today's behavior" guarantee
+       (`schema.json:4`). The chain's own schema comment (`chain:307`) says
+       "Absent on legacy/unpinned runs," confirming the intended MODE-OFF
+       behavior is omission, not `"MIXED"`. (Functional impact is low —
+       `schema.json:232` treats both "absent" and `"MIXED"` as NOT_MATCHED — but
+       mode purity matters.) Do NOT write `"MIXED"` or any value in MODE-OFF.
      - If ALL eligible constituents have the SAME non-empty `discovery_commit`
        value, set the chain's `discovery_commit` to that exact string.
      - If the constituents' `discovery_commit` values DIFFER from one another,
-       OR any eligible constituent has a missing/empty `discovery_commit`, set
-       the chain's `discovery_commit` to the literal string `"MIXED"`. Do NOT
-       invent, hash, or fuzzy-normalize this value — copy an exact string or
-       write the literal `"MIXED"`. Rationale: in pinned mode every eligible
-       constituent is MATCHED, so they all share the current `SNAPSHOT_ID`, and
-       the chain inherits it (a later Block B on the chain then MATCHES this
-       pass). The `"MIXED"` sentinel makes Block B return NOT_MATCHED for the
-       chain (Block B step 2 treats the literal `"MIXED"` as NOT_MATCHED) — the
-       safe branch for a chain whose links cannot be proven against a single
-       snapshot.
+       OR any eligible constituent has a missing/empty `discovery_commit` (only
+       reachable in PINNED/HALT mode — in MODE-OFF, the short-circuit above
+       already OMITted the field), set the chain's `discovery_commit` to the
+       literal string `"MIXED"`. Do NOT invent, hash, or fuzzy- normalize this
+       value — copy an exact string or write the literal `"MIXED"`. Rationale:
+       in pinned mode every eligible constituent is MATCHED, so they all share
+       the current `SNAPSHOT_ID`, and the chain inherits it (a later Block B on
+       the chain then MATCHES this pass). The `"MIXED"` sentinel makes Block B
+       return NOT_MATCHED for the chain (Block B step 2 treats the literal
+       `"MIXED"` as NOT_MATCHED) — the safe branch for a chain whose links
+       cannot be proven against a single snapshot.
+   - **Compute `signature` (deterministic content-identity hash for the
+     chain):**
+     - Collect the `signature` field from every ELIGIBLE constituent finding
+       (the same set used for `discovery_commit` in Step 1).
+     - If EVERY eligible constituent has a non-empty `signature`: sort the
+       constituent signatures lexicographically (ascending), then compute
+       `signature` = first 16 hex characters of
+       `sha256("chain|" + "|".join(sorted_constituent_signatures))`. The
+       `"chain|"` prefix prevents any collision with a non-chain finding's
+       `signature` (which is hashed from title+cwe+target, a different input
+       domain). Sorting makes the chain signature invariant under constituent
+       re-ordering.
+     - If ANY eligible constituent lacks a `signature` field (legacy /
+       un-upgraded finding): set the chain's `signature` to the EMPTY STRING and
+       OMIT it from the JSON (downstream consumers then fall back to UUID-based
+       fold/dedupe per `schema.json:256`). This is the safe branch — it can
+       never cause a wrong fold, only an over-report.
+     - Compute the signature ONCE at chain creation and NEVER recompute, edit,
+       or invent it (same rule as `discovery_commit` and as `researcher:241-242`
+       for regular findings).
+   - **Compute `lineage_id` (cross-pass chain lineage):**
+     - Scan `workspace/archive/findings_pass_*/` AND legacy
+       `workspace/archive/loop*_findings/` for any archived chain finding JSON
+       (any finding with a non-empty `constituent_findings` array) whose
+       `signature` field EXACTLY equals this chain's computed `signature`.
+     - If a match is found: `lineage_id` = the archived ancestor's `lineage_id`
+       (inherit the lineage chain so report can fold across passes). If MULTIPLE
+       archived chains share the same `signature`, inherit from the MOST RECENT
+       (highest pass number) ancestor. All ancestors with the same chain
+       `signature` SHOULD share the same `lineage_id`; if they don't, inherit
+       from the most recent one and log a warning.
+     - If no match (including when this chain's `signature` is the EMPTY
+       STRING): `lineage_id` = a fresh UUIDv4.
+     - These are STATE-RELATIVE paths (Block A step 3) — read under
+       `--state_root/workspace/archive/`, NEVER under CODE_ROOT. (Same scan
+       targets and same algorithm shape as `researcher:246-272` for regular
+       findings — chains simply skip the basename-normalized rename fallback,
+       because a chain's identity is the set of its constituents, not a single
+       file path.)
    - **Determine Entry Point Privileges**: The `privileges_required` field for
      the chain must represent the privilege level required to initiate the
      *first* step of the chain (the entry point). For example, if the chain
@@ -304,7 +371,9 @@ Execute the chaining stage as follows:
      "production_viability": "VIABLE / SAMPLE_OR_TEST / CONDITIONAL_VIABLE",
      "repro_status": "statically_confirmed / not_attempted",
      "constituent_findings": ["UUID_A", "UUID_B"],
-     "discovery_commit": "The SNAPSHOT_ID shared by all constituents, or the literal \"MIXED\" if they differ / are missing. Absent on legacy/unpinned runs.",
+     "signature": "First 16 hex chars of sha256(\"chain|\" + \"|\".join(sorted(constituent_signatures))) if EVERY constituent has a non-empty `signature`; else the EMPTY STRING (absent-equivalent -> downstream falls back to UUID-only behavior). Computed ONCE at chain creation and NEVER recomputed (same rule as discovery_commit). See the signature/lineage computation steps above.",
+     "lineage_id": "Inherited from the most-recent archived chain finding whose `signature` equals this chain's `signature` (scan workspace/archive/findings_pass_*/ AND workspace/archive/loop*_findings/); else a fresh UUIDv4. See the signature/lineage computation steps above.",
+     "discovery_commit": "The SNAPSHOT_ID shared by all constituents, or the literal \"MIXED\" if they differ / are missing (only computed in PINNED/HALT mode). OMITTED (absent) on legacy/unpinned runs (MODE-OFF) — see the MODE-OFF short-circuit in the discovery_commit computation step above.",
      "history": [
        {
          "stage": "chainer",

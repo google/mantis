@@ -47,14 +47,15 @@ downstream skills.
 - **Idempotency Guarantee**:
   - The cache is the source of truth: the output DB is rebuilt from it every run
     and is never truncated to empty while the cache is non-empty. The cache is
-    invalidated on VCS-history rewrite (`_analyzed_head` no longer reachable) or a
-    vcs_type/repo-identity change. On `none`/`unknown` VCS the stage writes an
+    invalidated on VCS-history rewrite (`_analyzed_head` no longer reachable) or
+    a vcs_type/repo-identity change. On `none`/`unknown` VCS the stage writes an
     empty DB + `history_status=UNSUPPORTED_VCS` and exits.
 
 ## Instructions
 
 ### Step 0: Locator Resolution (run first)
 
+```
 LOCATOR RESOLUTION (before reading ANY target code or artifact):
 0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
    you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
@@ -93,6 +94,7 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    lacks .git/.hg/.repo.
 6. Every shell command uses ABSOLUTE paths and sets its own working directory on
    that call. Do NOT assume the working directory persists between calls.
+```
 
 CRITICAL for history: the pinned snapshot copy STRIPS `.git`/`.hg`/`.repo`, so
 per Block A step 5 you MUST run every VCS log / diff / blame command in the LIVE
@@ -100,8 +102,8 @@ repository root (the working directory Mantis was launched in), NOT under
 CODE_ROOT. Do NOT stop because CODE_ROOT lacks VCS metadata. Write the cache,
 `workspace/historical_learnings.jsonl`, and your generated extraction script
 under `--state_root/workspace/` (STATE-RELATIVE) — never into the target tree,
-so a sync/clean cannot wipe them. Record `active_snapshot.snapshot_id` on entries
-only for provenance.
+so a sync/clean cannot wipe them. Record `active_snapshot.snapshot_id` on
+entries only for provenance.
 
 Your task is to analyze the codebase architecture, determine what constitutes
 security-relevant history, and write a script on-the-fly to extract and document
@@ -123,24 +125,28 @@ Execute the history analysis stage as follows:
 
    - **VCS-support guard (run BEFORE writing/executing the script):** Determine
      `vcs_type` from `.mantis_state.json` `vcs_info` (or detect it in the LIVE
-     root). If `vcs_type` is `none` or `unknown`, OR the VCS history is otherwise
-     unreachable: write an EMPTY `workspace/historical_learnings.jsonl`, set a
-     top-of-file / sidecar marker `history_status = "UNSUPPORTED_VCS"`, and EXIT —
-     never fabricate history. For `multi-vcs` (.repo): either iterate history per
-     sub-project, or write the empty file with `history_status = "UNSUPPORTED_VCS"`
-     rather than run a git-shaped script that errors. For a SHALLOW git clone
+     root). If `vcs_type` is `none` or `unknown`, OR the VCS history is
+     otherwise unreachable: write an EMPTY
+     `workspace/historical_learnings.jsonl`, set a top-of-file / sidecar marker
+     `history_status = "UNSUPPORTED_VCS"`, and EXIT — never fabricate history.
+     For `multi-vcs` (.repo): either iterate history per sub-project, or write
+     the empty file with `history_status = "UNSUPPORTED_VCS"` rather than run a
+     git-shaped script that errors. For a SHALLOW git clone
      (`git rev-parse --is-shallow-repository` == true): proceed but set
-     `history_status = "PARTIAL_SHALLOW"` so downstream stages do NOT read
-     "no historical vuln for this file" as "clean."
+     `history_status = "PARTIAL_SHALLOW"` so downstream stages do NOT read "no
+     historical vuln for this file" as "clean."
 
    - Read the active pass number from the state file
      `workspace/.mantis_state.json` and resolve the current ISO 8601 timestamp.
+
    - Write a script (e.g. Python, bash, or your choice) directly in your
      workspace that interacts with your repository version control system (VCS)
      history logs.
+
    - **Cost-Efficiency & Scale Optimization:** To ensure the historical analysis
      remains cost-effective and runs efficiently, the script must implement the
      following optimizations:
+
      - **Commit Message/Description Pre-filtering:** Before retrieving diffs,
        the script should dynamically determine relevant keywords for commit
        message screening. It can do this by first inspecting the repository's
@@ -156,21 +162,22 @@ Execute the history analysis stage as follows:
        Skip commits with excessively large diffs (e.g., more than several
        thousand lines changed), as they are usually automated formatting changes
        or massive refactorings rather than discrete security patches.
-     - **Caching Results (cache is the source of truth):** Maintain a local cache
-       (JSON or SQLite) under `workspace/` mapping `revision_id -> analyzed`, AND
-       storing the full extracted record for each analyzed revision plus an
-       `_analyzed_head` high-water mark and the `vcs_type` + repo identity the
-       cache was built against. On each run, REBUILD
-       `workspace/historical_learnings.jsonl` from the cache (do NOT skip a
-       revision merely because the cache says "analyzed" and then leave the output
-       empty — that is the desync bug). NEVER truncate a non-empty output DB to
-       empty. Only analyze revisions NEWER than `_analyzed_head`.
+     - **Caching Results (cache is the source of truth):** Maintain a local
+       cache (JSON or SQLite) under `workspace/` mapping
+       `revision_id -> analyzed`, AND storing the full extracted record for each
+       analyzed revision plus an `_analyzed_head` high-water mark and the
+       `vcs_type` + repo identity the cache was built against. On each run,
+       REBUILD `workspace/historical_learnings.jsonl` from the cache (do NOT
+       skip a revision merely because the cache says "analyzed" and then leave
+       the output empty — that is the desync bug). NEVER truncate a non-empty
+       output DB to empty. Only analyze revisions NEWER than `_analyzed_head`.
        **Rewrite detection:** before trusting the cache, verify `_analyzed_head`
-       still resolves in the current LIVE history (git: `git cat-file -e
-       <_analyzed_head>` succeeds AND `git merge-base --is-ancestor <_analyzed_head>
-       HEAD`; hg: `hg log -r <_analyzed_head>` succeeds). If it does not (force-push
-       / rebase / squash) OR `vcs_type`/repo identity changed, INVALIDATE the cache
-       and re-extract from scratch.
+       still resolves in the current LIVE history (git:
+       `git cat-file -e <_analyzed_head>` succeeds AND
+       `git merge-base --is-ancestor <_analyzed_head> HEAD`; hg:
+       `hg log -r <_analyzed_head>` succeeds). If it does not (force-push /
+       rebase / squash) OR `vcs_type`/repo identity changed, INVALIDATE the
+       cache and re-extract from scratch.
      - **Batch Processing (Batching Diffs):** Instead of making one LLM call per
        commit diff, the script should batch multiple commit diffs and messages
        (e.g. 3 to 5 commits) into a single LLM call. Ask the LLM to analyze all
@@ -179,18 +186,22 @@ Execute the history analysis stage as follows:
      - **Model Selection:** Use lightweight and cost-efficient models for the
        initial commit analysis/filtering, and only fall back to heavier model
        tiers if deeper verification of a suspected vulnerability is needed.
+
    - **Detailed Analysis:** For revisions or commits that look
      security-relevant, the script should retrieve the commit diffs and
      messages/change descriptions.
+
    - **LLM/Agent Analysis:** The script should make API calls (e.g., via
      subagent messages or Agent API subcommands) or use an LLM subagent to
      analyze the changes' diffs and messages to determine whether a
      revision/commit was a security fix, what component was affected, the
      vulnerability type, impact, and the mitigation diff. Make sure it uses
      batching and caching to minimize API calls.
+
    - **Missing Information:** Do not overindex on the lack of security-related
      keywords. Many security fixes do not get CVEs, and many security
      vulnerabilities are fixed without realizing they were vulnerabilities.
+
    - **Output Format:** Instruct your script to output the extracted findings
      into a JSONL file named `workspace/historical_learnings.jsonl`, matching
      the following format:

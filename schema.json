@@ -606,7 +606,9 @@
                 "VERIFICATION_FAILED",
                 "ERROR"
               ]
-            }
+            },
+            "patch_base_snapshot": { "type": "string", "description": "The SNAPSHOT_ID the patch was verified against; written by mantis-patch (or omitted in LEGACY mode). Optional; absent -> legacy/patched-without-snapshot. Additive: NOT added to required." },
+            "snapshot": { "type": "string", "description": "The SNAPSHOT_ID at learning creation; written by mantis-critic and mantis-patch (or omitted in MODE-OFF). Optional; absent -> snapshot-agnostic/legacy learning. Additive: NOT added to required." }
           },
           "required": ["title", "code_paths", "status"]
         },
@@ -713,7 +715,7 @@
             "root": { "type": "string", "description": "Absolute path to the pinned snapshot root (SNAPSHOT_ROOT); stages read target code under this root. When snapshot_pinned is false this may point at the live tree." },
             "snapshot_id": { "type": "string", "description": "SNAPSHOT_ID of the pinned snapshot (SNAPSHOT_ID ladder). Passed to stages as --snapshot_id and compared by the Snapshot Match Check." },
             "snapshot_pinned": { "type": "boolean", "description": "True iff an immutable copy was successfully pinned and its sentinel written. False -> HALT mode (only when active_snapshot IS present): authoritative verdicts (VERIFIED_SECURE, failed_to_reproduce, DUPLICATE, FALSE_POSITIVE, NON_VIABLE) are forbidden this pass and every Snapshot Match Check returns NOT_MATCHED. When active_snapshot is ABSENT, snapshot_pinned is irrelevant (MODE-OFF, verdicts allowed)." },
-            "pass": { "type": "integer", "description": "The pass_number this snapshot was pinned for; used by crash-resume (on re-entry, equal pass -> reuse the existing snapshot dir, never re-pin)." },
+            "pass": { "type": "integer", "description": "The pass_number this snapshot was pinned for. Used by crash-resume (on re-entry, equal pass -> reuse the existing snapshot dir, never re-pin) AND by every consumer stage as a current-pass staleness gate: if active_snapshot.pass != state.pass_number, the snapshot is STALE for this pass (STOP or HALT-degrade: no authoritative verdicts, Block B NOT_MATCHED, reproduce not_attempted)." },
             "vcs_type": { "type": "string", "enum": ["git", "hg", "multi-vcs", "none", "unknown"], "description": "The detected VCS type of the target for this pass." }
           }
         },

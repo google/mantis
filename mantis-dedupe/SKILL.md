@@ -96,6 +96,17 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    that call. Do NOT assume the working directory persists between calls.
 ```
 
+> [!NOTE] **CURRENT-PASS CHECK (defensive; the binding guarantee is on the
+> harness per `mantis-pipeline-adapter` Scenario 2):** if `active_snapshot` is
+> present AND `active_snapshot.pass != state.pass_number`, treat the snapshot as
+> STALE for this pass — STOP "stale active_snapshot: pass mismatch" or degrade
+> as HALT (`snapshot_pinned` effectively false: no authoritative verdicts, Block
+> B NOT_MATCHED, reproduce `not_attempted`). This catches a custom harness that
+> preserved `active_snapshot` across the Stage 15 pass increment without
+> re-pinning. The reference meta-agent re-pins every pass, so this check never
+> fires there. Block B itself cannot detect this (it is `snapshot_id`-only, not
+> `pass`-aware).
+
 Notes: `workspace/findings/`, `workspace/archive/`, `workspace/.tx_log.jsonl`,
 `workspace/helpers/` and `.mantis_state.json` are STATE-RELATIVE (under
 --state_root). Any code snippet you inspect for a finding is SNAPSHOT-RELATIVE
@@ -238,7 +249,7 @@ Execute your task as follows:
       primary finding.
    2. **Reusable Deterministic Scripting (versioned):** Write a reusable helper
       script (e.g. `workspace/helpers/merge_findings.py`) whose FIRST LINE is
-      exactly `MANTIS_HELPER_VERSION = 2`. Before reusing an existing helper,
+      exactly `# MANTIS_HELPER_VERSION = 2`. Before reusing an existing helper,
       grep its first lines for `MANTIS_HELPER_VERSION = 2`; if that marker is
       absent or a different integer (a helper left by an older pipeline
       version), REGENERATE the helper. Only reuse it when the marker matches.

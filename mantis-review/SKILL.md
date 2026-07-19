@@ -41,7 +41,7 @@ to verify validity and filter out noise and false positives.
   - Target source code files exist.
 - **Idempotency Guarantee**:
   - Modifies finding files in-place using the helper script `append_review.py`,
-    which MUST carry `MANTIS_HELPER_VERSION = 2` as its first line; regenerate
+    which MUST carry `# MANTIS_HELPER_VERSION = 2` as its first line; regenerate
     the helper if that marker is absent or a different integer (see Instructions
     step 5).
   - Idempotency key is **(pass_number, snapshot)**. Before (re)writing a
@@ -111,13 +111,26 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    lacks .git/.hg/.repo.
 6. Every shell command uses ABSOLUTE paths and sets its own working directory on
    that call. Do NOT assume the working directory persists between calls.
-
-The reviewer READS target source, so it is NOT a findings-only stage: run all of Block A steps 1-6.
-`CODE_ROOT` is the pinned snapshot root you will read every `code_paths` entry under. Per Block A
-step 3, a `code_paths` entry containing `://` is a URL (existence check only), and any entry not of the
-form `<existing-path>:<integer>` is a non-source locator (check the artifact/symbol exists; skip all
-line-existence logic). Never STOP merely because `CODE_ROOT` lacks `.git`/`.hg` (Block A step 5).
 ```
+
+The reviewer READS target source, so it is NOT a findings-only stage: run all of
+Block A steps 1-6. `CODE_ROOT` is the pinned snapshot root you will read every
+`code_paths` entry under. Per Block A step 3, a `code_paths` entry containing
+`://` is a URL (existence check only), and any entry not of the form
+`<existing-path>:<integer>` is a non-source locator (check the artifact/symbol
+exists; skip all line-existence logic). Never STOP merely because `CODE_ROOT`
+lacks `.git`/`.hg` (Block A step 5).
+
+> [!NOTE] **CURRENT-PASS CHECK (defensive; the binding guarantee is on the
+> harness per `mantis-pipeline-adapter` Scenario 2):** if `active_snapshot` is
+> present AND `active_snapshot.pass != state.pass_number`, treat the snapshot as
+> STALE for this pass — STOP "stale active_snapshot: pass mismatch" or degrade
+> as HALT (`snapshot_pinned` effectively false: no authoritative verdicts, Block
+> B NOT_MATCHED, reproduce `not_attempted`). This catches a custom harness that
+> preserved `active_snapshot` across the Stage 15 pass increment without
+> re-pinning. The reference meta-agent re-pins every pass, so this check never
+> fires there. Block B itself cannot detect this (it is `snapshot_id`-only, not
+> `pass`-aware).
 
 0b. **Determine SNAPSHOT MODE (once, before touching findings):** - SNAPSHOT
 MODE is **OFF** iff `--snapshot_id` was NOT passed on this invocation AND
@@ -131,7 +144,7 @@ Snapshot Provenance Gate (0c) to every finding.
 findings, apply the match check to EACH finding F via **Block B — Snapshot Match
 Check**, applied to F:
 
-````
+```
 SNAPSHOT MATCH CHECK for finding F (decides MATCHED vs NOT_MATCHED):
 1. If snapshot_pinned is false -> NOT_MATCHED. Stop.
 2. Read F.discovery_commit:
@@ -143,27 +156,37 @@ field and proceed" backward-compat rule does NOT apply to discovery_commit:
 absent = NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's
 SNAPSHOT_ID already embeds the working-tree content hash, so within-pass findings
 MATCH and cross-pass bare-commit findings do not.)
+```
 
-Then, using the idempotency rule (Input/Output Contract → Idempotency Guarantee) to avoid double-writes:
-- **MATCHED** → F is grounded in the current pinned snapshot. Proceed to steps 2-5 (the full 13-rule
-  review) for F.
-- **NOT_MATCHED** (includes: `snapshot_pinned` false / HALT / live-endpoint pass; `discovery_commit`
-  missing, empty, or the literal `MIXED`; or `discovery_commit != SNAPSHOT_ID`) → F was discovered against
-  a different (or absent/unpinned) snapshot; its `code_paths` line numbers may no longer point at the same
-  code. **DO NOT run the 13 rules on F. DO NOT mark it FALSE_POSITIVE.** Finalize F as a drift
-  `NEEDS_RESEARCH` via the helper (step 5), writing EXACTLY:
+Then, using the idempotency rule (Input/Output Contract → Idempotency Guarantee)
+to avoid double-writes:
+
+- **MATCHED** → F is grounded in the current pinned snapshot. Proceed to steps
+  2-5 (the full 13-rule review) for F.
+- **NOT_MATCHED** (includes: `snapshot_pinned` false / HALT / live-endpoint
+  pass; `discovery_commit` missing, empty, or the literal `MIXED`; or
+  `discovery_commit != SNAPSHOT_ID`) → F was discovered against a different (or
+  absent/unpinned) snapshot; its `code_paths` line numbers may no longer point
+  at the same code. **DO NOT run the 13 rules on F. DO NOT mark it
+  FALSE_POSITIVE.** Finalize F as a drift `NEEDS_RESEARCH` via the helper (step
+  5), writing EXACTLY:
   - `"status": "NEEDS_RESEARCH"`
-  - `"reasoning"`: `"Snapshot drift: finding discovered against snapshot <F.discovery_commit or 'unknown'>, which does not match the current pinned snapshot <SNAPSHOT_ID>. Not re-validated this pass; routed to re-research."`
-  - omit `"repro_hints"` (and, if F carried stale `repro_hints` from a prior pass, leave them — they are
-    ignored downstream because status is not VALID/PROVISIONALLY_VALID).
-  - `"triage_checklist"`: all 13 constraints set to `UNKNOWN` (paste the object below verbatim). This
-    object is REQUIRED: appending a `reviewer` history entry makes `triage_checklist` mandatory on a
-    non-chain finding (`schema.json` lines 333-366), and for a `NEEDS_RESEARCH` finding every entry MUST
-    avoid `FAIL`/`passes:false` (`schema.json` lines 386-437). Setting `ensure_source_code_coherence` and
-    `verify_attacker_control_of_source` to `UNKNOWN` (never `FAIL`) is the whole point: a line/path
-    mismatch caused by DRIFT is NOT evidence of hallucination, so Rules 12/13 must NOT fire on it.
-  - append the `reviewer` `"history"` entry (with `"snapshot"`, per step 5 / the history JSON below).
-  Then STOP processing F — skip steps 2-5 for it.
+  - `"reasoning"`:
+    `"Snapshot drift: finding discovered against snapshot <F.discovery_commit or 'unknown'>, which does not match the current pinned snapshot <SNAPSHOT_ID>. Not re-validated this pass; routed to re-research."`
+  - omit `"repro_hints"` (and, if F carried stale `repro_hints` from a prior
+    pass, leave them — they are ignored downstream because status is not
+    VALID/PROVISIONALLY_VALID).
+  - `"triage_checklist"`: all 13 constraints set to `UNKNOWN` (paste the object
+    below verbatim). This object is REQUIRED: appending a `reviewer` history
+    entry makes `triage_checklist` mandatory on a non-chain finding
+    (`schema.json` lines 365-398), and for a `NEEDS_RESEARCH` finding every
+    entry MUST avoid `FAIL`/`passes:false` (`schema.json` lines 418-470).
+    Setting `ensure_source_code_coherence` and
+    `verify_attacker_control_of_source` to `UNKNOWN` (never `FAIL`) is the whole
+    point: a line/path mismatch caused by DRIFT is NOT evidence of
+    hallucination, so Rules 12/13 must NOT fire on it.
+  - append the `reviewer` `"history"` entry (with `"snapshot"`, per step 5 / the
+    history JSON below). Then STOP processing F — skip steps 2-5 for it.
 
 Drift `triage_checklist` (paste verbatim; all 13 keys, all `UNKNOWN`):
 
@@ -184,6 +207,7 @@ Drift `triage_checklist` (paste verbatim; all 13 keys, all `UNKNOWN`):
   "verify_attacker_control_of_source": { "outcome": "UNKNOWN", "reason": "snapshot drift: trust-boundary path not re-traced against the current pinned snapshot" }
 }
 ```
+
 ````
 
 Findings finalized as drift `NEEDS_RESEARCH` in Step 0c are DONE — do not
@@ -300,7 +324,7 @@ findings (SNAPSHOT MODE OFF) flow into steps 2-5 below.
        `triage_checklist` entry may be `"FAIL"` (or `"passes": false`). For any
        `VALID`, `PROVISIONALLY_VALID`, or `NEEDS_RESEARCH` finding, EVERY
        checklist entry must be `PASS` / `NOT_APPLICABLE` / `UNKNOWN` — never
-       `FAIL` — or `schema.json` (lines 386-437) will reject the finding. If a
+       `FAIL` — or `schema.json` (lines 418-470) will reject the finding. If a
        rule looks failed but you are NOT setting status to `FALSE_POSITIVE`
        (e.g. Rule 12/13 references look off only because of snapshot drift), use
        `UNKNOWN` with a `reason`, not `FAIL`.
@@ -313,9 +337,9 @@ findings (SNAPSHOT MODE OFF) flow into steps 2-5 below.
          rule, meaning the bug remains potentially valid).
        - `"FAIL"`: if the finding violates the rule. Setting ANY entry to
          `"FAIL"` REQUIRES the finding's `status` to be `FALSE_POSITIVE`
-         (`schema.json` lines 386-437 reject `FAIL` on `VALID`/
+         (`schema.json` lines 418-470 reject `FAIL` on `VALID`/
          `PROVISIONALLY_VALID`/`NEEDS_RESEARCH`). A `FAIL` entry also REQUIRES a
-         `reason` (`schema.json` lines 718-725).
+         `reason` (`schema.json` lines 788-797).
        - `"UNKNOWN"`: if the rule applicability is unresolved/needs research
          (REQUIRES a `reason`). Use this — not `"FAIL"` — whenever the finding
          is not being marked `FALSE_POSITIVE`, including all rules on a drift
@@ -324,7 +348,7 @@ findings (SNAPSHOT MODE OFF) flow into steps 2-5 below.
          of bug (REQUIRES a `reason`).
      - Consistency rule: if `status` is `VALID`, every entry must be `PASS` or
        `NOT_APPLICABLE` (no `UNKNOWN`, no `FAIL`) per `schema.json` lines
-       439-475.
+       471-507.
 
 4. **Construct Reproduction Script Hints:** For every finding marked as
    **VALID** or **PROVISIONALLY_VALID**, provide high-signal `"repro_hints"`
@@ -413,3 +437,4 @@ findings (SNAPSHOT MODE OFF) flow into steps 2-5 below.
    so this extra field validates unchanged.
 
 When complete, notify the user.
+````

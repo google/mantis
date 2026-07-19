@@ -33,42 +33,43 @@ mistakes.
     representation. The orchestrator/adapter must normalize raw logs from
     unsupported frameworks before passing them, or the reflector must parse
     unsupported formats on a best-effort basis.
-  - **Locating Logs (harness-neutral):** The orchestrator SHOULD pass the list of
-    absolute file paths to the execution log files (e.g. `transcript.jsonl`) for
-    the subagents executed during this round; when provided, use these paths
+  - **Locating Logs (harness-neutral):** The orchestrator SHOULD pass the list
+    of absolute file paths to the execution log files (e.g. `transcript.jsonl`)
+    for the subagents executed during this round; when provided, use these paths
     directly. Do NOT hardcode any single framework's log layout. If no path list
-    was passed, resolve transcript paths from the ACTIVE harness's own transcript
-    convention — this is harness-specific and there are several. For example,
-    Antigravity stores them under
+    was passed, resolve transcript paths from the ACTIVE harness's own
+    transcript convention — this is harness-specific and there are several. For
+    example, Antigravity stores them under
     `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`;
     other harnesses (e.g. Gemini CLI, the Google ADK, Claude Code) use different
-    layouts. Antigravity is ONE example among several, not the default. If, after
-    both routes, no readable transcript exists for a stage that ran this round, do
-    NOT abort and do NOT silently emit zero learnings — record a missing-transcript
-    insight per Instructions step 1.
+    layouts. Antigravity is ONE example among several, not the default. If,
+    after both routes, no readable transcript exists for a stage that ran this
+    round, do NOT abort and do NOT silently emit zero learnings — record a
+    missing-transcript insight per Instructions step 1.
 - **Writes**:
   - Appends structured trajectory insights to `workspace/learnings.jsonl`.
 - **Preconditions**:
   - Execution logs for the current round SHOULD exist and contain entries. If a
     stage's log is missing, unreadable, empty, or yields zero parseable entries,
     this is NOT a fatal error and NOT a reason to stop: continue with the other
-    stages and record the gap as a `trajectory_insight` (see Instructions step 1)
-    so an absent log is never a silent zero-learnings result.
+    stages and record the gap as a `trajectory_insight` (see Instructions step
+    1\) so an absent log is never a silent zero-learnings result.
 - **Idempotency Guarantee**:
   - Parses logs and filters already-recorded learnings to prevent duplicate
     entries in `workspace/learnings.jsonl`. It should check existing lines in
     `workspace/learnings.jsonl` to ensure it doesn't duplicate the same insight
     if retried.
-  - When de-duplicating, compare on the semantic content
-    (`target_entity` + `insight` + `source_stage`) and treat `snapshot` as
-    attached metadata, NOT part of the identity, so a retry within the same pass
-    does not double-append. Missing-transcript insights (step 1) are
-    de-duplicated the same way.
+  - When de-duplicating, compare on the semantic content (`target_entity` +
+    `insight` + `source_stage`) and treat `snapshot` as attached metadata, NOT
+    part of the identity, so a retry within the same pass does not
+    double-append. Missing-transcript insights (step 1) are de-duplicated the
+    same way.
 
 ## Instructions
 
 ### 0. Locator Resolution (Block A — FINDINGS-ONLY role)
 
+```
 LOCATOR RESOLUTION (before reading ANY target code or artifact):
 0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
    you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
@@ -107,14 +108,17 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    lacks .git/.hg/.repo.
 6. Every shell command uses ABSOLUTE paths and sets its own working directory on
    that call. Do NOT assume the working directory persists between calls.
+```
 
-Reflector is a FINDINGS-ONLY stage (same class as report and calibrate). Per Block A step 0 it SKIPS
-steps 2-6 — it resolves NO CODE_ROOT, checks NO `.mantis_snapshot_id` sentinel, and applies NO
-snapshot-relative path logic — but it STILL reads `active_snapshot` from state for provenance and NEVER
-stops because a code root is unset or unpinned. Reflector needs only `--state_root` to locate
-`workspace/.mantis_state.json`, `workspace/learnings.jsonl`, and the transcript log files; all of these
-are STATE-RELATIVE (Block A step 3) and MUST NEVER be prefixed with CODE_ROOT. Reflector MUST NOT run
-any live VCS command (`git`/`hg`/`repo`); its only snapshot signal is `active_snapshot.snapshot_id`
+Reflector is a FINDINGS-ONLY stage (same class as report and calibrate). Per
+Block A step 0 it SKIPS steps 2-6 — it resolves NO CODE_ROOT, checks NO
+`.mantis_snapshot_id` sentinel, and applies NO snapshot-relative path logic —
+but it STILL reads `active_snapshot` from state for provenance and NEVER stops
+because a code root is unset or unpinned. Reflector needs only `--state_root` to
+locate `workspace/.mantis_state.json`, `workspace/learnings.jsonl`, and the
+transcript log files; all of these are STATE-RELATIVE (Block A step 3) and MUST
+NEVER be prefixed with CODE_ROOT. Reflector MUST NOT run any live VCS command
+(`git`/`hg`/`repo`); its only snapshot signal is `active_snapshot.snapshot_id`
 read from state.
 
 Analyze the execution trajectories of all successfully executed subagents in the
@@ -128,24 +132,26 @@ Execute the reflection stage as follows:
 
    - Do not attempt to read the entire, raw `transcript.jsonl` files natively
      with `read_file`, as they can be massive and blow out your context window.
+
    - Use the absolute log file paths passed to you by the orchestrator to access
      the log files.
+
    - Instead of reading the full files, use your bash/command execution tools to
      parse and filter the logs. For example, write a short Python script or use
      `jq`/`grep` to extract key events (which should conform to the
      `execution_log_entry` schema; if raw logs from different frameworks are
      provided, parse them on a best-effort basis): tool error messages, final
      agent summaries, instances where an agent "gave up", or messages indicating
-      a trust boundary assumption was incorrect.
+     a trust boundary assumption was incorrect.
 
    - **Missing / empty logs (never silent):** For each stage that ran this round
      whose transcript is missing, unreadable, empty, or yields zero parseable
      entries, append exactly one `trajectory_insight` with `action: "add"`,
-     `source_stage: "mantis-reflect"`, `target_entity: "<stage-name> transcript"`,
-     and an `insight` naming the stage and the reason (e.g. "no transcript file at
-     <path>", "empty log", "0 parseable entries"). Do this BEFORE synthesizing
-     insights, so even a fully empty round produces auditable output instead of
-     nothing.
+     `source_stage: "mantis-reflect"`,
+     `target_entity: "<stage-name> transcript"`, and an `insight` naming the
+     stage and the reason (e.g. "no transcript file at <path>", "empty log", "0
+     parseable entries"). Do this BEFORE synthesizing insights, so even a fully
+     empty round produces auditable output instead of nothing.
 
 2. **Synthesize Insights:** Review the extracted events. Look for:
 
@@ -170,8 +176,8 @@ Execute the reflection stage as follows:
    (STATE-RELATIVE, under `--state_root`). Set the OPTIONAL `snapshot` field on
    EVERY emitted `trajectory_insight` (including the missing-transcript insights
    from step 1) to that value, so each learning is attributable to the pass's
-   pinned snapshot. Do NOT run `git`/`hg`/`repo` or any live VCS command to derive
-   it. Backward-compat: if `active_snapshot` is absent, `snapshot` is
+   pinned snapshot. Do NOT run `git`/`hg`/`repo` or any live VCS command to
+   derive it. Backward-compat: if `active_snapshot` is absent, `snapshot` is
    empty/null, or state is unreadable, OMIT the `snapshot` field entirely and
    proceed (degraded) — never stop and never fabricate an id. `snapshot` is an
    OPTIONAL field: the `trajectory_insight` sub-schema in `schema.json` does not

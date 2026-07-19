@@ -105,6 +105,17 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    that call. Do NOT assume the working directory persists between calls.
 ```
 
+> [!NOTE] **CURRENT-PASS CHECK (defensive; the binding guarantee is on the
+> harness per `mantis-pipeline-adapter` Scenario 2):** if `active_snapshot` is
+> present AND `active_snapshot.pass != state.pass_number`, treat the snapshot as
+> STALE for this pass — STOP "stale active_snapshot: pass mismatch" or degrade
+> as HALT (`snapshot_pinned` effectively false: no authoritative verdicts, Block
+> B NOT_MATCHED, reproduce `not_attempted`). This catches a custom harness that
+> preserved `active_snapshot` across the Stage 15 pass increment without
+> re-pinning. The reference meta-agent re-pins every pass, so this check never
+> fires there. Block B itself cannot detect this (it is `snapshot_id`-only, not
+> `pass`-aware).
+
 Skill-specific notes for the strategist:
 
 - Plan is a CODE-READING stage in Mode A (it crawls production directories); the
@@ -241,19 +252,19 @@ Execute the planning stage as follows:
           rule above, or `patch_status` in
           {`VERIFICATION_FAILED`,`ERROR`,`VERIFICATION_INCOMPLETE`}), run:
 
+          ```
           SNAPSHOT MATCH CHECK for finding F (decides MATCHED vs NOT_MATCHED):
-
           1. If snapshot_pinned is false -> NOT_MATCHED. Stop.
           2. Read F.discovery_commit:
              - missing OR empty OR the literal "MIXED" -> NOT_MATCHED.
-             - not exactly equal to SNAPSHOT_ID -> NOT_MATCHED.
-             - exactly equal to SNAPSHOT_ID -> MATCHED. There is no other route
-               to MATCHED; never fuzzy-compare. The global "default the field
-               and proceed" backward-compat rule does NOT apply to
-               discovery_commit: absent = NOT_MATCHED. (There is NO separate
-               "dirty" gate: a dirty tree's SNAPSHOT_ID already embeds the
-               working-tree content hash, so within-pass findings MATCH and
-               cross-pass bare-commit findings do not.)
+             - not exactly equal to SNAPSHOT_ID          -> NOT_MATCHED.
+             - exactly equal to SNAPSHOT_ID              -> MATCHED.
+          There is no other route to MATCHED; never fuzzy-compare. The global "default the
+          field and proceed" backward-compat rule does NOT apply to discovery_commit:
+          absent = NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's
+          SNAPSHOT_ID already embeds the working-tree content hash, so within-pass findings
+          MATCH and cross-pass bare-commit findings do not.)
+          ```
 
           Then decide mechanically:
 
@@ -264,6 +275,25 @@ Execute the planning stage as follows:
             `workspace/findings/<uuid>.json` preserving the UUID **and its
             ORIGINAL `discovery_commit`** (do not re-stamp it — drift must stay
             detectable).
+
+          - **MODE-OFF bypass (3-state rule):** if `active_snapshot` is ABSENT
+            in state (MODE-OFF — no `--sync` was requested), Block B always
+            returns NOT_MATCHED (`snapshot_pinned is false -> NOT_MATCHED`), so
+            the COPY-VERBATIM gate above never fires and every retry- eligible
+            finding is RE-DISCOVERed — a regression from today's behavior
+            (today, pass ≥2 carries forward unchanged findings when the file
+            still exists). In MODE-OFF, COPY-VERBATIM when the finding's primary
+            file (first `code_paths`, line stripped) EXISTS under CODE_ROOT
+            (drop the `Block B MATCHED` and `file NOT in changed_files`
+            conjuncts — there is no `changed_files` diff in MODE-OFF anyway).
+            This mirrors `mantis-patch`'s LEGACY-mode carve- out
+            (`patch:133-138`, `patch:172-174`). Do NOT gate the bypass on
+            `snapshot_pinned==false` — that would also catch HALT mode, where
+            the STALE banner + AS_OF:UNKNOWN tags legitimately mark the finding
+            as needing re-verification. Gate ONLY on `active_snapshot` absent.
+            (Do NOT change Block B itself — it is character-identical across
+            skills per `README_AGENTS.md:711-718` block-fidelity warning; the
+            fix goes in plan's CONSUMERS of Block B, not Block B.)
 
           - **RE-DISCOVER** in every other case (Block B NOT_MATCHED, or file in
             `changed_files`, or file missing, or
@@ -330,7 +360,16 @@ Execute the planning stage as follows:
             or that has reached the 2-attempt cap for the CURRENT snapshot. But
             if such a finding's file IS in `changed_files` or Block B is
             NOT_MATCHED, treat it as a possible regression: RE-DISCOVER it (do
-            not trust the old terminal verdict against changed code).
+            not trust the old terminal verdict against changed code). **MODE-OFF
+            carve-out:** if `active_snapshot` is ABSENT (MODE-OFF), drop the
+            `or Block B is NOT_MATCHED` disjunct above — in MODE-OFF, Block B is
+            NOT_MATCHED for every finding (artifact of no snapshot, not a signal
+            of drift), so leaving the disjunct in would re-open every terminal
+            verdict (FALSE_POSITIVE/VERIFIED_SECURE/reproduced) every pass. In
+            MODE-OFF, rely ONLY on `file IS in changed_files` (which is
+            vacuously false in MODE-OFF — there is no `changed_files` diff), so
+            terminal findings are carried forward unchanged. This is today's
+            behavior.
 
      - **Changed / new attack-surface coverage (MANDATORY):** Add an
        investigation titled `Exhaustive Review: <path>` for EVERY path in

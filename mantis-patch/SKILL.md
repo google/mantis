@@ -125,6 +125,17 @@ Execute the patching and verification stage as follows:
       that call. Do NOT assume the working directory persists between calls.
    ```
 
+   > [!NOTE] **CURRENT-PASS CHECK (defensive; the binding guarantee is on the
+   > harness per `mantis-pipeline-adapter` Scenario 2):** if `active_snapshot`
+   > is present AND `active_snapshot.pass != state.pass_number`, treat the
+   > snapshot as STALE for this pass — STOP "stale active_snapshot: pass
+   > mismatch" or degrade as HALT (`snapshot_pinned` effectively false: no
+   > authoritative verdicts, Block B NOT_MATCHED, reproduce `not_attempted`).
+   > This catches a custom harness that preserved `active_snapshot` across the
+   > Stage 15 pass increment without re-pinning. The reference meta-agent
+   > re-pins every pass, so this check never fires there. Block B itself cannot
+   > detect this (it is `snapshot_id`-only, not `pass`-aware).
+
    For this stage: mantis-patch READS target code (it is NOT a findings-only
    stage), so it runs Block A steps 1–6 in full. CODE_ROOT is the immutable
    pinned snapshot; you MUST NOT write, compile, or run reproducers under it
@@ -298,14 +309,22 @@ Execute the patching and verification stage as follows:
        under CODE_ROOT are FORBIDDEN** (Block A step 4: never write under a
        pinned snapshot).
      - Else if the finding is a RETRY (it already carries a prior `"patch"`
-       history entry or a `patch_base_snapshot`) OR its Snapshot Match Check
-       result is NOT_MATCHED → **Option A is MANDATORY** (do not risk editing a
-       live tree that no longer matches the finding).
-     - Otherwise (LEGACY mode, MATCHED, first attempt) you may choose **Option
-       A** (recommended), **Option B: File-Level Backups**, or design/implement
-       **Option C: Alternative Isolation** (e.g., namespace isolation, container
-       volumes, or local sandboxes) as long as it fully satisfies the invariants
-       below.
+       history entry or a `patch_base_snapshot`) OR (PINNED mode AND its
+       Snapshot Match Check result is NOT_MATCHED) → **Option A is MANDATORY**
+       (do not risk editing a live tree that no longer matches the finding). The
+       `PINNED mode AND` qualifier on the NOT_MATCHED clause is essential: in
+       LEGACY mode (snapshot_pinned=false), Block B returns NOT_MATCHED for
+       every finding as an artifact of no snapshot, not as a signal of drift —
+       so NOT_MATCHED must only fire when it means "the snapshot changed"
+       (PINNED), not when it means "no snapshot exists" (LEGACY).
+     - Otherwise (snapshot_pinned is false AND first attempt — no prior
+       `"patch"` history entry and no `patch_base_snapshot`) you may choose
+       **Option A** (recommended), **Option B: File-Level Backups**, or
+       design/implement **Option C: Alternative Isolation** (e.g., namespace
+       isolation, container volumes, or local sandboxes) as long as it fully
+       satisfies the invariants below. This covers both LEGACY and HALT mode
+       first-attempt findings (neither has a prior patch to protect, and neither
+       is in the PINNED read-only snapshot regime).
 
      Whichever method you choose, you must guarantee these invariants:
 
@@ -443,16 +462,28 @@ Execute the patching and verification stage as follows:
        on disk under `<state_root>/.mantis_snapshots/` (retention kept them; if
        the base snapshot was GC'd this fails → fall back); (b) the finding's
        `signature` matches an archived finding with a prior `patch_diff` (same
-       bug, same signature); (c) Block B is NOT_MATCHED (the snapshot changed);
-       and (d) the finding's primary file is in `changed_files`. If `signature`
-       is absent (legacy finding), condition (b) cannot be satisfied — fall back
-       to fresh patch generation. Do NOT gate on `--snapshot_keep`: that flag is
-       set on the orchestrator and is NOT passed to or readable by the patch
-       stage; the on-disk presence check (a) is the correct observable
-       substitute and works under any retention setting (the default keep-2
-       already retains the immediately-prior pass). `changed_files` and
-       `changed_files_status` are read from `workspace/.mantis_state.json` (the
-       same state object read for `active_snapshot`).
+       bug, same signature) — this is the ARCHIVED finding referenced by the
+       remaining gates; (c) the ARCHIVED finding's `patch_base_snapshot` is
+       present and DIFFERENT from the current `SNAPSHOT_ID` (the snapshot the
+       prior patch was verified against has changed; this is the correct
+       "snapshot changed" test — do NOT test Block B on the CURRENT finding,
+       whose `discovery_commit` is always `== SNAPSHOT_ID` in PINNED mode
+       because researcher stamps it, dedupe backfills it, and plan only
+       copy-verbatim's MATCHED findings preserving the original
+       `discovery_commit`); if the archived finding's `patch_base_snapshot` is
+       ABSENT or EMPTY (legacy prior pass, or a pre-Phase-2 patcher that did not
+       write it — detected by the helper-version marker at step 6), the
+       snapshot-changed test is UNKN and you MUST fall back to fresh patch
+       generation (do NOT rebase onto a possibly-unchanged base); and (d) the
+       finding's primary file is in `changed_files`. If `signature` is absent
+       (legacy finding), condition (b) cannot be satisfied — fall back to fresh
+       patch generation. Do NOT gate on `--snapshot_keep`: that flag is set on
+       the orchestrator and is NOT passed to or readable by the patch stage; the
+       on-disk presence check (a) is the correct observable substitute and works
+       under any retention setting (the default keep-2 already retains the
+       immediately-prior pass). `changed_files` and `changed_files_status` are
+       read from `workspace/.mantis_state.json` (the same state object read for
+       `active_snapshot`).
 
    - **When rebasing SUCCEEDS** (clean 3-way merge): use the rebased patch as
      the starting point for verification. Still run Block G (unpatched baseline
@@ -512,14 +543,21 @@ Execute the patching and verification stage as follows:
      ```
      REACHED-SINK EVIDENCE GATE (mechanical):
      Each reproducer produces REACHED-SINK EVIDENCE via ONE channel, recorded in repro_hints:
-       (a) script/source harness -> write the exact bytes MANTIS_REACHED_ENTRYPOINT to a
-           sidecar file $SENTINEL_FILE and flush+fsync (or unbuffered write) BEFORE
-           invoking the sink. (A file survives a crash that truncates buffered stdout.)
-       (b) binary / firmware / raw-payload -> a wrapper YOU author writes the sidecar
-           marker before invoking the target, OR the captured crash backtrace/ASan frame
-           explicitly names the target sink function.
-     EVIDENCE PRESENT = sidecar file contains MANTIS_REACHED_ENTRYPOINT, OR (channel b)
-       the backtrace/ASan output names the sink.
+        (a) script/source harness -> write the exact bytes MANTIS_REACHED_ENTRYPOINT to a
+            sidecar file $SENTINEL_FILE and flush+fsync (or unbuffered write) BEFORE
+            invoking the sink. (A file survives a crash that truncates buffered stdout.)
+        (b) binary / firmware / raw-payload -> reached-sink evidence is a captured
+            crash backtrace or ASan frame that explicitly names the target sink
+            function (target-produced tracing). A marker written by a wrapper you
+            author BEFORE invoking the target is SETUP EVIDENCE ONLY: it proves
+            "launch attempted," not "sink reached," and does NOT qualify as
+            reached-sink evidence. If no in-path marker (channel a) and no
+            target-produced backtrace/ASan (channel b) is achievable, the sink is
+            unreached.
+      EVIDENCE PRESENT (reached-sink) = (channel a) sidecar file contains
+        MANTIS_REACHED_ENTRYPOINT written in-path, OR (channel b) target-produced
+        backtrace/ASan output names the sink. A wrapper pre-launch marker alone is
+        NOT evidence present.
      EVIDENCE ABSENT includes: any compiler/build nonzero exit; exit 127 (command not
        found); exit 2 with a "No such file" message.
      DECISION GATE (gate the DECISION, not specific verdict strings):

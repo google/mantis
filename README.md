@@ -37,7 +37,7 @@ useful, it is even more important to use this in a suitably isolated environment
 to prevent impacting production systems. See the notes on unattended cloud
 deployment later in this guide.
 
----
+______________________________________________________________________
 
 ## Architecture and Sequential Flow
 
@@ -45,7 +45,7 @@ For a detailed breakdown of the pipeline stages, sequential flow, and
 inter-stage contracts, please refer to the
 [Agent Reference Guide](README_AGENTS.md).
 
----
+______________________________________________________________________
 
 ## Prerequisites and Setup
 
@@ -88,7 +88,7 @@ To install the skills via CLI:
 npx skills add google/mantis
 ```
 
----
+______________________________________________________________________
 
 ## Beginner's Guide & Best Practices
 
@@ -148,7 +148,7 @@ AI-based scanning will produce
 - **Iterate Small**: Start with narrow-scope scans to tune the pipeline rather
   than running a repository-wide sweep on Day 1.
 
----
+______________________________________________________________________
 
 ## Running the Pipeline (Manual Mode)
 
@@ -208,16 +208,21 @@ CLI terminal.
    # 15. (Manual Step) Review the report. Optionally, apply & commit approved patches to your codebase. To continue analysis, archive workspace/findings/ so it is empty. To pick up upstream code changes for the next pass, OPTIONALLY sync the target NON-DESTRUCTIVELY at this boundary only (e.g. `git fetch && git merge --ff-only`; SKIP the sync if the tree is dirty, detached, or has no upstream; NEVER `git reset --hard` / `git checkout -- .` / `git clean`). If you synced, force-refresh the Knowledge Base by re-running /mantis-architecture (Step 2) so it reflects the new code, then loop back to Step 2. See README_AGENTS.md#the-snapshot-model.
    ```
 
-> [!NOTE] **Interactive / manual mode runs DEGRADED by default.** Run this way,
-> the stages receive no `--snapshot_root` / `--snapshot_id` / `--state_root`
-> arguments and no orchestrator pins a snapshot, so they operate **unpinned** on
-> the current directory: reviews are non-authoritative and mid-run edits are not
-> frozen, but the pipeline does **not** deadlock waiting for a snapshot. Enable
-> the opt-in [Snapshot Model](README_AGENTS.md#the-snapshot-model) — via
+> [!NOTE] **Interactive / manual mode runs in MODE-OFF by default**
+> (byte-for-byte today's behavior: a point-in-time review of the current
+> directory with all verdicts permitted). Run this way, the stages receive no
+> `--snapshot_root` / `--snapshot_id` / `--state_root` arguments and no
+> orchestrator pins a snapshot, so mid-run edits are not frozen, but the
+> pipeline does **not** deadlock waiting for a snapshot. Enable the opt-in
+> [Snapshot Model](README_AGENTS.md#the-snapshot-model) — via
 > `/mantis-meta-agent` with `--sync`, or a harness that implements the pass
-> lifecycle — for pinned, authoritative passes on a living codebase.
+> lifecycle — for pinned, authoritative passes on a living codebase. When using
+> `--sync`, the default `state_root` is the current working directory (typically
+> the target repo root); if this is inside the target, pass
+> `--state_root=<path outside the target>` to avoid the colocated-state hazard
+> (see `mantis-pipeline-adapter` Scenario 1).
 
----
+______________________________________________________________________
 
 ## Building Deterministic Pipelines & Non-Determinism
 
@@ -225,7 +230,7 @@ For information on how to build production-grade deterministic pipelines
 wrapping these skills, and how to manage LLM non-determinism, see the
 [Agent Reference Guide](README_AGENTS.md).
 
----
+______________________________________________________________________
 
 ## Advanced / Unattended Cloud Deployment (GCE)
 
@@ -234,14 +239,14 @@ hardened environment to mitigate security risks (such as prompt injection). For
 the step-by-step hardened Google Compute Engine (GCE) deployment guide, see the
 [Agent Reference Guide](README_AGENTS.md#advanced--unattended-cloud-deployment-gce).
 
----
+______________________________________________________________________
 
 ## Meta-Agent Orchestration & Evaluation
 
 For details on autonomous Meta-Agent execution and how to evaluate/optimize
 skill performance, see the [Agent Reference Guide](README_AGENTS.md).
 
----
+______________________________________________________________________
 
 ## Roadmap / Future Work
 
@@ -275,7 +280,7 @@ skill performance, see the [Agent Reference Guide](README_AGENTS.md).
   it must have had N hours of adversarial vulnerability research or "red
   teaming" by a pipeline like Mantis.
 
----
+______________________________________________________________________
 
 ## Troubleshooting Guide
 

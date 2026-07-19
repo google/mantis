@@ -19,7 +19,7 @@ capabilities beyond what is already inherent to their starting position (or
 already possessed via legitimate means), the finding must be capped or
 downgraded.
 
----
+______________________________________________________________________
 
 ### Category A: Force-Downgrade to LOW (Cap at 2.0 / LOW Priority)
 
@@ -32,8 +32,8 @@ downgraded.
     **Snapshot carve-out (STALE_EVIDENCE):** do NOT fire this rule when the
     finding is NOT_MATCHED to the active snapshot, or its `code_paths` file is
     absent under the pinned CODE_ROOT (see the STALE-EVIDENCE guard in
-    `mantis-calibrate/SKILL.md`). A failed/absent reproduction against drifted or
-    missing code is uninformative; keep the higher score and mark
+    `mantis-calibrate/SKILL.md`). A failed/absent reproduction against drifted
+    or missing code is uninformative; keep the higher score and mark
     `calibration_checklist.repro_failure.outcome = "UNKNOWN"` with a
     `STALE_EVIDENCE:` reason instead of force-LOW.
 
@@ -58,12 +58,13 @@ downgraded.
 06. **`vague_code_paths` (Vague Code Paths / Fragile Assumptions)** Relying on
     unverified assumptions about caller behavior or adjacent system components.
 
-    **Snapshot carve-out (STALE_EVIDENCE):** do NOT fire this rule when the finding
-    is NOT_MATCHED to the active snapshot, or its `code_paths` file is absent under
-    the pinned CODE_ROOT. "Caller behavior" re-checked against drifted callers is
-    meaningless; keep the higher score and mark
+    **Snapshot carve-out (STALE_EVIDENCE):** do NOT fire this rule when the
+    finding is NOT_MATCHED to the active snapshot, or its `code_paths` file is
+    absent under the pinned CODE_ROOT. "Caller behavior" re-checked against
+    drifted callers is meaningless; keep the higher score and mark
     `calibration_checklist.vague_code_paths.outcome = "UNKNOWN"` with a
-    `STALE_EVIDENCE:` reason. Also skip this rule for non-source LOCATOR findings.
+    `STALE_EVIDENCE:` reason. Also skip this rule for non-source LOCATOR
+    findings.
 
 07. **`unreliable_triggers` (Unreliable/Noisy Triggers)** Triggers that are
     likely to be ignored in practice or indistinguishable from normal
@@ -106,7 +107,7 @@ downgraded.
     guest enclaves, TEE, SEV, TDX, SGX, or attestation (in which case apply the
     CC Host Attacks cap-HIGH rule instead).
 
----
+______________________________________________________________________
 
 ### Category B: Force-Cap to HIGH (Cap at 7.9 / Maximum HIGH Priority)
 
@@ -119,16 +120,16 @@ downgraded.
    was triggered in execution (e.g., in a prior run or by external tools), treat
    it as empirically reproduced (Likelihood 5) and do not apply this static cap.
 
-   **Snapshot carve-out (STALE_EVIDENCE):** the trace-lift *Exception* above MUST
-   NOT be applied when the finding is NOT_MATCHED to the active snapshot, or its
-   `code_paths` file is absent under the pinned CODE_ROOT — a stack trace / ASan /
-   crash-log captured on a prior snapshot may not correspond to the current code,
-   so treating it as live reproduction would falsely inflate to CRITICAL. In that
-   case KEEP the static HIGH cap in force and mark
+   **Snapshot carve-out (STALE_EVIDENCE):** the trace-lift *Exception* above
+   MUST NOT be applied when the finding is NOT_MATCHED to the active snapshot,
+   or its `code_paths` file is absent under the pinned CODE_ROOT — a stack trace
+   / ASan / crash-log captured on a prior snapshot may not correspond to the
+   current code, so treating it as live reproduction would falsely inflate to
+   CRITICAL. In that case KEEP the static HIGH cap in force and mark
    `calibration_checklist.static_confirmation.outcome = "APPLIES"` with a
-   `STALE_EVIDENCE:` reason noting the trace-lift was suppressed. (The base static
-   cap itself is driven by `repro_status: "statically_confirmed"` from the finding
-   JSON and still applies normally.)
+   `STALE_EVIDENCE:` reason noting the trace-lift was suppressed. (The base
+   static cap itself is driven by `repro_status: "statically_confirmed"` from
+   the finding JSON and still applies normally.)
 
 2. **`strict_xss` (Strict XSS Caps)** All XSS vulnerabilities. Default to MEDIUM
    or LOW; cap at HIGH (7.9) only for stored XSS on critical admin pages with
@@ -182,7 +183,7 @@ downgraded.
    allows lateral reach into a different trust domain or achieves persistence
    surviving controller re-provisioning, do not cap).
 
----
+______________________________________________________________________
 
 ### Category C: Force-Cap to MEDIUM (Cap at 5.9 / Maximum MEDIUM Priority)
 

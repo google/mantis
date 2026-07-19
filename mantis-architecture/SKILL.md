@@ -88,55 +88,55 @@ Execute the architecture stage as follows:
 
 0. **LOCATOR RESOLUTION (Block A, inlined below):**
 
-   ```
-   LOCATOR RESOLUTION (before reading ANY target code or artifact):
-   0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
-      you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
-      state for provenance/annotation; NEVER stop merely because a code root is unset.
-   1. Determine CODE_ROOT, in this priority order:
-      a. If --target_root is passed on THIS invocation, CODE_ROOT = --target_root.
-         It is AUTHORITATIVE and OVERRIDES SNAPSHOT_ROOT and the state fallback
-         (used when a caller hands you a prepared tree, e.g. a patched shadow).
-      b. Else if --snapshot_root (or SNAPSHOT_ROOT) is passed, use it.
-      c. Else read state_root/workspace/.mantis_state.json (state_root from
-         --state_root if passed, else ./workspace/... relative to the current dir)
-         -> active_snapshot.root / .snapshot_id / .snapshot_pinned.
-      d. Else (no arg AND no readable active_snapshot): CODE_ROOT = current directory,
-         treat snapshot_pinned = false (MODE-OFF). Do NOT stop.
-   2. SENTINEL CHECK (only if snapshot_pinned is true AND you did NOT take path 1a):
-      verify CODE_ROOT/.mantis_snapshot_id exists and equals SNAPSHOT_ID. If missing
-      or different -> STOP "snapshot sentinel mismatch". (A --target_root tree (1a) is
-      deliberately mutated and is sentinel-EXEMPT.)
-   3. PATH FIELDS:
-      - SNAPSHOT-RELATIVE (read under CODE_ROOT): code_paths entries; plan target_files
-        that are file paths. Strip ONLY a trailing ":<digits>". A code_paths entry
-        containing "://" is a URL/endpoint, NOT a file read. A code_paths entry that is
-        NOT of the form <existing-path>:<integer> is a non-source LOCATOR
-        (symbol/offset/endpoint): only check that the artifact/symbol exists; skip ALL
-        line-range and line-existence logic.
-      - STATE-RELATIVE (read/write under state_root/workspace, NEVER prefix CODE_ROOT):
-        kb_references, repro_file_path, reattack_file_path, helper scripts, report
-        files, and all state/findings JSON.
-   4. Never WRITE under CODE_ROOT when snapshot_pinned is true. Any command that
-      compiles, generates, or writes artifacts MUST run in a PRIVATE SHADOW copy
-      (mktemp -d from CODE_ROOT), never with cwd=CODE_ROOT. Read-only inspection may
-      cd into CODE_ROOT.
-   5. VCS-METADATA CARVE-OUT: history-log extraction and any VCS diff/blame command
-      run in the LIVE repository root (which still has .git/.hg/.repo), NOT CODE_ROOT
-      (the snapshot copy strips VCS metadata). Do NOT stop merely because CODE_ROOT
-      lacks .git/.hg/.repo.
-   6. Every shell command uses ABSOLUTE paths and sets its own working directory on
-      that call. Do NOT assume the working directory persists between calls.
-   ```
+```
+LOCATOR RESOLUTION (before reading ANY target code or artifact):
+0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
+   you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
+   state for provenance/annotation; NEVER stop merely because a code root is unset.
+1. Determine CODE_ROOT, in this priority order:
+   a. If --target_root is passed on THIS invocation, CODE_ROOT = --target_root.
+      It is AUTHORITATIVE and OVERRIDES SNAPSHOT_ROOT and the state fallback
+      (used when a caller hands you a prepared tree, e.g. a patched shadow).
+   b. Else if --snapshot_root (or SNAPSHOT_ROOT) is passed, use it.
+   c. Else read state_root/workspace/.mantis_state.json (state_root from
+      --state_root if passed, else ./workspace/... relative to the current dir)
+      -> active_snapshot.root / .snapshot_id / .snapshot_pinned.
+   d. Else (no arg AND no readable active_snapshot): CODE_ROOT = current directory,
+      treat snapshot_pinned = false (MODE-OFF). Do NOT stop.
+2. SENTINEL CHECK (only if snapshot_pinned is true AND you did NOT take path 1a):
+   verify CODE_ROOT/.mantis_snapshot_id exists and equals SNAPSHOT_ID. If missing
+   or different -> STOP "snapshot sentinel mismatch". (A --target_root tree (1a) is
+   deliberately mutated and is sentinel-EXEMPT.)
+3. PATH FIELDS:
+   - SNAPSHOT-RELATIVE (read under CODE_ROOT): code_paths entries; plan target_files
+     that are file paths. Strip ONLY a trailing ":<digits>". A code_paths entry
+     containing "://" is a URL/endpoint, NOT a file read. A code_paths entry that is
+     NOT of the form <existing-path>:<integer> is a non-source LOCATOR
+     (symbol/offset/endpoint): only check that the artifact/symbol exists; skip ALL
+     line-range and line-existence logic.
+   - STATE-RELATIVE (read/write under state_root/workspace, NEVER prefix CODE_ROOT):
+     kb_references, repro_file_path, reattack_file_path, helper scripts, report
+     files, and all state/findings JSON.
+4. Never WRITE under CODE_ROOT when snapshot_pinned is true. Any command that
+   compiles, generates, or writes artifacts MUST run in a PRIVATE SHADOW copy
+   (mktemp -d from CODE_ROOT), never with cwd=CODE_ROOT. Read-only inspection may
+   cd into CODE_ROOT.
+5. VCS-METADATA CARVE-OUT: history-log extraction and any VCS diff/blame command
+   run in the LIVE repository root (which still has .git/.hg/.repo), NOT CODE_ROOT
+   (the snapshot copy strips VCS metadata). Do NOT stop merely because CODE_ROOT
+   lacks .git/.hg/.repo.
+6. Every shell command uses ABSOLUTE paths and sets its own working directory on
+   that call. Do NOT assume the working directory persists between calls.
+```
 
-   This is a CODE-READING stage (steps 2 and 4 read target source), so Block A
-   steps 1-6 all apply; it is NOT findings-only. Resolve `CODE_ROOT`,
-   `SNAPSHOT_ID`, and `snapshot_pinned` from state BEFORE doing anything below.
-   Per Block A step 3, all `workspace/kb/...` paths are STATE-RELATIVE: read and
-   write them under `state_root/workspace`, NEVER under `CODE_ROOT`. Read all
-   target source under `CODE_ROOT`. Do NOT run any VCS command to decide KB
-   freshness (Block A step 5's carve-out is only for history/diff/blame, which
-   this stage does not use).
+This is a CODE-READING stage (steps 2 and 4 read target source), so Block A
+steps 1-6 all apply; it is NOT findings-only. Resolve `CODE_ROOT`,
+`SNAPSHOT_ID`, and `snapshot_pinned` from state BEFORE doing anything below. Per
+Block A step 3, all `workspace/kb/...` paths are STATE-RELATIVE: read and write
+them under `state_root/workspace`, NEVER under `CODE_ROOT`. Read all target
+source under `CODE_ROOT`. Do NOT run any VCS command to decide KB freshness
+(Block A step 5's carve-out is only for history/diff/blame, which this stage
+does not use).
 
 0b. **KB SNAPSHOT FRESHNESS GATE (mechanical; STATE + KB marker only, NO live
 VCS):**
@@ -256,13 +256,27 @@ VCS):**
      `[Auth Module](entities/auth_module.md)`). Ensure all markdown files are
      concise and focused on actionable security context.
 
-   - **Snapshot stamping (REQUIRED on every (re)written KB file):** Make the
-     FIRST line of `index.md`, each `entities/*.md`, and each
-     `vulnerabilities/*.md` exactly `<!-- KB_SNAPSHOT: <SNAPSHOT_ID> -->`
-     (substitute `CUR` from step 0b; it is an HTML comment so it does not
-     render). This is how the next pass's freshness gate (step 0b) detects
-     drift. (Note: `mantis-threat-model` writes a bare `KB_SNAPSHOT:` header on
-     `THREAT_MODEL.md` only, not the comment-wrapped marker; the freshness gate
+   - **Snapshot stamping (REQUIRED on every (re)written KB file when running the
+     freshness gate, i.e. HALT or PINNED; never in MODE-OFF):** Make the FIRST
+     line of `index.md`, each `entities/*.md`, and each `vulnerabilities/*.md`
+     exactly `<!-- KB_SNAPSHOT: <SNAPSHOT_ID> -->` (substitute `CUR` from step
+     0b; it is an HTML comment so it does not render). This is how the next
+     pass's freshness gate (step 0b) detects drift. **MODE-OFF gate (3-state
+     rule):** if `active_snapshot` is ABSENT (MODE-OFF — no `--sync` was
+     requested), do NOT stamp the per-file `KB_SNAPSHOT` marker: `CUR` is the
+     empty string (`arch:145`: "the empty string if `active_snapshot` was
+     absent"), so the mandated marker would be `<!-- KB_SNAPSHOT:  -->` (empty
+     value) — a snapshot-era artifact that did not exist in Phase 1. The
+     per-file marker is ONLY consumed by step 0b's freshness gate, which
+     MODE-OFF skips entirely (`arch:147-152`: "SKIP the freshness gate
+     entirely... This is byte-for-byte today's behavior. Only HALT and PINNED
+     run the gate below."). This MODE-OFF gate mirrors the AS_OF tag subsection
+     below (`arch:284-285`: "In MODE-OFF — no freshness gate — do NOT emit AS_OF
+     tags; this is today's behavior.") and step 0b's outcome clauses, which
+     mention per-file `KB_SNAPSHOT: CUR` stamping only in HALT/PINNED outcomes
+     (CURRENT `:164`, scoped BUILD FRESH `:178`, full BUILD FRESH `:195`).
+     (Note: `mantis-threat-model` writes a bare `KB_SNAPSHOT:` header on
+     `THREAT_MODEL.md` only, not the comment-­wrapped marker; the freshness gate
      reads `kb_snapshot_id` from state as its primary source and the file marker
      as a secondary check. `mantis-critic` reads the `KB_SNAPSHOT:` marker on
      the first line of `THREAT_MODEL.md` first, falling back to `kb_snapshot_id`

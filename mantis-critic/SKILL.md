@@ -116,6 +116,17 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    that call. Do NOT assume the working directory persists between calls.
 ```
 
+> [!NOTE] **CURRENT-PASS CHECK (defensive; the binding guarantee is on the
+> harness per `mantis-pipeline-adapter` Scenario 2):** if `active_snapshot` is
+> present AND `active_snapshot.pass != state.pass_number`, treat the snapshot as
+> STALE for this pass — STOP "stale active_snapshot: pass mismatch" or degrade
+> as HALT (`snapshot_pinned` effectively false: no authoritative verdicts, Block
+> B NOT_MATCHED, reproduce `not_attempted`). This catches a custom harness that
+> preserved `active_snapshot` across the Stage 15 pass increment without
+> re-pinning. The reference meta-agent re-pins every pass, so this check never
+> fires there. Block B itself cannot detect this (it is `snapshot_id`-only, not
+> `pass`-aware).
+
 **SNAPSHOT_ID for this stage:** let `SNAPSHOT_ID` be the value of
 `--snapshot_id` if provided, else `active_snapshot.snapshot_id` from
 `workspace/.mantis_state.json`. If neither is present (no `--snapshot_id` AND no
@@ -188,18 +199,19 @@ Execute the critic evaluation as follows:
    finding by comparing its `discovery_commit` against the current
    `SNAPSHOT_ID`.
 
+   ```
    SNAPSHOT MATCH CHECK for finding F (decides MATCHED vs NOT_MATCHED):
-
    1. If snapshot_pinned is false -> NOT_MATCHED. Stop.
    2. Read F.discovery_commit:
       - missing OR empty OR the literal "MIXED" -> NOT_MATCHED.
-      - not exactly equal to SNAPSHOT_ID -> NOT_MATCHED.
-      - exactly equal to SNAPSHOT_ID -> MATCHED. There is no other route to
-        MATCHED; never fuzzy-compare. The global "default the field and proceed"
-        backward-compat rule does NOT apply to discovery_commit: absent =
-        NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's
-        SNAPSHOT_ID already embeds the working-tree content hash, so within-pass
-        findings MATCH and cross-pass bare-commit findings do not.)
+      - not exactly equal to SNAPSHOT_ID          -> NOT_MATCHED.
+      - exactly equal to SNAPSHOT_ID              -> MATCHED.
+   There is no other route to MATCHED; never fuzzy-compare. The global "default the
+   field and proceed" backward-compat rule does NOT apply to discovery_commit:
+   absent = NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's
+   SNAPSHOT_ID already embeds the working-tree content hash, so within-pass findings
+   MATCH and cross-pass bare-commit findings do not.)
+   ```
 
    c. **Drift / missing-file / out-of-range guard (fail-safe — NEVER
    NON_VIABLE):** If Block B yields **NOT_MATCHED**, OR the resolved target file

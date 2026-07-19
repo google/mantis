@@ -121,18 +121,30 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    that call. Do NOT assume the working directory persists between calls.
 ```
 
-SNAPSHOT MATCH CHECK for finding F (decides MATCHED vs NOT_MATCHED):
+> [!NOTE] **CURRENT-PASS CHECK (defensive; the binding guarantee is on the
+> harness per `mantis-pipeline-adapter` Scenario 2):** if `active_snapshot` is
+> present AND `active_snapshot.pass != state.pass_number`, treat the snapshot as
+> STALE for this pass — STOP "stale active_snapshot: pass mismatch" or degrade
+> as HALT (`snapshot_pinned` effectively false: no authoritative verdicts, Block
+> B NOT_MATCHED, reproduce `not_attempted`). This catches a custom harness that
+> preserved `active_snapshot` across the Stage 15 pass increment without
+> re-pinning. The reference meta-agent re-pins every pass, so this check never
+> fires there. Block B itself cannot detect this (it is `snapshot_id`-only, not
+> `pass`-aware).
 
+```
+SNAPSHOT MATCH CHECK for finding F (decides MATCHED vs NOT_MATCHED):
 1. If snapshot_pinned is false -> NOT_MATCHED. Stop.
 2. Read F.discovery_commit:
    - missing OR empty OR the literal "MIXED" -> NOT_MATCHED.
-   - not exactly equal to SNAPSHOT_ID -> NOT_MATCHED.
-   - exactly equal to SNAPSHOT_ID -> MATCHED. There is no other route to
-     MATCHED; never fuzzy-compare. The global "default the field and proceed"
-     backward-compat rule does NOT apply to discovery_commit: absent =
-     NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's SNAPSHOT_ID
-     already embeds the working-tree content hash, so within-pass findings MATCH
-     and cross-pass bare-commit findings do not.)
+   - not exactly equal to SNAPSHOT_ID          -> NOT_MATCHED.
+   - exactly equal to SNAPSHOT_ID              -> MATCHED.
+There is no other route to MATCHED; never fuzzy-compare. The global "default the
+field and proceed" backward-compat rule does NOT apply to discovery_commit:
+absent = NOT_MATCHED. (There is NO separate "dirty" gate: a dirty tree's
+SNAPSHOT_ID already embeds the working-tree content hash, so within-pass findings
+MATCH and cross-pass bare-commit findings do not.)
+```
 
 Notes: When invoked by the patcher with `--target_root=<shadow>` (a patched
 copy), Block A step 1a makes that shadow the authoritative CODE_ROOT and SKIPS
@@ -156,8 +168,18 @@ Execute the reproduction stage under these constraints:
        state** for the loaded finding:
        - The finding's `"status"` must be `"VALID"` or `"PROVISIONALLY_VALID"`.
        - The finding's `"repro_status"` must be `"reproduced"`.
-       - The finding's `"patch_status"` must NOT be `"VERIFIED_SECURE"` or
-         `"MITIGATION_PROPOSED"`.
+       - The finding's `"patch_status"` must NOT be `"MITIGATION_PROPOSED"`.
+         (`VERIFIED_SECURE` IS allowed: C5 below handles the case where the
+         snapshot changed since the patch was verified secure, and downgrades
+         `VERIFIED_SECURE` → `VERIFICATION_INCOMPLETE` in the same atomic write
+         as setting `reattack_status=inconclusive_baseline_changed`, precisely
+         to avoid persisting the schema-invalid combination
+         `patch_status=VERIFIED_SECURE` +
+         `reattack_status=inconclusive_baseline_changed` that would violate the
+         `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass` allOf gate.
+         `MITIGATION_PROPOSED` remains forbidden because C5's downgrade clause
+         only handles `VERIFIED_SECURE`; a separate change would be needed to
+         add C5 handling for `MITIGATION_PROPOSED`.)
        - Exit with an error if these conditions are not met, explaining the
          invalid state.
      - If `--reattack` is NOT specified (Targeted Normal Run):
@@ -292,14 +314,19 @@ Execute the reproduction stage under these constraints:
    script/source harness -> write the exact bytes MANTIS_REACHED_ENTRYPOINT to a
    sidecar file $SENTINEL_FILE and flush+fsync (or unbuffered write) BEFORE
    invoking the sink. (A file survives a crash that truncates buffered stdout.)
-   (b) binary / firmware / raw-payload -> a wrapper YOU author writes the
-   sidecar marker before invoking the target, OR the captured crash
-   backtrace/ASan frame explicitly names the target sink function. EVIDENCE
-   PRESENT = sidecar file contains MANTIS_REACHED_ENTRYPOINT, OR (channel b) the
-   backtrace/ASan output names the sink. EVIDENCE ABSENT includes: any
-   compiler/build nonzero exit; exit 127 (command not found); exit 2 with a "No
-   such file" message. DECISION GATE (gate the DECISION, not specific verdict
-   strings):
+   (b) binary / firmware / raw-payload -> reached-sink evidence is a captured
+   crash backtrace or ASan frame that explicitly names the target sink function
+   (target-produced tracing). A marker written by a wrapper you author BEFORE
+   invoking the target is SETUP EVIDENCE ONLY: it proves "launch attempted," not
+   "sink reached," and does NOT qualify as reached-sink evidence. If no in-path
+   marker (channel a) and no target-produced backtrace/ASan (channel b) is
+   achievable, the sink is unreached. EVIDENCE PRESENT (reached-sink) = (channel
+   a) sidecar file contains MANTIS_REACHED_ENTRYPOINT written in-path, OR
+   (channel b) target-produced backtrace/ASan output names the sink. A wrapper
+   pre-launch marker alone is NOT evidence present. EVIDENCE ABSENT includes:
+   any compiler/build nonzero exit; exit 127 (command not found); exit 2 with a
+   "No such file" message. DECISION GATE (gate the DECISION, not specific
+   verdict strings):
 
    - Record repro_status = reproduced OR statically_confirmed ONLY if EVIDENCE
      is PRESENT. If ABSENT -> repro_status = not_attempted (retry-eligible),
@@ -420,7 +447,19 @@ Execute the reproduction stage under these constraints:
 
      - If reproduction succeeds (`repro_status` is evaluated as `"reproduced"`
        or `"statically_confirmed"`) and the finding's current `"status"` is
-       `"PROVISIONALLY_VALID"`, you **must** update `"status"` to `"VALID"`.
+       `"PROVISIONALLY_VALID"`: BEFORE upgrading, scan the finding's
+       `triage_checklist` (if present). If ANY entry has `outcome == "UNKNOWN"`
+       (or `passes == false`), do NOT upgrade: leave `status` as
+       `"PROVISIONALLY_VALID"`, still set `repro_status` to the success value
+       (reproduction DID succeed), and append a history note
+       `upgrade-to-VALID-blocked: triage_checklist has UNKNOWN entries (re-review required)`.
+       This avoids violating the schema's `VALID ⇒ no UNKNOWN` allOf gate
+       (schema.json lines 471-507), which forbids `UNKNOWN`/`passes:false` on
+       any `VALID` non-chain finding's `triage_checklist`. Reproduce does NOT
+       touch `triage_checklist` entries (the checklist is review's artifact;
+       only review may resolve `UNKNOWN` entries). If `triage_checklist` is
+       absent (no `reviewer` history entry, e.g. a legacy finding), or NO entry
+       is `UNKNOWN`/`passes:false`, you **must** update `"status"` to `"VALID"`.
 
      - An entry to the `"history"` array:
 

@@ -252,21 +252,38 @@ Execute the research stage as follows:
         MOST RECENT (highest pass number) ancestor. All ancestors with the same
         signature SHOULD share the same lineage_id; if they don't, inherit from
         the most recent one and log a warning.
-      - If no match by exact signature: attempt a **path-normalized fallback**
-        for TRUE renames ONLY. Re-compute the signature using only the basename
-        of `primary_target` (e.g., `src/auth.c` → `auth.c`) and scan archives
-        again. Inherit an ancestor's `lineage_id` via this fallback ONLY IF the
-        ancestor's full-path `primary_target` NO LONGER EXISTS on the current
-        snapshot (check that the old path is absent under CODE_ROOT — this
-        distinguishes a real rename from a second, independent file that merely
-        shares a basename). When you do inherit via basename, ALSO add a finding
-        history note `lineage-via-basename-rename` so downstream consumers treat
-        the link as basename-derived (the report folds two findings only when
-        their full `signature`s ALSO match, so a basename-derived link never
-        collapses distinct bugs). If the old full path still exists on the
-        current snapshot, do NOT inherit — treat as no match (fresh UUIDv4).
-      - If no match by either exact or basename-normalized signature:
-        `lineage_id` = a fresh UUIDv4.
+      - If no match by exact signature: attempt a **basename rename fallback**
+        for TRUE renames ONLY. Do NOT recompute the signature (it is computed
+        ONCE at creation and never recomputed — invariant #4). Instead:
+        1. Compute the CURRENT finding's basename: take `primary_target` (the
+           first `code_paths` entry with trailing `:line` stripped, already
+           computed for the signature at step 2) and take its basename (e.g.
+           `src/auth.c` → `auth.c`). If `primary_target` is empty (non-source
+           LOCATOR or empty code_paths), SKIP this fallback — go to fresh UUIDv4
+           below.
+        2. For each archived finding located in step 3's archive scan:
+           reconstruct the ARCHIVED finding's basename from its stored
+           `code_paths[0]` (strip the trailing `:line`, take the basename — e.g.
+           `lib/old_auth.c:88` → `old_auth.c`). Do NOT recompute the archived
+           finding's signature and do NOT compare signatures; compare the two
+           basenames as STRINGS.
+        3. Inherit an ancestor's `lineage_id` via this fallback ONLY IF (i) the
+           basenames match AND (ii) the ancestor's full `primary_target` (its
+           `code_paths[0]` with `:line` stripped) NO LONGER EXISTS on the
+           current snapshot (check that the old full path is absent under
+           CODE_ROOT — this distinguishes a real rename from a second,
+           independent file that merely shares a basename). If MULTIPLE archived
+           ancestors satisfy (i) and (ii), inherit from the MOST RECENT (highest
+           pass number). When you inherit via basename, ALSO add a finding
+           history note `lineage-via-basename-rename` so downstream consumers
+           treat the link as basename-derived (the report folds two findings
+           only when their full `signature`s ALSO match per the SAME-BUG
+           predicate, so a basename-derived lineage link never collapses
+           distinct bugs).
+        4. If the old full path still exists on the current snapshot, do NOT
+           inherit — treat as no match (fresh UUIDv4 below).
+      - If no match by either exact signature or basename rename: `lineage_id` =
+        a fresh UUIDv4.
       - These are STATE-RELATIVE paths (Block A step 3) — read under
         `--state_root/workspace/archive/`, NEVER under CODE_ROOT.
 

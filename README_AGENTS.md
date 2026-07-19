@@ -8,7 +8,7 @@ run and extend the pipeline.
 As an agent, you must adhere to the contracts, file paths, and execution
 patterns defined in this document.
 
----
+______________________________________________________________________
 
 ## Adaptability & Specialized Domains
 
@@ -34,7 +34,7 @@ they can be adapted for:
   stage with isolated VMs, physical hardware testbeds (via USB/serial), or
   custom simulators.
 
----
+______________________________________________________________________
 
 ## Architecture and Sequential Flow
 
@@ -50,9 +50,11 @@ shared state stored on disk.
 > pinned copy (so edits made mid-pass are ignored), every finding is stamped
 > with the snapshot it was discovered against, and the target is synced only
 > **non-destructively, at a pass boundary**. Run WITHOUT these arguments and
-> each stage degrades to an **unpinned, non-authoritative** review of the
-> current directory rather than stopping. See
-> [The Snapshot Model](#the-snapshot-model) for the full contract.
+> each stage runs in MODE-OFF — byte-for-byte today's behavior (a point-in-time
+> review of the current directory with all verdicts permitted) — rather than
+> stopping. Reserve "non-authoritative" for HALT mode (`--sync` requested but
+> snapshot could not be pinned). See [The Snapshot Model](#the-snapshot-model)
+> for the full contract.
 
 ```mermaid
 graph TD
@@ -193,16 +195,16 @@ graph TD
     and patch information at `workspace/report/review_packet-latest.md` (and
     archives to `review_packet_pass_<N>.md`).
 
----
+______________________________________________________________________
 
 ## The Snapshot Model
 
 Mantis can review **living / synced codebases** through a **snapshot-per-pass**
 model. It is **opt-in and default off**: with no `--sync` flag and no snapshot
 arguments, a run behaves byte-for-byte as before — a single, point-in-time
-review of whatever is on disk (see *Degraded / unpinned mode*, below). Enabling
-it makes long-running, continuous reviews of a changing codebase correct instead
-of silently wrong.
+review of whatever is on disk (see *MODE-OFF / HALT*, below). Enabling it makes
+long-running, continuous reviews of a changing codebase correct instead of
+silently wrong.
 
 **Opt-in, default off.** Passing `--sync` (or instructing `/mantis-meta-agent`
 to sync) enables the model. Without it, `snapshot_pinned` is never set and every
@@ -261,22 +263,35 @@ Knowledge Base and directory summaries from the previous snapshot are stale and
 must be **force-refreshed** (re-run `/mantis-architecture`) before planning the
 new pass.
 
-**Degraded / unpinned mode (never deadlocks).** If a stage is run WITHOUT
-`--snapshot_root` / `--snapshot_id` and with no readable `active_snapshot` in
-state (plain interactive / manual use, or an orchestrator that does not
-implement the lifecycle), it does **not** stop. It falls back to the current
-directory with `snapshot_pinned = false` and runs **degraded**: results are
-non-authoritative, every snapshot match check reports "not matched," and no
-authoritative `VERIFIED_SECURE` / `failed_to_reproduce` verdict is emitted.
-Live-endpoint or uncopyable targets run in this same unpinned mode by design.
+**MODE-OFF / HALT (never deadlocks).** The 3-state snapshot model (per
+`schema.json`) branches on `active_snapshot` presence:
+
+- **MODE-OFF** (`active_snapshot` ABSENT — plain interactive / manual use, or an
+  orchestrator that does not implement the lifecycle): the stage does **not**
+  stop. It runs byte-for-byte as today's behavior — a point-in-time review of
+  the current directory with **all verdicts permitted** (`VERIFIED_SECURE`,
+  `failed_to_reproduce`, `DUPLICATE`, etc. are all emittable, because MODE-OFF
+  is defined as exactly today's behavior). Every snapshot match check reports
+  "not matched" (no `active_snapshot` to compare against). Mid-run edits are not
+  frozen.
+
+- **HALT** (`active_snapshot` PRESENT with `snapshot_pinned = false` — `--sync`
+  was requested but the snapshot could not be pinned: live endpoint,
+  too-big-to-copy, copy failure, dirty/racing tree): the stage does **not**
+  stop, but runs **degraded**: results are non-authoritative, and no
+  authoritative `VERIFIED_SECURE` / `failed_to_reproduce` verdict is emitted
+  (the HALT ceiling forces `not_attempted` / `VERIFICATION_INCOMPLETE` instead).
+  Live-endpoint or uncopyable targets run in HALT by design when `--sync` is
+  requested.
 
 **Absent → conservative (backward compatible).** Every new field is optional.
 Any absent / empty / null new field routes to the safe branch: absent
 `discovery_commit` → re-research; absent `snapshot_history` predecessor → treat
 all files as changed; absent reached-sink evidence → `not_attempted` (never a
-negative verdict); absent `active_snapshot` → degraded / unpinned. No new
-`required` field or `allOf` gate is added, so existing workspaces and
-pre-upgrade findings validate and run unchanged.
+negative verdict); absent `active_snapshot` → MODE-OFF (byte-for-byte today's
+behavior; all verdicts permitted). No new `required` field or `allOf` gate is
+added, so existing workspaces and pre-upgrade findings validate and run
+unchanged.
 
 **New optional state/finding fields and stage flags.**
 
@@ -300,7 +315,7 @@ immutable copy and write the sentinel, record `active_snapshot` / append
 `--state_root`, then archive findings and increment the pass. A harness that
 does not implement it leaves `snapshot_pinned` unset and gets today's behavior.
 
----
+______________________________________________________________________
 
 ## Building Deterministic Pipelines (Production-Grade)
 
@@ -398,7 +413,7 @@ deterministic execution, you can build a pipeline that:
    generate* the patch or script file, leaving the actual execution and grading
    to your harness in a strictly controlled sandbox.
 
----
+______________________________________________________________________
 
 ## Exploit Chains and Reproduction Limits
 
@@ -416,7 +431,7 @@ end-to-end reproduction scripts for these chains**.
   environment-dependent. Users wishing to verify end-to-end chains must write
   custom orchestrators or manually verify the combined flow.
 
----
+______________________________________________________________________
 
 ## Patch Verification and Re-attack Constraints
 
@@ -439,7 +454,7 @@ Re-attack fields (`reattack_status`, etc.) are strictly required only when
 `patch_status` is `VERIFIED_SECURE`. This is an intentional design decision to
 support binary-only targets and verification fallbacks.
 
----
+______________________________________________________________________
 
 ## The Reality of Non-Determinism
 
@@ -476,7 +491,7 @@ rescan, such as when new models with greater capabilities are made available or
 when a codebase has received sufficiently large changes to warrant a complete
 rescan instead of just an analysis of a given diff or changelist.
 
----
+______________________________________________________________________
 
 ## Meta-Agent Orchestration Pattern
 
@@ -508,7 +523,7 @@ session) is responsible for driving the entire reviewing pipeline.
 This pattern transforms the suite from a set of disjointed tools into a
 continuous, self-driving security research operation.
 
----
+______________________________________________________________________
 
 ## Model Selection & Efficiency Guidelines
 
@@ -538,7 +553,7 @@ need to use the heaviest, most advanced frontier models for every stage:
 Try different tiers of models in different parts of your pipeline to see what
 works well and what does not.
 
----
+______________________________________________________________________
 
 ## Understanding False Positives (The "Negative Filter" Rule)
 
@@ -563,7 +578,7 @@ doesn't, then adapt.
   potential vulnerabilities might work, but in our experience is unlikely to be
   the most successful way to adopt this new technology.
 
----
+______________________________________________________________________
 
 ## Evaluating and Optimizing Mantis Skills
 
@@ -655,7 +670,7 @@ token investment:
   tokens. Conversely, if parallel patchers consistently produce a much cleaner,
   more idiomatic fix than a single agent, the compute cost can be justified.
 
----
+______________________________________________________________________
 
 ## Code Style & Formatting
 
@@ -684,38 +699,37 @@ files when you run `git commit`.
 If you want to run the formatter manually:
 
 - **Via pre-commit (Recommended):**
+
   ```bash
   pre-commit run --all-files
   ```
 
-  This is the **only** fully safe method. It creates an isolated venv with
-  the correct `mdformat` version (0.7.21) and the required plugins
-  (`mdformat-gfm`, `mdformat-frontmatter`), and preserves YAML frontmatter.
+  This is the **only** fully safe method. It creates an isolated venv with the
+  correct `mdformat` version (0.7.21) and the required plugins (`mdformat-gfm`,
+  `mdformat-frontmatter`), and preserves YAML frontmatter.
 
 - **Via `mdformat` directly (NOT recommended):** If you install `mdformat`
-  manually, you **must** install the required plugins and use the `--number`
-  and `--wrap 80` flags to match repository standards:
+  manually, you **must** install the required plugins and use the `--number` and
+  `--wrap 80` flags to match repository standards:
+
   ```bash
   pip install mdformat==0.7.21 mdformat-gfm mdformat-frontmatter
   mdformat --number --wrap 80 .
   ```
 
-  > [!WARNING]
-  > Running bare `mdformat` without `mdformat-frontmatter` will **destroy
-  > YAML frontmatter** in all SKILL.md files (replacing `---` delimiters with
-  > underscores and collapsing the YAML into a markdown heading). Never run
-  > `mdformat` directly unless you have installed the plugins above. If you
-  > see `pip show mdformat-frontmatter` return "not found", do NOT run
-  > `mdformat`.
+  > [!WARNING] Running bare `mdformat` without `mdformat-frontmatter` will
+  > **destroy YAML frontmatter** in all SKILL.md files (replacing `---`
+  > delimiters with underscores and collapsing the YAML into a markdown
+  > heading). Never run `mdformat` directly unless you have installed the
+  > plugins above. If you see `pip show mdformat-frontmatter` return "not
+  > found", do NOT run `mdformat`.
 
-> [!CAUTION]
-> **Verbatim blocks (Block A/B/C/D/E/F/G) are not inside code fences in most
-> SKILL.md files.** `mdformat` (even via pre-commit) will rewrap their
-> content to fit the 80-column wrap, which breaks block fidelity. The blocks
-> must remain character-identical across all skills. If you run `mdformat`,
-> **verify with `git diff` that no verbatim block content was rewrapped**
-> before committing. If you see rewrapping, revert those files and
-> hand-format only the non-block prose around them.
+> [!CAUTION] **Verbatim blocks (Block A/B/C/D/E/F/G) are wrapped in code fences
+> (```` ``` ````) in all SKILL.md files.** This protects them from `mdformat`
+> rewrapping. The blocks must remain character-identical across all skills.
+> Never insert content *inside* their fences — add notes *after* the closing
+> ```` ``` ````. If you run `mdformat`, **verify with `git diff` that no fenced
+> block content was modified** before committing.
 
 ## Advanced / Unattended Cloud Deployment (GCE)
 

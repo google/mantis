@@ -115,8 +115,7 @@ containing source code.
 
 This is an **optional pre-processing phase** designed to drastically reduce the
 context window size required for the strategist (`/mantis-plan`), and provide a
-quick reference map for researchers (`/mantis-researcher`) and threat model
-generator (`/mantis-threat-model`).
+quick reference map for researchers (`/mantis-researcher`).
 
 Execute the summarize stage as follows:
 

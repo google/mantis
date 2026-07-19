@@ -30,6 +30,18 @@ resilience, and monitors long-running security pipelines.
     `<state_root>/.mantis_snapshots/` (Block D step 6 GC). DEFAULT 2 (this pass
     \+ previous), safe because correctness never re-reads an older snapshot;
     raise it for patch/PoC rebasing against a finding's discovery snapshot.
+  - `--state_root=<absolute path>`: directory that contains `workspace/` and
+    `.mantis_snapshots/`. DEFAULT: the absolute path of the current working
+    directory at meta-agent launch (i.e., the parent of `workspace/`). If
+    `state_root` resolves inside `CODE_ROOT` (the colocated case — the default
+    when launching from inside the target repo), Step 3 (PIN) MUST either (a)
+    HALT and yield to the user with a message to pass `--state_root` outside
+    `CODE_ROOT`, or (b) auto-relocate by moving `workspace/` and
+    `.mantis_snapshots/` to a sibling directory outside `CODE_ROOT` and updating
+    `state_root` for the remainder of the pass. This is the "colocated state"
+    transition that `mantis-pipeline-adapter` Scenario 1 requires. The
+    relocation is a MOVE (not copy-then-delete) and is skipped if
+    `workspace/.workspace_edit.lock` is held (INV-5: no user data loss).
 
 ## Input/Output Contract
 
@@ -190,13 +202,19 @@ Execute your orchestration duties in a continuous loop:
            - `commit_hash` (via `git rev-parse HEAD`)
            - `branch` (via `git branch --show-current` or
              `git rev-parse --abbrev-ref HEAD`)
-           - `dirty` status (check if `git status --porcelain` is non-empty)
+           - `dirty` status (check if
+             `git status --porcelain -- ':(exclude)**/mantis-summary.md' ':(exclude)**/*.bak-*' ':(exclude)workspace/' ':(exclude).mantis_snapshots/'`
+             is non-empty — same exclude set as STEP 1, so colocated
+             `workspace/` and `.mantis_snapshots/` do not make the tree falsely
+             dirty)
         2. Check for Mercurial: check if `.hg` directory exists or run `hg root`
            (if Mercurial is installed). If found, set `vcs_type` to `"hg"` and
            extract:
            - `commit_hash` (via `hg id -i`)
            - `branch` (via `hg branch`)
-           - `dirty` status (check if `hg status` is non-empty)
+           - `dirty` status (check if
+             `hg status -X '**/mantis-summary.md' -X '*.bak-*' -X 'workspace/**' -X '.mantis_snapshots/**'`
+             is non-empty — same exclude set as STEP 1)
         3. Check for Multi-VCS systems: check if `.repo` directory exists or
            look for other multi-VCS markers. If found, resolve the active
            manifest revision (set `revision`) or branch, and check if any
@@ -214,10 +232,16 @@ Execute your orchestration duties in a continuous loop:
 
         PIN SNAPSHOT (after SYNC, before any stage): 0. CRASH-RESUME (run FIRST,
         before any copy/detect): if `state.active_snapshot.pass == N` on entry,
-        REUSE that dir (no re-copy/re-pin). If `snapshot_pinned` was true but
+        REUSE that dir (no re-copy/re-pin). This reuse check is SAME-PASS ONLY —
+        it does NOT cover cross-pass staleness (where Stage 15 preserved
+        `active_snapshot` while incrementing `pass_number`). Consumer stages
+        must apply the current-pass check
+        (`active_snapshot.pass == state.pass_number`) described in
+        `mantis-pipeline-adapter` Scenario 2. If `snapshot_pinned` was true but
         the dir is now missing -> STOP and yield to the user (never re-pin to a
         possibly-drifted live tree). If reusing, skip steps 1–4 and go straight
-        to step 5 (state write + snapshot_history append).
+        to step 5 (state write; the `snapshot_history` append inside Step 5 is
+        itself idempotent — see Step 5).
 
         1. Detect vcs_info (existing meta-agent detection). VCS_ID = commit_hash
            (git/hg) / manifest revision (multi-vcs) / "" (else).
@@ -230,11 +254,15 @@ Execute your orchestration duties in a continuous loop:
              -> `hg archive <SNAPSHOT_ROOT>` (cheap, buildable). GC MUST later
              run the matching teardown (git worktree remove/prune).
            - Else copyable tree -> SNAPSHOT_ROOT =
-             \<state_root>/.mantis_snapshots/pass\_<N> (MUST NOT contain the
+             \<state_root>/.mantis_snapshots/pass\_\<N> (MUST NOT contain the
              path segment "/workspace/"). Copy EXCLUDING .git .hg .repo .svn CVS
-             and nested submodule VCS dirs; dereference symlinks pointing INSIDE
-             the tree; DROP symlinks pointing outside; smudge LFS content if the
-             analysis needs it.
+             nested submodule VCS dirs, workspace/, .mantis_snapshots/,
+             mantis-summary.md, and *.bak-* (same hide-list as STEP 0, so a
+             colocated state_root cannot cause recursive self-copy); dereference
+             symlinks pointing INSIDE the tree; DROP symlinks pointing outside;
+             smudge LFS content if the analysis needs it. If `state_root` itself
+             resolves inside CODE_ROOT, the copy MUST additionally exclude the
+             `state_root` path itself.
            - Single binary/firmware -> copy the artifact into SNAPSHOT_ROOT.
            - Live endpoint / not a local dir -> go to step 5b.
         4. FAILURE-TOLERANT VERIFY: check copy exit status + a cheap sanity
@@ -250,7 +278,15 @@ Execute your orchestration duties in a continuous loop:
            verdicts are forbidden this pass.
         5. Write state.active_snapshot = {root, snapshot_id, snapshot_pinned,
            pass:N, vcs_type}. APPEND {pass:N, snapshot_id, snapshot_pinned,
-           timestamp} to state.snapshot_history (NEVER overwrite prior entries).
+           timestamp} to state.snapshot_history ONLY IF no entry with
+           `pass == N` already exists (idempotency check: scan
+           `snapshot_history` for `pass == N`; this mirrors the once-only
+           pattern used for `signature` and `discovery_commit`). On crash-resume
+           reuse (Step 0 routed here), an entry for pass N may already have been
+           written by the prior run — in that case, write `active_snapshot` only
+           and do NOT append a second `snapshot_history` entry for the same
+           pass. NEVER overwrite prior entries. There must be exactly one
+           `snapshot_history` entry per pass.
         6. RETENTION/GC: keep the last N snapshot dirs (operator-configurable
            via `--snapshot_keep`, DEFAULT 2 = this pass + previous); delete
            older via the matching teardown (rm -rf for copies; git worktree

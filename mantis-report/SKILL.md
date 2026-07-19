@@ -379,22 +379,36 @@ Execute the reporting stage as follows:
        `MITIGATION_PROPOSED`. This gives stakeholders a visible "what got fixed"
        view alongside the open findings.
      - **Unresolved — retry cap reached:** A callout listing open findings whose
-       `repro_attempts` count is at the cap (check both the integer and
-       `{count, last_snapshot}` object forms). These are items the planner
-       stopped carrying back — they should be prominent, not silently dropped.
+       reproduction attempt count is at the cap. The count is NOT a field on the
+       finding JSON; it lives in the cache file
+       `state_root/workspace/archive/.repro_attempts.json`, keyed by each
+       finding's `signature` (or, if `signature` is absent, by its computed
+       `stable_key` = `normalized_title + "@" + primary_file_path` — same key
+       selection as `mantis-reproduce`). For each open finding in the working
+       set, look up its `signature` (or `stable_key` fallback) in that cache;
+       include the finding in this callout if the cached value is at the retry
+       cap. Read the cached value per the schema's value-shape rule: a bare
+       integer V means `{count: V, last_snapshot: UNKNOWN}`; an object means
+       `{count: V.count, last_snapshot: V.last_snapshot or UNKNOWN}`. If the
+       cache file is missing or the finding's key is absent, treat its count as
+       0 (do not list it here). These are items the planner stopped carrying
 
-   > [!NOTE] **De-dup caveat:** de-dup is by finding identity. When `lineage_id`
-   > is present, findings are folded by `lineage_id` (same lineage = same bug
-   > across passes/snapshots, most-recent state wins). When `lineage_id` is
-   > absent, de-dup falls back to finding `id` (UUID), which is exact for
-   > carried-forward findings (they preserve their UUID). A bug re-discovered
-   > under a new UUID without `lineage_id` (a regression, or a non-deterministic
-   > re-find) lists as a separate entry from its archived ancestor —
-   > over-reporting (safe), never hiding. With stable finding signatures and
-   > lineage tracking now landed (Phase 3), most re-discovered findings carry
-   > the same `signature` and inherit the ancestor's `lineage_id`, so they
-   > correctly fold into a single report entry. The UUID-only fallback remains
-   > as the safe branch for legacy/un-upgraded findings.
+   > [!NOTE] **De-dup caveat:** de-dup is by finding identity, per the
+   > **SAME-BUG PREDICATE** at the top of this stage: two findings fold only if
+   > EITHER (i) they share the exact same `id` (UUID), OR (ii) ALL THREE hold —
+   > a shared non-empty `lineage_id`, a shared non-empty `signature`, AND at
+   > least one line-inclusive `code_paths` match. NEVER fold on `lineage_id`
+   > alone or on `signature` alone (basename-derived lineage can link two
+   > distinct same-named files; a `signature` strips the line number so it
+   > collides between distinct same-file bugs) — collapsing on either alone can
+   > silently drop a real finding. A bug re-discovered under a new UUID that
+   > does NOT satisfy predicate (ii) — a regression, a file rename that shifts
+   > the line, or a non-deterministic re-find — lists as a SEPARATE entry from
+   > its archived ancestor: over-reporting (safe), never hiding. With stable
+   > finding signatures and lineage tracking landed (Phase 3), a re-discovered
+   > finding folds into its ancestor's single entry ONLY when predicate (ii) is
+   > fully satisfied; the UUID-only match remains the safe branch for
+   > legacy/un-upgraded findings.
 
    - **`review_packet-latest.md` is authoritative:** Note that
      `review_packet-latest.md` is now the authoritative current open state of
