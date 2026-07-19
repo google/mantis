@@ -150,9 +150,13 @@ VCS):**
   do NOT prepend any STALE banner, do NOT emit `AS_OF:UNKNOWN` tags, and do
   NOT stamp `kb_snapshot_id`. This is byte-for-byte today's behavior. (Only
   HALT and PINNED run the gate below.)
-- `KB_ID` = the text after `KB_SNAPSHOT:` on the FIRST line of
-  `state_root/workspace/kb/index.md` if that file exists; else the
-  `kb_snapshot_id` value in `.mantis_state.json`; else `""` (no prior KB).
+- `KB_ID` = the `kb_snapshot_id` value in `.mantis_state.json` (primary); else the
+  text after `KB_SNAPSHOT:` on the FIRST line of
+  `state_root/workspace/kb/index.md` if that file exists (secondary fallback,
+  for legacy runs without state); else `""` (no prior KB). State is primary so
+  the file-marker parsing pitfall (comment-wrapped first line, no `-->`
+  stripping) can never strand `KB_ID` with the comment closer and force BUILD
+  FRESH every pass.
 - Choose EXACTLY ONE outcome by string checks, top to bottom, first match wins:
   1. `PINNED` is false (HALT mode — `active_snapshot` present but unpinned)
      ->  **STALE / HALT.** Do a best-effort build/update against `CODE_ROOT`,
