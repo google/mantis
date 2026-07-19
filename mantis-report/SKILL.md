@@ -212,6 +212,11 @@ Execute the reporting stage as follows:
      are visible as such. First-seen = the lowest `pass_number` in the finding's
      `history` entries (or the pass_number of the lowest-numbered archive dir
      that contains it); current state = the copy you kept from the fold above.
+   - **Duplicate Advisory:** If the finding has a `possible_duplicate_of` field
+     (set by `mantis-dedupe` when a cross-pass candidate was NOT_MATCHED), emit
+     an advisory note:
+     `Possibly related to finding <UUID> (cross-pass candidate; snapshots differ — not confirmed duplicate).`
+     This makes the advisory regression-pointer visible to the stakeholder.
    - **Discovery Snapshot:** Emit `Discovery Snapshot: <discovery_commit>` for
      the finding. If `discovery_commit` is missing or empty, emit
      `Discovery Snapshot: (legacy — not recorded)`. Never omit or drop the

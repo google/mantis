@@ -204,7 +204,14 @@ Execute your task as follows:
      is false at the PASS level (`active_snapshot.snapshot_pinned` — it is NOT a
      per-finding field) and Block B is uninformative — fall back to today's
      dedup by `signature` if present, else `stable_key` = normalized_title +
-     first `code_paths` entry (path only). This preserves dedup for targets that
+     first `code_paths` entry **including its trailing `:line`**
+     (line-inclusive, same as Step 2). Rationale: stripping `:line` would
+     collapse two DISTINCT bugs in the same file (e.g. `parser.c:100` vs
+     `parser.c:900`) with the same title+CWE into one — silently deleting a real
+     finding. Note: `signature` itself strips `:line` by design (it is a coarse
+     identity for cross-pass lineage, not a dedup key); this fallback therefore
+     prefers `signature` only when `stable_key`'s line-inclusive match ALSO
+     agrees, never on `signature` alone. This preserves dedup for targets that
      can never MATCH. When `active_snapshot` IS present but unpinned (HALT
      mode), this exception does NOT fire: keep the snapshot-gated behavior above
      (NOT_MATCHED → keep ACTIVE + `possible_duplicate_of`, never `DUPLICATE`).
@@ -213,9 +220,11 @@ Execute your task as follows:
      ALWAYS kept active (never trashed), regardless of mode.
 
 3. **Filter Duplicate Findings in Current Batch:** Check the current findings
-   against each other to find duplicates (using `code_paths` and `title`
-   similarities). If multiple findings refer to the exact same flaw or highly
-   overlapping code paths, they must be merged.
+   against each other to find duplicates. Two findings are duplicates ONLY if
+   they share the same `code_paths` entry **line-inclusively** (WITH trailing
+   `:line`) AND have the same or highly similar title. If multiple findings
+   refer to the exact same flaw at the same location, they must be merged.
+   Findings at different lines in the same file are DISTINCT — never merge them.
 
 4. **Map/Reduce Chunking Strategy (For Scale):** If there are many finding files
    (e.g., > 20 items), use a Map/Reduce approach to group them by target file or

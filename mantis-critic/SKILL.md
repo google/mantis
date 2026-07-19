@@ -146,10 +146,11 @@ Execute the critic evaluation as follows:
    sources (try in order, first match wins):
 
    1. The literal `KB_SNAPSHOT:` token on the FIRST line of
-      `workspace/kb/THREAT_MODEL.md` (this is what the producers — architecture
-      and threat-model — actually write; do NOT look for `kb_snapshot_id:` or
-      `Snapshot:` — those tokens are never written and the gate would never
-      match).
+      `workspace/kb/THREAT_MODEL.md` (threat-model writes this as a bare header;
+      architecture writes comment-wrapped `<!-- KB_SNAPSHOT: ... -->` on each KB
+      file). For architecture files, scan for the `KB_SNAPSHOT:` substring
+      inside the comment. Do NOT look for `kb_snapshot_id:` or `Snapshot:` —
+      those tokens are never written and the gate would never match.
    2. Else the `kb_snapshot_id` value in `workspace/.mantis_state.json` (which
       architecture writes in its state-stamp step).
    3. Else `""` (no prior KB provenance). The blanket mass-mark below is gated

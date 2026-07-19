@@ -150,16 +150,18 @@ Execute your orchestration duties in a continuous loop:
         (Else pass-1 summary pollution makes the tree permanently "dirty" and
         sync silently never runs.) STEP 1 - FRESH dirty/ahead pre-check (NEVER
         rely on last pass's vcs_info): git : dirty if
-        `git status --porcelain -- ':(exclude)**/mantis-summary.md'         ':(exclude)**/*.bak-*'`
+        `git status --porcelain         -- ':(exclude)**/mantis-summary.md'         ':(exclude)**/*.bak-*'         ':(exclude)workspace/'         ':(exclude).mantis_snapshots/'`
         is non-empty; ahead if `git rev-list --count @{u}..HEAD 2>/dev/null`
         errors or > 0; detached if `git symbolic-ref -q HEAD` errors. hg : dirty
-        if `hg status -X '**/mantis-summary.md' -X 'workspace/**'` non-empty.
-        multi-vcs : dirty if `repo forall -c 'git status --porcelain'` produces
-        ANY output. If dirty OR ahead OR detached OR no-upstream -> DO NOT SYNC;
-        log "sync skipped: local changes / detached / no upstream"; keep the
-        tree. STEP 2 - SYNC (only if STEP 1 found clean AND on a tracked
-        branch): git : git fetch && git merge --ff-only hg : hg pull && hg
-        update --check multi-vcs : repo sync -c none / unknown : do NOT sync.
+        if
+        `hg status -X '**/mantis-summary.md' -X '*.bak-*' -X 'workspace/**' -X '.mantis_snapshots/**'`
+        non-empty. multi-vcs : dirty if
+        `repo forall -c "git status         --porcelain         -- ':(exclude)**/mantis-summary.md'         ':(exclude)**/*.bak-*'         ':(exclude)workspace/'         ':(exclude).mantis_snapshots/'"`
+        produces ANY output. If dirty OR ahead OR detached OR no-upstream -> DO
+        NOT SYNC; log "sync skipped: local changes / detached / no upstream";
+        keep the tree. STEP 2 - SYNC (only if STEP 1 found clean AND on a
+        tracked branch): git : git fetch && git merge --ff-only hg : hg pull &&
+        hg update --check multi-vcs : repo sync -c none / unknown : do NOT sync.
         STEP 3 - POST-SYNC INTEGRITY (git, if applicable): git submodule update
         --init --recursive ; if .gitattributes uses filter=lfs, git lfs pull. If
         either is needed but unavailable/fails -> force content_hash into
@@ -214,8 +216,8 @@ Execute your orchestration duties in a continuous loop:
         before any copy/detect): if `state.active_snapshot.pass == N` on entry,
         REUSE that dir (no re-copy/re-pin). If `snapshot_pinned` was true but
         the dir is now missing -> STOP and yield to the user (never re-pin to a
-        possibly-drifted live tree). If reusing, skip steps 1–5 and go straight
-        to step 6 (state write).
+        possibly-drifted live tree). If reusing, skip steps 1–4 and go straight
+        to step 5 (state write + snapshot_history append).
 
         1. Detect vcs_info (existing meta-agent detection). VCS_ID = commit_hash
            (git/hg) / manifest revision (multi-vcs) / "" (else).

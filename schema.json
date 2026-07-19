@@ -680,7 +680,7 @@
             "branch": { "type": "string", "description": "The active branch name." },
             "revision": { "type": "string", "description": "The revision identifier (e.g., manifest revision for multi-VCS)." },
             "dirty": { "type": "boolean", "description": "True if there are uncommitted changes in the target repository." },
-            "snapshot_id": { "type": "string", "description": "The SNAPSHOT_ID computed for this pass per the SNAPSHOT_ID ladder (top-level description), assigned AFTER sync. For clean git/hg this equals commit_hash; for dirty / no-VCS / multi-vcs it embeds a whole-tree content_hash so an unchanged tree compares equal across passes. Optional; absent -> pass ran unpinned/legacy (degraded)." }
+            "snapshot_id": { "type": "string", "description": "Redundant with active_snapshot.snapshot_id; kept for legacy harnesses that read vcs_info instead of active_snapshot. The SNAPSHOT_ID computed for this pass per the SNAPSHOT_ID ladder (top-level description), assigned AFTER sync. For clean git/hg this equals commit_hash; for dirty / no-VCS / multi-vcs it embeds a whole-tree content_hash so an unchanged tree compares equal across passes. Optional; the default meta-agent does NOT write this field (it writes active_snapshot.snapshot_id instead); absent -> pass ran unpinned/legacy (degraded)." }
           },
           "required": ["vcs_type"],
           "allOf": [
@@ -708,11 +708,11 @@
         },
         "active_snapshot": {
           "type": "object",
-          "description": "The immutable pinned snapshot the CURRENT pass reads through. Written by the orchestrator/harness during Pin (see the Pass Lifecycle Contract in the top-level description) AFTER sync, and read by every stage's Locator Resolution to resolve CODE_ROOT and the sentinel. Optional and backward-compatible: absent (legacy state, or a harness that does not implement the Pass Lifecycle Contract) -> every stage runs DEGRADED with snapshot_pinned treated as false, i.e. today's single-static-snapshot behavior.",
+          "description": "The immutable pinned snapshot the CURRENT pass reads through. Written by the orchestrator/harness during Pin (see the Pass Lifecycle Contract in the top-level description) AFTER sync, and read by every stage's Locator Resolution to resolve CODE_ROOT and the sentinel. Optional and backward-compatible: absent (legacy state, or a harness that does not implement the Pass Lifecycle Contract) -> MODE-OFF (today's single-static-snapshot behavior; verdicts are allowed). When present with snapshot_pinned=false -> HALT (verdicts forbidden). When present with snapshot_pinned=true -> PINNED (full gating).",
           "properties": {
             "root": { "type": "string", "description": "Absolute path to the pinned snapshot root (SNAPSHOT_ROOT); stages read target code under this root. When snapshot_pinned is false this may point at the live tree." },
             "snapshot_id": { "type": "string", "description": "SNAPSHOT_ID of the pinned snapshot (SNAPSHOT_ID ladder). Passed to stages as --snapshot_id and compared by the Snapshot Match Check." },
-            "snapshot_pinned": { "type": "boolean", "description": "True iff an immutable copy was successfully pinned and its sentinel written. False -> HALT/degraded mode: authoritative verdicts (VERIFIED_SECURE, failed_to_reproduce, DUPLICATE, FALSE_POSITIVE, NON_VIABLE) are forbidden this pass and every Snapshot Match Check returns NOT_MATCHED." },
+            "snapshot_pinned": { "type": "boolean", "description": "True iff an immutable copy was successfully pinned and its sentinel written. False -> HALT mode (only when active_snapshot IS present): authoritative verdicts (VERIFIED_SECURE, failed_to_reproduce, DUPLICATE, FALSE_POSITIVE, NON_VIABLE) are forbidden this pass and every Snapshot Match Check returns NOT_MATCHED. When active_snapshot is ABSENT, snapshot_pinned is irrelevant (MODE-OFF, verdicts allowed)." },
             "pass": { "type": "integer", "description": "The pass_number this snapshot was pinned for; used by crash-resume (on re-entry, equal pass -> reuse the existing snapshot dir, never re-pin)." },
             "vcs_type": { "type": "string", "enum": ["git", "hg", "multi-vcs", "none", "unknown"], "description": "The detected VCS type of the target for this pass." }
           }

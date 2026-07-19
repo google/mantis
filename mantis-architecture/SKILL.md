@@ -176,10 +176,14 @@ VCS):**
        `CODE_ROOT`; carry forward all other KB entries unchanged (they were
        built against the same code, just a different snapshot ID). Re-stamp
        `KB_SNAPSHOT: CUR` on every (re)written file.
-       - **Parent-rollup:** When invalidating a KB entry for changed file F,
-         also invalidate any KB entry that REFERENCES F (e.g., an entity that
-         imports F's module). This ensures downstream architectural analysis is
-         updated when a dependency changes.
+        - **Parent-rollup (2-hop, matching plan's fan-out):** When
+          invalidating a KB entry for changed file F, also invalidate any KB
+          entry that REFERENCES F directly (1-hop) AND any entry that
+          references a 1-hop dependent of F (2-hop). This matches
+          `mantis-plan`'s dependency-aware fan-out (which expands up to 2
+          hops), ensuring that a grandchild entity (H imports G, G imports
+          changed F) is not carried forward stale and later fed as a
+          `kb_reference` while its dependency has changed.
        - **Guardrail:** If ANY uncertainty arises (can't determine which KB
          entries map to which source files, the KB structure is ambiguous, or
          changed_files is empty but KB_ID != CUR), fall back to full rebuild
@@ -256,8 +260,14 @@ VCS):**
      FIRST line of `index.md`, each `entities/*.md`, and each
      `vulnerabilities/*.md` exactly `<!-- KB_SNAPSHOT: <SNAPSHOT_ID> -->`
      (substitute `CUR` from step 0b; it is an HTML comment so it does not
-     render). This is how the next pass's freshness gate (step 0b) and
-     downstream readers (Planner, Threat Modeler) detect drift.
+     render). This is how the next pass's freshness gate (step 0b) detects
+     drift. (Note: `mantis-threat-model` writes a bare `KB_SNAPSHOT:` header on
+     `THREAT_MODEL.md` only, not the comment-wrapped marker; the freshness gate
+     reads `kb_snapshot_id` from state as its primary source and the file marker
+     as a secondary check. `mantis-critic` reads the `KB_SNAPSHOT:` marker on
+     the first line of `THREAT_MODEL.md` first, falling back to `kb_snapshot_id`
+     in state if the marker is absent. Neither `mantis-plan` nor `mantis-report`
+     reads per-file KB_SNAPSHOT markers.)
 
    - **`AS_OF` tags (REQUIRED when running the freshness gate, i.e. HALT or
      PINNED; never write a timeless verdict):** Any assertion DERIVED FROM A
