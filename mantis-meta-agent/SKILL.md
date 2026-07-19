@@ -34,14 +34,29 @@ resilience, and monitors long-running security pipelines.
     `.mantis_snapshots/`. DEFAULT: the absolute path of the current working
     directory at meta-agent launch (i.e., the parent of `workspace/`). If
     `state_root` resolves inside `CODE_ROOT` (the colocated case — the default
-    when launching from inside the target repo), Step 3 (PIN) MUST either (a)
-    HALT and yield to the user with a message to pass `--state_root` outside
-    `CODE_ROOT`, or (b) auto-relocate by moving `workspace/` and
+    when launching from inside the target repo), Step 3 (PIN) MUST (a) HALT and
+    yield to the user with a message to pass `--state_root` outside `CODE_ROOT`
+    — this is the DEFAULT and the only safe behavior without explicit opt-in.
+    Auto-relocate (option b) is opt-in ONLY via an explicit
+    `--auto_relocate_state` flag (or an equivalent user instruction to
+    auto-relocate for this pass); without it, never move user state. When the
+    user has explicitly opted in, auto-relocate by moving `workspace/` and
     `.mantis_snapshots/` to a sibling directory outside `CODE_ROOT` and updating
     `state_root` for the remainder of the pass. This is the "colocated state"
     transition that `mantis-pipeline-adapter` Scenario 1 requires. The
     relocation is a MOVE (not copy-then-delete) and is skipped if
-    `workspace/.workspace_edit.lock` is held (INV-5: no user data loss).
+    `workspace/.workspace_edit.lock` is held (INV-5: no user data loss). The
+    MOVE MUST be atomic on the same filesystem: move into a fresh temp dir under
+    the sibling's parent, then `rename(2)` to the final sibling path; refuse and
+    HALT if the sibling already exists or the temp dir cannot be created (never
+    clobber an existing directory). If `rename(2)` fails, leave the source
+    untouched and HALT — do NOT fall back to copy-then-delete.
+  - `--auto_relocate_state`: OPT-IN flag. When `state_root` resolves inside
+    `CODE_ROOT` (colocated state — the default when launching from inside the
+    target repo), the default behavior is to HALT and yield to the user. Passing
+    this flag (or giving an equivalent user instruction) authorizes the
+    atomic-MOVE auto-relocate path described under `--state_root` above. Without
+    it, never move user state.
 
 ## Input/Output Contract
 
@@ -148,20 +163,29 @@ Execute your orchestration duties in a continuous loop:
         - GATE B: every finding in `workspace/findings/` must have its
           `patch_status` set (patching finalized). If any finding is mid-patch
           (no `patch_status`), SKIP deletion.
-        - SCOPE: delete only within the TARGET tree, never under Mantis state:
-          `find <target_root> -name '*.bak-*' -not -path '*/.mantis_snapshots/*' -not -path '*/workspace/*' -delete`.
-          Never delete `workspace/`, `<state_root>/.mantis_snapshots/`, or
-          anything beneath them. Then synchronize the target with upstream at
-          the pass boundary:
+        - SCOPE: delete only within the TARGET tree, never under Mantis state.
+          The glob MUST be narrow: `mantis-patch` only ever creates
+          `<target>.bak-[finding_id]` where `finding_id` is a UUIDv4
+          (`schema.json` `#/$defs/uuid`). The broad `*.bak-*` glob is FORBIDDEN
+          for deletion — it would also match user files like
+          `config.yaml.bak-old` or `data.bak-2024`. Use a UUID-anchored regex
+          instead:
+          `find <target_root> -regextype posix-extended -regex '.*\.bak-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -not -path '*/.mantis_snapshots/*' -not -path '*/workspace/*' -delete`.
+          For full precision, enumerate `workspace/findings/*.json`, read each
+          `id`, and delete only `<anything>.bak-<that-id>` files. Never delete
+          `workspace/`, `<state_root>/.mantis_snapshots/`, or anything beneath
+          them. Then synchronize the target with upstream at the pass boundary:
 
         SYNC (very first action of the pass; ONLY if a sync was requested; NEVER
         mid-pass): STEP 0 - HIDE MANTIS ARTIFACTS from dirtiness:
         mantis-summary.md, *.bak-*, workspace/, .mantis_snapshots/ MUST be
-        invisible to every dirty check. Delete stray mantis-summary.md and
-        *.bak-* at the LIVE root first, and pass the per-VCS excludes below.
-        (Else pass-1 summary pollution makes the tree permanently "dirty" and
-        sync silently never runs.) STEP 1 - FRESH dirty/ahead pre-check (NEVER
-        rely on last pass's vcs_info): git : dirty if
+        invisible to every dirty check. Delete stray `mantis-summary.md` and
+        UUID-shaped `*.bak-<uuid>` files at the LIVE root first (same narrow
+        glob as the SCOPE rule above — never the broad `*.bak-*` glob for
+        deletion), and pass the per-VCS excludes below. (Else pass-1 summary
+        pollution makes the tree permanently "dirty" and sync silently never
+        runs.) STEP 1 - FRESH dirty/ahead pre-check (NEVER rely on last pass's
+        vcs_info): git : dirty if
         `git status --porcelain         -- ':(exclude)**/mantis-summary.md'         ':(exclude)**/*.bak-*'         ':(exclude)workspace/'         ':(exclude).mantis_snapshots/'`
         is non-empty; ahead if `git rev-list --count @{u}..HEAD 2>/dev/null`
         errors or > 0; detached if `git symbolic-ref -q HEAD` errors. hg : dirty
@@ -340,14 +364,27 @@ Execute your orchestration duties in a continuous loop:
           counter is written in State Maintenance below.
         - In MODE-OFF (no `--sync` requested): do NOT write `active_snapshot` or
           `snapshot_history` (leave them absent → downstream stages run exactly
-          as today per the global backward-compat rule). Writing
-          `active_snapshot` with `snapshot_pinned=false` is NOT the same as
-          omitting it: an absent `active_snapshot` means MODE-OFF, while a
-          present one with `snapshot_pinned=false` means HALT (conservative, no
-          authoritative verdicts). Never erase a HALT signal by omitting
-          `active_snapshot` when `--sync` was requested. Never write
-          `active_snapshot` or set `snapshot_pinned=true` before Steps 1–3 have
-          completed for this pass.
+          as today per the global backward-compat rule). Because Stage 15
+          sub-step 7 PRESERVES `active_snapshot` across pass boundaries, a prior
+          `--sync` pass leaves a stale `active_snapshot` (with `pass == N-1`)
+          behind. To actually achieve MODE-OFF semantics, you MUST actively
+          DELETE any pre-existing `active_snapshot` key from
+          `workspace/.mantis_state.json` when running a pass without `--sync`
+          (in-place key delete, NOT a fresh-object overwrite — preserve
+          `vcs_info`, `snapshot_history`, `pass_number`, etc.). This is a
+          DELETE-when-entering-MODE-OFF, not a "do not overwrite": leaving the
+          stale key would trip the cross-pass staleness gate
+          (`active_snapshot.pass != state.pass_number`) in consumer stages
+          (`mantis-calibrate`, `mantis-chain`, `mantis-architecture`) and
+          contradict the schema's MODE-OFF = `active_snapshot` ABSENT rule.
+          `snapshot_history` is an append-only log — NEVER delete or truncate
+          it; it remains as historical provenance. Writing `active_snapshot`
+          with `snapshot_pinned=false` is NOT the same as omitting it: an absent
+          `active_snapshot` means MODE-OFF, while a present one with
+          `snapshot_pinned=false` means HALT (conservative, no authoritative
+          verdicts). Never erase a HALT signal by omitting `active_snapshot`
+          when `--sync` was requested. Never write `active_snapshot` or set
+          `snapshot_pinned=true` before Steps 1–3 have completed for this pass.
 
    - **State Maintenance:** Write the current pass `N` to `"pass_number"` and
      the current ISO 8601 timestamp to `"last_updated"` in
