@@ -58,7 +58,9 @@ inside isolated sandbox environments to empirically verify bugs.
     `state_root/workspace/findings/` (sets `"reattack_status"`,
     `"reattack_file_path"`, `"reattack_run_command"`, `"reattack_output"`, and
     appends history with stage `"reattack"`). Does not modify `"repro_*"` fields
-    or `"status"`.
+    or `"status"`. **Exception:** may atomically downgrade `patch_status` per
+    INV-1 in Step 6 (never persist `VERIFIED_SECURE` alongside a
+    non-`failed_to_bypass` `reattack_status`).
   - Updates `state_root/workspace/archive/.repro_attempts.json` atomically.
   - Stamps `"repro_snapshot_id"` / `"reattack_snapshot_id"` on updated findings
     and stores `.repro_attempts.json` values as `{count,last_snapshot}` objects
@@ -73,8 +75,11 @@ inside isolated sandbox environments to empirically verify bugs.
     `state_root/workspace/archive/.repro_attempts.json.tmp`) to guarantee
     concurrency safety and retry stability.
   - Snapshot-aware: regenerates the PoC when the finding's snapshot no longer
-    matches; refuses to emit a negative verdict without reached-sink evidence;
-    refuses a reattack verdict when the reattack snapshot != the repro snapshot.
+    matches; refuses to emit a negative verdict without reached-sink evidence.
+    Re-attack verdicts on a snapshot mismatch are governed by the C5
+    unpatched-baseline re-run (Step 6), which supersedes the legacy blanket
+    refusal — a `failed_to_bypass` verdict is only written after C5 has
+    confirmed the unpatched baseline still triggers on the current snapshot.
 
 ## Instructions
 
@@ -169,23 +174,8 @@ Execute the reproduction stage under these constraints:
        - The finding's `"status"` must be `"VALID"` or `"PROVISIONALLY_VALID"`.
        - The finding's `"repro_status"` must be `"reproduced"`.
        - The finding's `"patch_status"` must NOT be `"MITIGATION_PROPOSED"`.
-         (`VERIFIED_SECURE` IS allowed: C5 below handles the case where the
-         snapshot changed since the patch was verified secure, and downgrades
-         `VERIFIED_SECURE` → `VERIFICATION_INCOMPLETE` in the same atomic write
-         as setting `reattack_status=inconclusive_baseline_changed` (C5 step 2),
-         and `VERIFIED_SECURE` → `VERIFICATION_FAILED` in the same atomic write
-         as setting `reattack_status=bypassed_patch` (C5 step 3, and the general
-         `bypassed_patch` write rule below), precisely to avoid persisting the
-         schema-invalid combinations of `patch_status=VERIFIED_SECURE` plus
-         `reattack_status=inconclusive_baseline_changed`, or
-         `patch_status=VERIFIED_SECURE` plus `reattack_status=bypassed_patch`,
-         each of which would violate the
-         `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass` allOf gate. A
-         `bypassed_patch` outcome is a definitive defeat of the patch, so
-         `VERIFICATION_FAILED` (not `VERIFICATION_INCOMPLETE`) is the correct
-         downgrade there. `MITIGATION_PROPOSED` remains forbidden because C5's
-         downgrade clauses only handle `VERIFIED_SECURE`; a separate change
-         would be needed to add C5 handling for `MITIGATION_PROPOSED`.)
+         (`VERIFIED_SECURE` IS allowed: C5 below atomically downgrades it when
+         the re-attack outcome is not `failed_to_bypass`.)
        - Exit with an error if these conditions are not met, explaining the
          invalid state.
      - If `--reattack` is NOT specified (Targeted Normal Run):
@@ -315,33 +305,35 @@ Execute the reproduction stage under these constraints:
    Before classifying ANY negative outcome (`failed_to_reproduce`, or in
    `--reattack` mode `failed_to_bypass`), apply this gate:
 
-   REACHED-SINK EVIDENCE GATE (mechanical): Each reproducer produces
-   REACHED-SINK EVIDENCE via ONE channel, recorded in repro_hints: (a)
-   script/source harness -> write the exact bytes MANTIS_REACHED_ENTRYPOINT to a
-   sidecar file $SENTINEL_FILE and flush+fsync (or unbuffered write) BEFORE
-   invoking the sink. (A file survives a crash that truncates buffered stdout.)
-   (b) binary / firmware / raw-payload -> reached-sink evidence is a captured
-   crash backtrace or ASan frame that explicitly names the target sink function
-   (target-produced tracing). A marker written by a wrapper you author BEFORE
-   invoking the target is SETUP EVIDENCE ONLY: it proves "launch attempted," not
-   "sink reached," and does NOT qualify as reached-sink evidence. If no in-path
-   marker (channel a) and no target-produced backtrace/ASan (channel b) is
-   achievable, the sink is unreached. EVIDENCE PRESENT (reached-sink) = (channel
-   a) sidecar file contains MANTIS_REACHED_ENTRYPOINT written in-path, OR
-   (channel b) target-produced backtrace/ASan output names the sink. A wrapper
-   pre-launch marker alone is NOT evidence present. EVIDENCE ABSENT includes:
-   any compiler/build nonzero exit; exit 127 (command not found); exit 2 with a
-   "No such file" message. DECISION GATE (gate the DECISION, not specific
-   verdict strings):
-
-   - Record repro_status = reproduced OR statically_confirmed ONLY if EVIDENCE
-     is PRESENT. If ABSENT -> repro_status = not_attempted (retry-eligible),
-     STOP.
-   - In patch verification, EVIDENCE is required on the UNPATCHED baseline
-     (Block G), NOT on the post-patch attack run (a correct patch legitimately
-     stops the input before the sink).
-   - If NO evidence channel is achievable for this target, downgrade to
-     not_attempted / VERIFICATION_INCOMPLETE. NEVER synthesize the marker.
+   ```
+   REACHED-SINK EVIDENCE GATE (mechanical):
+   Each reproducer produces REACHED-SINK EVIDENCE via ONE channel, recorded in repro_hints:
+      (a) script/source harness -> write the exact bytes MANTIS_REACHED_ENTRYPOINT to a
+          sidecar file $SENTINEL_FILE and flush+fsync (or unbuffered write) BEFORE
+          invoking the sink. (A file survives a crash that truncates buffered stdout.)
+      (b) binary / firmware / raw-payload -> reached-sink evidence is a captured
+          crash backtrace or ASan frame that explicitly names the target sink
+          function (target-produced tracing). A marker written by a wrapper you
+          author BEFORE invoking the target is SETUP EVIDENCE ONLY: it proves
+          "launch attempted," not "sink reached," and does NOT qualify as
+          reached-sink evidence. If no in-path marker (channel a) and no
+          target-produced backtrace/ASan (channel b) is achievable, the sink is
+          unreached.
+    EVIDENCE PRESENT (reached-sink) = (channel a) sidecar file contains
+      MANTIS_REACHED_ENTRYPOINT written in-path, OR (channel b) target-produced
+      backtrace/ASan output names the sink. A wrapper pre-launch marker alone is
+      NOT evidence present.
+   EVIDENCE ABSENT includes: any compiler/build nonzero exit; exit 127 (command not
+     found); exit 2 with a "No such file" message.
+   DECISION GATE (gate the DECISION, not specific verdict strings):
+     - Record repro_status = reproduced OR statically_confirmed ONLY if EVIDENCE is
+       PRESENT. If ABSENT -> repro_status = not_attempted (retry-eligible), STOP.
+     - In patch verification, EVIDENCE is required on the UNPATCHED baseline (Block G),
+       NOT on the post-patch attack run (a correct patch legitimately stops the input
+       before the sink).
+     - If NO evidence channel is achievable for this target, downgrade to
+       not_attempted / VERIFICATION_INCOMPLETE. NEVER synthesize the marker.
+   ```
 
    Concretely: if the run produced NO reached-sink evidence (build/setup error,
    exit 127, "No such file", or the sink was never reached), record
@@ -485,106 +477,59 @@ Execute the reproduction stage under these constraints:
      - `"reattack_status"` (`"bypassed_patch"`, `"failed_to_bypass"`,
        `"inconclusive_baseline_changed"`).
 
-     - `"bypassed_patch"`: The new/modified PoC successfully bypassed the patch
-       and triggered the bug. **If the finding's current `patch_status` is
-       `VERIFIED_SECURE`, you MUST set `patch_status = "VERIFICATION_FAILED"` in
-       the SAME atomic write (with a history note).** This prevents persisting
-       the schema-invalid combination of `patch_status=VERIFIED_SECURE` plus
-       `reattack_status=bypassed_patch` (the allOf gate requires
-       `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass`); a bypass means the
-       patch was just defeated, so `VERIFIED_SECURE` would over-claim security.
-       This is an explicit exception to "do not touch status" and applies to
-       BOTH the C5 step-3 path and the same-snapshot attack run — a standalone
-       `/mantis-reproduce --reattack` (or cross-pass re-verify) that bypasses a
-       previously-verified patch must not leave `VERIFIED_SECURE` behind. The
-       patcher normally overwrites `patch_status` afterward, but without this
-       same-write downgrade a standalone or cross-pass run persists the invalid
-       state. (`failed_to_bypass` needs NO downgrade — it is the exact value the
-       allOf gate requires for `VERIFIED_SECURE`.)
+     - `"bypassed_patch"`: The PoC bypassed the patch and triggered the bug. If
+       `patch_status` is `VERIFIED_SECURE`, atomically set
+       `patch_status = "VERIFICATION_FAILED"` in the same write (a bypass
+       defeats the patch). This is an explicit exception to "do not touch
+       status" and applies to both the C5 step-3 path and same-snapshot runs.
 
-     - `"failed_to_bypass"`: The PoC was run but failed to bypass the patch.
+     - `"failed_to_bypass"`: The PoC was run but failed to bypass the patch. (No
+       downgrade needed — `failed_to_bypass` is the value the allOf gate
+       requires for `VERIFIED_SECURE`.)
 
-     - `"inconclusive_baseline_changed"`: The unpatched baseline was re-run on
-       the current snapshot (see C5 below) and the bug NO LONGER TRIGGERS on the
-       current unpatched code. The re-attack is inconclusive — the patch was not
-       tested against a live bug. Do NOT claim `failed_to_bypass` (the patch may
-       be correct or the bug may have been fixed upstream). The patcher should
-       set `patch_status` to `ERROR` with details
-       `reproducer_invalid_on_current_snapshot` or `VERIFICATION_INCOMPLETE`,
-       never `VERIFIED_SECURE`.
+     - `"inconclusive_baseline_changed"`: The unpatched baseline was re-run (see
+       C5 below) and the bug NO LONGER TRIGGERS on the current unpatched code.
+       Do NOT claim `failed_to_bypass`. If `patch_status` is `VERIFIED_SECURE`,
+       atomically set `patch_status = "VERIFICATION_INCOMPLETE"` in the same
+       write.
 
-     - **Snapshot-mismatch handling → governed by C5 below (do not bail out
-       blindly):** When the finding's `reattack_snapshot_id` (this run) is not
-       equal to its `repro_snapshot_id` (the run the patch was verified
-       against), do NOT independently record a verdict here — follow **C5**
-       instead, which re-establishes the unpatched baseline on the CURRENT
-       snapshot and either records `inconclusive_baseline_changed` (baseline no
-       longer triggers) or, only if the baseline DOES still trigger on the
-       current snapshot, proceeds with the attack. Rationale: C5 supersedes the
-       old blanket "leave UNSET" refusal, and it stays safe against a false
-       `VERIFIED_SECURE` because `mantis-patch`'s Block G independently
-       re-establishes the unpatched baseline on the current snapshot before any
-       `VERIFIED_SECURE`. If C5 cannot run for any reason (e.g. the current
-       snapshot cannot be materialized), fall back to the conservative behavior:
-       leave `reattack_status` UNSET with a `SNAPSHOT_MISMATCH` history note so
-       the patcher lands `VERIFICATION_INCOMPLETE`.
+     - **INV-1 (single source — the schema's `VERIFIED_SECURE` allOf gate):**
+       `VERIFIED_SECURE => reattack_status` must be `failed_to_bypass`. Any
+       other outcome MUST atomically downgrade `patch_status` in the same write
+       — `VERIFICATION_INCOMPLETE` for `inconclusive_baseline_changed`,
+       `VERIFICATION_FAILED` for `bypassed_patch`. Never persist
+       `VERIFIED_SECURE` alongside a non-`failed_to_bypass` `reattack_status`.
+
+     - **Snapshot-mismatch -> governed by C5 below:** When
+       `reattack_snapshot_id` != `repro_snapshot_id`, do NOT independently
+       record a verdict — follow C5, which re-establishes the unpatched baseline
+       on the CURRENT snapshot. If C5 cannot run, fall back to leaving
+       `reattack_status` UNSET with a `SNAPSHOT_MISMATCH` history note.
 
      - **C5 — Unpatched-baseline re-run (Phase 2):** Before running the attack
-       on the patched build, check whether the snapshot changed since the patch
-       was verified. If `reattack_snapshot_id` != `repro_snapshot_id` (a genuine
-       snapshot change, NOT a HALT-mode `live:` tree), FIRST re-establish the
-       unpatched baseline on the CURRENT snapshot:
+       on the patched build, if `reattack_snapshot_id` != `repro_snapshot_id` (a
+       genuine snapshot change, NOT a HALT-mode `live:` tree), FIRST
+       re-establish the unpatched baseline:
 
        1. Run the reproducer against a FRESH UNPATCHED copy of the current
-          snapshot — i.e. a fresh `mktemp -d` copy of `active_snapshot.root`
-          (the pinned snapshot for THIS pass), NOT the patched shadow. (This is
-          the same "unpatched baseline" that `mantis-patch` Block G step 1 runs;
-          reproduce has no Block G of its own.)
+          snapshot — a fresh `mktemp -d` copy of `active_snapshot.root`, NOT the
+          patched shadow. (This is the same unpatched baseline that
+          `mantis-patch` Block G step 1 runs; reproduce has no Block G.)
        2. If the unpatched baseline does NOT trigger (evidence absent per Block
-          F): set `reattack_status = "inconclusive_baseline_changed"` with a
-          history note, and do NOT proceed with the attack run. Do NOT claim
-          `failed_to_bypass`. **You MUST still populate `reattack_file_path`,
-          `reattack_run_command`, and `reattack_output`** with the baseline
-          re-run's script path, command, and output (the schema's allOf gate
-          requires these fields whenever `reattack_status` is present). Use the
-          reproducer script and command you ran for the baseline re-run, and
-          capture the output showing no trigger. **Additionally, if the
-          finding's current `patch_status` is `VERIFIED_SECURE`, set
-          `patch_status = "VERIFICATION_INCOMPLETE"` in the SAME atomic write
-          (with a history note).** This is an explicit exception to "do not
-          touch status" — it prevents the finding from ever persisting the
-          schema-invalid combination `patch_status=VERIFIED_SECURE` +
-          `reattack_status=inconclusive_baseline_changed` (the allOf gate
-          requires `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass`), and it
-          simply pre-empts the patcher's later downgrade.
-       3. If the unpatched baseline DOES trigger: proceed with the attack on the
-          patched build as normal (`bypassed_patch` or `failed_to_bypass`).
-          **Additionally, if the outcome is `bypassed_patch` and the finding's
-          current `patch_status` is `VERIFIED_SECURE`, set
-          `patch_status = "VERIFICATION_FAILED"` in the SAME atomic write (with
-          a history note).** This mirrors step 2's downgrade and prevents the
-          finding from ever persisting the schema-invalid combination
-          `patch_status=VERIFIED_SECURE` + `reattack_status=bypassed_patch` (the
-          allOf gate requires
-          `VERIFIED_SECURE ⇒ reattack_status=failed_to_bypass`); a bypass means
-          the patch was just defeated, so `VERIFIED_SECURE` would over-claim
-          security. (`failed_to_bypass` needs NO downgrade — it is the exact
-          value the allOf gate requires for `VERIFIED_SECURE`.) This is an
-          explicit exception to "do not touch status", matching step 2.
+          F): set `reattack_status = "inconclusive_baseline_changed"`, do NOT
+          proceed with the attack, do NOT claim `failed_to_bypass`. You MUST
+          still populate `reattack_file_path`, `reattack_run_command`, and
+          `reattack_output` with the baseline re-run's details. Apply INV-1
+          (downgrade `VERIFIED_SECURE` -> `VERIFICATION_INCOMPLETE`).
+       3. If the unpatched baseline DOES trigger: proceed with the attack
+          (`bypassed_patch` or `failed_to_bypass`). Apply INV-1 (downgrade
+          `VERIFIED_SECURE` -> `VERIFICATION_FAILED` if `bypassed_patch`).
 
-       - **HALT-mode guardrail (detect HALT by the PASS's snapshot id, NOT the
-         `--target_root` flag):** HALT means the ORIGINAL pass could not pin a
-         snapshot — detect it by reading state: `active_snapshot.snapshot_id`
-         starts with `live:` (equivalently `active_snapshot.snapshot_pinned` is
-         false IN STATE). Do NOT infer HALT from the `--snapshot_pinned=false`
-         ARGUMENT passed on THIS reattack invocation: that argument is only the
-         sentinel-exemption for the patched-shadow `--target_root` (Block A step
-         1a/2) and does NOT mean the pass is degraded. In genuine HALT (pass id
-         is `live:`), authoritative verdicts are forbidden anyway; skip the C5
-         re-baseline and follow the existing HALT ceiling (leave
-         `reattack_status` UNSET with the HALT history note). When the pass IS
-         pinned (pass id is not `live:`), run C5 normally even though
-         `--snapshot_pinned=false` was passed for the shadow.
+       - **HALT-mode guardrail:** Detect HALT by the PASS's snapshot id in state
+         (`active_snapshot.snapshot_id` starts with `live:`), NOT the
+         `--snapshot_pinned=false` argument (that's only the sentinel-exemption
+         for the patched shadow). In HALT, skip C5 and follow the existing HALT
+         ceiling (leave `reattack_status` UNSET with the HALT note).
        - This does NOT change the VERIFIED_SECURE gate — Block G still requires
          the unpatched baseline to trigger.
 

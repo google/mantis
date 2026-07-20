@@ -742,6 +742,10 @@
           "type": "string",
           "enum": ["COMPUTED", "UNKNOWN"],
           "description": "Whether changed_files is a trustworthy diff (COMPUTED) or could not be computed (UNKNOWN: no PREV entry, unpinned, vcs_type none/unknown, a content:/live:/+content_hash fallback id on either end, or a diff error). UNKNOWN MUST be treated as 'every file changed' -> never drop, never skip. Optional; absent -> UNKNOWN."
+        },
+        "changed_files_pass": {
+          "type": "integer",
+          "description": "The pass_number when changed_files/changed_files_status were last computed. Consumers MUST compare this to state.pass_number: if absent or different, the diff is from a prior pass and MUST be treated as UNKNOWN (full rebuild / all files potentially changed). Written by mantis-plan Block E alongside changed_files. Optional; absent -> stale."
         }
       },
       "required": ["pass_number", "last_updated"]

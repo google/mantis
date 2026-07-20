@@ -46,9 +46,9 @@ a canonical, interlinked Markdown Knowledge Base (`workspace/kb/`).
     current KB was last built against; absent on a first/legacy KB).
   - `workspace/.mantis_state.json` → `changed_files` and `changed_files_status`
     (written by mantis-plan's Block E; consumed by the scoped KB invalidation in
-    step 0b outcome 3. Absent on the Stage-2 invocation before planning — the
-    guardrail falls back to full rebuild. Present on the Stage-15 invocation
-    after planning — enables scoped invalidation).
+    step 0b outcome 3. Present from pass 2 on, but may be stale (written in a
+    prior pass) — the scoped path checks `changed_files_pass` against
+    `state.pass_number` and falls back to full rebuild if they differ.)
 - **Writes**:
   - Markdown files under `workspace/kb/` (`architecture.md`,
     `entities/[component_name].md`, `vulnerabilities/[CWE-ID].md`, `index.md`).
@@ -173,13 +173,16 @@ VCS):**
      unstamped / legacy. Choose full or scoped:
      - **Scoped invalidation (Phase 2 incremental efficiency):** If
        `changed_files_status` is known (not UNKNOWN) AND the KB already has a
-       `KB_SNAPSHOT` stamp (KB_ID was non-empty, just different), attempt a
-       SCOPED rebuild: only invalidate KB entries whose source files are in
-       `changed_files`, plus their parent-rollup dependents (KB entities that
-       import/reference the changed files). Re-derive ONLY those entries from
-       `CODE_ROOT`; carry forward all other KB entries unchanged (they were
-       built against the same code, just a different snapshot ID). Re-stamp
-       `KB_SNAPSHOT: CUR` on every (re)written file.
+       `KB_SNAPSHOT` stamp (KB_ID was non-empty, just different) AND
+       `changed_files_pass` equals the current `state.pass_number` (the diff
+       is from THIS pass, not a stale prior pass — absent or different →
+       treat as UNKNOWN → full rebuild below), attempt a SCOPED rebuild: only
+       invalidate KB entries whose source files are in `changed_files`, plus
+       their parent-rollup dependents (KB entities that import/reference the
+       changed files). Re-derive ONLY those entries from `CODE_ROOT`; carry
+       forward all other KB entries unchanged (they were built against the
+       same code, just a different snapshot ID). Re-stamp `KB_SNAPSHOT: CUR`
+       on every (re)written file.
         - **Parent-rollup (2-hop, matching plan's fan-out):** When
           invalidating a KB entry for changed file F, also invalidate any KB
           entry that REFERENCES F directly (1-hop) AND any entry that

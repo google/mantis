@@ -196,7 +196,9 @@ Execute the planning stage as follows:
        live tree). Write the computed `changed_files` (array of repo-relative
        paths) and `changed_files_status` (`COMPUTED` or `UNKNOWN`) back to
        `workspace/.mantis_state.json`, then use them for the rest of the stage.
-       Use the following to know which files changed since the previous pass:
+       Also write `changed_files_pass` = the current `pass_number` from state,
+       so consumers can detect a stale (prior-pass) diff. Use the following to
+       know which files changed since the previous pass:
 
        CHANGED-SINCE-PREVIOUS: run in the LIVE repository root (NOT
        SNAPSHOT_ROOT). CUR = current commit/revision; PREV = snapshot_history
