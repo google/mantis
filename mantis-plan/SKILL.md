@@ -291,11 +291,11 @@ Execute the planning stage as follows:
             This mirrors `mantis-patch`'s LEGACY-mode carve- out
             (`patch:133-138`, `patch:172-174`). Do NOT gate the bypass on
             `snapshot_pinned==false` — that would also catch HALT mode, where
-            the STALE banner + AS_OF:UNKNOWN tags legitimately mark the finding
-            as needing re-verification. Gate ONLY on `active_snapshot` absent.
-            (Do NOT change Block B itself — it is character-identical across
-            skills per `README_AGENTS.md:711-718` block-fidelity warning; the
-            fix goes in plan's CONSUMERS of Block B, not Block B.)
+            the STALE banner legitimately marks the finding as needing
+            re-verification. Gate ONLY on `active_snapshot` absent. (Do NOT
+            change Block B itself — it is character-identical across skills per
+            `README_AGENTS.md:711-718` block-fidelity warning; the fix goes in
+            plan's CONSUMERS of Block B, not Block B.)
 
           - **RE-DISCOVER** in every other case (Block B NOT_MATCHED, or file in
             `changed_files`, or file missing, or

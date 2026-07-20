@@ -74,10 +74,9 @@ a canonical, interlinked Markdown Knowledge Base (`workspace/kb/`).
     programmatically verifying all KB Markdown updates were written
     successfully. KB files are overwritten in-place.
   - Snapshot stamping is part of the same transaction: the `KB_SNAPSHOT`
-    markers, `AS_OF` tags, the per-pass
-    `workspace/archive/kb/kb_pass_${N}_${X_kb}/` copy, and the `kb_snapshot_id`
-    state write complete before (or together with) the learnings move. On any
-    failure, leave `workspace/learnings.jsonl` intact.
+    markers, the per-pass `workspace/archive/kb/kb_pass_${N}_${X_kb}/` copy, and
+    the `kb_snapshot_id` state write complete before (or together with) the
+    learnings move. On any failure, leave `workspace/learnings.jsonl` intact.
 
 ## Instructions
 
@@ -147,7 +146,7 @@ VCS):**
 - **MODE-OFF short-circuit (3-state rule):** if `active_snapshot` is ABSENT
   in state (no `--sync` was requested — MODE-OFF = today's default), SKIP the
   freshness gate entirely: do a best-effort build/update against `CODE_ROOT`,
-  do NOT prepend any STALE banner, do NOT emit `AS_OF:UNKNOWN` tags, and do
+  do NOT prepend any STALE banner, and do
   NOT stamp `kb_snapshot_id`. This is byte-for-byte today's behavior. (Only
   HALT and PINNED run the gate below.)
 - `KB_ID` = the `kb_snapshot_id` value in `.mantis_state.json` (primary); else the
@@ -161,7 +160,7 @@ VCS):**
   1. `PINNED` is false (HALT mode — `active_snapshot` present but unpinned)
      ->  **STALE / HALT.** Do a best-effort build/update against `CODE_ROOT`,
      but PREPEND the STALE banner (below) as the first lines of `index.md`.
-     Do NOT claim currency: keep every assertion's `AS_OF` tag and leave the
+     Do NOT claim currency: leave the
      banner in place. Set `kb_snapshot_id` = `CUR` (a `live:` id).
   2. Else `KB_ID` == `CUR` (both non-empty)  ->  **CURRENT.** Do the incremental
      update + decay-check (step 4) as today. Re-stamp `KB_SNAPSHOT: CUR` on
@@ -277,33 +276,18 @@ VCS):**
      per-file marker is ONLY consumed by step 0b's freshness gate, which
      MODE-OFF skips entirely (`arch:147-152`: "SKIP the freshness gate
      entirely... This is byte-for-byte today's behavior. Only HALT and PINNED
-     run the gate below."). This MODE-OFF gate mirrors the AS_OF tag subsection
-     below (`arch:284-285`: "In MODE-OFF — no freshness gate — do NOT emit AS_OF
-     tags; this is today's behavior.") and step 0b's outcome clauses, which
-     mention per-file `KB_SNAPSHOT: CUR` stamping only in HALT/PINNED outcomes
-     (CURRENT `:164`, scoped BUILD FRESH `:178`, full BUILD FRESH `:195`).
-     (Note: `mantis-threat-model` writes a bare `KB_SNAPSHOT:` header on
-     `THREAT_MODEL.md` only, not the comment-­wrapped marker; the freshness gate
-     reads `kb_snapshot_id` from state as its primary source and the file marker
-     as a secondary check. `mantis-critic` reads the `KB_SNAPSHOT:` marker on
-     the first line of `THREAT_MODEL.md` first, falling back to `kb_snapshot_id`
-     in state if the marker is absent. Neither `mantis-plan` nor `mantis-report`
-     reads per-file KB_SNAPSHOT markers.)
+     run the gate below."). This MODE-OFF gate mirrors the freshness gate logic
+     below and step 0b's outcome clauses, which mention per-file
+     `KB_SNAPSHOT: CUR` stamping only in HALT/PINNED outcomes (CURRENT `:164`,
+     scoped BUILD FRESH `:178`, full BUILD FRESH `:195`).
 
-   - **`AS_OF` tags (REQUIRED when running the freshness gate, i.e. HALT or
-     PINNED; never write a timeless verdict):** Any assertion DERIVED FROM A
-     FINDING OR LEARNING OUTCOME that a component or bug-class is
-     `VERIFIED_SECURE`/FIXED, `NON_VIABLE`, `SAMPLE_OR_TEST`, or
-     `FALSE_POSITIVE` MUST end with a trailing `(AS_OF:<snapshot>)`, where
-     `<snapshot>` is that learning's `snapshot` field (the `SNAPSHOT_ID` the
-     learning was recorded against — reflect already stamps this; critic/patch
-     MUST stamp it too). If the learning has no `snapshot` (missing, empty),
-     write `(AS_OF:UNKNOWN)`. Example: `render()` sanitizes input —
-     VERIFIED_SECURE (AS_OF:9af3c1:deadbeef). This prevents a later-reverted fix
-     from being laundered into the KB as a timeless "secure" claim: a reader
-     compares `AS_OF` to the current `SNAPSHOT_ID` and re-verifies on any
-     mismatch. NEVER omit the tag to make an assertion timeless. (In MODE-OFF —
-     no freshness gate — do NOT emit AS_OF tags; this is today's behavior.)
+   - **Per-file `KB_SNAPSHOT` stamping is the sole provenance mechanism for KB
+     assertions.** Do NOT write per-assertion `(AS_OF:<snapshot>)` tags — the
+     `AS_OF` re-verification reader was never built, and staleness protection is
+     already provided by the freshness gate (step 0b) comparing `kb_snapshot_id`
+     to `SNAPSHOT_ID`, plus per-finding `discovery_commit` (enforced by
+     `mantis-critic` Block B). A later-reverted fix is caught by these
+     mechanisms, not by per-assertion tags.
 
 4. **Validate and Decay Knowledge (Drift Prevention):**
 
@@ -321,9 +305,8 @@ VCS):**
    - If a learning is repeatedly proven wrong by the current trajectory
      insights, actively correct it to prevent the "wrong learning" from
      persisting and blinding future agents.
-   - When you correct or re-confirm a finding-derived assertion, update its
-     `(AS_OF:<snapshot>)` tag to the `snapshot` of the evidence you used (or
-     `UNKNOWN` if none). Never drop the tag to make an assertion timeless.
+   - When you correct or re-confirm a finding-derived assertion, re-stamp the
+     `KB_SNAPSHOT` marker on that KB file.
 
 5. **Transactional Inbox Clearing & Archiving:**
 
@@ -333,7 +316,7 @@ VCS):**
      updates were successfully written to disk and that cross-references are
      valid. Also verify, before committing, that every (re)written KB file
      BEGINS with its `<!-- KB_SNAPSHOT: <SNAPSHOT_ID> -->` marker and that every
-     finding-derived verdict carries an `(AS_OF:...)` tag.
+     finding-derived verdict is grounded in the current `SNAPSHOT_ID`.
    - **Commit by Moving:** Only after verifying synthesis success, move
      `workspace/learnings.jsonl` to the archive directory:
      - Ensure the target directory exists (e.g.,
@@ -365,8 +348,7 @@ VCS):**
    - If `workspace/learnings.jsonl` is ABSENT on entry (e.g. the Stage-15
      invocation, because the Stage-2 invocation already archived it this pass),
      skip ONLY the learnings move; STILL run the freshness gate (step 0b), stamp
-     the `KB_SNAPSHOT` markers and `AS_OF` tags, write `kb_snapshot_id`, and
-     copy the per-pass KB archive. KB provenance must be recorded on every
-     invocation.
+     the `KB_SNAPSHOT` markers, write `kb_snapshot_id`, and copy the per-pass KB
+     archive. KB provenance must be recorded on every invocation.
 
 When complete, notify the user.
