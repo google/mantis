@@ -60,7 +60,8 @@ shared state stored on disk.
 graph TD
     subgraph CoreStages [Pipeline Execution Loop]
         Meta["/mantis-meta-agent (Supervisor)"] --> Hist["/mantis-history (History Extractor)"]
-        Hist --> Sum["/mantis-summarize (Summarizer)"]
+        Hist --> SI["/mantis-structural-index (Index Builder)"]
+        SI --> Sum["/mantis-summarize (Summarizer)"]
         Sum --> Arch["/mantis-architecture (KB Architect)"]
         Arch --> TM["/mantis-threat-model (Threat Modeler)"]
         TM --> Plan["/mantis-plan (Strategist)"]
@@ -78,6 +79,7 @@ graph TD
     end
 
     FileHist[("workspace/historical_learnings.jsonl")]
+    FileSI[("workspace/kb/structural_index.jsonl")]
     FileSum[("mantis-summary.md")]
     FileKB[/"workspace/kb/ (Markdown KB)"/]
     FilePlan[("workspace/plan.json")]
@@ -86,7 +88,8 @@ graph TD
     FileRpt[/"workspace/report/review_packet-latest.md"/]
 
     Meta --> Hist
-    Hist --> Sum
+    Hist --> SI
+    SI --> Sum
     Sum --> Arch
     Arch --> TM
     TM --> Plan
@@ -103,6 +106,7 @@ graph TD
     Ref --> Rpt
 
     Hist -.->|Generates| FileHist
+    SI -.->|Generates| FileSI
     Hist -.->|Reads| FileSum
     Sum -.->|Reads| FileHist
     Sum -.->|Generates| FileSum
@@ -135,13 +139,23 @@ graph TD
     Rpt -.->|Generates| FileRpt
 ```
 
-01. **`/mantis-meta-agent` (Supervisor):** A persistent, overarching agent that
-    launches the continuous loop, monitors execution, handles errors, reports
-    findings, and archives the `workspace/findings/` directory between loops.
-02. **`/mantis-history` (History Extractor):** An optional pre-processing step
-    that analyzes the repository's version control system (VCS) history to
-    extract past vulnerabilities, security fixes, and vulnerability patterns,
-    saving findings to `workspace/historical_learnings.jsonl`.
+1. **`/mantis-meta-agent` (Supervisor):** A persistent, overarching agent that
+   launches the continuous loop, monitors execution, handles errors, reports
+   findings, and archives the `workspace/findings/` directory between loops.
+2. **`/mantis-history` (History Extractor):** An optional pre-processing step
+   that analyzes the repository's version control system (VCS) history to
+   extract past vulnerabilities, security fixes, and vulnerability patterns,
+   saving findings to `workspace/historical_learnings.jsonl`.
+
+02b. **`/mantis-structural-index` (Structural Index Builder):** An optional
+stage that builds a function-level call graph and symbol table from source code,
+writing `workspace/kb/structural_index.jsonl`. It runs immediately after the
+snapshot is pinned and before the first code-reading analysis stage. Uses the
+most precise cross-reference backend available (LSP, SCIP, cscope, tree-sitter,
+ctags, regex, grep — degrading gracefully). In MODE-OFF it builds against the
+current directory. The index is HINT-only — it never gates findings and degrades
+to grep when unavailable.
+
 03. **`/mantis-summarize` (Summarizer):** An optional pre-processing step that
     generates a `mantis-summary.md` for each directory, reading past
     vulnerabilities from `workspace/historical_learnings.jsonl` to enrich
@@ -374,9 +388,14 @@ format (not SARIF) that any SAST tool can convert to. See
 ### Structural Code Index (AST-Level Context)
 
 For large codebases where grep-based call-site discovery is unreliable, the
-Pipeline Adapter Guide includes a **Structural Code Index** pattern (Guideline
-9). This opt-in adapter builds a function-level call graph and symbol table
-using ctags (zero-dependency) or tree-sitter (pip-installable). See
+**Structural Code Index** is an optional first-class stage
+(`/mantis-structural-index`) that builds a function-level call graph and symbol
+table from source code using the most precise cross-reference backend available
+(LSP, SCIP/LSIF, cscope, tree-sitter, ast-grep, ctags, regex — degrading to
+grep). It runs immediately after the snapshot is pinned and before the first
+code-reading analysis stage. See
+[mantis-structural-index/SKILL.md](mantis-structural-index/SKILL.md) and the
+deep spec at
 [mantis-pipeline-adapter/references/mantis-structural-index.md](mantis-pipeline-adapter/references/mantis-structural-index.md).
 
 > **Note on Standalone vs. Harness Mode:** When using Mantis Skills directly

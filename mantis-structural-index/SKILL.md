@@ -1,13 +1,18 @@
-# Reference Blueprint: mantis-structural-index Skill
+---
+name: mantis-structural-index
+description: >-
+  Builds a function-level call graph and symbol table from source code for
+  structural context. Use when a pinned or live codebase is available and
+  structural cross-reference data would improve research quality. Don't use for
+  findings analysis, patching, or reporting.
+---
 
-This is a **reference blueprint** that documents the real
-`mantis-structural-index` skill (see
-[../../mantis-structural-index/SKILL.md](../../mantis-structural-index/SKILL.md)).
-It retains the deep spec and implementation details. Builders use it as a
-template to invoke `mantis-structural-index` in their own environment, invoked
-by the harness or by `mantis-plan` / `mantis-researcher` as a sub-agent when
-AST-level structural context (function boundaries, call graphs, symbol tables)
-is available.
+# Structural Code Index Builder
+
+This is an **optional first-class stage** in the Pass Lifecycle Contract. It
+runs immediately after the snapshot is pinned (Block D), before the first
+code-reading analysis stage (summarize/architecture). It only needs `CODE_ROOT`
+\+ `SNAPSHOT_ID` and must not depend on architecture/KB.
 
 ## System Goal
 
@@ -33,6 +38,8 @@ awareness to improve LLM reasoning quality during discovery — supplementing
 - **Reads**:
   - `workspace/.mantis_state.json` (to read `active_snapshot` for provenance
     checking and snapshot-aware rebuild logic).
+  - `workspace/kb/structural_index.jsonl` (to check provenance for
+    reuse-on-match idempotency).
   - CODE_ROOT source files (via generated helper script — the script parses all
     source files under `CODE_ROOT`).
 - **Writes**:
@@ -45,17 +52,15 @@ awareness to improve LLM reasoning quality during discovery — supplementing
     (MODE-OFF and no readable `active_snapshot`), build against the current
     directory with `snapshot_id` set to `"unknown"`. Do NOT skip — this is the
     standalone-efficiency case.
-- **Inert until wired:** This skill returns an empty index until both (1) a
-  caller invokes it (the harness, `mantis-plan`, or `mantis-researcher`), and
-  (2) `CODE_ROOT` is resolved. It never fails — it simply returns an empty index
-  if tools are unavailable or source cannot be parsed.
+- **Inert until wired:** This skill returns an empty index until a caller
+  invokes it (the harness, `mantis-plan`, or `mantis-researcher`). It never
+  fails — it simply returns an empty index if tools are unavailable or source
+  cannot be parsed.
 - **Idempotency Guarantee**:
-  - Read-only on `CODE_ROOT`. Writes only to STATE-RELATIVE paths. If
-    `structural_index.jsonl` already carries the current `SNAPSHOT_ID` in its
-    provenance header, reuse it — do not rebuild (reuse-on-match). Rebuild only
-    when `SNAPSHOT_ID` differs. In MODE-OFF (`snapshot_id` = `"unknown"`),
-    always rebuild — the live tree is mutable and `"unknown"` is not a freshness
-    signal.
+  - Read-only on `CODE_ROOT`. Writes only to STATE-RELATIVE paths. Re-running
+    with the same `CODE_ROOT` and `SNAPSHOT_ID` reuses the existing index
+    (reuse-on-match) rather than rebuilding — except in MODE-OFF, where it
+    always rebuilds.
 
 ## Instructions
 
@@ -105,25 +110,57 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
 This is a CODE-READING stage — it reads target source files under CODE_ROOT via
 the helper script. Block A step 0's findings-only skip does NOT apply.
 
-### Step 1: Check Tool Availability
+### Step 1: Idempotency / Freshness Check
+
+1. If `workspace/kb/structural_index.jsonl` already exists, read its provenance
+   header (the `_provenance`, `snapshot_id` top-level keys).
+2. If `snapshot_id` in the header matches the current `SNAPSHOT_ID` → **reuse
+   it**. Do not rebuild. This bounds cost across retries/crash-resume.
+3. If `SNAPSHOT_ID` differs (or is absent) → proceed to rebuild (Steps 2–5).
+4. In MODE-OFF, `SNAPSHOT_ID` is `"unknown"`. Because the live tree is mutable
+   and `"unknown"` is a constant (not a freshness signal), **always rebuild** in
+   MODE-OFF — do not reuse a previous `"unknown"` index.
+5. Changed-files-only incremental rebuild via Block E (changed-since-previous
+   diff) is explicitly a **future optimization**, not now. Today the rebuild is
+   full (all source files under `CODE_ROOT`).
+
+### Step 2: Probe Backend Availability
 
 Use the most precise cross-reference backend available in this environment,
-degrading to grep. The following are **examples, not an exhaustive enum**:
+degrading to grep. The following are **examples, not an exhaustive enum** — the
+helper probes each tier and steps down to the first that is available:
 
 1. **LSP** (clangd / gopls / pyright / rust-analyzer / …) or **SCIP / LSIF** —
-   if a pre-built index or running language server is available.
-2. **cscope / GNU global** — if available.
+   if a pre-built index or a running language server is available. Most precise:
+   full type-aware cross-reference, call hierarchy, and hover/signature data.
+2. **cscope / GNU global** — if available. Language-aware inverted index with
+   caller/callee lookups and definition references.
 3. **tree-sitter / ast-grep** — if `tree_sitter_languages` is importable or
-   `ast-grep` is on `PATH`.
-4. **universal-ctags** — if `ctags` is on `PATH`.
-5. **stdlib-regex symbol/boundary helper** — fallback Python regex pass.
-6. **grep** — final fallback (empty index, grep behavior unchanged).
+   `ast-grep` is on `PATH`. Full AST parsing: function boundaries, call
+   expressions, signatures.
+4. **universal-ctags** — if `ctags` is on `PATH`. Symbol table only (function
+   definitions, locations — no call graph). Call-site extraction uses a
+   lightweight regex pass within known function boundaries.
+5. **stdlib-regex symbol/boundary helper** — fallback Python regex pass over
+   source files. Identifies function definitions and call patterns using
+   language-agnostic heuristics. Less precise but zero-dependency.
+6. **grep** — final fallback. No structural index is written; consumers fall
+   back to grep-based discovery (today's behavior byte-for-byte). An empty index
+   is produced.
 
-If no backend is available, fall back to an empty index (notify the caller: "No
-structural analysis tool available — returning empty index. Structural context
-unavailable, falling back to grep-based discovery.").
+The determinism lives in a runtime-generated versioned helper
+(`build_structural_index.py`, `# MANTIS_HELPER_VERSION = 1`, grep-and-regenerate
+on reuse) that probes and steps down the ladder. No shipped binaries;
+air-gapped-safe.
 
-### Step 2: Write and Run Helper Script
+**Large-tree guard:** On very large source trees (>50K source files), a full
+rebuild can dominate stage-0 wall-clock (100MB+ indexes). If the plan has
+already identified target files, the helper SHOULD restrict parsing to those
+files and their import/call-graph neighborhood rather than the entire tree. If
+no plan exists yet, cap at the first 10K functions discovered — the index is
+HINT-only, so partial coverage is safe (grep remains authoritative).
+
+### Step 3: Write and Run Helper Script
 
 1. Write a reusable helper script to
    `workspace/helpers/build_structural_index.py`. The FIRST LINE of the script
@@ -135,7 +172,7 @@ unavailable, falling back to grep-based discovery.").
    - **Function definitions**: `name`, `signature`, `start_line`, `end_line`.
    - **Call edges**: `caller` (enclosing function), `callee` (called function
      name), `file`, `line`.
-3. The script probes the available backends (Step 1 ladder) and steps down to
+3. The script probes the available backends (Step 2 ladder) and steps down to
    the first available:
    - **LSP / SCIP / LSIF**: Query the running server or parse the pre-built
      index. Extract function definitions, call hierarchy, and signatures.
@@ -157,9 +194,10 @@ unavailable, falling back to grep-based discovery.").
    cscope `cscope.out`, clangd cache) MUST be redirected to STATE-RELATIVE
    paths: `ctags -f <state>/helpers/tags`,
    `cscope -f <state>/helpers/cscope.out`,
-   `CLANGD_INDEX_STORAGE=<state>/helpers/`.
+   `CLANGD_INDEX_STORAGE=<state>/helpers/`. LSP/SCIP queries to a running server
+   are read-only and need no redirect.
 
-### Step 3: Write `structural_index.jsonl`
+### Step 4: Write `structural_index.jsonl`
 
 1. Capture the JSON output from the helper script.
 2. The output is JSONL (one JSON object per line). Line 1 is the provenance
@@ -170,17 +208,17 @@ unavailable, falling back to grep-based discovery.").
 {
   "_provenance": true,
   "snapshot_id": "<SNAPSHOT_ID or 'unknown'>",
-  "tool": "tree-sitter"
+  "tool": "<backend-name>"
 }
 ```
 
 3. Write the complete index to `workspace/kb/structural_index.jsonl`
    (STATE-RELATIVE — NEVER under `CODE_ROOT`).
-4. The `tool` field records which backend was used (e.g., `"lsp-clangd"`,
-   `"scip"`, `"cscope"`, `"tree-sitter"`, `"ast-grep"`, `"ctags"`, `"regex"`,
-   `"grep"`), so consumers know the precision level.
+4. The `tool` field records which backend was actually used (e.g.,
+   `"lsp-clangd"`, `"scip"`, `"cscope"`, `"tree-sitter"`, `"ast-grep"`,
+   `"ctags"`, `"regex"`, `"grep"`), so consumers know the precision level.
 
-### Step 4: Return Results / Notify Caller
+### Step 5: Return Results / Notify Caller
 
 1. Return the path to `structural_index.jsonl` and a summary (function count,
    call-site count, tool used).
@@ -220,29 +258,31 @@ Lines 2+ — structural records (one per line, `_type` discriminator):
 | `function`  | Function definition with boundary and signature | `key`, `start_line`, `end_line`, `signature`, `calls` |
 | `call_edge` | A call from caller to callee at file:line       | `caller`, `callee`, `file`, `line`                    |
 
+`find_callers(Y)` = filter `callee: Y`; `find_callees(X)` = filter `caller: X`.
+
 ## Snapshot Safety
 
-1. **Build from `CODE_ROOT`, not live tree (when pinned).** The structural index
-   is built from the pinned snapshot, ensuring it reflects the exact bytes the
-   pipeline is analyzing.
+1. **Build from `CODE_ROOT`, not live tree (when pinned).** When the snapshot is
+   pinned, the structural index is built from the pinned `CODE_ROOT`, ensuring
+   it reflects the exact bytes the pipeline is analyzing.
 2. **Reuse-on-match.** If `structural_index.jsonl` already carries the current
    `SNAPSHOT_ID` in its provenance header, reuse it — do not rebuild. Rebuild
-   only when `SNAPSHOT_ID` differs.
+   only when `SNAPSHOT_ID` differs. This bounds cost across
+   retries/crash-resume.
 3. **STALE flag in HALT mode.** When `snapshot_pinned` is false (HALT), the
-   index may be built from the unpinned `CODE_ROOT` but should be marked as
-   potentially stale. Consumers treat structural hints as advisory.
+   index may be built from the unpinned `CODE_ROOT` but is marked as potentially
+   stale. Consumers treat structural hints as advisory.
 4. **MODE-OFF: build, do not skip.** When `active_snapshot` is absent
    (MODE-OFF), build against the current directory (cwd) with provenance
-   `snapshot_id` set to `"unknown"`. This is the standalone-efficiency case. Do
-   NOT return an empty index merely because the snapshot is absent. **Always
-   rebuild in MODE-OFF** — the live tree is mutable and `"unknown"` is a
-   constant, not a freshness signal.
+   `snapshot_id` set to `"unknown"`. This is the standalone-efficiency case —
+   the index is still useful for the researcher/planner even without snapshot
+   pinning. Do NOT return an empty index merely because the snapshot is absent.
 
-## Per-Skill Augmentation Guidance
+## Consumption Contract
 
-These are the consumption contract — runtime instructions passed by the harness.
-The structural index is a HINT-only enhancement; skills that do not use it
-behave exactly as they do today.
+These are runtime instructions for callers — they define how consumers use the
+structural index. The structural index is a HINT-only enhancement; skills that
+do not use it behave exactly as they do today.
 
 ### mantis-plan
 
@@ -272,20 +312,33 @@ behave exactly as they do today.
   (today's behavior). The structural index is a coverage HINT only — it improves
   audit quality but is never required.
 
-## Safety Properties
+### Query Interface
 
-Safety guardrails are defined in Guideline 9G of the Pipeline Adapter
-([../SKILL.md](../SKILL.md#g-safety-guardrails-9)). Key properties:
+The JSONL file is the contract. Consumers read `structural_index.jsonl` directly
+(or generate a tiny `query_structural_index.py` helper to return one slice for
+large indexes). A kb-query-style query sub-agent or MCP (`find_callers()` etc.)
+is the scale upgrade only — do not create a second top-level query skill by
+default; that is over-engineering, and it mirrors how consumers already read
+`dependencies.json` directly.
 
-- **Optional first-class stage.** The skill is additive; a non-conformant
-  harness simply skips it. No impact when not wired.
-- **Coverage HINTs only.** The structural index decides ORDER, never MEMBERSHIP
-  of the audit set.
-- **Fallback on failure.** Most precise backend available → grep (empty index →
-  grep fallback). Examples: LSP/SCIP → cscope/GNU global → tree-sitter/ast-grep
-  → universal-ctags → stdlib-regex → grep.
-- **Snapshot-aware.** Provenance-stamped, reuse-on-match, rebuilt on SNAPSHOT_ID
-  change.
-- **Read-only on CODE_ROOT.** The helper script only reads source files.
+## Safety
 
-See the Pipeline Adapter for the full invariant analysis.
+Non-negotiable invariants:
+
+1. **Agnostic.** Nothing is ever required; no-tool / parse-fail / not-invoked →
+   empty index → grep fallback = today's behavior byte-for-byte. Optional in the
+   Pass Lifecycle Contract; a non-conformant harness simply skips it.
+2. **HINT-only / union / never MEMBERSHIP.** Consumers audit the union with
+   grep; a symbol the index misses must still be reachable by the exhaustive
+   sweep. The structural index decides ORDER, never MEMBERSHIP.
+3. **No verdicts, touches no findings.** Cannot violate INV-1 and cannot itself
+   drop a finding.
+4. **Narrow scope: source cross-reference only.** Binary/build-derived
+   reachability ("is it compiled into production") is explicitly out of scope —
+   a dev customization, not part of this skill, because absence-from-a-build can
+   hide a real finding (INV-2). Do not fold build-derived reachability into this
+   skill.
+
+A complete reference blueprint with additional implementation details is
+available at
+[mantis-pipeline-adapter/references/mantis-structural-index.md](../mantis-pipeline-adapter/references/mantis-structural-index.md).

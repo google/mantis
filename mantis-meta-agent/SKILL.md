@@ -423,6 +423,18 @@ Execute your orchestration duties in a continuous loop:
      extract past vulnerabilities and security fixes into a
      `workspace/historical_learnings.jsonl` file.
 
+   - **Stage 0.5 (Optional Structural Index):** Call the
+     `@mantis-structural-index` subagent to build
+     `workspace/kb/structural_index.jsonl` — a function-level call graph and
+     symbol table from source code. It runs immediately after the snapshot is
+     pinned (Block D), before the first code-reading analysis stage, using only
+     CODE_ROOT + SNAPSHOT_ID. In MODE-OFF, it builds against the current
+     directory with `snapshot_id` set to `"unknown"` and rebuilds each pass (the
+     live tree is mutable, so a reused index could lag current code). The index
+     is a HINT-only enhancement — it never gates findings and degrades
+     gracefully to an empty index (grep fallback) when unavailable or not
+     invoked. A non-conformant harness simply skips this stage.
+
    - **Stage 1 (Optional Directory Mapping):** If not already mapped, call the
      `@mantis-summarize` subagent to generate `mantis-summary.md` files for each
      directory to optimize downstream planning and summaries with historical
@@ -475,12 +487,12 @@ Execute your orchestration duties in a continuous loop:
      failures to the `workspace/learnings.jsonl` inbox. **Important:** You must
      pass the absolute file paths to the execution log files (e.g.
      `transcript.jsonl` files) of all subagents successfully executed during
-     this round (every stage that ran: history, summarize, architecture,
-     threat-model, plan, researcher, dedupe, review, critic, reproduce, chain,
-     patch, calibrate) to the `@mantis-reflect` subagent. Resolve these paths
-     from whatever mechanism the ACTIVE coding-agent harness exposes for
-     per-subagent execution logs; do NOT hardcode any single framework's layout.
-     Harnesses differ — e.g. Antigravity stores them under
+     this round (every stage that ran: history, structural-index, summarize,
+     architecture, threat-model, plan, researcher, dedupe, review, critic,
+     reproduce, chain, patch, calibrate) to the `@mantis-reflect` subagent.
+     Resolve these paths from whatever mechanism the ACTIVE coding-agent harness
+     exposes for per-subagent execution logs; do NOT hardcode any single
+     framework's layout. Harnesses differ — e.g. Antigravity stores them under
      `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`,
      while Gemini CLI, the Google ADK, Claude Code, and custom pipelines use
      different locations; Antigravity is ONE example, not the default. If your

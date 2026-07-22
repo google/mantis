@@ -291,13 +291,20 @@ Execute the reproduction stage under these constraints:
      If any trajectory succeeds, immediately adopt its payload and discard the
      others to escape potential "give up" loops.
 
-3a. **Variant Hunting (re-attack only, MANDATORY):** When invoked with
-`--reattack`, you MUST author and execute **N ≥ 3 boundary-mutated variant
-inputs** in addition to re-running the original PoC. The schema (`schema.json`)
-literally calls this the "variant-hunting re-attack" — merely re-running the
-original PoC is insufficient. Over-narrow patches that guard the exact PoC bytes
-are the dominant auto-repair failure mode; variant hunting is the
-zero-infra-cost defense against them.
+### Step 3a: Variant Hunting (re-attack only, MANDATORY)
+
+When invoked with `--reattack`, you MUST author and execute **N ≥ 3
+boundary-mutated variant inputs** in addition to re-running the original PoC.
+The schema (`schema.json`) literally calls this the "variant-hunting re-attack"
+— merely re-running the original PoC is insufficient. Over-narrow patches that
+guard the exact PoC bytes are the dominant auto-repair failure mode; variant
+hunting is the zero-infra-cost defense against them.
+
+**Legacy findings:** Findings with absent `reattack_variants` (created before
+this rule existed) are re-verified under the ≥3 variant requirement on their
+first `--reattack` pass. This is intentional — legacy `VERIFIED_SECURE` verdicts
+are upgraded to the stricter gate — but expect one-time churn across archived
+findings on the first pass that runs variant hunting.
 
 **What to generate (bug-class-aware):**
 
@@ -354,7 +361,13 @@ causing `bypassed_patch`) ONLY if it satisfies BOTH:
    `len=SIZE_MAX` causing an unrelated OOM, an alternate endpoint 404-ing then
    erroring, or a completely different crash) does NOT count as a bypass.
    Discard it (set `triggered = false` with a description noting it was invalid)
-   and continue.
+   and continue. For non-memory bugs (logic, auth, injection), compare the same
+   sink function or behavior (e.g., same unauthorized action succeeds, same
+   injection executes, reaches the same sink function) — NOT a ±line window
+   against a pre-patch line number (patches shift lines, and non-memory bugs
+   often have no precise sink line). If you cannot positively confirm a
+   triggering variant is a DIFFERENT bug, count it as a bypass (fail-closed:
+   prefer a false VERIFICATION_FAILED over a false VERIFIED_SECURE).
 2. **Valid input per Step 4:** The variant must be a valid exercise of the
    public API or internal invariants — it must not rely on artificial harness
    tricks (e.g., private-function direct calls with custom-allocated buffers)
@@ -464,6 +477,10 @@ and apply INV-1 (downgrade `VERIFIED_SECURE` → `VERIFICATION_FAILED`).
      - UndefinedBehaviorSanitizer (UBSan) runtime reports (e.g.
        `runtime error:`, `SUMMARY: UndefinedBehaviorSanitizer`).
      - MemorySanitizer (MSan) error outputs (e.g. `WARNING: MemorySanitizer`).
+       **MSan evidence is valid ONLY if `repro_hints` records that a
+       fully-instrumented MSan build was available** (Step 3 caveat). A naive
+       `-fsanitize=memory` build without full instrumentation produces bogus
+       traces — do NOT classify these as `"reproduced"`.
      - ThreadSanitizer (TSan) race reports (e.g. `WARNING: ThreadSanitizer`).
      - Segmentation faults (SIGSEGV, exit code `139`).
      - Abort signals (SIGABRT, exit code `134`).

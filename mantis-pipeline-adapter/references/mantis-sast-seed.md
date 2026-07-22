@@ -57,7 +57,9 @@ structurally under-detects.
   - Writes new findings as separate files with unique UUIDs. Relies on
     `mantis-dedupe` to cluster and merge duplicates with LLM-generated findings.
     Re-running with the same IR produces equivalent findings (new UUIDs, same
-    content — dedupe handles the overlap).
+    content — dedupe handles the overlap). This is eventually-consistent, not
+    strictly idempotent: a crashed-and-resumed harness that re-invokes sast-seed
+    writes new files each time, but dedupe catches the overlap.
 
 ## Instructions
 
@@ -196,9 +198,12 @@ For each surviving finding:
 - `impact`: Derived from CWE/severity.
 - `severity`: From IR (already mapped to Mantis enum: `CRITICAL`/`HIGH`/
   `MEDIUM`/`LOW`).
-- `attacker_position`: `"EXTERNAL"` (conservative default; review will refine).
-- `privileges_required`: `"NONE"` (conservative default).
-- `user_interaction`: `"NONE"` (conservative default).
+- `attacker_position`: `"EXTERNAL"` (conservative for INV-2 — don't drop — but
+  severity-inflating: EXTERNAL+NONE+NONE is the maximum-severity triple. Review
+  and critic MUST refine these before calibrate runs, or the finding will be
+  over-rated).
+- `privileges_required`: `"NONE"` (see note above).
+- `user_interaction`: `"NONE"` (see note above).
 - `status`: `PROVISIONALLY_VALID` if VERIFIED or MODE-OFF, else `NEEDS_RESEARCH`
   (DRIFT, UNVERIFIED, or HALT).
 - `mitigation`: Generic placeholder ("Review and fix the issue identified by the

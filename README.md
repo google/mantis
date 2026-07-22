@@ -163,6 +163,9 @@ CLI terminal.
    # 0. (Optional) Analyze repository's version control system (VCS) history and extract past vulnerabilities
    /mantis-history
 
+   # 0.5. (Optional) Build structural cross-reference index (call graph + symbol table)
+   /mantis-structural-index
+
    # 1. (Optional) Generate mantis-summary.md directory maps
    /mantis-summarize
 
