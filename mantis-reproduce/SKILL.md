@@ -56,11 +56,11 @@ inside isolated sandbox environments to empirically verify bugs.
     history). Updates status to `"VALID"` if provisionally valid.
   - If run with `--reattack`: updates findings in-place under
     `state_root/workspace/findings/` (sets `"reattack_status"`,
-    `"reattack_file_path"`, `"reattack_run_command"`, `"reattack_output"`, and
-    appends history with stage `"reattack"`). Does not modify `"repro_*"` fields
-    or `"status"`. **Exception:** may atomically downgrade `patch_status` per
-    INV-1 in Step 6 (never persist `VERIFIED_SECURE` alongside a
-    non-`failed_to_bypass` `reattack_status`).
+    `"reattack_file_path"`, `"reattack_run_command"`, `"reattack_output"`,
+    `"reattack_variants"`, and appends history with stage `"reattack"`). Does
+    not modify `"repro_*"` fields or `"status"`. **Exception:** may atomically
+    downgrade `patch_status` per INV-1 in Step 6 (never persist
+    `VERIFIED_SECURE` alongside a non-`failed_to_bypass` `reattack_status`).
   - Updates `state_root/workspace/archive/.repro_attempts.json` atomically.
   - Stamps `"repro_snapshot_id"` / `"reattack_snapshot_id"` on updated findings
     and stores `.repro_attempts.json` values as `{count,last_snapshot}` objects
@@ -270,19 +270,95 @@ Execute the reproduction stage under these constraints:
      If any trajectory succeeds, immediately adopt its payload and discard the
      others to escape potential "give up" loops.
 
-   - **Reproduction Status Classification:**
+3a. **Variant Hunting (re-attack only, MANDATORY):** When invoked with
+`--reattack`, you MUST author and execute **N ≥ 3 boundary-mutated variant
+inputs** in addition to re-running the original PoC. The schema (`schema.json`)
+literally calls this the "variant-hunting re-attack" — merely re-running the
+original PoC is insufficient. Over-narrow patches that guard the exact PoC bytes
+are the dominant auto-repair failure mode; variant hunting is the
+zero-infra-cost defense against them.
 
-     - **`reproduced`**: The PoC successfully triggered the vulnerability.
-     - **`failed_to_reproduce`**: The PoC was executed but did not trigger the
-       vulnerability.
-     - **`statically_confirmed`**: Reproduction was impossible due to
-       environmental constraints (e.g., missing hardware emulators, unavailable
-       external services) but the flaw is statically obvious (e.g., hardcoded
-       credentials). This is strongly discouraged and should only be used as a
-       last resort.
-     - **`not_attempted`**: The reproduction stage was skipped entirely (e.g.,
-       due to infrastructure setup failure, timeouts, or explicit skip
-       configuration).
+**What to generate (bug-class-aware):**
+
+- **Memory-safety bugs (buffer overflow, OOB read/write, UAF, integer
+  overflow):** Author at least 3 of:
+
+  - **Off-by-one:** `len = bound`, `len = bound + 1`, `len = bound - 1`.
+  - **Size mutations:** `len ± 1`, `len = 0`, `len = SIZE_MAX`, sign flips on
+    signed lengths.
+  - **Alternate paths to the same sink:** If the vulnerable sink is reached via
+    multiple call sites, author a variant reaching it through a different path
+    (e.g., different API endpoint, file format variant, or protocol command).
+  - **Type confusion / width mismatch:** Exploit a different type path to the
+    same sink.
+
+- **Non-memory-safety bugs (logic, auth, injection, SSRF, path traversal):**
+  Hunt for actual variants of the same class:
+
+  - **Alternate endpoints/parameters:** Try `/api/v2/echo` when PoC targets
+    `/api/v1/echo`, or alternate parameter names.
+  - **Equivalent payloads:** `..%2fetc%2fpasswd`, `..\\..\\`, URL-encoding,
+    double encoding, unicode normalization variants.
+  - **Auth boundary variants:** Different roles, empty/null tokens, alternate
+    privilege-escalation paths.
+  - **Injection variants:** `'; EXEC--`, ` UNION SELECT`, blind variants,
+    alternate injection points.
+
+- **Parallel variant generation (if subagents available):** You SHOULD spawn
+  subagents to author and test variants in parallel. Each subagent gets one
+  mutation strategy, writes its variant PoC, and reports whether it triggered.
+  Aggregate all results before setting `reattack_status`. If subagents are
+  unavailable, do them sequentially.
+
+**Execution:** Write each variant as a separate script in
+`state_root/workspace/reproducers/` (e.g., `reattack_variant_[uuid]_[N].py`).
+Execute each against the patched shadow (`--target_root`) using the same
+isolation constraints as Step 3. Record each variant's description and whether
+it triggered in the `reattack_variants` array (Step 6).
+
+**Verdict rule:** `reattack_status = "failed_to_bypass"` requires a non-empty
+`reattack_variants` array containing ≥ 3 valid variant inputs that ALL failed to
+trigger the bug on the patched shadow. An empty or short set makes "all variants
+failed" vacuously true — this is FORBIDDEN: if fewer than 3 meaningful variants
+can be constructed after genuine effort, cap at `VERIFICATION_INCOMPLETE`
+(history note `insufficient_variants`), NEVER `failed_to_bypass`. The `[]` case
+may ONLY coexist with a non-`failed_to_bypass` status (e.g., C5 baseline failure
+that halted before variant hunting).
+
+**Variant validity guardrail:** A variant counts as a bypass (`triggered = true`
+causing `bypassed_patch`) ONLY if it satisfies BOTH:
+
+1. **Same vulnerability class:** The variant reproduces the original bug class —
+   same sink function / sanitizer signature / crash type. A junk mutant (e.g.,
+   `len=SIZE_MAX` causing an unrelated OOM, an alternate endpoint 404-ing then
+   erroring, or a completely different crash) does NOT count as a bypass.
+   Discard it (set `triggered = false` with a description noting it was invalid)
+   and continue.
+2. **Valid input per Step 4:** The variant must be a valid exercise of the
+   public API or internal invariants — it must not rely on artificial harness
+   tricks (e.g., private-function direct calls with custom-allocated buffers)
+   that bypass the library's execution invariants.
+
+Ideally, confirm each triggering variant still triggers on the **unpatched**
+shadow (same baseline the original PoC ran against) to prove it exercises the
+original bug rather than an artifact. If the unpatched shadow is unavailable
+(e.g., snapshot mismatch), require the same-sink evidence (same ASan frame, same
+crash address, same logic failure) as corroboration.
+
+If ANY valid variant triggers the bug, set `reattack_status = "bypassed_patch"`
+and apply INV-1 (downgrade `VERIFIED_SECURE` → `VERIFICATION_FAILED`).
+
+- **Reproduction Status Classification:**
+
+  - **`reproduced`**: The PoC successfully triggered the vulnerability.
+  - **`failed_to_reproduce`**: The PoC was executed but did not trigger the
+    vulnerability.
+  - **`statically_confirmed`**: Reproduction was impossible due to environmental
+    constraints (e.g., missing hardware emulators, unavailable external
+    services) but the flaw is statically obvious (e.g., hardcoded credentials).
+    This is strongly discouraged and should only be used as a last resort.
+  - **`not_attempted`**: The reproduction stage was skipped entirely (e.g., due
+    to infrastructure setup failure, timeouts, or explicit skip configuration).
 
 4. **Strict Public-API & Internal Invariant Constraints:**
 
@@ -494,9 +570,14 @@ Execute the reproduction stage under these constraints:
        write.
 
      - **INV-1 (single source — the schema's `VERIFIED_SECURE` allOf gate):**
-       `VERIFIED_SECURE => reattack_status` must be `failed_to_bypass`. Any
-       other outcome MUST atomically downgrade `patch_status` in the same write
-       — `VERIFICATION_INCOMPLETE` for `inconclusive_baseline_changed`,
+       `VERIFIED_SECURE => reattack_status` must be `failed_to_bypass`, and
+       `failed_to_bypass` requires a non-empty `reattack_variants` array with ≥
+       3 valid variant inputs (Step 3a) that ALL failed to trigger the bug on
+       the patched shadow. An empty or short variant set makes "all failed"
+       vacuously true — this is FORBIDDEN: cap at `VERIFICATION_INCOMPLETE`
+       instead. Any other outcome MUST atomically downgrade `patch_status` in
+       the same write — `VERIFICATION_INCOMPLETE` for
+       `inconclusive_baseline_changed` or an insufficient variant set,
        `VERIFICATION_FAILED` for `bypassed_patch`. Never persist
        `VERIFIED_SECURE` alongside a non-`failed_to_bypass` `reattack_status`.
 
@@ -539,6 +620,21 @@ Execute the reproduction stage under these constraints:
 
      - `"reattack_output"`
 
+     - `"reattack_variants"`: An array of objects, one per variant input
+       attempted during Step 3a. Each object MUST have:
+
+       - `"description"`: What the variant does (e.g.,
+         `"off-by-one: len=bound+1"`, `"alternate path via /api/v2/echo"`).
+       - `"triggered"`: boolean — whether this variant triggered the original
+         vulnerability class on the patched shadow (per the variant validity
+         guardrail in Step 3a). Invalid/junk mutants that produced an unrelated
+         crash or error are recorded as `triggered = false` with a description
+         noting invalidity. `reattack_variants` MUST be non-empty (≥ 3 entries)
+         for `reattack_status = "failed_to_bypass"`. An empty array `[]` may
+         ONLY coexist with a non-`failed_to_bypass` status (e.g., C5 baseline
+         failure that halted before variant hunting, or
+         `inconclusive_baseline_changed`).
+
      - `"reattack_snapshot_id"`: the current SNAPSHOT_ID this run executed
        against.
 
@@ -558,5 +654,13 @@ Execute the reproduction stage under these constraints:
    example of reproducing the reported vulnerability, have a subagent with a
    fresh context window review and criticize the generated PoC. Seek genuine
    criticism to ensure false reports are never surfaced later.
+
+   **Variant criticism (re-attack only):** When `--reattack` is specified, the
+   critic subagent MUST also verify that the variant inputs (Step 3a) are
+   genuinely diverse — not trivially identical mutations (e.g., changing a
+   comment while keeping the same payload). If the critic finds the variants are
+   not meaningfully diverse, record a history note
+   `variant_diversity_insufficient` and re-author variants before finalizing
+   `reattack_status`.
 
 When complete, notify the user.

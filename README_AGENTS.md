@@ -441,8 +441,15 @@ step (confirming `reattack_status`), the schema supports several distinct
 verification outcome statuses:
 
 - **`VERIFIED_SECURE`**: Completed verification, meaning the post-patch run
-  passed AND a successful variant re-attack check was executed to confirm the
-  fix cannot be bypassed.
+  passed AND a successful variant-hunting re-attack was executed. The
+  independent re-attack agent authors N ≥ 3 boundary-mutated variant inputs
+  (off-by-one around the fixed bound, len±1, sign flips, alternate paths to the
+  same sink for memory-safety bugs; equivalent payloads and alternate endpoints
+  for non-memory-safety bugs) and the patched shadow must survive ALL of them
+  before `VERIFIED_SECURE` is set. An empty or short variant set caps at
+  `VERIFICATION_INCOMPLETE` — a vacuous "all zero variants failed" never
+  qualifies. A variant only counts as a bypass if it reproduces the original
+  vulnerability class (same sink/crash type); junk mutants are discarded.
 - **`MITIGATION_PROPOSED`**: Set for binary targets where code patching is not
   possible but a functional or architectural mitigation is proposed in
   `patch_diff`. These may bypass code modification and re-attack checks.

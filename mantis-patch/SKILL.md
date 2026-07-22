@@ -52,7 +52,8 @@ logs to long-term memory.
 - **Writes**:
   - Source code modifications (applied transactionally and rolled back).
   - Updates finding JSON files in-place (sets `"patch_status"`, `"patch_diff"`,
-    re-attack details, and history).
+    re-attack details including `"reattack_status"` and `"reattack_variants"`,
+    and history).
   - Appends to `workspace/learnings.jsonl`.
   - Reusable helper script `workspace/helpers/append_patch.py`.
 - **Preconditions**:
@@ -601,7 +602,11 @@ Execute the patching and verification stage as follows:
         the attack input on the patched build does NOT crash/trigger.
      2. **Re-attack fails to bypass:** a fresh, independent
         `@mantis-reproduce --reattack` sub-agent (spawned per the block below)
-        writes `reattack_status = "failed_to_bypass"`.
+        writes `reattack_status = "failed_to_bypass"` — meaning a non-empty
+        `reattack_variants` array with ≥ 3 valid variant inputs (reproduce Step
+        3a) ALL failed to trigger the original vulnerability class on the
+        patched shadow. An empty or short variant set caps at
+        `VERIFICATION_INCOMPLETE`, never `VERIFIED_SECURE`.
      3. **Not degraded:** PATCH_MODE is not HALT/DEGRADED. If PATCH_MODE is
         HALT/DEGRADED (snapshot mismatch / unpinnable snapshot), the ceiling is
         `"VERIFICATION_INCOMPLETE"`, never `"VERIFIED_SECURE"`. If Block G
@@ -741,8 +746,8 @@ Execute the patching and verification stage as follows:
    - If a patch was successful, a `"patch_diff"` field containing the unified
      diff.
    - If a re-attack was performed, the `"reattack_status"`,
-     `"reattack_file_path"`, `"reattack_run_command"`, and `"reattack_output"`
-     fields.
+     `"reattack_file_path"`, `"reattack_run_command"`, `"reattack_output"`, and
+     `"reattack_variants"` fields.
    - An entry to the `"history"` array:
 
    ```json

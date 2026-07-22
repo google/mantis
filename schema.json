@@ -155,7 +155,7 @@
         "reattack_status": {
           "type": "string",
           "enum": ["bypassed_patch", "failed_to_bypass", "inconclusive_baseline_changed"],
-          "description": "The outcome of the variant-hunting re-attack. `inconclusive_baseline_changed` means the unpatched baseline no longer triggers on the current snapshot; it is mutually exclusive with `VERIFIED_SECURE` (the reproduce skill forces ERROR or VERIFICATION_INCOMPLETE when the baseline no longer triggers)."
+          "description": "The outcome of the variant-hunting re-attack. `failed_to_bypass` requires a non-empty `reattack_variants` array with ≥ 3 valid variant inputs that ALL failed to trigger the bug on the patched shadow (not merely the original PoC); an empty or short set caps at VERIFICATION_INCOMPLETE, never failed_to_bypass. `inconclusive_baseline_changed` means the unpatched baseline no longer triggers on the current snapshot; it is mutually exclusive with `VERIFIED_SECURE` (the reproduce skill forces ERROR or VERIFICATION_INCOMPLETE when the baseline no longer triggers)."
         },
         "reattack_file_path": {
           "type": "string",
@@ -168,6 +168,24 @@
         "reattack_output": {
           "type": "string",
           "description": "Standard output and error from the re-attack run."
+        },
+        "reattack_variants": {
+          "type": "array",
+          "description": "Variant inputs attempted during the variant-hunting re-attack. Each entry records a mutation strategy and whether it triggered the bug on the patched shadow. A variant counts as triggered (bypass) only if it reproduces the original vulnerability class (same sink/crash type) and is a valid input per the reproduce skill's Step 4 constraints. Must be non-empty (≥ 3 entries) for reattack_status = failed_to_bypass; an empty array may only coexist with a non-failed_to_bypass status. Populated by the reproduce skill when reattack_status is set; absent for legacy findings (pre-variant-hunting).",
+          "items": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string",
+                "description": "What the variant does (e.g., 'off-by-one: len=bound+1', 'alternate path via /api/v2/echo')."
+              },
+              "triggered": {
+                "type": "boolean",
+                "description": "Whether this variant triggered the original vulnerability class (same sink/crash type) on the patched shadow. Unrelated crashes or errors from junk mutants are recorded as false."
+              }
+            },
+            "required": ["description", "triggered"]
+          }
         },
         "impact_score": {
           "type": "integer",
