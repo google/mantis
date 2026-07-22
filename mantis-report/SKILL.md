@@ -183,9 +183,9 @@ Execute the reporting stage as follows:
       present, or "Exploit Chain" in title/history) OR `repro_status` is
       `reproduced` OR (`repro_status` is `statically_confirmed` AND it carries
       empirical execution evidence — an external stack trace, sanitizer trace
-      (ASan/UBSan), or crash log). Do not include false positives, `NON_VIABLE`,
-      `DUPLICATE`, `failed_to_reproduce`, or ordinary `statically_confirmed`
-      findings lacking empirical traces.
+      (ASan/UBSan/MSan/TSan), or crash log). Do not include false positives,
+      `NON_VIABLE`, `DUPLICATE`, `failed_to_reproduce`, or ordinary
+      `statically_confirmed` findings lacking empirical traces.
    5. **Open predicate** (archived carry-forward in step 2 only): an archived
       finding is "still open" if it satisfies (4) AND `patch_status` is NOT
       `VERIFIED_SECURE`/`MITIGATION_PROPOSED` AND `status` is not

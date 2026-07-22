@@ -526,16 +526,16 @@ Execute the patching and verification stage as follows:
             sidecar file $SENTINEL_FILE and flush+fsync (or unbuffered write) BEFORE
             invoking the sink. (A file survives a crash that truncates buffered stdout.)
         (b) binary / firmware / raw-payload -> reached-sink evidence is a captured
-            crash backtrace or ASan frame that explicitly names the target sink
-            function (target-produced tracing). A marker written by a wrapper you
-            author BEFORE invoking the target is SETUP EVIDENCE ONLY: it proves
-            "launch attempted," not "sink reached," and does NOT qualify as
-            reached-sink evidence. If no in-path marker (channel a) and no
-            target-produced backtrace/ASan (channel b) is achievable, the sink is
-            unreached.
+            crash backtrace or sanitizer frame (ASan/UBSan/MSan/TSan) that
+            explicitly names the target sink function (target-produced tracing). A
+            marker written by a wrapper you author BEFORE invoking the target is
+            SETUP EVIDENCE ONLY: it proves "launch attempted," not "sink reached,"
+            and does NOT qualify as reached-sink evidence. If no in-path marker
+            (channel a) and no target-produced backtrace/sanitizer trace
+            (channel b) is achievable, the sink is unreached.
       EVIDENCE PRESENT (reached-sink) = (channel a) sidecar file contains
         MANTIS_REACHED_ENTRYPOINT written in-path, OR (channel b) target-produced
-        backtrace/ASan output names the sink. A wrapper pre-launch marker alone is
+        backtrace/sanitizer output names the sink. A wrapper pre-launch marker alone is
         NOT evidence present.
      EVIDENCE ABSENT includes: any compiler/build nonzero exit; exit 127 (command not
        found); exit 2 with a "No such file" message.
@@ -579,6 +579,15 @@ Execute the patching and verification stage as follows:
         integrity holds, step 3 attack does NOT crash/trigger, AND the `--reattack` run
         also fails to bypass. Otherwise VERIFICATION_FAILED.
      ```
+
+     **Sanitizer consistency guardrail (Block G):** All runs in this gate
+     (unpatched baseline, benign control, attack, and re-attack) MUST use the
+     SAME sanitizer flags that made the unpatched baseline trigger. If the
+     baseline triggered via UBSan (exit 0, recover-mode), the attack run must
+     also be compiled with UBSan — otherwise the attack might exit 0 without a
+     trace even though the bug is still present, producing a false
+     `VERIFIED_SECURE` (INV-1 violation). Record the sanitizer flags used in
+     `repro_hints` so downstream stages replicate them.
 
    - **HALT/DEGRADED ceiling:** If PATCH_MODE is HALT/DEGRADED (snapshot_pinned
      false with a `live:` SNAPSHOT_ID), authoritative verdicts are forbidden

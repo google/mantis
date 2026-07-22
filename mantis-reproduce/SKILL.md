@@ -246,6 +246,27 @@ Execute the reproduction stage under these constraints:
    itself under `state_root/workspace/reproducers/` (STATE-RELATIVE) and store
    its ABSOLUTE path in `"run_command"`/`"reattack_run_command"`.
 
+   **Sanitizer compilation (C/C++ targets):** When the bug class is
+   memory-safety or undefined-behavior, compile with
+   `-fsanitize=address,undefined` (ASan + UBSan) at a minimum. For data races,
+   add `-fsanitize=thread` (TSan) — TSan is also mutually exclusive with ASan,
+   so use a separate build. Use `-fno-omit-frame-pointer` for usable stack
+   traces. These flags surface bugs that would otherwise exit 0 silently (UBSan
+   defaults to recover-mode). **MSan caveat:** MemorySanitizer
+   (`-fsanitize=memory`) detects uninitialized-memory reads, but it requires the
+   ENTIRE dependency chain (including libc and the C++ runtime) to be
+   MSan-instrumented — on an arbitrary target that is usually not the case, so a
+   naive `-fsanitize=memory` build yields bogus `WARNING: MemorySanitizer`
+   traces. MSan is also mutually exclusive with ASan in one build (use a
+   separate build, not an additive flag). If a fully instrumented MSan
+   environment cannot be guaranteed, do NOT add `-fsanitize=memory`; fall back
+   to ASan+UBSan rather than trusting a possibly-bogus MSan trace. Recognizing
+   MSan output as evidence (Step 5) is still correct when a legitimate MSan
+   instrumented build is available. **Sanitizer consistency guardrail:** the
+   SAME sanitizer flags MUST be used for the baseline, attack, and re-attack
+   runs — a different sanitizer can mask the bug and produce a false negative
+   (INV-2) or false `VERIFIED_SECURE` (INV-1). See Block G.
+
    **{TARGET_ROOT} token substitution (numbered step):**
 
    1. When writing `run_command` or `reattack_run_command`, use the literal
@@ -342,8 +363,8 @@ causing `bypassed_patch`) ONLY if it satisfies BOTH:
 Ideally, confirm each triggering variant still triggers on the **unpatched**
 shadow (same baseline the original PoC ran against) to prove it exercises the
 original bug rather than an artifact. If the unpatched shadow is unavailable
-(e.g., snapshot mismatch), require the same-sink evidence (same ASan frame, same
-crash address, same logic failure) as corroboration.
+(e.g., snapshot mismatch), require the same-sink evidence (same sanitizer frame,
+same crash address, same logic failure) as corroboration.
 
 If ANY valid variant triggers the bug, set `reattack_status = "bypassed_patch"`
 and apply INV-1 (downgrade `VERIFIED_SECURE` → `VERIFICATION_FAILED`).
@@ -388,16 +409,16 @@ and apply INV-1 (downgrade `VERIFIED_SECURE` → `VERIFICATION_FAILED`).
           sidecar file $SENTINEL_FILE and flush+fsync (or unbuffered write) BEFORE
           invoking the sink. (A file survives a crash that truncates buffered stdout.)
       (b) binary / firmware / raw-payload -> reached-sink evidence is a captured
-          crash backtrace or ASan frame that explicitly names the target sink
-          function (target-produced tracing). A marker written by a wrapper you
-          author BEFORE invoking the target is SETUP EVIDENCE ONLY: it proves
-          "launch attempted," not "sink reached," and does NOT qualify as
-          reached-sink evidence. If no in-path marker (channel a) and no
-          target-produced backtrace/ASan (channel b) is achievable, the sink is
-          unreached.
+          crash backtrace or sanitizer frame (ASan/UBSan/MSan/TSan) that
+          explicitly names the target sink function (target-produced tracing). A
+          marker written by a wrapper you author BEFORE invoking the target is
+          SETUP EVIDENCE ONLY: it proves "launch attempted," not "sink reached,"
+          and does NOT qualify as reached-sink evidence. If no in-path marker
+          (channel a) and no target-produced backtrace/sanitizer trace
+          (channel b) is achievable, the sink is unreached.
     EVIDENCE PRESENT (reached-sink) = (channel a) sidecar file contains
       MANTIS_REACHED_ENTRYPOINT written in-path, OR (channel b) target-produced
-      backtrace/ASan output names the sink. A wrapper pre-launch marker alone is
+      backtrace/sanitizer output names the sink. A wrapper pre-launch marker alone is
       NOT evidence present.
    EVIDENCE ABSENT includes: any compiler/build nonzero exit; exit 127 (command not
      found); exit 2 with a "No such file" message.
@@ -434,10 +455,16 @@ and apply INV-1 (downgrade `VERIFIED_SECURE` → `VERIFICATION_FAILED`).
      unit test or script that explicitly demonstrates the logic failure (e.g.,
      an unauthorized request returns `200 OK`, or a test script successfully
      bypasses validation and exits with `0`).
-   - **Memory Safety & Binary Crashes:** If the sandbox execution completes with
-     a non-zero exit code but the stderr/stdout displays memory corruption
-     signals, mark the reproduction as `"reproduced"`. Check for:
+   - **Memory Safety & Binary Crashes:** If the sandbox execution produces a
+     crash signal or sanitizer trace in stdout/stderr, mark the reproduction as
+     `"reproduced"`. **Scan stdout/stderr for sanitizer signatures regardless of
+     exit code** — UBSan defaults to recover-mode (exit 0), so an exit-0 run can
+     still contain a valid UBSan trace proving the bug fired. Check for:
      - AddressSanitizer (ASan) error outputs (e.g. `ERROR: AddressSanitizer`).
+     - UndefinedBehaviorSanitizer (UBSan) runtime reports (e.g.
+       `runtime error:`, `SUMMARY: UndefinedBehaviorSanitizer`).
+     - MemorySanitizer (MSan) error outputs (e.g. `WARNING: MemorySanitizer`).
+     - ThreadSanitizer (TSan) race reports (e.g. `WARNING: ThreadSanitizer`).
      - Segmentation faults (SIGSEGV, exit code `139`).
      - Abort signals (SIGABRT, exit code `134`).
      - Crash or core dumps.
@@ -606,6 +633,11 @@ and apply INV-1 (downgrade `VERIFIED_SECURE` → `VERIFICATION_FAILED`).
           (`bypassed_patch` or `failed_to_bypass`). Apply INV-1 (downgrade
           `VERIFIED_SECURE` -> `VERIFICATION_FAILED` if `bypassed_patch`).
 
+       - **Sanitizer consistency:** the baseline re-run, attack, and re-attack
+         MUST use the same sanitizer flags that made the original baseline
+         trigger. If the baseline triggered via UBSan (exit 0), recompiling the
+         attack without UBSan would mask the bug and produce a false negative
+         (INV-2) or false `failed_to_bypass` (INV-1).
        - **HALT-mode guardrail:** Detect HALT by the PASS's snapshot id in state
          (`active_snapshot.snapshot_id` starts with `live:`), NOT the
          `--snapshot_pinned=false` argument (that's only the sentinel-exemption

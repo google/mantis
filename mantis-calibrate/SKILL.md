@@ -155,9 +155,9 @@ otherwise have. - **`repro_failure`** (Section 3 rule): do NOT force-LOW; set
 `"STALE_EVIDENCE: "`. - **`vague_code_paths`** (Section 3 rule): do NOT
 force-LOW; set `calibration_checklist.vague_code_paths.outcome = "UNKNOWN"`,
 `reason` beginning `"STALE_EVIDENCE: "`. - **`static_confirmation` trace-lift**
-(Section 3 rule, its "valid external stack trace/ASan…" exception): do NOT apply
-the trace-lift; KEEP the static HIGH cap in force (`likelihood_score` \<= 3, 0.8
-Hazard multiplier, NOT CRITICAL). Set
+(Section 3 rule, its "valid external stack trace/sanitizer…" exception): do NOT
+apply the trace-lift; KEEP the static HIGH cap in force (`likelihood_score` \<=
+3, 0.8 Hazard multiplier, NOT CRITICAL). Set
 `calibration_checklist.static_confirmation.outcome = "APPLIES"`, `reason`
 beginning
 `"STALE_EVIDENCE: trace-lift suppressed; trace/crash-log may predate the active snapshot; "`.
@@ -502,7 +502,7 @@ declares otherwise.
      rules MUST NOT be used to lower or inflate the score from live
      re-inspection: `repro_failure` (do not force-LOW), `vague_code_paths` (do
      not force-LOW), and the `static_confirmation` **trace-lift exception** (do
-     not treat a stale trace/ASan/crash-log as live reproduction — KEEP the
+     not treat a stale trace/sanitizer/crash-log as live reproduction — KEEP the
      static HIGH cap). Also do not apply the Section 2 dead-code 0.2 multiplier
      (see Section 2). Keep the conservative score and **prepend the literal
      token `STALE_EVIDENCE` as the FIRST token of `sanity_triage_applied`**

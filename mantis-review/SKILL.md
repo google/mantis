@@ -351,9 +351,9 @@ findings (SNAPSHOT MODE OFF) flow into steps 2-5 below.
 4. **Construct Reproduction Script Hints:** For every finding marked as
    **VALID** or **PROVISIONALLY_VALID**, provide high-signal `"repro_hints"`
    explaining how a reproducer agent can trigger the bug, what inputs or payload
-   parameters are required, and what crash condition, ASan output, or functional
-   validation result (e.g., an unexpected HTTP 200 OK) is expected to confirm
-   the security flaw.
+   parameters are required, and what crash condition, sanitizer trace
+   (ASan/UBSan/MSan/TSan), or functional validation result (e.g., an unexpected
+   HTTP 200 OK) is expected to confirm the security flaw.
 
 5. **Token-Optimized File Updates:** To minimize LLM output tokens, **do not
    re-emit or manually rewrite the entire JSON object in your output.** Instead,

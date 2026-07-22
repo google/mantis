@@ -507,14 +507,14 @@ target-produced tracing/backtraces: (a) a PoC script/source harness writes
 `MANTIS_REACHED_ENTRYPOINT` to a sidecar file at the point just before the sink
 call, within its own execution flow (the marker write is part of the invoked
 path, not a pre-launch step); OR (b) for binary/firmware/raw-payload targets,
-the captured crash backtrace/ASan frame explicitly names the target sink
-function (target-produced tracing). A marker written by an external wrapper
-BEFORE invoking the target is SETUP EVIDENCE ONLY (proves "launch attempted,"
-not "sink reached") and does NOT by itself justify `failed_to_reproduce` — treat
-it as EVIDENCE ABSENT for the decision gate. Evidence is recorded in
-`repro_hints`. In HALT mode, the HALT ceiling additionally forces
-`not_attempted` (no `failed_to_reproduce`), since a negative result on an
-unpinned tree cannot be trusted as authoritative.
+the captured crash backtrace or sanitizer trace (ASan/UBSan/MSan/TSan)
+explicitly names the target sink function (target-produced tracing). A marker
+written by an external wrapper BEFORE invoking the target is SETUP EVIDENCE ONLY
+(proves "launch attempted," not "sink reached") and does NOT by itself justify
+`failed_to_reproduce` — treat it as EVIDENCE ABSENT for the decision gate.
+Evidence is recorded in `repro_hints`. In HALT mode, the HALT ceiling
+additionally forces `not_attempted` (no `failed_to_reproduce`), since a negative
+result on an unpinned tree cannot be trusted as authoritative.
 
 ______________________________________________________________________
 
