@@ -360,6 +360,25 @@ efficiency (such as using UUID-based referencing), and adaptability to custom
 environments (via MCP), see the
 [Pipeline Adapter Guide](mantis-pipeline-adapter/SKILL.md).
 
+### SAST Seeding (External Tool Ingestion)
+
+For teams that want to augment LLM discovery with findings from external SAST
+tools (CodeQL, Semgrep, etc.), the Pipeline Adapter Guide includes a **SAST
+Seeding** pattern (Guideline 8). This opt-in adapter ingests external tool
+findings as `PROVISIONALLY_VALID` / `NEEDS_RESEARCH` candidates that must earn
+their verdict through the unchanged downstream gates. It is purely additive — no
+existing skills are modified. The adapter uses a platform-agnostic JSONL IR
+format (not SARIF) that any SAST tool can convert to. See
+[mantis-pipeline-adapter/references/mantis-sast-seed.md](mantis-pipeline-adapter/references/mantis-sast-seed.md).
+
+### Structural Code Index (AST-Level Context)
+
+For large codebases where grep-based call-site discovery is unreliable, the
+Pipeline Adapter Guide includes a **Structural Code Index** pattern (Guideline
+9). This opt-in adapter builds a function-level call graph and symbol table
+using ctags (zero-dependency) or tree-sitter (pip-installable). See
+[mantis-pipeline-adapter/references/mantis-structural-index.md](mantis-pipeline-adapter/references/mantis-structural-index.md).
+
 > **Note on Standalone vs. Harness Mode:** When using Mantis Skills directly
 > from the CLI in standalone mode, skills like `/mantis-review` or
 > `/mantis-patch` will instruct the LLM to write temporary reusable Python

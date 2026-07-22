@@ -19,7 +19,8 @@ grep-based discovery is insufficient.
 - **Description:** Semantic search over KB and code chunks for large codebases.
 - **Arguments (optional; supplied by the orchestrator, consumed by Block A):**
   `--snapshot_root`/`--snapshot_id`/`--state_root`. All absent → MODE-OFF/legacy
-  mode (reads chunks from `./workspace/kb/chunks.jsonl` relative to current dir).
+  mode (reads chunks from `./workspace/kb/chunks.jsonl` relative to current
+  dir).
 
 ## Input/Output Contract
 
@@ -40,14 +41,14 @@ grep-based discovery is insufficient.
   researcher) is wired to invoke this skill as a sub-agent. It never fails — it
   simply returns empty results until both ends are connected.
 - **Idempotency Guarantee**:
-  - Read-only. No state mutation. Re-running with the same query and chunks
-    file produces identical results.
+  - Read-only. No state mutation. Re-running with the same query and chunks file
+    produces identical results.
 
 ## Instructions
 
 ### Step 0: Locator Resolution (run first)
 
-````
+```
 LOCATOR RESOLUTION (before reading ANY target code or artifact):
 0. ROLE: If this skill NEVER reads target source (report, calibrate, reflect),
    you are a FINDINGS-ONLY stage: skip steps 2-6; still read active_snapshot from
@@ -86,7 +87,7 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
    lacks .git/.hg/.repo.
 6. Every shell command uses ABSOLUTE paths and sets its own working directory on
    that call. Do NOT assume the working directory persists between calls.
-````
+```
 
 This is a FINDINGS-ONLY stage — it does not read target source code. Block A
 step 0's findings-only skip applies: read `active_snapshot` from state for
@@ -100,8 +101,8 @@ provenance checking, but do not require a `CODE_ROOT` to proceed.
 2. If the file does not exist, output an empty JSON array `[]` and notify the
    caller: "chunks.jsonl not found — semantic search unavailable, falling back
    to manual scanning." Do NOT error or stop.
-3. If the file exists but is empty (or contains only a provenance header), output
-   `[]` and notify the caller.
+3. If the file exists but is empty (or contains only a provenance header),
+   output `[]` and notify the caller.
 
 ### Step 2: Provenance Check
 
@@ -112,8 +113,7 @@ provenance checking, but do not require a `CODE_ROOT` to proceed.
 3. Compare the chunk's `snapshot_id` to the current `SNAPSHOT_ID`:
    - If they match → proceed (chunks are current).
    - If they differ → output results but prepend a warning:
-     `"WARNING: chunks.jsonl is stale (built against snapshot_id=X, current=Y).
-     Results may be inaccurate. Rebuild chunks post-architecture."`
+     `"WARNING: chunks.jsonl is stale (built against snapshot_id=X, current=Y). Results may be inaccurate. Rebuild chunks post-architecture."`
    - If `active_snapshot` is absent (MODE-OFF) → skip the check (no snapshot to
      compare against). Proceed without warning.
    - If `snapshot_pinned` is false (HALT mode) → output results with a `STALE`
@@ -123,10 +123,13 @@ provenance checking, but do not require a `CODE_ROOT` to proceed.
 
 1. Determine the query string. The caller (planner or researcher) provides this
    as the sub-agent's prompt or as a `--query` argument.
+
 2. Determine the top-K limit (default: 5). The caller may specify a different
    value.
+
 3. Determine the entity type filter (optional). The caller may request only
    `entity`, `vulnerability`, or `code` chunks.
+
 4. **Reusable Deterministic Scripting (versioned):** Write a reusable helper
    script (e.g. `workspace/helpers/search_chunks.py`) whose FIRST LINE is
    exactly `# MANTIS_HELPER_VERSION = 1`. Before reusing an existing helper,
@@ -147,6 +150,7 @@ provenance checking, but do not require a `CODE_ROOT` to proceed.
 
 5. Execute the script with the query, chunks file path, top-K, and optional
    filter as arguments. Capture the JSON output from stdout.
+
 6. Return the results to the caller. Do not write any result files.
 
 ### Step 4: Return Results
@@ -169,5 +173,5 @@ includes:
 For code chunks, `start_line` and `end_line` are integers. For KB chunks, they
 are `null`.
 
-When complete, return the results to the caller. Do not notify the user
-directly — this skill is invoked as a sub-agent by the planner or researcher.
+When complete, return the results to the caller. Do not notify the user directly
+— this skill is invoked as a sub-agent by the planner or researcher.

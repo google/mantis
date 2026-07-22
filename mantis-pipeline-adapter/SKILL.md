@@ -51,45 +51,58 @@ that wraps Mantis Skills.
 
 Follow these guidelines during the consultation:
 
-1. **Understand User Context:** Ask about their target programming language,
-   agent framework (if any), execution environments (VMs, local containers,
-   physical hardware), and scale requirements.
-2. **Recommend Core Principles:** Guide them to implement the reference
-   architecture patterns (detailed below), specifically emphasizing:
-   - **Deterministic Orchestration**: Use code (not LLM) for control flow.
-   - **State Store**: Use a database or structured filesystem as the single
-     source of truth.
-   - **Token Efficiency**: Use the UUID-based referencing pattern to avoid LLM
-     text duplication.
-   - **Custom Environment Integration**: Use Custom MCP servers for isolated
-     testing (VMs) or hardware interaction.
-3. **Ensure Schema Consistency**: Advise the user to strictly adhere to the
-   inter-stage data contracts defined in [schema.json](../schema.json) when
-   building their harness.
-4. **Adaptive Design**: Help them draft the code/architecture tailored to their
-   specific stack, rather than imposing a rigid template.
-5. **Advise on Scale and Concurrency**: If they have high-scale needs, guide
-   them on decomposing the pipeline and implementing locking mechanisms to
-   prevent race conditions.
-6. **Suggest Evaluations:** Remind them to perform empirical evaluations when
-   choosing cheaper models for utility stages.
-7. **Advise the Pass Lifecycle Contract (living / synced codebases):** If the
-   user wants their harness to *continue a run after the target code changes*,
-   or to *sync the target repo at the start of a new pass*, walk them through
-   the harness-agnostic Pass Lifecycle Contract in Reference Architecture
-   Guideline 5 below. Emphasize that this support is **opt-in**: a harness that
-   does not implement the contract MUST leave `snapshot_pinned` unset, which
-   preserves today's single-snapshot behavior byte-for-byte. When `--sync` is
-   requested, the harness PINs in the PIN step and passes
-   `--snapshot_root`/`--snapshot_id` normally; Block A (Locator Resolution) is
-   universal across all code-reading stages.
-8. **Advise on Semantic Retrieval at Scale:** If the user is targeting a large
-   codebase (e.g., thousands of source files, multi-pass campaigns, or multiple
-   teams contributing findings), walk them through the optional semantic
-   retrieval patterns in Reference Architecture Guidelines 6 and 7 below.
-   Emphasize that these are **opt-in**: they augment the pipeline via a
-   dedicated query skill or MCP tools, but never modify the existing skills' own
-   deterministic logic or fail-safe invariants.
+01. **Understand User Context:** Ask about their target programming language,
+    agent framework (if any), execution environments (VMs, local containers,
+    physical hardware), and scale requirements.
+02. **Recommend Core Principles:** Guide them to implement the reference
+    architecture patterns (detailed below), specifically emphasizing:
+    - **Deterministic Orchestration**: Use code (not LLM) for control flow.
+    - **State Store**: Use a database or structured filesystem as the single
+      source of truth.
+    - **Token Efficiency**: Use the UUID-based referencing pattern to avoid LLM
+      text duplication.
+    - **Custom Environment Integration**: Use Custom MCP servers for isolated
+      testing (VMs) or hardware interaction.
+03. **Ensure Schema Consistency**: Advise the user to strictly adhere to the
+    inter-stage data contracts defined in [schema.json](../schema.json) when
+    building their harness.
+04. **Adaptive Design**: Help them draft the code/architecture tailored to their
+    specific stack, rather than imposing a rigid template.
+05. **Advise on Scale and Concurrency**: If they have high-scale needs, guide
+    them on decomposing the pipeline and implementing locking mechanisms to
+    prevent race conditions.
+06. **Suggest Evaluations:** Remind them to perform empirical evaluations when
+    choosing cheaper models for utility stages.
+07. **Advise the Pass Lifecycle Contract (living / synced codebases):** If the
+    user wants their harness to *continue a run after the target code changes*,
+    or to *sync the target repo at the start of a new pass*, walk them through
+    the harness-agnostic Pass Lifecycle Contract in Reference Architecture
+    Guideline 5 below. Emphasize that this support is **opt-in**: a harness that
+    does not implement the contract MUST leave `snapshot_pinned` unset, which
+    preserves today's single-snapshot behavior byte-for-byte. When `--sync` is
+    requested, the harness PINs in the PIN step and passes
+    `--snapshot_root`/`--snapshot_id` normally; Block A (Locator Resolution) is
+    universal across all code-reading stages.
+08. **Advise on Semantic Retrieval at Scale:** If the user is targeting a large
+    codebase (e.g., thousands of source files, multi-pass campaigns, or multiple
+    teams contributing findings), walk them through the optional semantic
+    retrieval patterns in Reference Architecture Guidelines 6 and 7 below.
+    Emphasize that these are **opt-in**: they augment the pipeline via a
+    dedicated query skill or MCP tools, but never modify the existing skills'
+    own deterministic logic or fail-safe invariants.
+09. **Advise on SAST Seeding:** If the user wants to augment LLM-based discovery
+    with external SAST tool findings (CodeQL, Semgrep, etc.), walk them through
+    the optional SAST seeding pattern in Reference Architecture Guideline 8
+    below. Emphasize that this is **opt-in**: it ingests external findings as
+    candidates that must earn their verdict through unchanged downstream gates,
+    and it follows exactly the RAG pattern (provenance-tracked, snapshot-aware,
+    fallback on failure).
+10. **Advise on Structural Code Indexing:** If the user is targeting a large
+    codebase where grep-based call-site discovery is unreliable, walk them
+    through the optional structural code index pattern in Reference Architecture
+    Guideline 9 below. Emphasize that this is **opt-in**: it provides AST-level
+    structural context (function boundaries, call graphs) to improve LLM
+    reasoning, but never modifies existing skills.
 
 ## Reference Architecture Guidelines
 
@@ -731,3 +744,402 @@ If the builder also implements Guideline 6 (Semantic Retrieval), reuse the same
 vector embedding infrastructure for finding embeddings. The finding embedding is
 a different payload (finding JSON, not KB chunks) but the same embedding
 capability can serve both.
+
+______________________________________________________________________
+
+### 8. SAST Seeding (External Tool Ingestion)
+
+Mantis's discovery engine is 100% LLM-generative (grep swarm + reasoning). A
+weak LLM can structurally under-detect whole-program taint classes (injection,
+path traversal, deserialization, UAF, format-string) that mature SAST tools
+(CodeQL, Semgrep-taint) encode as interprocedural queries. A SAST seeding
+adapter ingests external tool findings as `PROVISIONALLY_VALID` /
+`NEEDS_RESEARCH` candidates that must earn their verdict through the unchanged
+downstream gates. This is purely additive (INV-2-strengthening) — it expands
+detection breadth without weakening any verification gate.
+
+This follows exactly the RAG pattern from Guideline 6: opt-in, default off,
+provenance-tracked, snapshot-aware, fallback on failure.
+
+**Platform-agnostic IR (not SARIF):** Rather than tying the adapter to SARIF (a
+complex, tool-specific format), the adapter consumes a minimal JSONL
+intermediate representation (IR). Any SAST tool's output (SARIF, Semgrep JSON,
+Bandit JSON, etc.) is converted to this IR by a thin wrapper. This maximizes
+platform agnosticism — the adapter works with any tool that can produce the
+simple JSONL format.
+
+Two implementations are supported, sharing the same data contract:
+
+- **Option A (Default — Skill-Based):** A dedicated skill (`/mantis-sast-seed`)
+  reads the IR and uses LLM reasoning to normalize findings into mantis finding
+  JSONs. The LLM reads actual source code at each reported location under
+  CODE_ROOT to verify the finding and enrich the description with root-cause
+  analysis. Zero external dependencies — works air-gapped.
+- **Option B (Maximum Control — Harness-Based):** The harness directly
+  normalizes SAST output into finding JSONs using deterministic code (e.g., a
+  SARIF-to-finding converter script), bypassing the LLM for the normalization
+  step. The harness writes finding JSONs to `workspace/findings/` before
+  invoking `/mantis-dedupe`.
+
+Both are **opt-in**. The existing skills are not modified. Seeded findings enter
+`workspace/findings/` alongside researcher findings and flow through the
+unchanged downstream gates (dedupe -> review -> critic -> reproduce -> patch ->
+calibrate).
+
+A complete reference blueprint is available at
+[references/mantis-sast-seed.md](references/mantis-sast-seed.md).
+
+#### A. Shared Data Contract: `sast_findings.jsonl`
+
+The IR is a JSONL file at `workspace/sast_findings.jsonl` (STATE-RELATIVE). It
+follows the same provenance-header pattern as `chunks.jsonl` (Guideline 6A).
+
+**Line 1 — Provenance header:**
+
+```json
+{"_provenance": true, "scan_snapshot_id": "abc123def456", "tool": "codeql", "tool_version": "2.15.0", "scan_timestamp": "2026-07-22T10:00:00Z"}
+```
+
+- `scan_snapshot_id`: The SNAPSHOT_ID the scan was run against. This is the
+  **primary provenance anchor** — compared byte-for-byte to the current pass
+  `SNAPSHOT_ID` (same comparison as Block B). If the harness ran the SAST tool
+  against the pinned CODE_ROOT, it sets this to `SNAPSHOT_ID`.
+- `tool`: Tool name (e.g., `codeql`, `semgrep`, `bandit`). Informational.
+- `tool_version`: Tool version. Informational.
+- `scan_timestamp`: ISO 8601. Informational.
+
+**Lines 2+ — One finding per line:**
+
+```json
+{"rule_id": "cpp/sql-injection", "rule_name": "SQL injection", "cwe": "CWE-89", "severity": "HIGH", "code_paths": ["src/db/query.c:42"], "message": "User input flows into SQL query without sanitization"}
+```
+
+| Field        | Type   | Required | Description                                        |
+| ------------ | ------ | -------- | -------------------------------------------------- |
+| `rule_id`    | string | Yes      | Tool-specific rule identifier                      |
+| `severity`   | string | Yes      | `CRITICAL`, `HIGH`, `MEDIUM`, `LOW` (Mantis scale) |
+| `code_paths` | array  | Yes      | Array of `"file:line"` strings (SNAPSHOT-RELATIVE) |
+| `message`    | string | Yes      | Original SAST finding message                      |
+| `rule_name`  | string | No       | Human-readable rule name                           |
+| `cwe`        | string | No       | CWE identifier (e.g., `CWE-89`)                    |
+
+**IR conversion (harness responsibility):** The harness converts SAST tool
+output to this IR before invoking the adapter. Conversion examples:
+
+- SARIF: extract `ruleId`, map `level` to severity (`error`->`HIGH`,
+  `warning`->`MEDIUM`, `note`->`LOW`), extract `locations` to `code_paths`, copy
+  `message.text`.
+- Semgrep JSON: extract `check_id` as `rule_id`, map `extra.severity` to Mantis
+  severity, extract `path:start.line` as `code_paths`, copy `extra.message`.
+
+#### B. Option A: Skill-Based Ingestion (Default — No Infrastructure)
+
+A dedicated skill reads `sast_findings.jsonl`, applies allow-listing, verifies
+provenance, computes `signature`/`lineage_id`/`discovery_commit`, and writes
+finding JSONs. The LLM reads actual source code at each reported location under
+CODE_ROOT to verify the finding and enrich the description.
+
+- **Invocation:** The harness invokes `/mantis-sast-seed` with
+  `--snapshot_root`/`--snapshot_id`/`--state_root` after Stage 6 (Research) and
+  before Stage 7 (Dedupe). The seeded findings land in `workspace/findings/`
+  before `/mantis-dedupe` runs.
+- **Inert until wired:** If `sast_findings.jsonl` is absent, the skill outputs
+  nothing and notifies the caller. It never fails — it simply returns empty.
+- **Anti-hallucination:** The LLM MUST read the actual code at each reported
+  location before writing the finding JSON. It MUST NOT invent findings not
+  present in the SAST output. The `sast_provenance.line_verified` field records
+  whether verification succeeded.
+- **Snapshot safety:** The skill reads `active_snapshot` from state via Block A
+  and stamps `discovery_commit` only when the snapshot is pinned and the
+  finding's location is verified under CODE_ROOT.
+
+#### C. Option B: Harness-Based Ingestion (For Deterministic Ingestion)
+
+For maximum determinism, the harness can normalize SAST output into finding
+JSONs using deterministic code. This bypasses the LLM for the normalization
+step:
+
+1. **Harness Action:** Reads the SAST tool output, parses it deterministically,
+   and writes finding JSONs to `workspace/findings/`.
+2. **Harness Action:** Stamps `discovery_commit` only if the scan provably ran
+   against the pinned CODE_ROOT.
+3. **Harness Action:** Applies allow-listing filters.
+4. **mantis-dedupe invocation:** Proceeds as usual — the seeded findings are
+   indistinguishable from researcher findings.
+
+#### D. Provenance Verification
+
+The adapter stamps `discovery_commit` ONLY if the scan provably ran against a
+line-identical pinned CODE_ROOT. Verification ladder:
+
+1. Read `active_snapshot` from `workspace/.mantis_state.json` (via Block A). If
+   absent, this is MODE-OFF — skip to step 5.
+2. If `snapshot_pinned` is false, this is HALT — skip to step 6.
+3. Read the IR provenance header's `scan_snapshot_id`.
+4. **VERIFIED**: `scan_snapshot_id` present AND exactly equals `SNAPSHOT_ID`.
+   Stamp `discovery_commit = SNAPSHOT_ID`. Status = `PROVISIONALLY_VALID`.
+5. **MODE-OFF**: `active_snapshot` absent. OMIT `discovery_commit`. Status =
+   `PROVISIONALLY_VALID` (MODE-OFF permits all verdicts).
+6. **HALT**: `snapshot_pinned` is false. OMIT `discovery_commit`. Status =
+   `NEEDS_RESEARCH`.
+7. **DRIFT**: `scan_snapshot_id` present but differs. OMIT `discovery_commit`
+   entirely. Status = `NEEDS_RESEARCH`.
+8. **UNVERIFIED**: `scan_snapshot_id` absent. OMIT `discovery_commit`. Status =
+   `NEEDS_RESEARCH`.
+
+**Line-existence verification** (additional check when VERIFIED or DRIFT and
+CODE_ROOT is resolved): For each finding, verify each `code_paths` entry: strip
+trailing `:line`, check file exists under CODE_ROOT, check line number is within
+file's line count. If file missing or line out of range -> downgrade to DRIFT
+(omit `discovery_commit`, status = `NEEDS_RESEARCH`).
+
+This is the exact same "UNTRUSTED-IF-ABSENT" pattern as `discovery_commit`
+(schema.json) and `signature`/`lineage_id`.
+
+#### E. Allow-Listing and Noise Control
+
+`workspace/sast_allowlist.json` (optional config file, STATE-RELATIVE):
+
+```json
+{
+  "enabled": true,
+  "severity_filter": ["CRITICAL", "HIGH"],
+  "cwe_allowlist": {
+    "enabled": true,
+    "cwes": ["CWE-89", "CWE-78", "CWE-79", "CWE-22", "CWE-787", "CWE-416", "CWE-502"]
+  },
+  "rule_allowlist": {
+    "enabled": false,
+    "rules": []
+  },
+  "per_rule_cap": 5,
+  "total_cap": 50
+}
+```
+
+If the config file is absent, defaults apply: CRITICAL+HIGH only,
+`per_rule_cap=5`, `total_cap=50`.
+
+**How allow-listing protects the retry cap:** The reproduce stage
+(`/mantis-reproduce`) has a hard ceiling of 6 attempts per finding (absolute,
+never reset). If 1000 SAST findings are seeded without filtering, the reproduce
+stage would need up to 6000 attempts — starving the retry budget. The
+allow-listing chain (severity filter -> CWE/rule filters -> per-rule cap ->
+total cap) ensures only a bounded, high-signal set of candidates enters the
+pipeline. The review (13-rule negative filter) and critic (production viability)
+stages further filter before reproduce runs.
+
+#### F. Per-Skill Augmentation Guidance
+
+When the SAST seed skill is available, instruct the harness to invoke it between
+Stage 6 (Research) and Stage 7 (Dedupe). These are runtime instructions passed
+by the harness — the skill files themselves are not modified:
+
+- **mantis-meta-agent:** Invoke `/mantis-sast-seed` with
+  `--snapshot_root`/`--snapshot_id`/`--state_root` after `/mantis-researcher`
+  completes and before `/mantis-dedupe`.
+- **mantis-dedupe:** No changes needed. Seeded findings are in
+  `workspace/findings/` alongside researcher findings. Dedupe processes them
+  identically (signature-based matching, Block B pairwise check).
+- **mantis-review:** No changes needed. The 13-rule negative filter applies to
+  seeded findings identically.
+- **mantis-report:** No changes needed. The `sast_provenance` field is
+  informational and can be displayed in reports.
+
+#### G. Snapshot Safety
+
+The SAST seed adapter follows Block A (Locator Resolution) exactly like every
+other code-reading skill:
+
+- Resolve CODE_ROOT from `--snapshot_root` / state `active_snapshot`.
+- Honor the sentinel check (Block A step 2).
+- Read source files under CODE_ROOT (SNAPSHOT-RELATIVE) for line-existence
+  verification.
+- Write findings under `state_root/workspace/findings/` (STATE-RELATIVE).
+- Never write under CODE_ROOT when pinned.
+- In MODE-OFF: proceed without `discovery_commit`. All verdicts permitted.
+- In HALT: omit `discovery_commit`. Seeded findings get `NEEDS_RESEARCH`.
+- In PINNED: verify each finding's location under CODE_ROOT, stamp
+  `discovery_commit = SNAPSHOT_ID` if verified.
+
+The SAST tool output itself is NOT snapshot-aware — it may have been produced
+against a different tree. The adapter's provenance verification is what bridges
+the gap: it re-grounds each finding against the pinned CODE_ROOT before stamping
+`discovery_commit`.
+
+#### H. Safety Guardrails
+
+- **Purely additive.** Seeded findings are `PROVISIONALLY_VALID` /
+  `NEEDS_RESEARCH` candidates. They must pass through the unchanged downstream
+  gates: dedupe (Block B), review (13-rule filter), critic (viability),
+  reproduce (Block F reached-sink evidence + HALT ceiling), patch (Block G
+  re-attack), calibrate (sanity caps). No gate is weakened.
+- **No false `VERIFIED_SECURE`.** Seeded findings start at `PROVISIONALLY_VALID`
+  — they can never reach `VERIFIED_SECURE` without passing through the full
+  patch + re-attack pipeline.
+- **No false `failed_to_reproduce`.** Seeded findings that reach reproduce are
+  subject to the same Block F evidence gate and HALT ceiling.
+- **No dropped regression.** If a SAST-seeded finding matches an archived
+  finding with a different `discovery_commit`, Block B returns NOT_MATCHED ->
+  `possible_duplicate_of` -> finding stays active.
+- **Fail-safe on missing data.** If `sast_findings.jsonl` is absent, no findings
+  written. If a finding can't be verified, `NEEDS_RESEARCH`.
+- **No existing skills modified.** The adapter writes findings to
+  `workspace/findings/` before `/mantis-dedupe` runs.
+- **`sast_provenance` is informational only.** It does not affect any safety-
+  critical invariant, gate, or verdict. The finding's `discovery_commit` is the
+  field that governs Block B snapshot matching.
+
+______________________________________________________________________
+
+### 9. Structural Code Index (AST-Level Context)
+
+For small repositories, the researcher can grep for call-sites and the planner
+can infer dependencies. At scale, grep-based call-site discovery is unreliable
+(misses indirect calls, cannot distinguish calls from comments/strings, no
+function boundary awareness). A structural code index provides AST-level context
+(function boundaries, call graphs, symbol tables) to improve LLM reasoning
+quality during discovery.
+
+This follows exactly the RAG pattern from Guideline 6: opt-in, default off,
+provenance-tracked, snapshot-aware, fallback on failure. The structural index is
+a **coverage HINT only** — it decides ordering and prioritization, never the
+membership of the audit set. A miss must never cause a file, call-site, or
+investigation to be skipped or dropped.
+
+Two implementations are supported, sharing the same data contract:
+
+- **Option A (Default — Skill-Based):** A skill that generates and runs a helper
+  script using ctags (zero-dependency, often pre-installed) or tree-sitter
+  (pip-installable, full AST). Zero external infrastructure required.
+- **Option B (Maximum Power — MCP-Based):** The harness owns a persistent
+  structural index using tree-sitter or LSP, serving `find_callers(symbol)`,
+  `find_callees(function)`, `get_function_boundary(file, line)` MCP tools.
+
+Both are **opt-in**. The existing skills are not modified. The structural index
+supplements grep as a ranking HINT ONLY — it decides ORDER, never MEMBERSHIP of
+the audit set.
+
+A complete reference blueprint is available at
+[references/mantis-structural-index.md](references/mantis-structural-index.md).
+
+#### A. Shared Data Contract: `structural_index.json`
+
+After Stage 2 (`/mantis-architecture`) completes, the structural index is built
+into `workspace/kb/structural_index.json` (STATE-RELATIVE). The first line is a
+provenance header (same pattern as `chunks.jsonl`):
+
+```json
+{"_provenance": true, "snapshot_id": "abc123", "tool": "tree-sitter"}
+```
+
+The index contains function-level structural data:
+
+```json
+{
+  "functions": {
+    "src/parser.c:parse_input": {
+      "start_line": 45,
+      "end_line": 120,
+      "signature": "int parse_input(char *buf, size_t len)",
+      "calls": ["malloc", "validate_input", "memcpy"]
+    }
+  },
+  "call_sites": {
+    "malloc": [
+      {"file": "src/parser.c", "line": 78, "caller": "parse_input"}
+    ]
+  },
+  "callers": {
+    "parse_input": [
+      {"file": "src/main.c", "line": 203, "caller": "main"}
+    ]
+  }
+}
+```
+
+Before serving queries, check `snapshot_id` in the provenance header against the
+current `SNAPSHOT_ID`; rebuild if they differ. In MODE-OFF, skip the index
+entirely. In HALT mode, serve with a `STALE` flag.
+
+#### B. Option A: Skill-Based (ctags -> tree-sitter upgrade path)
+
+The skill writes `workspace/helpers/build_structural_index.py` with
+`# MANTIS_HELPER_VERSION = 2` as the first line (same versioned helper pattern
+as `search_chunks.py` in Guideline 6B). The script:
+
+1. Tries `import tree_sitter_languages` — if available, uses tree-sitter for
+   full AST extraction (function boundaries, call sites, signatures).
+2. If tree-sitter unavailable, tries
+   `subprocess.run(["ctags", "-R", "--output-format=json"])` — if available,
+   uses ctags for symbol extraction (function definitions, locations — no call
+   graph).
+3. If neither available, outputs an empty index and notifies the caller.
+
+The script is generated by the agent at runtime — no code is shipped with the
+skill (same pattern as `mantis-dedupe`'s `merge_findings.py`).
+
+#### C. Option B: MCP-Based (For Maximum Scale)
+
+For very large codebases, the harness can own a persistent structural index
+serving three MCP tools:
+
+- `find_callers(symbol: string) -> [{file, line, caller}]`
+- `find_callees(function: string) -> [{file, line, callee}]`
+- `get_function_boundary(file: string, line: int) -> {start_line, end_line, signature}`
+
+The harness manages the index lifecycle: build from CODE_ROOT, rebuild when
+`SNAPSHOT_ID` changes, handle freshness checks.
+
+#### D. Per-Skill Augmentation Guidance
+
+When a structural index is available, instruct the following skills to use it.
+These are runtime instructions passed by the harness — the skill files
+themselves are not modified:
+
+- **mantis-architecture:** Optionally build the structural index during KB
+  synthesis (Step 3), writing it alongside `dependencies.json`.
+- **mantis-plan:** Use the structural index for function-level dependency
+  fan-out (more precise than file-level `dependencies.json`).
+- **mantis-researcher:** Wave 1 sub-agents use `find_callers()` to SUPPLEMENT
+  grep as a ranking HINT for call-site discovery — it decides ORDER, never
+  MEMBERSHIP. It MUST NEVER replace the exhaustive Step-3 call-site sweep; every
+  call-site that a full grep would reach must still be audited whether or not it
+  ranks in the structural index. Audit the union of grep results and structural
+  index results. Wave 2 deep auditors use `get_function_boundary()` to start
+  with the enclosing function, expanding to callers/callees/file as needed for
+  cross-function context. The researcher's existing Wave 1/Wave 2 structure is
+  unchanged.
+
+#### E. Integration with RAG (Guideline 6)
+
+- Structural index entries can be added to `chunks.jsonl` as
+  `entity_type: "structural"` chunks.
+- Code chunks can become function-boundary-aligned (instead of dumb line-range
+  slices) by using function boundaries from the structural index.
+- The structural index and the RAG index can share the same vector embedding
+  infrastructure if both are implemented.
+
+#### F. Snapshot Safety
+
+The structural index is a **cache of the pinned snapshot**, never a live view:
+
+- Build from CODE_ROOT (the pinned snapshot), not the live tree.
+- Rebuild when `SNAPSHOT_ID` changes (new pass, new pin).
+- In HALT mode (`snapshot_pinned=false`), serve results with a `STALE` flag or
+  refuse to serve.
+- In MODE-OFF, skip the index entirely.
+
+#### G. Safety Guardrails
+
+- **Opt-in, default off.** No impact when not wired.
+- **No existing skills modified.** Runtime instructions only.
+- **Coverage HINTs only.** Structural index decides ORDER, never MEMBERSHIP. A
+  miss must never cause a file, call-site, or investigation to be skipped.
+- **Fallback on failure.** If ctags/tree-sitter unavailable, empty index. Skills
+  fall back to grep.
+- **Snapshot-aware.** Provenance-stamped, rebuilt on SNAPSHOT_ID change.
+- **Complementary to SAST seeding (Guideline 8).** Tree-sitter gives structural
+  context (better LLM reasoning); SAST seeding gives taint-flow coverage
+  (broader detection breadth). They attack different problems and are
+  synergistic: the structural index helps verify SAST candidates efficiently.
