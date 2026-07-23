@@ -424,16 +424,18 @@ Execute your orchestration duties in a continuous loop:
      `workspace/historical_learnings.jsonl` file.
 
    - **Stage 0.5 (Optional Structural Index):** Call the
-     `@mantis-structural-index` subagent to build
-     `workspace/kb/structural_index.jsonl` — a function-level call graph and
-     symbol table from source code. It runs immediately after the snapshot is
-     pinned (Block D), before the first code-reading analysis stage, using only
-     CODE_ROOT + SNAPSHOT_ID. In MODE-OFF, it builds against the current
-     directory with `snapshot_id` set to `"unknown"` and rebuilds each pass (the
-     live tree is mutable, so a reused index could lag current code). The index
-     is a HINT-only enhancement — it never gates findings and degrades
-     gracefully to an empty index (grep fallback) when unavailable or not
-     invoked. A non-conformant harness simply skips this stage.
+     `@mantis-structural-index` subagent to build the structural index — a
+     content-addressed semantic-unit index published as
+     `workspace/kb/structural_index/manifest.json` + `catalog.sqlite` (with
+     `structural_index.jsonl` as a compatibility pointer) and exposed via
+     `workspace/helpers/query_structural_index.py`. It runs immediately after
+     the snapshot is pinned (Block D), before the first code-reading analysis
+     stage, using only CODE_ROOT + SNAPSHOT_ID. In MODE-OFF, it builds against
+     the current directory with `snapshot_id` set to `"unknown"` and rebuilds
+     each pass (the live tree is mutable, so a reused index could lag current
+     code). The index is a HINT-only enhancement — it never gates findings and
+     degrades gracefully to an empty index (grep fallback) when unavailable or
+     not invoked. A non-conformant harness simply skips this stage.
 
    - **Stage 1 (Optional Directory Mapping):** If not already mapped, call the
      `@mantis-summarize` subagent to generate `mantis-summary.md` files for each

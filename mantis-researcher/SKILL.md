@@ -43,6 +43,10 @@ interface violations.
   - referenced Markdown files in `"kb_references"` (e.g.
     `workspace/kb/entities/*.md`).
   - Target source code files.
+  - `workspace/kb/structural_index/manifest.json` (to check structural index
+    availability/status).
+  - `workspace/helpers/query_structural_index.py` (to invoke bounded
+    structural-index queries).
 - **Writes**:
   - Raw finding files to `workspace/findings/<uuid>.json` (creates
     `workspace/findings/` if missing).
@@ -140,10 +144,12 @@ Execute the research stage as follows:
    - Do not execute investigations sequentially if sub-agents are supported.
      Split the investigations in `workspace/plan.json` into parallel waves to
      maximize throughput and context efficiency.
+
    - **Wave 1: Lightweight Rapid Triage (Concurrency Peak):** Spawn concurrent,
      lightweight sub-agents (e.g. up to 10-20 in parallel) to sweep all files
      listed in `workspace/plan.json`. Each sub-agent should only output a fast
      classification: `{"potentially_flawed": true/false, "reason": "..."}`.
+
    - **Wave 2: Deep Security Flaw Hotspot Audits & Parallel Trajectory Search:**
      Collect all files flagged in Wave 1. Spawn a wave of concurrent deep
      auditor sub-agents (e.g. up to 4-8 in parallel) to focus exclusively on
@@ -152,12 +158,14 @@ Execute the research stage as follows:
      constraints or a diverse set of less expensive LLMs to explore parallel
      attack vectors. Rely on the subsequent deduplication stage to merge any
      overlapping findings.
+
    - **Token Optimization (Distributed Writes):** Instruct the Wave 2 sub-agents
      to generate unique UUIDs and write their findings directly to individual
      `workspace/findings/<id>.json` files on disk. Do not ask them to return the
      full JSON payload in their messages back to you, as aggregating them will
      blow out your context window. Ask them to only return the list of UUIDs
      they created.
+
    - **Snapshot Isolation (Wave Pinning) — MANDATORY:** Pass the SAME
      `--snapshot_root` (CODE_ROOT resolved in Step 0) and the same
      `--snapshot_id` value to EVERY Wave-1 and Wave-2 sub-agent, and instruct
@@ -169,14 +177,67 @@ Execute the research stage as follows:
      any command that changes the working tree or switches revisions — the
      snapshot is immutable for the whole pass. A sub-agent that cannot see the
      snapshot must report that, not re-sync.
+
    - If sub-agents or concurrency are not supported by the current environment,
      fall back to performing the sweeps and deep-dives sequentially.
+
+   - **Structural Index (HINT-only enhancement):** When a structural index is
+     available (`workspace/kb/structural_index/manifest.json` exists), use it to
+     SUPPLEMENT the wave-based swarm above. The structural index decides ORDER,
+     never MEMBERSHIP. It MUST NEVER replace the exhaustive Step-3 call-site
+     sweep.
+
+     - **Resolution-first protocol (MANDATORY before any structural query):**
+
+       1. Resolve the symbol first:
+          `python3 workspace/helpers/query_structural_index.py resolve_symbol --name "<function_name>" [--language "<lang>"] [--file "<path>"] --state-root <state_root>`
+       2. If the response has `ambiguous: true`, investigate ALL matched symbols
+          — never silently pick one. Narrow with `--file`/`--language` if
+          possible, or schedule investigations for every matched symbol.
+       3. Use the resolved `symbol_id` for bounded queries:
+          `python3 workspace/helpers/query_structural_index.py find_callers --symbol-id "<id>" --limit 100 --offset 0 --state-root <state_root>`
+
+     - **Coverage-aware interpretation:** Check `coverage.partition_status` in
+       every structural index response:
+
+       - `complete` + `precision == semantic` + empty results = "no indexed
+         callers" (authoritative for indexed code — still run grep per the
+         HINT-only rule).
+       - `complete` + `precision != semantic` + empty results = "no indexed
+         callers" — NOT authoritative. MUST run exhaustive grep.
+       - `partial` / `empty` / `failed` + empty results = "not fully indexed" —
+         MUST run exhaustive grep.
+       - Use the `precision` and `backend` fields on every result to weight
+         trust (`semantic` > `typecheck` > `ast` > `symbol-only` > `heuristic` >
+         `coverage-only`).
+
+     - **Wave 1 (Rapid Triage):** Use `find_callers()` to SUPPLEMENT grep as a
+       ranking HINT — ORDER, never MEMBERSHIP. Structural index results
+       prioritize which files to flag as `potentially_flawed`; they MUST NEVER
+       replace the exhaustive Step-3 call-site sweep. Audit the union of grep
+       results and structural index results.
+
+     - **Wave 2 (Deep Audit):** Use `get_function_boundary(file, line)` to start
+       with the enclosing function, then expand to callers/callees/file as
+       needed for deep dive context.
+
+     - **Graceful degradation:** If the structural index is absent (no
+       `manifest.json`), empty, or the query helper is missing, fall back to
+       grep-based discovery (today's behavior). The structural index is a
+       coverage HINT only.
 
 3. **Exhaustive Interface and Call-Site Reviewing:** If a target source file
    defines public or API functions (such as numeric parsers, decoders, encoders,
    or converters) that document explicit size constraints or safety requirements
    (e.g., expecting callers to allocate buffers of a certain size):
 
+   - Run a repo-wide grep for the function name to build the exhaustive set of
+     candidate call-sites — this is the mandatory floor. Then use the structural
+     index query helper (`resolve_symbol` then `find_callers`) to RANK and
+     prioritize which call-sites to audit first (the index distinguishes actual
+     calls from comments/strings/variable names). Audit the union of both result
+     sets — the structural index may miss macro-based calls, function pointers,
+     and dynamic dispatch, so grep remains the floor.
    - Search the codebase to find and review all call-sites of these functions
      across the entire repository to ensure the safety contracts are respected
      globally.

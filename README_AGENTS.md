@@ -79,7 +79,7 @@ graph TD
     end
 
     FileHist[("workspace/historical_learnings.jsonl")]
-    FileSI[("workspace/kb/structural_index.jsonl")]
+    FileSI[("workspace/kb/structural_index/")]
     FileSum[("mantis-summary.md")]
     FileKB[/"workspace/kb/ (Markdown KB)"/]
     FilePlan[("workspace/plan.json")]
@@ -148,13 +148,16 @@ graph TD
    saving findings to `workspace/historical_learnings.jsonl`.
 
 02b. **`/mantis-structural-index` (Structural Index Builder):** An optional
-stage that builds a function-level call graph and symbol table from source code,
-writing `workspace/kb/structural_index.jsonl`. It runs immediately after the
-snapshot is pinned and before the first code-reading analysis stage. Uses the
-most precise cross-reference backend available (LSP, SCIP, cscope, tree-sitter,
-ctags, regex, grep — degrading gracefully). In MODE-OFF it builds against the
-current directory. The index is HINT-only — it never gates findings and degrades
-to grep when unavailable.
+stage that builds a content-addressed semantic-unit index from source code,
+writing `workspace/kb/structural_index/manifest.json` + `catalog.sqlite` (with
+`structural_index.jsonl` as a compatibility pointer). It runs immediately after
+the snapshot is pinned and before the first code-reading analysis stage. Uses
+capability-based per-partition backend selection (prebuilt SCIP/Kythe, compiler,
+AST, ctags, regex, grep — degrading gracefully). Supports content-addressed unit
+reuse and incremental overlays. In MODE-OFF it builds against the current
+directory. The index is HINT-only — it never gates findings and degrades to grep
+when unavailable. Consumers query via
+`workspace/helpers/query_structural_index.py` for bounded, paginated results.
 
 03. **`/mantis-summarize` (Summarizer):** An optional pre-processing step that
     generates a `mantis-summary.md` for each directory, reading past
@@ -389,14 +392,16 @@ format (not SARIF) that any SAST tool can convert to. See
 
 For large codebases where grep-based call-site discovery is unreliable, the
 **Structural Code Index** is an optional first-class stage
-(`/mantis-structural-index`) that builds a function-level call graph and symbol
-table from source code using the most precise cross-reference backend available
-(LSP, SCIP/LSIF, cscope, tree-sitter, ast-grep, ctags, regex — degrading to
-grep). It runs immediately after the snapshot is pinned and before the first
+(`/mantis-structural-index`) that builds a content-addressed semantic-unit index
+from source code using capability-based per-partition backend selection
+(prebuilt SCIP/Kythe, compiler, AST, ctags, regex — degrading to grep). It
+supports content-addressed unit reuse, incremental overlays, and a bounded query
+interface. It runs immediately after the snapshot is pinned and before the first
 code-reading analysis stage. See
-[mantis-structural-index/SKILL.md](mantis-structural-index/SKILL.md) and the
-deep spec at
-[mantis-pipeline-adapter/references/mantis-structural-index.md](mantis-pipeline-adapter/references/mantis-structural-index.md).
+[mantis-structural-index/SKILL.md](mantis-structural-index/SKILL.md) for the
+full specification, and
+[mantis-pipeline-adapter/references/mantis-structural-index.md](mantis-pipeline-adapter/references/mantis-structural-index.md)
+for the adapter reference pointer.
 
 > **Note on Standalone vs. Harness Mode:** When using Mantis Skills directly
 > from the CLI in standalone mode, skills like `/mantis-review` or

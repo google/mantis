@@ -1003,82 +1003,41 @@ function boundary awareness). A structural code index provides AST-level context
 (function boundaries, call graphs, symbol tables) to improve LLM reasoning
 quality during discovery.
 
-This follows exactly the RAG pattern from Guideline 6: optional, provenance-
-tracked, snapshot-aware, fallback on failure. The structural index is a
-**coverage HINT only** — it decides ordering and prioritization, never the
-membership of the audit set. A miss must never cause a file, call-site, or
-investigation to be skipped or dropped.
+This follows the RAG pattern from Guideline 6: optional, provenance-tracked,
+snapshot-aware, fallback on failure. The structural index is a **coverage HINT
+only** — it decides ordering and prioritization, never the membership of the
+audit set. A miss must never cause a file, call-site, or investigation to be
+skipped or dropped.
 
-Two implementations are supported, sharing the same data contract:
+The full specification — including the manifest schema, SQLite serving store,
+capability-based per-partition backend selection, canonical symbol IDs, query
+interface, baseline-plus-delta overlay, deterministic partial coverage, and
+safety guardrails — lives in a single source of truth:
+
+**→ [../mantis-structural-index/SKILL.md](../mantis-structural-index/SKILL.md)**
+
+A thin reference blueprint is at
+[references/mantis-structural-index.md](references/mantis-structural-index.md).
+
+Two implementations are supported, sharing the same query contract:
 
 - **Option A (Default — Skill-Based):** The `mantis-structural-index` skill
-  generates and runs a helper script using the most precise cross-reference
-  backend available in the environment, degrading to grep. See
-  [mantis-structural-index/SKILL.md](../mantis-structural-index/SKILL.md).
+  generates and runs helper scripts (`build_structural_index.py` and
+  `query_structural_index.py`, both `# MANTIS_HELPER_VERSION = 4`) using
+  capability-based per-partition backend selection, degrading to grep.
 - **Option B (Maximum Power — MCP-Based):** The harness owns a persistent
-  structural index using LSP or tree-sitter, serving `find_callers(symbol)`,
-  `find_callees(function)`, `get_function_boundary(file, line)` MCP tools.
+  structural index serving `find_callers(symbol)`, `find_callees(function)`,
+  `get_function_boundary(file, line)` MCP tools, backed by the same SQLite
+  serving store.
 
 Both are **optional**. A non-conformant harness simply skips the structural
 index stage. The structural index supplements grep as a ranking HINT ONLY — it
 decides ORDER, never MEMBERSHIP of the audit set.
 
-A complete reference blueprint with implementation details is available at
-[references/mantis-structural-index.md](references/mantis-structural-index.md).
-
-#### A. Shared Data Contract: `structural_index.jsonl`
-
-The structural index is built into `workspace/kb/structural_index.jsonl`
-(STATE-RELATIVE) immediately after the snapshot is pinned (Block D), before the
-first code-reading analysis stage. It only needs `CODE_ROOT` + `SNAPSHOT_ID`.
-The file is JSONL — line 1 is the provenance header, lines 2+ are structural
-records with a `_type` discriminator:
-
-```json
-{"_provenance": true, "snapshot_id": "abc123", "tool": "tree-sitter"}
-{"_type": "function", "key": "src/parser.c:parse_input", "start_line": 45, "end_line": 120, "signature": "int parse_input(char *buf, size_t len)", "calls": ["malloc", "validate_input", "memcpy"]}
-{"_type": "call_edge", "caller": "parse_input", "callee": "malloc", "file": "src/parser.c", "line": 78}
-{"_type": "call_edge", "caller": "main", "callee": "parse_input", "file": "src/main.c", "line": 203}
-```
-
-Before serving queries, check `snapshot_id` in the provenance header (line 1)
-against the current `SNAPSHOT_ID`; reuse if they match, rebuild if they differ.
-In MODE-OFF, build against cwd with `snapshot_id` set to `"unknown"` and always
-rebuild (the live tree is mutable). In HALT mode, serve with a `STALE` flag.
-
-#### B. Option A: Skill-Based (most precise backend → grep)
-
-The `mantis-structural-index` skill writes
-`workspace/helpers/build_structural_index.py` with `# MANTIS_HELPER_VERSION = 1`
-as the first line (same versioned helper pattern as `search_chunks.py` in
-Guideline 6B). The script probes the most precise cross-reference backend
-available in the environment, degrading to grep. The following are **examples,
-not an exhaustive enum**:
-
-1. LSP (clangd / gopls / pyright / rust-analyzer / …) or SCIP / LSIF — if a
-   pre-built index or running language server is available.
-2. cscope / GNU global — if available.
-3. tree-sitter / ast-grep — if `tree_sitter_languages` is importable or
-   `ast-grep` is on `PATH`.
-4. universal-ctags — if `ctags` is on `PATH`.
-5. stdlib-regex symbol/boundary helper — fallback Python regex pass.
-6. grep — final fallback (empty index, grep behavior unchanged).
-
-The script is generated by the agent at runtime — no code is shipped with the
-skill (same pattern as `mantis-dedupe`'s `merge_findings.py`). No shipped
-binaries; air-gapped-safe.
-
-#### C. Option B: MCP-Based (For Maximum Scale)
-
-For very large codebases, the harness can own a persistent structural index
-serving three MCP tools:
-
-- `find_callers(symbol: string) -> [{file, line, caller}]`
-- `find_callees(function: string) -> [{file, line, callee}]`
-- `get_function_boundary(file: string, line: int) -> {start_line, end_line, signature}`
-
-The harness manages the index lifecycle: build from CODE_ROOT, rebuild when
-`SNAPSHOT_ID` changes, handle freshness checks.
+Consumers MUST use the query interface (`query_structural_index.py`) rather than
+filtering JSONL directly. The query interface provides bounded results,
+pagination, explicit name resolution, precision/backend metadata, and coverage
+on empty results.
 
 #### D. Per-Skill Augmentation Guidance
 
@@ -1110,32 +1069,3 @@ behave exactly as they do today:
   slices) by using function boundaries from the structural index.
 - The structural index and the RAG index can share the same vector embedding
   infrastructure if both are implemented.
-
-#### F. Snapshot Safety
-
-The structural index is a **cache of the pinned snapshot** (or a best-effort
-index of the live tree in MODE-OFF), never a live view:
-
-- Build from CODE_ROOT (the pinned snapshot), not the live tree (when pinned).
-- Reuse-on-match: if `structural_index.jsonl` already carries the current
-  `SNAPSHOT_ID`, reuse it — do not rebuild. Rebuild only when `SNAPSHOT_ID`
-  differs.
-- In HALT mode (`snapshot_pinned=false`), best-effort build, serve with a
-  `STALE` flag.
-- In MODE-OFF, build against cwd with `snapshot_id` set to `"unknown"`. Do NOT
-  skip — this is the standalone-efficiency case.
-
-#### G. Safety Guardrails
-
-- **Optional first-class stage.** The skill is additive; a non-conformant
-  harness simply skips it. No impact when not wired.
-- **Coverage HINTs only.** Structural index decides ORDER, never MEMBERSHIP. A
-  miss must never cause a file, call-site, or investigation to be skipped.
-- **Fallback on failure.** If no backend is available, empty index. Skills fall
-  back to grep (today's behavior byte-for-byte).
-- **Snapshot-aware.** Provenance-stamped, reuse-on-match, rebuilt on SNAPSHOT_ID
-  change.
-- **Complementary to SAST seeding (Guideline 8).** The structural index gives
-  structural context (better LLM reasoning); SAST seeding gives taint-flow
-  coverage (broader detection breadth). They attack different problems and are
-  synergistic: the structural index helps verify SAST candidates efficiently.

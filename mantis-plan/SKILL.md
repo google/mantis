@@ -40,6 +40,10 @@ records to map the external boundary and formulate an adaptive review roadmap.
   - Mode B: reads `workspace/kb/index.md`, `workspace/kb/THREAT_MODEL.md`,
     `workspace/archive/.repro_attempts.json` (if exists), VCS diffs or file
     timestamps/hashes.
+  - `workspace/kb/structural_index/manifest.json` (to check structural index
+    availability/status).
+  - `workspace/helpers/query_structural_index.py` (to invoke bounded
+    structural-index queries).
   - `workspace/.mantis_state.json` NEW fields:
     `active_snapshot.{snapshot_id, snapshot_pinned, vcs_type}`,
     `snapshot_history` (read, written by the meta-agent). `vcs_type` is read
@@ -395,14 +399,21 @@ Execute the planning stage as follows:
        files, so the planner can schedule targeted investigations for consumers
        of the changed code (not just the changed code itself).
 
-       - **How:** Build or read a dependency graph from the `workspace/kb/`
-         directory. If the KB contains an import/build graph (e.g.,
-         `workspace/kb/dependencies.json` or entity-relationship markdown), use
-         it to compute the transitive set of files that import or call into the
-         changed files. For each changed file F, find all files that import F
-         (directly or transitively up to 2 hops). Add these dependent files to
-         the investigation scope as `Exhaustive Review: <dependent_file>`
-         entries.
+       - **How:** Start with the file-level dependency graph
+         (`workspace/kb/dependencies.json` or entity-relationship markdown) as
+         the mandatory floor: for each changed file F, find all files that
+         import F (directly or transitively up to 2 hops). Add these dependent
+         files to the investigation scope as
+         `Exhaustive Review: <dependent_file>` entries. Then ADD structural
+         index callers on top: use the query helper
+         (`workspace/helpers/query_structural_index.py`) for function-level
+         precision when available — call `resolve_symbol()` for a changed file's
+         exported functions, then `find_callers()` to enumerate dependents at
+         the symbol level. Schedule investigations for the UNION of
+         dependency-graph-found dependents and structural-index-found callers —
+         they are complementary, not alternatives. If the structural index is
+         absent (no `manifest.json`), empty, or the query helper is missing, the
+         dependency graph alone remains the floor.
        - **When to use:** ONLY when `changed_files_status` is known AND the KB
          contains dependency information. If the KB lacks an import/build graph,
          or the KB is stale (check `kb_snapshot_id` in
@@ -417,6 +428,56 @@ Execute the planning stage as follows:
        - **VCS-agnostic:** The dependency graph is derived from the KB's
          architecture analysis, not from VCS metadata. It works for any language
          with import/include/use statements that the KB has indexed.
+
+     - **Structural Index Queries (HINT-only enhancement):** When a structural
+       index is available (`workspace/kb/structural_index/manifest.json`
+       exists), use it to SUPPLEMENT the dependency-aware fan-out above with
+       precise, symbol-level caller discovery. The structural index decides
+       ORDER of investigation priority, NEVER MEMBERSHIP of the audit set.
+
+       - **Resolution-first protocol (MANDATORY):** Before querying callers,
+         resolve the symbol:
+
+         `python3 workspace/helpers/query_structural_index.py resolve_symbol --name "<function_name>" [--language "<lang>"] [--file "<path>"] --state-root <state_root>`
+
+         If the response has `ambiguous: true`, do NOT silently pick one match.
+         Narrow with `--file`/`--language`, or schedule investigations for ALL
+         matched symbols.
+
+       - **Bounded caller queries:** Once resolved, query callers with explicit
+         bounds:
+
+         `python3 workspace/helpers/query_structural_index.py find_callers --symbol-id "<resolved_id>" --limit 100 --offset 0 --state-root <state_root>`
+
+         Paginate with `--offset` if `has_more` is true.
+
+       - **Coverage-aware interpretation:** Check `coverage.partition_status` in
+         every structural index response:
+
+         - `complete` + `precision == semantic` + no callers = "no indexed
+           callers" — the partition is fully indexed with a semantic backend, so
+           the empty result is authoritative for indexed code. Still run grep
+           per the HINT-only rule (grep catches macro-based calls, function
+           pointers, and dynamic dispatch).
+         - `complete` + `precision != semantic` + no callers = "no indexed
+           callers" — the partition is complete but precision is below semantic,
+           so the empty result is NOT authoritative. MUST run exhaustive grep
+           fallback.
+         - `partial` / `empty` / `failed` + no callers = "not fully indexed" —
+           the partition is not complete, so expand the investigation scope and
+           MUST run exhaustive grep fallback.
+
+       - **Guardrails:**
+
+         - HINT-only: structural index results decide ORDER, never MEMBERSHIP.
+           They prioritize which dependent files to investigate first; they MUST
+           NEVER cause a file to be dropped from the audit scope.
+         - Every result carries `precision` and `backend` fields — use
+           `precision` (`semantic` > `typecheck` > `ast` > `symbol-only` >
+           `heuristic` > `coverage-only`) to weight trust in the result.
+         - If the structural index is absent (no `manifest.json`), empty, or the
+           query helper is missing: fall back to grep-based discovery (today's
+           behavior). The structural index is a coverage HINT only.
 
      - **Context Injection (`kb_references`):** For each investigation you plan,
        you must determine which files in the `workspace/kb/` directory (e.g.,

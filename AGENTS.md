@@ -42,3 +42,19 @@ Extract a block into a `references/` file only if ALL three hold:
 `mantis-patch/references/patch_rebasing.md` qualifies (pure mechanics, no
 invariant restated, fails safe to Phase-1). Do not extract content that restates
 a crown-jewel invariant — trim it inline instead.
+
+## Structural index spec
+
+The structural index spec lives in **one canonical location**:
+`mantis-structural-index/SKILL.md`. Two other files reference it — the adapter
+blueprint stub (`mantis-pipeline-adapter/references/mantis-structural-index.md`)
+and the adapter Guideline 9 (`mantis-pipeline-adapter/SKILL.md`). Before
+committing changes that touch any of these three files, verify:
+
+1. The blueprint stub is under 50 lines, links to
+   `mantis-structural-index/SKILL.md`, and contains **no**
+   `MANTIS_HELPER_VERSION`.
+2. The adapter Guideline 9 `MANTIS_HELPER_VERSION` matches the canonical
+   `SKILL.md` version.
+3. The Block A verbatim fence (LOCATOR RESOLUTION) appears **only** in the
+   canonical `SKILL.md` — never in the stub or the adapter.
