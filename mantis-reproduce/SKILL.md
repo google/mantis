@@ -341,8 +341,9 @@ findings on the first pass that runs variant hunting.
 **Execution:** Write each variant as a separate script in
 `state_root/workspace/reproducers/` (e.g., `reattack_variant_[uuid]_[N].py`).
 Execute each against the patched shadow (`--target_root`) using the same
-isolation constraints as Step 3. Record each variant's description and whether
-it triggered in the `reattack_variants` array (Step 6).
+isolation constraints as Step 3. Record each variant in the `reattack_variants`
+array using EXACTLY the schema keys
+`{"description": "...", "triggered": true/false}` (Step 6).
 
 **Verdict rule:** `reattack_status = "failed_to_bypass"` requires a non-empty
 `reattack_variants` array containing ≥ 3 valid variant inputs that ALL failed to
@@ -670,7 +671,27 @@ and apply INV-1 (downgrade `VERIFIED_SECURE` → `VERIFICATION_FAILED`).
      - `"reattack_output"`
 
      - `"reattack_variants"`: An array of objects, one per variant input
-       attempted during Step 3a. Each object MUST have:
+       attempted during Step 3a. Each object MUST contain EXACTLY the two
+       required keys `"description"` (string) and `"triggered"` (boolean). Do
+       NOT invent free-form or custom keys (such as `input`, `result`,
+       `bypassed`, `label`, `name`):
+
+       ```json
+       "reattack_variants": [
+         {
+           "description": "off-by-one: len=bound+1",
+           "triggered": false
+         },
+         {
+           "description": "alternate path via /api/v2/echo",
+           "triggered": false
+         },
+         {
+           "description": "boundary mutation: max INT_MAX",
+           "triggered": false
+         }
+       ]
+       ```
 
        - `"description"`: What the variant does (e.g.,
          `"off-by-one: len=bound+1"`, `"alternate path via /api/v2/echo"`).

@@ -132,24 +132,30 @@ LOCATOR RESOLUTION (before reading ANY target code or artifact):
 This is a CODE-READING stage — it reads target source files under CODE_ROOT via
 the helper script. Block A step 0's findings-only skip does NOT apply.
 
-### Step 1: Idempotency / Freshness Check
+### Step 1: Idempotency / Freshness Check (MANDATORY FIRST)
 
-1. If `workspace/kb/structural_index/manifest.json` exists, read its
+**MANDATORY FIRST STEP:** Before writing any build scripts, probing backends, or
+extracting symbols, check for MODE-OFF or an existing manifest:
+
+1. **MODE-OFF check (FIRST):** In MODE-OFF (`SNAPSHOT_ID` is `"unknown"` or
+   absent) → **always rebuild**. Do NOT reuse a previous `"unknown"` index,
+   because the live tree is mutable and `"unknown"` is a constant (not a
+   freshness signal). Skip directly to Step 2 (individual units whose content
+   has not changed may still hit the content-addressed cache).
+2. If `workspace/kb/structural_index/manifest.json` exists, read its
    `snapshot_id` field.
-2. If `snapshot_id` matches the current `SNAPSHOT_ID` → **reuse it**. Do not
-   rebuild. This bounds cost across retries/crash-resume.
-3. If `manifest.json` is absent but `workspace/kb/structural_index.jsonl` exists
+3. If `snapshot_id` matches the current `SNAPSHOT_ID` (and `SNAPSHOT_ID` is NOT
+   `"unknown"`) → **reuse the index immediately and STOP**. Do NOT invoke Step
+   2, probe backends, or write build scripts. This bounds cost across
+   retries/crash-resume.
+4. If `manifest.json` is absent but `workspace/kb/structural_index.jsonl` exists
    (backward compat), read its provenance header (`_provenance`, `snapshot_id`
-   keys). If `snapshot_id` matches → **reuse**. Otherwise proceed to rebuild.
-4. If `SNAPSHOT_ID` differs (or is absent) → proceed to rebuild (Steps 2–5). For
-   incremental reuse: before rebuilding a semantic unit, check `units/` for a
+   keys). If `snapshot_id` matches (and is NOT `"unknown"`) → **reuse and
+   STOP**. Otherwise proceed to rebuild.
+5. If `SNAPSHOT_ID` differs → proceed to rebuild (Steps 2–5). For incremental
+   reuse: before rebuilding a semantic unit, check `units/` for a
    content-addressed cache hit (see Content-Addressed Cache Key below). A cache
    hit reuses the unit output without re-extraction.
-5. In MODE-OFF, `SNAPSHOT_ID` is `"unknown"`. Because the live tree is mutable
-   and `"unknown"` is a constant (not a freshness signal), **always rebuild** in
-   MODE-OFF — do not reuse a previous `"unknown"` index. However, individual
-   units whose content has not changed may still be reused from the
-   content-addressed cache.
 
 ### Step 2: Select Backend per Partition
 
@@ -514,6 +520,14 @@ Edge kinds are kept explicitly separate — never silently merged:
 | TypeScript  | Project          | tsconfig.json               | sha256 of imported module type declarations |
 | Fallback    | Individual file  | None                        | Empty string                                |
 
+**Fallback Granularity Rule:** For the fallback tier (regex, AST parser, or
+lightweight crawler without a language build system), **each source file MUST be
+its own independent semantic unit**. Never bundle multiple source files into a
+single fallback unit. Per-file unit isolation is essential for content-addressed
+cache efficiency — when one file changes in a future snapshot, only that single
+file's unit invalidates while all unchanged files hit the cache
+(`reused = N-1`).
+
 ### Baseline + Delta Overlay
 
 - **Static baseline**: Built once in CI for the complete snapshot.
@@ -569,8 +583,9 @@ Lines 2+ — structural records (one per line, `_type` discriminator):
    pinned, the structural index is built from the pinned `CODE_ROOT`, ensuring
    it reflects the exact bytes the pipeline is analyzing.
 2. **Reuse-on-match.** If `manifest.json` already carries the current
-   `SNAPSHOT_ID`, reuse it — do not rebuild. Rebuild only when `SNAPSHOT_ID`
-   differs. Individual units may still be reused from the content-addressed
+   `SNAPSHOT_ID` (and `SNAPSHOT_ID` is NOT `"unknown"` — in MODE-OFF, always
+   rebuild), reuse it — do not rebuild. Rebuild when `SNAPSHOT_ID` differs or is
+   `"unknown"`. Individual units may still be reused from the content-addressed
    cache. This bounds cost across retries/crash-resume.
 3. **Manifest atomicity.** The manifest is written LAST via atomic rename from
    `tmp/`. Interrupted builds leave unreferenced temp objects without corrupting

@@ -756,7 +756,8 @@ Execute the patching and verification stage as follows:
      diff.
    - If a re-attack was performed, the `"reattack_status"`,
      `"reattack_file_path"`, `"reattack_run_command"`, `"reattack_output"`, and
-     `"reattack_variants"` fields.
+     `"reattack_variants"` fields (each object in `"reattack_variants"` MUST
+     have EXACTLY `{"description": "...", "triggered": true/false}`).
    - An entry to the `"history"` array:
 
    ```json
