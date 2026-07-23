@@ -438,7 +438,7 @@ Execute the planning stage as follows:
        - **Resolution-first protocol (MANDATORY):** Before querying callers,
          resolve the symbol:
 
-         `python3 workspace/helpers/query_structural_index.py resolve_symbol --name "<function_name>" [--language "<lang>"] [--file "<path>"] --state-root <state_root>`
+         `python3 workspace/helpers/query_structural_index.py resolve_symbol --name "<function_name>" [--language "<lang>"] [--file "<path>"] --state_root <state_root>`
 
          If the response has `ambiguous: true`, do NOT silently pick one match.
          Narrow with `--file`/`--language`, or schedule investigations for ALL
@@ -447,7 +447,7 @@ Execute the planning stage as follows:
        - **Bounded caller queries:** Once resolved, query callers with explicit
          bounds:
 
-         `python3 workspace/helpers/query_structural_index.py find_callers --symbol-id "<resolved_id>" --limit 100 --offset 0 --state-root <state_root>`
+         `python3 workspace/helpers/query_structural_index.py find_callers --symbol_id "<resolved_id>" --limit 100 --offset 0 --state_root <state_root>`
 
          Paginate with `--offset` if `has_more` is true.
 

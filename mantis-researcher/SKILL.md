@@ -190,12 +190,12 @@ Execute the research stage as follows:
      - **Resolution-first protocol (MANDATORY before any structural query):**
 
        1. Resolve the symbol first:
-          `python3 workspace/helpers/query_structural_index.py resolve_symbol --name "<function_name>" [--language "<lang>"] [--file "<path>"] --state-root <state_root>`
+          `python3 workspace/helpers/query_structural_index.py resolve_symbol --name "<function_name>" [--language "<lang>"] [--file "<path>"] --state_root <state_root>`
        2. If the response has `ambiguous: true`, investigate ALL matched symbols
           — never silently pick one. Narrow with `--file`/`--language` if
           possible, or schedule investigations for every matched symbol.
        3. Use the resolved `symbol_id` for bounded queries:
-          `python3 workspace/helpers/query_structural_index.py find_callers --symbol-id "<id>" --limit 100 --offset 0 --state-root <state_root>`
+          `python3 workspace/helpers/query_structural_index.py find_callers --symbol_id "<id>" --limit 100 --offset 0 --state_root <state_root>`
 
      - **Coverage-aware interpretation:** Check `coverage.partition_status` in
        every structural index response:
