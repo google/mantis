@@ -141,8 +141,9 @@ Execute your task as follows:
 
    **Signature-based candidate matching (Phase 3) — TIGHTENS, never replaces:**
    `signature` may only PROMOTE a pair to "candidate for the pairwise snapshot
-   check"; it may NEVER by itself cause a hard DUPLICATE/trash. A pair is
-   eligible for hard-DUPLICATE treatment ONLY if it satisfies BOTH:
+   check"; it may NEVER by itself cause a hard DUPLICATE/trash. A pair is a
+   candidate for the Pairwise Snapshot Match Check below ONLY if it satisfies
+   BOTH:
 
    - it matches under today's `code_paths` + `title` similarity, comparing
      `code_paths` entries line-inclusively (WITH their trailing `:line`); AND
@@ -200,6 +201,18 @@ Execute your task as follows:
      inherit the archived finding's `lineage_id` onto the current finding (so
      the lineage chain is preserved for report folding even when the findings
      are on different snapshots).
+
+   > [!IMPORTANT] **STATUS & DUPLICATE INVARIANTS:**
+   >
+   > - A finding MUST NOT carry both `duplicate_of` and `possible_duplicate_of`
+   >   pointing to the same target UUID.
+   > - `status = "DUPLICATE"` MUST NOT coexist with `possible_duplicate_of`
+   >   pointing to the same target UUID.
+   > - Under **NOT_MATCHED**, the finding's `status` MUST remain active (e.g.
+   >   `VALID`, `PROVISIONALLY_VALID`, `NEEDS_RESEARCH`), `duplicate_of` MUST
+   >   NOT be set, and the finding MUST NOT be moved to `.trash/`. Setting
+   >   `possible_duplicate_of` is a non-terminal hint only.
+
    - **POSSIBLE REGRESSION:** if the archived match has a RESOLVED status
      (`patch_status` in {`VERIFIED_SECURE`,`MITIGATION_PROPOSED`} OR
      `status`==`FALSE_POSITIVE` OR `production_viability`==`NON_VIABLE`) AND the
