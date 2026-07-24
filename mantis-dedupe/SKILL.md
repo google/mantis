@@ -188,12 +188,12 @@ Execute your task as follows:
 
    - **MATCHED** (both present and equal): soft-delete the current finding as a
      loop-duplicate exactly as before — set `"status": "DUPLICATE"` and
-     `"duplicate_of": "<archived_uuid>"`, ensure
-     `mkdir -p workspace/findings/.trash/`, move it there, and log a
-     `loop_filter` transaction in `workspace/.tx_log.jsonl`. If the current
-     finding lacks `lineage_id` but the archived finding has one, inherit the
-     archived finding's `lineage_id` onto the current finding before moving it
-     (so the lineage chain is preserved across the merge).
+     `"duplicate_of": "<archived_uuid>"`, clear `possible_duplicate_of` if
+     present, ensure `mkdir -p workspace/findings/.trash/`, move it there, and
+     log a `loop_filter` transaction in `workspace/.tx_log.jsonl`. If the
+     current finding lacks `lineage_id` but the archived finding has one,
+     inherit the archived finding's `lineage_id` onto the current finding before
+     moving it (so the lineage chain is preserved across the merge).
    - **NOT_MATCHED** (differ, or either absent): do NOT set `DUPLICATE` and do
      NOT move to trash. Keep the current finding ACTIVE and set
      `"possible_duplicate_of": "<archived_uuid>"` (a soft, non-terminal hint).
@@ -208,9 +208,10 @@ Execute your task as follows:
    >   pointing to the same target UUID.
    > - `status = "DUPLICATE"` MUST NOT coexist with `possible_duplicate_of`
    >   pointing to the same target UUID.
-   > - Under **NOT_MATCHED**, the finding's `status` MUST remain active (e.g.
-   >   `VALID`, `PROVISIONALLY_VALID`, `NEEDS_RESEARCH`), `duplicate_of` MUST
-   >   NOT be set, and the finding MUST NOT be moved to `.trash/`. Setting
+   > - Under **NOT_MATCHED** (outside the MODE-OFF fallback exception), the
+   >   finding's `status` MUST remain active (e.g. `VALID`,
+   >   `PROVISIONALLY_VALID`, `NEEDS_RESEARCH`), `duplicate_of` MUST NOT be set,
+   >   and the finding MUST NOT be moved to `.trash/`. Setting
    >   `possible_duplicate_of` is a non-terminal hint only.
 
    - **POSSIBLE REGRESSION:** if the archived match has a RESOLVED status

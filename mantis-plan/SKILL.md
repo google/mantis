@@ -474,7 +474,8 @@ Execute the planning stage as follows:
            NEVER cause a file to be dropped from the audit scope.
          - Every result carries `precision` and `backend` fields — use
            `precision` (`semantic` > `typecheck` > `ast` > `symbol-only` >
-           `heuristic` > `coverage-only`) to weight trust in the result.
+           `heuristic` > `deferred` > `coverage-only`) to weight trust in the
+           result.
          - If the structural index is absent (no `manifest.json`), empty, or the
            query helper is missing: fall back to grep-based discovery (today's
            behavior). The structural index is a coverage HINT only.

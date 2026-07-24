@@ -46,6 +46,8 @@ exposed through a bounded query helper.
     manifest absent).
   - `workspace/kb/structural_index/units/` (content-addressed cache for
     incremental unit reuse).
+  - `workspace/kb/structural_index/native/` and sidecar `provenance.json` files
+    (prebuilt index attachments and metadata manifests).
   - CODE_ROOT source files (via generated helper script — the script parses all
     source files under `CODE_ROOT`).
 - **Writes**:
@@ -186,6 +188,39 @@ helper probes each tier per partition and selects the highest available:
    grep; no structural index is written. Manifest records `status: "empty"`.
    Consumers fall back to grep-based discovery (today's behavior byte-for-byte).
 
+**Native Index Probing & Resolution Rules**:
+
+- **Probe instruction**: Before evaluating per-partition backends, probe
+  `workspace/kb/structural_index/native/` and subdirectories
+  `native/{scip,lsif,kythe}/` for prebuilt index files.
+- **Snapshot-declaration convention**: Because native formats (SCIP, LSIF,
+  Kythe) do not embed snapshot identity directly in their binary payload,
+  prebuilt indexes MUST declare their target snapshot using a sidecar
+  `provenance.json` manifest located at
+  `workspace/kb/structural_index/native/provenance.json` or
+  `native/<kind>/provenance.json`. The manifest contains an array of
+  attachments:
+  `[{"kind": "scip|lsif|kythe", "path": "...", "snapshot_id": "...", "root_fingerprint": "...", "language": "...", "indexer": "...", "precision": "semantic", "files": [...]}]`.
+  A native index is matched if its declared `snapshot_id` equals `SNAPSHOT_ID`
+  (when `SNAPSHOT_ID != "unknown"`) or its `root_fingerprint` matches the
+  workspace's calculated root fingerprint. If the `files` array is absent or
+  empty, treat the native index as covering no individual files directly (record
+  in `manifest.native_indexes` but do not update `coverage` rows; fall through
+  to lower tiers for all files).
+- **Record-and-Defer Ingestion Rule**: Parsing raw binary native indexes (e.g.
+  SCIP protobuf) in pure Python without dependencies is costly and complex.
+  Option A builder scripts MUST detect matching prebuilt native indexes, record
+  their entries in `manifest.native_indexes`, and set the `coverage` table
+  `backend` (e.g., `"scip"` or `"scip-clangd"`) for all files listed in the
+  provenance manifest. If `catalog.sqlite` is NOT populated with symbols from
+  the native index (raw binary deferred to harness/MCP readers), set
+  `coverage.status = "deferred"` and `precision = "deferred"` (with
+  `indexed_files = 0`). This prevents the query helper from claiming an
+  un-ingested partition is "authoritative empty" at `semantic` precision,
+  ensuring consumers run the mandatory grep fallback. When `catalog.sqlite` IS
+  populated (e.g., via Option B pre-ingestion or `scip-to-sqlite`), set
+  `precision = "semantic"` and `status = "indexed"`.
+
 **LSP is NOT equivalent to SCIP / LSIF.** LSP is an interactive protocol whose
 workspace state may be partial or mutable. Use it only when the server can
 demonstrate snapshot identity AND complete workspace coverage. A running
@@ -198,7 +233,7 @@ indexers (e.g., a SCIP index for Go + tree-sitter for Python) within a single
 catalog.
 
 The determinism lives in a runtime-generated versioned helper
-(`build_structural_index.py`, `# MANTIS_HELPER_VERSION = 4`, grep-and-regenerate
+(`build_structural_index.py`, `# MANTIS_HELPER_VERSION = 5`, grep-and-regenerate
 on reuse) that probes and selects backends per partition. No shipped binaries;
 air-gapped-safe.
 
@@ -231,8 +266,8 @@ a different integer, REGENERATE.
 #### Builder: `build_structural_index.py`
 
 1. Write the builder to `workspace/helpers/build_structural_index.py`. The FIRST
-   LINE MUST be exactly `# MANTIS_HELPER_VERSION = 4`. Before reusing an
-   existing helper, grep its first lines for `MANTIS_HELPER_VERSION = 4`; if
+   LINE MUST be exactly `# MANTIS_HELPER_VERSION = 5`. Before reusing an
+   existing helper, grep its first lines for `MANTIS_HELPER_VERSION = 5`; if
    that marker is absent or a different integer, REGENERATE the helper.
 2. The builder partitions the codebase into semantic units (see Per-Language
    Semantic Units), computes content-addressed cache keys, checks `units/` for
@@ -261,8 +296,8 @@ a different integer, REGENERATE.
 #### Query helper: `query_structural_index.py`
 
 1. Write the query helper to `workspace/helpers/query_structural_index.py`. The
-   FIRST LINE MUST be exactly `# MANTIS_HELPER_VERSION = 4`. Before reusing an
-   existing helper, grep its first lines for `MANTIS_HELPER_VERSION = 4`; if
+   FIRST LINE MUST be exactly `# MANTIS_HELPER_VERSION = 5`. Before reusing an
+   existing helper, grep its first lines for `MANTIS_HELPER_VERSION = 5`; if
    absent or a different integer, REGENERATE.
 2. The query helper provides bounded, paginated operations against
    `catalog.sqlite` (or a remote endpoint — identical API). It IS the
@@ -316,13 +351,14 @@ workspace/kb/structural_index/
 ├── shards/                # Partitioned serving data (large corpora)
 │   └── shard_0000.sqlite
 ├── native/                # Prebuilt index attachments (SCIP, Kythe, LSIF)
+│   ├── provenance.json    # Prebuilt index provenance manifest
 │   ├── scip/
 │   └── kythe/
 └── tmp/                   # Temporary objects during build
 
 workspace/helpers/
-├── build_structural_index.py    # Builder (MANTIS_HELPER_VERSION = 4)
-└── query_structural_index.py    # Query helper (MANTIS_HELPER_VERSION = 4)
+├── build_structural_index.py    # Builder (MANTIS_HELPER_VERSION = 5)
+└── query_structural_index.py    # Query helper (MANTIS_HELPER_VERSION = 5)
 
 workspace/kb/structural_index.jsonl  # Compatibility pointer
 ```
@@ -347,7 +383,7 @@ workspace/kb/structural_index.jsonl  # Compatibility pointer
   "coverage": {"total_files": 0, "indexed_files": 0, "failed_files": 0, "deferred_files": 0},
   "shards": [{"id": "", "path": "", "checksum": "", "partition_key": "", "symbol_count": 0, "edge_count": 0}],
   "deferred_units": [{"unit_id": "", "language": "", "files": [], "priority": 4, "reason": ""}],
-  "native_indexes": [{"kind": "scip", "path": "", "language": "", "indexer": "", "precision": ""}],
+  "native_indexes": [{"kind": "scip", "path": "", "snapshot_id": "", "root_fingerprint": "", "language": "", "indexer": "", "precision": ""}],
   "baseline": {"source": "ci|local|none", "snapshot_id": "", "manifest_path": ""},
   "overlay": {"units_added": 0, "units_modified": 0, "files": []},
   "compat_pointer": {"path": "structural_index.jsonl", "full_export": true, "symbol_count": 0},
@@ -379,7 +415,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     kind            TEXT NOT NULL,
     signature       TEXT,
     backend         TEXT NOT NULL,
-    precision       TEXT NOT NULL CHECK (precision IN ('semantic','typecheck','ast','symbol-only','heuristic','coverage-only')),
+    precision       TEXT NOT NULL CHECK (precision IN ('semantic','typecheck','ast','symbol-only','heuristic','deferred','coverage-only')),
     corpus          TEXT DEFAULT 'default',
     partition_key   TEXT,
     unit_cache_key  TEXT,

@@ -209,7 +209,7 @@ Execute the research stage as follows:
          MUST run exhaustive grep.
        - Use the `precision` and `backend` fields on every result to weight
          trust (`semantic` > `typecheck` > `ast` > `symbol-only` > `heuristic` >
-         `coverage-only`).
+         `deferred` > `coverage-only`).
 
      - **Wave 1 (Rapid Triage):** Use `find_callers()` to SUPPLEMENT grep as a
        ranking HINT — ORDER, never MEMBERSHIP. Structural index results

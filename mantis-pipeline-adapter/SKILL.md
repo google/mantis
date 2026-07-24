@@ -1023,7 +1023,7 @@ Two implementations are supported, sharing the same query contract:
 
 - **Option A (Default — Skill-Based):** The `mantis-structural-index` skill
   generates and runs helper scripts (`build_structural_index.py` and
-  `query_structural_index.py`, both `# MANTIS_HELPER_VERSION = 4`) using
+  `query_structural_index.py`, both `# MANTIS_HELPER_VERSION = 5`) using
   capability-based per-partition backend selection, degrading to grep.
 - **Option B (Maximum Power — MCP-Based):** The harness owns a persistent
   structural index serving `find_callers(symbol)`, `find_callees(function)`,
