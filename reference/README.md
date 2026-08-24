@@ -4,6 +4,31 @@ This directory contains a reference implementation of Mantis built directly on
 top of the **Agent Development Kit (ADK)** using the full suite of canonical
 **Mantis Skills** and **isolated sandboxed execution environments**.
 
+## Getting Started
+
+First, install python3-venv such as with `sudo apt install python3-venv`, then
+run the install script, and the Mantis pipeline as below. Before you do that,
+consider whether you want to use the default isolated GCE VM reproduction
+pipeline or whether you'd prefer another mechanism like gVisor/microsandbox or
+even static. Update `workflow.json` based on your choices. Ask a coding agent
+like antigravity or opencode or anything else to help you write a workflow
+configuration that works for you.
+
+```bash
+cd reference && ./install.sh
+export GOOGLE_CLOUD_PROJECT=your-gcp-project   # required: default model is vertex_ai/*
+gcloud auth application-default login  # if using ADC credentials
+./run.sh path/to/code            # a file or a directory
+```
+
+Once you have run it you can add the mantis-advise skill to your favorite coding
+agent and use that while developing your code to have your coding agent attempt
+to create fewer vulnerabilities. To try it manually you can run the script:
+
+```
+python3 scripts/advise.py --file path/to/file.py   # query accumulated knowledge
+```
+
 ## Core Pipeline Stages
 
 The pipeline in `workflow.json` orchestrates 16 canonical Mantis skills across
@@ -55,6 +80,80 @@ The reference harness implements ADK's `BaseEnvironment` interface:
 - **`GvisorEnvironment`**: OCI container isolation via gVisor (`runsc`).
   Networkless (`--network=none`), container-isolated filesystem at `/workspace`.
 - **`StaticOnlyEnvironment`**: Safe no-op environment for static-only scans.
+
+### Configuring the Sandbox Backend in `workflow.json`
+
+To change the sandbox backend, update the `"config.sandbox"` block in
+[`workflow.json`](workflow.json):
+
+#### 1. Static-Only (`"static-only"`)
+
+Zero dependencies. Dynamic exploit execution and patch testing are skipped.
+
+```json
+"sandbox": {
+  "type": "static-only"
+}
+```
+
+#### 2. gVisor (`"gvisor"`)
+
+Local OCI container isolation via Docker/Podman with gVisor `runsc` and
+`--network=none`.
+
+```json
+"sandbox": {
+  "type": "gvisor",
+  "options": {
+    "image": "mantis-sandbox:latest",
+    "runtime": "runsc",
+    "timeout_seconds": 600
+  }
+}
+```
+
+#### 3. MicroSandbox (`"microsandbox"`)
+
+In-process hardware microVM isolation via `libkrun` and `Network.none()`.
+
+```json
+"sandbox": {
+  "type": "microsandbox",
+  "options": {
+    "image": "mantis-sandbox:latest",
+    "timeout_seconds": 600
+  }
+}
+```
+
+#### 4. Hardened GCE VM (`"gce"`)
+
+Ephemeral cloud VM in an isolated VPC with link-local DNS blackholing.
+
+```json
+"sandbox": {
+  "type": "gce",
+  "options": {
+    "project": "YOUR_PROJECT_ID",
+    "zone": "us-central1-b",
+    "image": "mantis-sandbox-image",
+    "subnet": "mantis-isolated-subnet",
+    "workdir": "/workspace",
+    "tunnel_through_iap": true,
+    "no_service_account": true,
+    "no_external_ip": true,
+    "verify_isolation": true,
+    "timeout_seconds": 600
+  }
+}
+```
+
+| Sandbox Type         | Dynamic Execution | Prerequisites                                       |
+| :------------------- | :---------------: | :-------------------------------------------------- |
+| **`"static-only"`**  |        ❌         | None                                                |
+| **`"gvisor"`**       |        ✅         | Docker/Podman + `runsc` runtime                     |
+| **`"microsandbox"`** |        ✅         | Hardware virtualization (`/dev/kvm`)                |
+| **`"gce"`**          |        ✅         | GCP Project, Isolated VPC/Subnet, Custom Disk Image |
 
 ### Quickstart: Isolated GCE Sandbox Setup
 
@@ -164,3 +263,23 @@ tools:
 When compiled by `core/graph_loader.py`, each skill is loaded via
 `google.adk.skills.load_skill_from_dir` and attached to the agent as a
 `SkillToolset` connected to the active sandboxed environment.
+
+### No-Skill / Custom System Prompt Alternative
+
+As an alternative to loading a canonical Mantis skill directory,
+`core/graph_loader.py` also supports configuring an agent node with a custom
+markdown prompt file via `system_prompt` (such as
+[`prompts/system-researcher.md`](prompts/system-researcher.md)):
+
+```json
+{
+  "id": "researcher",
+  "type": "agent",
+  "system_prompt": "prompts/system-researcher.md",
+  "tools": ["read_file", "write_file", "list_files", "report_findings", "get_findings"]
+}
+```
+
+When `system_prompt` is specified instead of `skill`, `core/graph_loader.py`
+loads the agent's instructions directly from the given file and attaches the
+specified tools directly to the agent without instantiating a `SkillToolset`.

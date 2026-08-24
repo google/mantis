@@ -960,7 +960,14 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     await sb_no_proj.preflight()
                 self.assertIn("GCP project not specified", str(ctx_proj.exception))
 
-        # 2c. Fails when no active gcloud authentication
+        # 2c. Fails when GCP project is set to default placeholder (e.g. YOUR_PROJECT_ID)
+        sb_placeholder = GceSandbox(project="YOUR_PROJECT_ID", gcloud_bin="/usr/bin/gcloud")
+        with patch("shutil.which", return_value="/usr/bin/gcloud"):
+            with self.assertRaises(ValueError) as ctx_ph:
+                await sb_placeholder.preflight()
+            self.assertIn("default placeholder 'YOUR_PROJECT_ID'", str(ctx_ph.exception))
+
+        # 2d. Fails when no active gcloud authentication
         sb_auth_fail = GceSandbox(project="test-proj", gcloud_bin="/usr/bin/gcloud")
         sb_auth_fail._run_gcloud = MagicMock(return_value=(0, ""))
         with patch("shutil.which", return_value="/usr/bin/gcloud"):
@@ -968,7 +975,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 await sb_auth_fail.preflight()
             self.assertIn("No active Google Cloud authentication found", str(ctx_auth.exception))
 
-        # 2d. Preflight passes when active account is found
+        # 2e. Preflight passes when active account is found
         sb_pass = GceSandbox(project="test-proj", gcloud_bin="/usr/bin/gcloud")
         sb_pass._run_gcloud = MagicMock(return_value=(0, "user@example.com\n"))
         with patch("shutil.which", return_value="/usr/bin/gcloud"):
@@ -2431,6 +2438,67 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             data = json.loads(proc_json.stdout)
             self.assertEqual(data["filepath"], "src/auth.py")
             self.assertEqual(len(data["confirmed_vulnerabilities"]), 1)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_no_skill_system_prompt_loading_and_execution(self):
+        """Validates loading an agent configured with system_prompt (prompts/system-researcher.md) without a skill."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            prompt_src = os.path.join(os.path.dirname(__file__), "prompts", "system-researcher.md")
+            self.assertTrue(os.path.exists(prompt_src), "prompts/system-researcher.md must exist as canonical no-skill example")
+
+            prompts_dir = os.path.join(temp_dir, "prompts")
+            os.makedirs(prompts_dir, exist_ok=True)
+            shutil.copy(prompt_src, os.path.join(prompts_dir, "system-researcher.md"))
+
+            workflow_def = {
+                "name": "no_skill_workflow",
+                "nodes": [
+                    {
+                        "id": "researcher",
+                        "type": "agent",
+                        "system_prompt": "prompts/system-researcher.md",
+                        "tools": ["read_file", "report_findings"]
+                    }
+                ],
+                "edges": [
+                    {"from": "START", "to": "researcher"}
+                ]
+            }
+            wf_path = os.path.join(temp_dir, "workflow.json")
+            with open(wf_path, "w") as f:
+                json.dump(workflow_def, f)
+
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+                wf, cfg = load_workflow_from_json(wf_path)
+                self.assertIsNotNone(wf)
+                self.assertEqual(len(wf.edges), 1)
+                self.assertEqual(wf.edges[0].to_node.name, "researcher")
+                with open(prompt_src, "r", encoding="utf-8") as f:
+                    expected_instructions = f.read()
+                self.assertEqual(wf.edges[0].to_node.instruction, expected_instructions)
+
+            # Test fail-fast when system_prompt points to a missing file
+            bad_wf_def = {
+                "nodes": [
+                    {
+                        "id": "researcher_bad",
+                        "type": "agent",
+                        "system_prompt": "prompts/non_existent.md"
+                    }
+                ],
+                "edges": [
+                    {"from": "START", "to": "researcher_bad"}
+                ]
+            }
+            bad_wf_path = os.path.join(temp_dir, "bad_workflow.json")
+            with open(bad_wf_path, "w") as f:
+                json.dump(bad_wf_def, f)
+
+            with self.assertRaises(ValueError) as ctx:
+                load_workflow_from_json(bad_wf_path)
+            self.assertIn("System prompt not found", str(ctx.exception))
         finally:
             shutil.rmtree(temp_dir)
 

@@ -32,13 +32,56 @@ export DEV_BUILD_VM="my-dev-build-vm"
 
 ______________________________________________________________________
 
-## 1. Assessment Disk Image Creation
+## 1. Assessment Disk Image Creation & Golden Image Prerequisites
+
+Before capturing your golden assessment disk image from the source build VM,
+ensure the following prerequisites are installed and configured:
+
+### Golden Image Prerequisites
+
+1. **Passwordless `sudo` (`NOPASSWD`)**:
+
+   - During instance initialization, `GceEnvironment` provisions the guest
+     workspace directory via SSH (`core/environments/gce_env.py:269`):
+     ```bash
+     sudo mkdir -p /workspace && sudo chown -R $(whoami) /workspace
+     ```
+   - The SSH user connecting to the sandbox VM must have passwordless `sudo`
+     rights in `/etc/sudoers` or `/etc/sudoers.d/` (e.g. standard
+     `%sudo ALL=(ALL) NOPASSWD:ALL` or `%admin ALL=(ALL) NOPASSWD:ALL`).
+     Standard GCP Ubuntu LTS images configure this by default for the
+     provisioning user.
+
+2. **`python3` Interpreter**:
+
+   - `GceEnvironment` runs automated active in-guest security isolation audits
+     (`_verify_guest_isolation()` in `core/environments/gce_env.py:338`) by
+     piping a base64-encoded isolation verification script directly to
+     `python3`:
+     ```bash
+     echo '<probe_script>' | base64 -d | python3 -
+     ```
+   - Ensure `python3` (or `python3-minimal`) is installed on the image and
+     available in `PATH` (`/usr/bin/python3`). Without `python3`, instance
+     startup fails fail-closed during guest isolation verification.
+
+3. **Pre-Warmed Build Tools & Dependencies**:
+
+   - Because the isolated VPC has zero external internet routing and no Cloud
+     NAT, all compilers, build runtimes, package manager caches, test
+     frameworks, and dependencies needed to compile the target repository and
+     reproduce vulnerabilities must be pre-installed and pre-built on the VM
+     before capturing the disk image.
+
+### Image Capture Workflow
 
 1. Provision a development VM with all necessary build runtimes, compilers,
    package managers, and test suites.
-2. Build your target repository on the VM to warm all local build caches,
+2. Confirm that passwordless `sudo` and `python3` are configured as described
+   above.
+3. Build your target repository on the VM to warm all local build caches,
    dependencies, and artifacts.
-3. Capture a custom disk image from the source build VM:
+4. Capture a custom disk image from the source build VM:
 
 ```bash
 gcloud compute images create "${IMAGE_NAME}" \

@@ -18,7 +18,7 @@
         "no_service_account": true,
         "no_external_ip": true,
         "verify_isolation": true,
-        "timeout_seconds": 60
+        "timeout_seconds": 600
       }
     }
   },

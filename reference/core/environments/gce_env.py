@@ -183,13 +183,24 @@ class GceEnvironment(BaseEnvironment):
                 f"sandbox type 'gce' requires '{self.gcloud_bin}' on PATH. "
                 "Install Google Cloud SDK or set sandbox.type to 'static-only'."
             )
+        if self.project and self.project.strip().upper() in {"YOUR_PROJECT_ID", "YOUR_PROJECT", "<YOUR_PROJECT_ID>"}:
+            raise ValueError(
+                f"GCE sandbox project is set to default placeholder '{self.project}'. "
+                "Update 'options.project' in workflow.json with your actual GCP Project ID, or configure sandbox.type to 'static-only' or 'microsandbox'."
+            )
         if not self.project:
             rc, out = self._run_gcloud(["config", "get-value", "project"])
             if rc != 0 or not out.strip() or "unset" in out:
                 raise ValueError(
                     "GCP project not specified for GCE VM sandbox. Set options.project or GOOGLE_CLOUD_PROJECT env."
                 )
-            self.project = out.strip()
+            resolved_proj = out.strip()
+            if resolved_proj.upper() in {"YOUR_PROJECT_ID", "YOUR_PROJECT", "<YOUR_PROJECT_ID>"}:
+                raise ValueError(
+                    f"GCE sandbox project is set to default placeholder '{resolved_proj}'. "
+                    "Update 'options.project' in workflow.json with your actual GCP Project ID, or configure sandbox.type to 'static-only' or 'microsandbox'."
+                )
+            self.project = resolved_proj
 
         rc, out = self._run_gcloud(["auth", "list", "--filter=status:ACTIVE", "--format=value(account)"])
         if rc != 0 or not out.strip():
