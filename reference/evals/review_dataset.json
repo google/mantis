@@ -1,0 +1,94 @@
+{
+  "dataset_name": "mantis_reviewer_triage_benchmark",
+  "description": "Evaluates the reviewer stage against real vulnerabilities and the 13 triage rejection rules (sample test code, generic hygiene, unreachable code, client-side only enforcement).",
+  "cases": [
+    {
+      "case_id": "rev_case_sql_injection",
+      "finding": {
+        "id": 101,
+        "title": "SQL injection via unescaped search parameter in user directory query",
+        "severity": "HIGH",
+        "filepath": "api/directory.py",
+        "description": "Direct string interpolation in SELECT statement allowing arbitrary SQL execution by unauthenticated callers."
+      },
+      "ground_truth": {
+        "expected_route": "confirmed",
+        "rationale": "True security vulnerability in active production route with direct untrusted attacker input."
+      }
+    },
+    {
+      "case_id": "rev_case_mock_test_code",
+      "finding": {
+        "id": 102,
+        "title": "Hardcoded static administrative secret key in mock auth provider",
+        "severity": "HIGH",
+        "filepath": "tests/mocks/mock_auth.py",
+        "description": "Static test credentials in mock authentication fixture used exclusively during offline unit tests."
+      },
+      "ground_truth": {
+        "expected_route": "false_positive",
+        "rejection_rule": "sample_test_or_mock_code",
+        "rationale": "Mock and test fixtures do not ship to production environments."
+      }
+    },
+    {
+      "case_id": "rev_case_generic_hygiene",
+      "finding": {
+        "id": 103,
+        "title": "Missing HTTP Strict Transport Security (HSTS) header on internal metric endpoint",
+        "severity": "LOW",
+        "filepath": "monitoring/health.py",
+        "description": "The internal /metrics endpoint does not emit max-age HSTS response headers."
+      },
+      "ground_truth": {
+        "expected_route": "false_positive",
+        "rejection_rule": "generic_best_practice",
+        "rationale": "Generic hygiene and missing best practice headers without exploitable impact."
+      }
+    },
+    {
+      "case_id": "rev_case_unreachable_code",
+      "finding": {
+        "id": 104,
+        "title": "Unsanitized string interpolation in legacy deprecated logging branch",
+        "severity": "MEDIUM",
+        "filepath": "utils/legacy_log.py",
+        "description": "Unescaped format string in function guarded by if False dead code conditional."
+      },
+      "ground_truth": {
+        "expected_route": "false_positive",
+        "rejection_rule": "unreachable_dead_code",
+        "rationale": "Unreachable dead code branch with no execution path from any application entrypoint."
+      }
+    },
+    {
+      "case_id": "rev_case_client_side_only",
+      "finding": {
+        "id": 105,
+        "title": "Client-side username length validation bypass",
+        "severity": "LOW",
+        "filepath": "static/js/register.js",
+        "description": "HTML form maxlength attribute can be removed in browser devtools, but the backend API strictly enforces length limit."
+      },
+      "ground_truth": {
+        "expected_route": "false_positive",
+        "rejection_rule": "client_side_only_enforcement",
+        "rationale": "Client-side only enforcement where backend server securely validates the constraint."
+      }
+    },
+    {
+      "case_id": "rev_case_path_traversal",
+      "finding": {
+        "id": 106,
+        "title": "Arbitrary file read via path traversal in report export handler",
+        "severity": "HIGH",
+        "filepath": "services/reports.py",
+        "description": "Direct concatenation of filename parameter with base path allowing ../ traversal to read arbitrary system files."
+      },
+      "ground_truth": {
+        "expected_route": "confirmed",
+        "rationale": "True high-severity vulnerability reachable by remote callers."
+      }
+    }
+  ]
+}

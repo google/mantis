@@ -1,0 +1,23 @@
+{
+  "dataset_name": "mantis_reflector_benchmark",
+  "cases": [
+    {
+      "case_id": "reflect_repeated_repro_failure",
+      "history": [
+        {
+          "stage": "reproducer",
+          "action": "execute_poc",
+          "details": "Failed due to missing database migration table in test environment."
+        }
+      ],
+      "ground_truth": {
+        "expected_category": "reproduction_environment",
+        "required_tags": [
+          "sandbox",
+          "database",
+          "environment"
+        ]
+      }
+    }
+  ]
+}

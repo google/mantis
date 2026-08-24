@@ -1,0 +1,64 @@
+{
+  "dataset_name": "mantis_critic_viability_benchmark",
+  "description": "Evaluates the critic stage on technical exploit viability, untrusted entrypoint reachability, and framework mitigation barriers.",
+  "cases": [
+    {
+      "case_id": "critic_public_webhook_rce",
+      "finding": {
+        "id": 201,
+        "title": "Remote code execution via YAML deserialization in public webhook",
+        "filepath": "api/webhook.py",
+        "severity": "CRITICAL",
+        "description": "Publicly accessible unauthenticated POST /webhook calls yaml.unsafe_load on request body."
+      },
+      "ground_truth": {
+        "expected_route": "viable",
+        "rationale": "Publicly exposed endpoint with zero auth prerequisites and direct arbitrary code execution."
+      }
+    },
+    {
+      "case_id": "critic_root_only_cli",
+      "finding": {
+        "id": 202,
+        "title": "Buffer overflow in administrative hardware diagnosis CLI",
+        "filepath": "cmd/diag.c",
+        "severity": "HIGH",
+        "description": "Local memory corruption only accessible when executed by root with explicit --dangerous-hardware-test flag."
+      },
+      "ground_truth": {
+        "expected_route": "non_viable",
+        "rejection_rule": "missing_attacker_vector",
+        "rationale": "Requires pre-existing root privileges on the local host."
+      }
+    },
+    {
+      "case_id": "critic_hardcoded_kms_ssrf",
+      "finding": {
+        "id": 203,
+        "title": "Theoretical SSRF in cloud key retrieval client",
+        "filepath": "services/kms.py",
+        "severity": "MEDIUM",
+        "description": "Outbound HTTP request uses urlopen, but target URL is strictly hardcoded constant to internal cloud KMS."
+      },
+      "ground_truth": {
+        "expected_route": "non_viable",
+        "rejection_rule": "framework_level_sanitization",
+        "rationale": "Target URL is hardcoded with no caller control over host, scheme, or path."
+      }
+    },
+    {
+      "case_id": "critic_authenticated_idor",
+      "finding": {
+        "id": 204,
+        "title": "Insecure Direct Object Reference in order status modification API",
+        "filepath": "controllers/order_controller.py",
+        "severity": "HIGH",
+        "description": "Standard authenticated users can update the order status of other users by altering order_id."
+      },
+      "ground_truth": {
+        "expected_route": "viable",
+        "rationale": "Reachable by any low-privilege authenticated user across tenant boundaries."
+      }
+    }
+  ]
+}

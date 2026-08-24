@@ -1,0 +1,16 @@
+{
+  "dataset_name": "mantis_patcher_benchmark",
+  "cases": [
+    {
+      "case_id": "patch_sql_interpolation",
+      "filepath": "services/query.py",
+      "original_code": "def fetch_user(cursor, username):\n    return cursor.execute(f\"SELECT * FROM users WHERE name = '{username}'\").fetchall()\n",
+      "vulnerability_description": "SQL string interpolation in fetch_user. Fix by using parameterized query: cursor.execute(\"SELECT * FROM users WHERE name = ?\", (username,)).",
+      "poc_verification": "python3 -c \"\nfrom services.query import fetch_user\nimport sqlite3\nconn = sqlite3.connect(':memory:')\ncur = conn.cursor()\ncur.execute('CREATE TABLE users (name text)')\ntry:\n    fetch_user(cur, \"admin' OR 1=1--\")\n    print('VULNERABLE')\nexcept Exception:\n    print('SECURE')\n\"",
+      "ground_truth": {
+        "expected_status": "failed_to_bypass",
+        "invariant": "VERIFIED_SECURE"
+      }
+    }
+  ]
+}

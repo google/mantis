@@ -1,0 +1,48 @@
+{
+  "dataset_name": "mantis_calibrator_scoring_benchmark",
+  "description": "Evaluates the calibrator stage on 0.1 - 10.0 risk scoring, impact/likelihood metrics, and priority assignment across varying severities.",
+  "cases": [
+    {
+      "case_id": "cal_unauth_rce",
+      "finding": {
+        "id": 401,
+        "title": "Unauthenticated Remote Code Execution in payment gateway webhook",
+        "severity": "CRITICAL",
+        "description": "Direct command injection with verified working sandbox PoC and zero auth prerequisites."
+      },
+      "ground_truth": {
+        "expected_min_score": 9.0,
+        "expected_max_score": 10.0,
+        "expected_priority": "P0_CRITICAL"
+      }
+    },
+    {
+      "case_id": "cal_tenant_idor",
+      "finding": {
+        "id": 402,
+        "title": "Cross-tenant IDOR data exfiltration in user export service",
+        "severity": "HIGH",
+        "description": "Authenticated standard user can export entire customer database records of other organizations."
+      },
+      "ground_truth": {
+        "expected_min_score": 6.5,
+        "expected_max_score": 8.5,
+        "expected_priority": "P1_HIGH"
+      }
+    },
+    {
+      "case_id": "cal_minor_timing_leak",
+      "finding": {
+        "id": 403,
+        "title": "Sub-microsecond timing discrepancy in non-sensitive invite token lookup",
+        "severity": "LOW",
+        "description": "Negligible timing variation on public event invitation links with no financial or credential impact."
+      },
+      "ground_truth": {
+        "expected_min_score": 1.0,
+        "expected_max_score": 3.5,
+        "expected_priority": "P3_LOW"
+      }
+    }
+  ]
+}

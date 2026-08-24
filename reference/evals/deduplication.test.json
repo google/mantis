@@ -1,0 +1,234 @@
+{
+  "eval_set_id": "mantis_synthetic_webapp_deduplication_bench",
+  "name": "Mantis Synthetic WebApp Deduplication Benchmark",
+  "description": "Challenging synthetic web application dataset evaluating deduplicator disambiguation across radical phrasing differences, caller/callee file boundaries, and superficially similar distinct flaws.",
+  "eval_cases": [
+    {
+      "eval_id": "case_01_radical_phrasing_cart_deserialization_duplicate",
+      "conversation": [
+        {
+          "invocation_id": "inv-cart-001",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Execute deduplication on active findings for shopping cart services (services/cart/session.py and controllers/cart_controller.py)."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "Deduplication complete. Identified that 'Denial of service through malformed shopping bag payload header' (controllers/cart_controller.py:18) is a duplicate manifestation of 'Unbounded memory consumption via unconstrained deserialization' (services/cart/session.py:42). Merged Finding 102 into Finding 101."
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "get_findings",
+                "args": {
+                  "filepath": "services/cart/session.py"
+                }
+              },
+              {
+                "name": "report_findings",
+                "args": {
+                  "report": {
+                    "findings": [
+                      {
+                        "id": 101,
+                        "title": "Unbounded memory consumption via unconstrained deserialization in session state hydration",
+                        "severity": "HIGH",
+                        "status": "reported",
+                        "filepath": "services/cart/session.py",
+                        "lines": [
+                          42,
+                          43
+                        ]
+                      },
+                      {
+                        "id": 102,
+                        "title": "Denial of service through malformed shopping bag payload header",
+                        "severity": "HIGH",
+                        "status": "duplicate_merged",
+                        "filepath": "controllers/cart_controller.py",
+                        "lines": [
+                          18
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "mantis_pipeline",
+        "user_id": "eval_user",
+        "state": {
+          "target_file": "services/cart/session.py"
+        }
+      }
+    },
+    {
+      "eval_id": "case_02_caller_callee_tenant_override_duplicate",
+      "conversation": [
+        {
+          "invocation_id": "inv-tenant-002",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Execute deduplication across multi-tenant API gateway (api/gateway.py) and context middleware (middleware/context.py)."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "Deduplication complete. Traced 'Missing tenant boundary enforcement in API request routing' (api/gateway.py:115) to the identical underlying context propagation flaw in 'Insecure Direct Object Reference via unauthenticated tenant header override' (middleware/context.py:34). Merged Finding 202 into Finding 201."
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "get_findings",
+                "args": {
+                  "filepath": "api/gateway.py"
+                }
+              },
+              {
+                "name": "report_findings",
+                "args": {
+                  "report": {
+                    "findings": [
+                      {
+                        "id": 201,
+                        "title": "Missing tenant boundary enforcement in API request routing",
+                        "severity": "CRITICAL",
+                        "status": "reported",
+                        "filepath": "api/gateway.py",
+                        "lines": [
+                          115
+                        ]
+                      },
+                      {
+                        "id": 202,
+                        "title": "Insecure Direct Object Reference (IDOR) via unauthenticated tenant header override",
+                        "severity": "CRITICAL",
+                        "status": "duplicate_merged",
+                        "filepath": "middleware/context.py",
+                        "lines": [
+                          34
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "mantis_pipeline",
+        "user_id": "eval_user",
+        "state": {
+          "target_file": "api/gateway.py"
+        }
+      }
+    },
+    {
+      "eval_id": "case_03_superficially_similar_discount_flaws_distinct",
+      "conversation": [
+        {
+          "invocation_id": "inv-discount-003",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Execute deduplication on promotional voucher race condition (services/checkout/discount.py) and pricing calculation underflow (services/checkout/pricing.py)."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "Deduplication complete. Verified that concurrency race condition in voucher redemption and arithmetic underflow in discount calculation are distinct flaws with different root causes and mechanics. Retained both active findings without merging."
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "get_findings",
+                "args": {
+                  "filepath": "services/checkout/discount.py"
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "mantis_pipeline",
+        "user_id": "eval_user",
+        "state": {
+          "target_file": "services/checkout/discount.py"
+        }
+      }
+    },
+    {
+      "eval_id": "case_04_server_vs_client_theme_injection_distinct",
+      "conversation": [
+        {
+          "invocation_id": "inv-theme-004",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Execute deduplication on server-side theme preview template injection (views/theme.py) and client-side DOM injection (static/js/theme_customizer.js)."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "Deduplication complete. Confirmed that server-side Jinja template injection and client-side DOM innerHTML manipulation represent distinct execution sinks and attack vectors. Retained both active findings."
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "get_findings",
+                "args": {
+                  "filepath": "views/theme.py"
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "mantis_pipeline",
+        "user_id": "eval_user",
+        "state": {
+          "target_file": "views/theme.py"
+        }
+      }
+    }
+  ]
+}

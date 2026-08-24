@@ -1,0 +1,219 @@
+{
+  "dataset_name": "acme_ecommerce_dedup_benchmark",
+  "description": "Synthetic web application findings evaluating deduplication at precise decision boundaries (same-file distinct flaws, same-function distinct flaws, radical phrasing duplicates, and caller/callee seams).",
+  "findings": [
+    {
+      "id": 101,
+      "title": "Unbounded memory consumption via unconstrained deserialization in session state hydration",
+      "severity": "HIGH",
+      "filepath": "services/cart/session.py",
+      "line_numbers": [
+        42,
+        43,
+        44
+      ],
+      "description": "The cart session hydration routine parses client-provided session blobs without payload size bounding or recursion depth limits, allowing remote attackers to trigger process memory exhaustion.",
+      "remediation": "Enforce strict maximum payload byte length and schema validation prior to object deserialization."
+    },
+    {
+      "id": 102,
+      "title": "Denial of service through malformed shopping bag payload header",
+      "severity": "HIGH",
+      "filepath": "controllers/cart_controller.py",
+      "line_numbers": [
+        18,
+        19
+      ],
+      "description": "Incoming cart requests pass the raw serialized header directly to the session backend which consumes excessive memory on nested structures.",
+      "remediation": "Validate and reject oversized shopping cart headers at the controller boundary."
+    },
+    {
+      "id": 201,
+      "title": "Missing tenant boundary enforcement in API request routing",
+      "severity": "CRITICAL",
+      "filepath": "api/gateway.py",
+      "line_numbers": [
+        115,
+        116,
+        117
+      ],
+      "description": "The API gateway forwards requests without validating the caller tenant against the X-Tenant-Context header.",
+      "remediation": "Derive tenant identity exclusively from verified cryptographically signed auth tokens."
+    },
+    {
+      "id": 202,
+      "title": "Insecure Direct Object Reference (IDOR) via unauthenticated tenant header override",
+      "severity": "CRITICAL",
+      "filepath": "middleware/context.py",
+      "line_numbers": [
+        34,
+        35
+      ],
+      "description": "Request context extraction permits arbitrary tenant override if an attacker supplies custom X-Tenant-Context HTTP headers.",
+      "remediation": "Strip client-supplied X-Tenant-Context headers before context population."
+    },
+    {
+      "id": 301,
+      "title": "Stored Cross-Site Scripting (XSS) via unescaped database comment rendering",
+      "severity": "HIGH",
+      "filepath": "views/comments.py",
+      "line_numbers": [
+        45,
+        46
+      ],
+      "description": "User comments persisted in the database are rendered into the HTML document using raw unescaped template markup, allowing stored script execution in other users' browsers.",
+      "remediation": "Apply contextual HTML entity escaping or use automatic template escaping."
+    },
+    {
+      "id": 302,
+      "title": "Reflected Cross-Site Scripting (XSS) via search query parameter in comment filter",
+      "severity": "MEDIUM",
+      "filepath": "views/comments.py",
+      "line_numbers": [
+        12,
+        13
+      ],
+      "description": "The comment search filter echoes the 'q' URL query parameter directly into the page header without sanitization, enabling reflected XSS via crafted phishing links.",
+      "remediation": "Sanitize and escape the 'q' query parameter prior to DOM injection."
+    },
+    {
+      "id": 401,
+      "title": "Timing discrepancy side-channel in HMAC token signature verification",
+      "severity": "LOW",
+      "filepath": "auth/token.py",
+      "line_numbers": [
+        65,
+        66
+      ],
+      "description": "The token signature comparison uses non-constant-time string equality '==', leaking signature bytes through timing side-channel analysis.",
+      "remediation": "Use hmac.compare_digest() for constant-time byte comparisons."
+    },
+    {
+      "id": 402,
+      "title": "Missing token expiration timestamp validation in authentication handler",
+      "severity": "HIGH",
+      "filepath": "auth/token.py",
+      "line_numbers": [
+        82,
+        83,
+        84
+      ],
+      "description": "The authentication token validation checks signature integrity but fails to inspect the 'exp' claim, allowing expired revoked tokens to remain valid indefinitely.",
+      "remediation": "Explicitly verify that current_time < token.exp during token decoding."
+    },
+    {
+      "id": 501,
+      "title": "Prototype pollution via recursive object property assignment in deep merge utility",
+      "severity": "HIGH",
+      "filepath": "utils/deep_merge.js",
+      "line_numbers": [
+        22,
+        23,
+        24
+      ],
+      "description": "The deep object merge helper does not block '__proto__' or 'constructor' keys when copying properties, allowing arbitrary Object prototype pollution.",
+      "remediation": "Filter out '__proto__', 'constructor', and 'prototype' keys during traversal."
+    },
+    {
+      "id": 502,
+      "title": "Object injection vulnerability in recursive dictionary merge routine",
+      "severity": "HIGH",
+      "filepath": "utils/deep_merge.js",
+      "line_numbers": [
+        22,
+        23,
+        24
+      ],
+      "description": "Regex security scan identified unsafe property traversal in merge function permitting global prototype alteration.",
+      "remediation": "Reject unsafe object metadata property names during recursive merge."
+    },
+    {
+      "id": 601,
+      "title": "Concurrency race condition in single-use promotional voucher redemption",
+      "severity": "HIGH",
+      "filepath": "services/checkout/discount.py",
+      "line_numbers": [
+        88,
+        89,
+        90
+      ],
+      "description": "Voucher balance validation and decrement are not enclosed in a pessimistic database transaction or distributed lock, allowing parallel requests to redeem a single-use code multiple times.",
+      "remediation": "Wrap voucher validation and redemption in atomic SELECT FOR UPDATE database transactions."
+    },
+    {
+      "id": 602,
+      "title": "Integer underflow / negative total price computation during percentage coupon stacking",
+      "severity": "MEDIUM",
+      "filepath": "services/checkout/pricing.py",
+      "line_numbers": [
+        102,
+        103,
+        104
+      ],
+      "description": "Stacked percentage discounts can reduce total invoice price below zero, resulting in credit balances or unintended customer payouts upon order finalization.",
+      "remediation": "Clamp discounted subtotal calculation to minimum floor of 0 cents."
+    }
+  ],
+  "ground_truth_clusters": {
+    "cluster_cart_deserialization_dos": {
+      "finding_ids": [
+        101,
+        102
+      ],
+      "relation": "DUPLICATE",
+      "canonical_id": 101,
+      "merged_ids": [
+        102
+      ],
+      "rationale": "Finding 102 is the controller entrypoint passing untrusted payloads to the session deserializer in Finding 101."
+    },
+    "cluster_tenant_override_idor": {
+      "finding_ids": [
+        201,
+        202
+      ],
+      "relation": "DUPLICATE",
+      "canonical_id": 201,
+      "merged_ids": [
+        202
+      ],
+      "rationale": "Finding 201 and Finding 202 describe the exact same X-Tenant-Context header bypass across gateway and context middleware."
+    },
+    "cluster_comments_xss_same_file": {
+      "finding_ids": [
+        301,
+        302
+      ],
+      "relation": "DISTINCT",
+      "rationale": "HARD NEGATIVE CONTROL: Both occur in views/comments.py (CWE-79), but 301 is Stored XSS while 302 is Reflected XSS. Merging drops a real flaw."
+    },
+    "cluster_token_auth_same_func": {
+      "finding_ids": [
+        401,
+        402
+      ],
+      "relation": "DISTINCT",
+      "rationale": "HARD NEGATIVE CONTROL: Both occur in auth/token.py, but 401 is a timing side-channel on HMAC verification while 402 is an expiration claim logic defect."
+    },
+    "cluster_prototype_pollution_ast_vs_regex": {
+      "finding_ids": [
+        501,
+        502
+      ],
+      "relation": "DUPLICATE",
+      "canonical_id": 501,
+      "merged_ids": [
+        502
+      ],
+      "rationale": "Finding 501 and Finding 502 describe the exact same prototype pollution flaw in utils/deep_merge.js reported under different scanner tool terminology."
+    },
+    "cluster_checkout_logic": {
+      "finding_ids": [
+        601,
+        602
+      ],
+      "relation": "DISTINCT",
+      "rationale": "NEGATIVE CONTROL: Finding 601 is a concurrency race condition in voucher validation, whereas Finding 602 is an arithmetic underflow defect."
+    }
+  }
+}

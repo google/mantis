@@ -8,7 +8,8 @@ from pathlib import Path
 
 from google.genai import types
 from google.adk.runners import Runner
-from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.sessions.sqlite_session_service import SqliteSessionService
+from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.apps.app import App
 
 from core.database import init_db, read_findings, read_risk_scores, update_status
@@ -21,7 +22,7 @@ USER_ID = "user1"
 
 async def execute_sub_task(
     runner: Runner,
-    session_service: InMemorySessionService,
+    session_service: BaseSessionService,
     filepath: str,
     run_id: str,
     db_path: str = "",
@@ -32,7 +33,10 @@ async def execute_sub_task(
     session_id = f"session_run_{run_id}_{uuid.uuid4().hex[:8]}"
     await session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
     
-    query_text = seed_prompt_template.format(filepath=filepath)
+    try:
+        query_text = seed_prompt_template.format(filepath=filepath, run_id=run_id)
+    except KeyError:
+        query_text = seed_prompt_template.format(filepath=filepath)
     new_message = types.Content(
         parts=[types.Part.from_text(text=query_text)],
         role="user"
@@ -83,11 +87,41 @@ async def execute_sub_task(
                     for part in getattr(event.content, "parts", []) or []:
                         if hasattr(part, 'text') and part.text:
                             print(part.text, end="", flush=True)
+                        elif hasattr(part, 'function_call') and part.function_call:
+                            call = part.function_call
+                            call_name = getattr(call, "name", "unknown_tool")
+                            call_args = getattr(call, "args", {})
+                            print(f"\n[TOOL CALL: {call_name}] args={call_args}")
+                        elif hasattr(part, 'function_response') and part.function_response:
+                            fn_resp = part.function_response
+                            fn_name = getattr(fn_resp, "name", "unknown_tool")
+                            raw_resp = getattr(fn_resp, "response", {})
+                            if isinstance(raw_resp, dict):
+                                resp_text = str(raw_resp.get("response") or raw_resp.get("result") or raw_resp.get("output") or raw_resp)
+                            else:
+                                resp_text = str(raw_resp)
+                            
+                            is_fatal = (
+                                resp_text.startswith("SANDBOX-ERROR")
+                                or "ERROR SAVING DB" in resp_text
+                                or "FATAL ERROR" in resp_text
+                            )
+                            is_validation_feedback = (
+                                resp_text.startswith("Error")
+                                or resp_text.startswith("ERROR")
+                            ) and "SANDBOX-UNAVAILABLE" not in resp_text
+
+                            if is_fatal:
+                                errored.add(f"tool:{fn_name}")
+                                print(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr)
+                            elif is_validation_feedback:
+                                print(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}")
+                            else:
+                                errored.discard(f"tool:{fn_name}")
+                                print(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}")
     finally:
-        try:
-            await session_service.delete_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
-        except Exception:
-            pass
+        # Session trajectories are retained in session_service database for auditability and rehydration
+        pass
             
     print("\n" + "-" * 60)
     return bool(errored)
@@ -125,40 +159,43 @@ def discover_files(target: Path, db_path: str = "") -> list[str]:
         if p.is_file() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
     ]
 
-async def pipeline(scan_target: str) -> int:
-    pipeline_dir = os.path.realpath(os.path.dirname(__file__))
-    workflow_path = os.path.join(pipeline_dir, "workflow.json")
-    
-    if not os.path.exists(workflow_path):
-        print(f"Error: Could not find workflow.json at {workflow_path}", file=sys.stderr)
-        return 1
+async def pipeline(scan_target: str, workflow_path: str = ""):
+    """Main pipeline loop compiled declaratively from JSON specification."""
+    if not workflow_path:
+        pipeline_dir = os.path.realpath(os.path.dirname(__file__))
+        workflow_path = os.path.join(pipeline_dir, "workflow.json")
 
     try:
         workflow, config = load_workflow_from_json(workflow_path)
     except ValueError as e:
-        print(f"Workflow Configuration Error:\n{e}", file=sys.stderr)
-        return 2
-        
-    target_path = Path(scan_target).resolve()
-    if not target_path.exists():
-        print(f"Error: Target path does not exist: {target_path}", file=sys.stderr)
+        print(f"Workflow Specification Error: {e}", file=sys.stderr)
         return 1
 
-    db_rel = config.get("db_path", "findings.db")
-    db_path = os.path.realpath(os.path.join(pipeline_dir, db_rel))
+    target_path = Path(scan_target).resolve()
+    if not target_path.exists():
+        print(f"Target '{scan_target}' does not exist.", file=sys.stderr)
+        return 1
+
+    db_path = config.get("db_path", "knowledge.db")
     init_db(db_path)
 
-    files_to_scan = discover_files(target_path, db_path)
-    jail_dir = str(target_path)
+    discovered_files = discover_files(target_path, db_path)
+    if not discovered_files:
+        print(f"Error: No source files found in target: {target_path}", file=sys.stderr)
+        return 1
 
-    if not files_to_scan:
-        print(f"No files found in target: {target_path}")
-        return 0
+    if target_path.is_file():
+        targets_to_scan = [str(target_path)]
+        jail_dir = str(target_path.parent)
+    else:
+        # Repository scope: execute the unified campaign across the entire repository
+        targets_to_scan = [str(target_path)]
+        jail_dir = str(target_path)
 
-    print(f"Compiling Graph Pipeline. Target: {target_path}")
+    print(f"Compiling Graph Pipeline. Target: {target_path} ({len(discovered_files)} source file(s) indexed)")
     
     try:
-        test_sandbox = build_sandbox(config.get("sandbox", {}), files_to_scan[0])
+        test_sandbox = build_sandbox(config.get("sandbox", {}), targets_to_scan[0])
         await test_sandbox.preflight()
         await test_sandbox.aclose()
     except (ValueError, TypeError, RuntimeError) as e:
@@ -170,7 +207,8 @@ async def pipeline(scan_target: str) -> int:
         root_agent=workflow
     )
     
-    session_service = InMemorySessionService()
+    sessions_db_path = config.get("sessions_db_path") or os.environ.get("MANTIS_SESSIONS_DB") or "sessions.db"
+    session_service = SqliteSessionService(db_path=sessions_db_path)
     runner = Runner(
         app=run_app,
         session_service=session_service
@@ -184,20 +222,20 @@ async def pipeline(scan_target: str) -> int:
         run_id=run_id
     )
 
-    print(f"\n🚀 Engaging JSON Graph over {len(files_to_scan)} discrete inputs (Run ID: {run_id})...")
+    print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
     
     failures = 0
     successes = 0
     try:
-        for filepath in files_to_scan:
-            sandbox = build_sandbox(config.get("sandbox", {}), filepath)
-            branch_ctx = dataclasses.replace(base_ctx, target_file=filepath, sandbox=sandbox)
+        for scan_item in targets_to_scan:
+            sandbox = build_sandbox(config.get("sandbox", {}), scan_item)
+            branch_ctx = dataclasses.replace(base_ctx, target_file=scan_item, sandbox=sandbox)
             current_run_context.set(branch_ctx)
             try:
                 task_failed = await execute_sub_task(
                     runner,
                     session_service,
-                    filepath,
+                    scan_item,
                     run_id,
                     db_path=db_path,
                     status_map=config.get("on_enter_status", {}),
@@ -208,7 +246,7 @@ async def pipeline(scan_target: str) -> int:
                 else:
                     successes += 1
             except Exception as e:
-                print(f"PIPELINE CRITICAL ABORT IN TASK ({filepath}): {e}", file=sys.stderr)
+                print(f"PIPELINE CRITICAL ABORT IN TASK ({scan_item}): {e}", file=sys.stderr)
                 failures += 1
             finally:
                 await sandbox.aclose()
@@ -216,7 +254,7 @@ async def pipeline(scan_target: str) -> int:
         await runner.close()
         findings = read_findings(db_path, run_id=run_id)
         scores = read_risk_scores(db_path, run_id=run_id)
-        print(f"\n📊 Summary: {len(findings)} vulnerability finding(s) recorded across {successes} scanned file(s).")
+        print(f"\n📊 Summary: {len(findings)} vulnerability finding(s) recorded.")
         for f in findings:
             lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""
             mark = " (suppressed at review)" if f.get("status") == "reported" else ""
@@ -224,16 +262,18 @@ async def pipeline(scan_target: str) -> int:
         if scores:
             print("\n🎯 Risk Calibration Scores:")
             for s in scores:
-                print(f"  - {s.get('filepath')}: {s.get('score')}/100 - {s.get('reasoning')}")
+                score_val = float(s.get('score', 0))
+                print(f"  - {s.get('filepath')}: {score_val:.1f}/10.0 - {s.get('reasoning')}")
 
         if failures > 0:
-            print(f"\n⚠️ Pipeline completed with {failures} failure(s) ({successes} succeeded).")
+            print(f"\n⚠️ Pipeline completed with {failures} failure(s).")
+            return 1
+        elif len(findings) == 0:
+            print(f"\nℹ️ Pipeline Execution Completed: No vulnerability findings recorded.")
+            return 0
         else:
-            print(f"\n🎉 Pipeline Execution Completed ({successes} file(s) scanned successfully).")
-
-    if failures > 0:
-        return 1
-    return 0
+            print(f"\n🎉 Pipeline Execution Completed: Processed {len(findings)} vulnerability finding(s).")
+            return 0
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

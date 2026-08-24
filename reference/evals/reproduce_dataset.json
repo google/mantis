@@ -1,0 +1,30 @@
+{
+  "dataset_name": "mantis_reproducer_benchmark",
+  "cases": [
+    {
+      "case_id": "repro_command_injection",
+      "finding": {
+        "id": 501,
+        "title": "Command injection in PDF export utility",
+        "description": "User supplied filename passed unescaped to shell subshell."
+      },
+      "target_code": "import os\ndef export_pdf(filename):\n    os.system(f\"cat {filename} > /dev/null\")\n",
+      "poc_script": "python3 -c \"import os; os.system('echo EXPLOIT_SUCCESS')\"",
+      "ground_truth": {
+        "expected_route": "success"
+      }
+    },
+    {
+      "case_id": "repro_unreachable_race",
+      "finding": {
+        "id": 502,
+        "title": "Theoretical distributed lock timeout race in unconfigured Redis cluster",
+        "description": "Requires distributed cluster with unavailable master nodes."
+      },
+      "poc_script": "python3 -c \"import sys; sys.exit(1)\"",
+      "ground_truth": {
+        "expected_route": "failed_repro"
+      }
+    }
+  ]
+}

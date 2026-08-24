@@ -59,14 +59,19 @@ consider:
 1. **Docker** For testing containers.
 
 2. **gVisor (runsc)**: For enhanced security when executing untrusted
-   AI-generated crash reproducer code, register the `runsc` runtime in your
-   Docker daemon configuration (`/etc/docker/daemon.json`):
+   AI-generated crash reproducer code, register the `runsc` runtime with
+   networkless execution
+   (`sudo runsc install -- --network=none && sudo systemctl restart docker`) or
+   add it to your Docker daemon configuration (`/etc/docker/daemon.json`):
 
    ```json
    {
      "runtimes": {
        "runsc": {
-         "path": "runsc"
+         "path": "runsc",
+         "runtimeArgs": [
+           "--network=none"
+         ]
        }
      }
    }

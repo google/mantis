@@ -1,0 +1,60 @@
+{
+  "dataset_name": "mantis_reporter_benchmark",
+  "findings": [
+    {
+      "id": 101,
+      "title": "Unbounded memory consumption via unconstrained deserialization in session state hydration",
+      "severity": "HIGH",
+      "filepath": "services/cart/session.py",
+      "line_numbers": [
+        42,
+        43,
+        44
+      ],
+      "description": "The cart session hydration routine parses client-provided session blobs without payload size bounding or recursion depth limits, allowing remote attackers to trigger process memory exhaustion.",
+      "remediation": "Enforce strict maximum payload byte length and schema validation prior to object deserialization."
+    },
+    {
+      "id": 102,
+      "title": "Denial of service through malformed shopping bag payload header",
+      "severity": "HIGH",
+      "filepath": "controllers/cart_controller.py",
+      "line_numbers": [
+        18,
+        19
+      ],
+      "description": "Incoming cart requests pass the raw serialized header directly to the session backend which consumes excessive memory on nested structures.",
+      "remediation": "Validate and reject oversized shopping cart headers at the controller boundary."
+    },
+    {
+      "id": 201,
+      "title": "Missing tenant boundary enforcement in API request routing",
+      "severity": "CRITICAL",
+      "filepath": "api/gateway.py",
+      "line_numbers": [
+        115,
+        116,
+        117
+      ],
+      "description": "The API gateway forwards requests without validating the caller tenant against the X-Tenant-Context header.",
+      "remediation": "Derive tenant identity exclusively from verified cryptographically signed auth tokens."
+    },
+    {
+      "id": 202,
+      "title": "Insecure Direct Object Reference (IDOR) via unauthenticated tenant header override",
+      "severity": "CRITICAL",
+      "filepath": "middleware/context.py",
+      "line_numbers": [
+        34,
+        35
+      ],
+      "description": "Request context extraction permits arbitrary tenant override if an attacker supplies custom X-Tenant-Context HTTP headers.",
+      "remediation": "Strip client-supplied X-Tenant-Context headers before context population."
+    }
+  ],
+  "ground_truth": {
+    "required_schema": "ExecutiveReport",
+    "min_recommendations": 2,
+    "must_contain_critical_count": true
+  }
+}

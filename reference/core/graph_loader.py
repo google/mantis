@@ -1,12 +1,16 @@
 import json
 import os
 from typing import Annotated, Any, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from google import adk
 from google.adk.workflow import Workflow, Edge, START, node, RetryConfig, DEFAULT_ROUTE
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.agents.context import Context
+from google.adk.skills import load_skill_from_dir
+from google.adk.tools.skill_toolset import SkillToolset
+
 from core.config import get_llm_kwargs, DEFAULT_MODEL
+from core.environments import ENVIRONMENTS, get_shared_proxy_environment
 from core.sandbox import SANDBOXES
 from tools import TOOLS
 
@@ -20,15 +24,22 @@ class _Base(BaseModel):
 class AgentNode(_Base):
     id: str
     type: Literal["agent"]
-    system_prompt: str
+    skill: Optional[str] = None
+    system_prompt: Optional[str] = None
     model: Optional[str] = None
     api_base: Optional[str] = None
     timeout: Optional[float] = Field(default=None, gt=0)
+    reasoning_effort: Optional[str] = None
     tools: list[str] = Field(default_factory=list)
     on_enter_status: Optional[str] = None
     output_schema: Optional[str] = None   # class name in core.schemas
     output_key: Optional[str] = None      # session-state key to write it to
 
+    @model_validator(mode="after")
+    def validate_skill_or_prompt(self) -> "AgentNode":
+        if not self.skill and not self.system_prompt:
+            raise ValueError(f"Agent node '{self.id}' must specify either 'skill' or 'system_prompt'.")
+        return self
 
 
 class ClassifierNode(_Base):
@@ -49,15 +60,21 @@ class EdgeSpec(_Base):
 
 
 class SandboxConfig(_Base):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
     type: str = "static-only"
+    image: Optional[str] = None
+    runtime: Optional[str] = None
+    container_tool: Optional[str] = None
+    timeout_seconds: Optional[int] = None
     options: dict[str, Any] = Field(default_factory=dict)
 
 
 class GlobalConfig(_Base):
-    db_path: str = "findings.db"
+    db_path: str = "knowledge.db"
     default_model: str = DEFAULT_MODEL
     api_base: Optional[str] = None
     timeout: Optional[float] = Field(default=None, gt=0)
+    reasoning_effort: Optional[str] = None
     retry_attempts: int = Field(default=3, ge=0)
     seed_prompt: str = DEFAULT_SEED_PROMPT
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
@@ -82,23 +99,49 @@ class WorkflowSpec(_Base):
 
 
 def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
-    async def _classify(ctx: Context, node_input: Optional[str] = None):
+    async def _classify(ctx: Context, node_input: Any = None):
         state_key = f"{node_id}_visits"
         visits = ctx.state.get(state_key, 0) + 1
 
-        verdict = ctx.state.get("verdict") or {}
-        route = verdict.get("route") if isinstance(verdict, dict) else getattr(verdict, "route", None)
+        verdict = None
+        if isinstance(node_input, dict) and "route" in node_input:
+            verdict = node_input
+        elif hasattr(node_input, "route") and getattr(node_input, "route") is not None:
+            verdict = node_input
+        elif isinstance(node_input, str):
+            try:
+                parsed = json.loads(node_input)
+                if isinstance(parsed, dict) and "route" in parsed:
+                    verdict = parsed
+                elif isinstance(parsed, str) and parsed in routes:
+                    verdict = parsed
+            except Exception:
+                if node_input in routes:
+                    verdict = node_input
 
-        if route in routes:
+        if verdict is None:
+            verdict = ctx.state.get("verdict") or (node_input if isinstance(node_input, dict) else {})
+
+        if isinstance(verdict, dict):
+            route = verdict.get("route")
+        elif hasattr(verdict, "route"):
+            route = getattr(verdict, "route")
+        elif isinstance(verdict, str):
+            route = verdict
+        else:
+            route = None
+
+        if isinstance(route, str):
+            route = route.lower().strip()
+
+        if max_visits and max_visits > 1 and visits >= max_visits:
+            return adk.Event(output=node_input, state={state_key: visits}, route="exceeded")
+
+        if route and route in routes:
             return adk.Event(output=node_input, state={state_key: visits}, route=route)
 
-        print(f"[{node_id}] verdict {route!r} not in declared routes {routes}; routing to fallback")
-
-        if max_visits and max_visits > 1:
-            if visits < max_visits:
-                return adk.Event(output=node_input, state={state_key: visits}, route=DEFAULT_ROUTE)
-            else:
-                return adk.Event(output=node_input, state={state_key: visits}, route="exceeded")
+        if route:
+            print(f"[{node_id}] verdict '{route}' not in declared routes {routes}; routing to fallback")
 
         return adk.Event(output=node_input, state={state_key: visits}, route=DEFAULT_ROUTE)
 
@@ -120,9 +163,9 @@ def load_workflow_from_json(json_path: str) -> tuple[Workflow, dict]:
     errors = []
     base_dir = os.path.dirname(os.path.abspath(json_path))
 
-    if spec.config.sandbox.type not in SANDBOXES:
+    if spec.config.sandbox.type not in SANDBOXES and spec.config.sandbox.type not in ENVIRONMENTS:
         errors.append(
-            f"Unknown sandbox type '{spec.config.sandbox.type}'. Available: {sorted(SANDBOXES)}"
+            f"Unknown sandbox type '{spec.config.sandbox.type}'. Available: {sorted(ENVIRONMENTS)}"
         )
 
     nodes = {}
@@ -137,10 +180,9 @@ def load_workflow_from_json(json_path: str) -> tuple[Workflow, dict]:
         if node_id == "START":
             errors.append("Node id 'START' is reserved for workflow entry.")
             continue
-        if node_id in nodes:
-            errors.append(f"Duplicate node id '{node_id}'.")
+        if node_id in declared_node_ids:
+            errors.append(f"Duplicate node id '{node_id}' found.")
             continue
-
         declared_node_ids.add(node_id)
 
         if isinstance(node_cfg, ClassifierNode):
@@ -163,27 +205,64 @@ def load_workflow_from_json(json_path: str) -> tuple[Workflow, dict]:
                     default_api_base=spec.config.api_base,
                     timeout=node_cfg.timeout,
                     default_timeout=spec.config.timeout,
+                    reasoning_effort=node_cfg.reasoning_effort,
+                    default_reasoning_effort=spec.config.reasoning_effort,
                 )
             except Exception as e:
                 errors.append(f"Node {node_id}: {str(e)}")
                 node_has_error = True
                 llm_kwargs = {}
 
-            resolved_prompt = os.path.normpath(os.path.join(base_dir, node_cfg.system_prompt))
             instruction = ""
-            if node_cfg.system_prompt and os.path.isfile(resolved_prompt):
-                with open(resolved_prompt, 'r', encoding='utf-8') as pf:
-                    instruction = pf.read()
-            else:
-                errors.append(f"Node {node_id}: System prompt not found or is a directory at '{resolved_prompt}'")
-                node_has_error = True
-
+            agent_tools = []
             tools_list = []
             for t in node_cfg.tools:
                 if t in TOOLS:
                     tools_list.append(TOOLS[t])
                 else:
                     errors.append(f"Node {node_id}: Unknown tool '{t}'")
+                    node_has_error = True
+
+            if node_cfg.skill:
+                candidate_paths = [
+                    os.path.normpath(os.path.join(base_dir, node_cfg.skill)),
+                    os.path.normpath(os.path.join(base_dir, "..", node_cfg.skill)),
+                    os.path.normpath(node_cfg.skill),
+                ]
+                resolved_skill_path = None
+                for cp in candidate_paths:
+                    if os.path.isdir(cp) and os.path.isfile(os.path.join(cp, "SKILL.md")):
+                        resolved_skill_path = cp
+                        break
+
+                if resolved_skill_path:
+                    try:
+                        skill_obj = load_skill_from_dir(resolved_skill_path)
+                        skill_ts = SkillToolset(
+                            skills=[skill_obj],
+                            environment=get_shared_proxy_environment(),
+                        )
+                        agent_tools = tools_list + [skill_ts]
+                        instruction = (
+                            f"You are the '{node_id}' stage in the Mantis vulnerability review pipeline.\n"
+                            f"Execute your assigned skill '{skill_obj.frontmatter.name}' using your available tools.\n"
+                            f"Retrieve upstream context using your specialized tools (e.g. get_findings, get_threat_model, get_plan, get_summary, read_file) and persist state via your write and record tools."
+                        )
+                    except Exception as se:
+                        errors.append(f"Node {node_id}: Failed to load skill from '{resolved_skill_path}': {se}")
+                        node_has_error = True
+                else:
+                    errors.append(f"Node {node_id}: Skill directory not found at any candidate location for '{node_cfg.skill}'")
+                    node_has_error = True
+
+            elif node_cfg.system_prompt:
+                resolved_prompt = os.path.normpath(os.path.join(base_dir, node_cfg.system_prompt))
+                if os.path.isfile(resolved_prompt):
+                    with open(resolved_prompt, 'r', encoding='utf-8') as pf:
+                        instruction = pf.read()
+                    agent_tools = tools_list
+                else:
+                    errors.append(f"Node {node_id}: System prompt not found or is a directory at '{resolved_prompt}'")
                     node_has_error = True
 
             schema_cls = None
@@ -201,7 +280,7 @@ def load_workflow_from_json(json_path: str) -> tuple[Workflow, dict]:
                 name=node_id,
                 model=LiteLlm(**llm_kwargs),
                 instruction=instruction,
-                tools=tools_list,
+                tools=agent_tools,
                 output_schema=schema_cls,
                 output_key=node_cfg.output_key,
             )

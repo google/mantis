@@ -1,5 +1,8 @@
 import os
+import sys
+import ast
 import json
+import sqlite3
 import shutil
 import tempfile
 import unittest
@@ -23,6 +26,12 @@ from core.database import (
     record_calibration,
     read_risk_scores,
     update_status,
+    record_artifact,
+    read_artifact,
+    record_learning,
+    query_historical_lineage,
+    query_security_guidance,
+    _db,
 )
 from core.schemas import VulnerabilityFinding
 from core.graph_loader import (
@@ -31,11 +40,28 @@ from core.graph_loader import (
     GlobalConfig,
     AgentNode,
 )
-from core.sandbox import StaticOnlySandbox, SANDBOXES, build_sandbox
-from core.sandboxes.gvisor import GvisorSandbox
-from main import APP_NAME, USER_ID, execute_sub_task, discover_files, is_binary_file
+from core.sandbox import (
+    StaticOnlySandbox,
+    SANDBOXES,
+    build_sandbox,
+    GvisorSandbox,
+    MicrosandboxSandbox,
+    GceSandbox,
+)
+from core.environments.gce_env import ISOLATION_PROBE_SCRIPT
 from pathlib import Path
-from tools.research_tools import read_file
+from main import APP_NAME, USER_ID, execute_sub_task, discover_files, is_binary_file
+from tools.research_tools import (
+    read_file,
+    write_file,
+    list_files,
+    get_findings,
+    get_plan,
+    get_threat_model,
+    get_summary,
+    get_security_guidance,
+    query_lineage,
+)
 from tools.sandbox_tools import run_sandbox, apply_patch
 
 
@@ -46,47 +72,81 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         workflow_path = os.path.join(os.path.dirname(__file__), "workflow.json")
 
         scripts = [
-            # Script 1: Confirmed bug & successful repro & patch -> 7 nodes -> dynamic_confirmed
+            # Script 1: Confirmed bug & successful repro & patch -> full pipeline -> dynamic_confirmed
             (
                 [
+                    "History extracted.",
+                    "Structural index built.",
+                    "Summary generated.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
                     "Found SQL injection in query handler.",
+                    "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Review completed."}),
+                    json.dumps({"route": "viable", "reason": "Exploit is viable."}),
                     json.dumps({"route": "success", "reason": "Exploit successfully reproduced vulnerability."}),
+                    "Exploit chained.",
                     "Patch created and applied successfully.",
                     "Calibration score: 90",
+                    "Learnings reflected.",
+                    "Report generated.",
                 ],
                 [
-                    "researcher", "reviewer", "reviewer_classifier",
-                    "reproducer", "repro_classifier", "patcher", "calibrator"
+                    "history", "structural_index", "summarizer", "architect", "threat_modeler",
+                    "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
+                    "critic", "critic_classifier", "reproducer", "repro_classifier",
+                    "chainer", "patcher", "calibrator", "reflector", "reporter"
                 ],
                 "dynamic_confirmed"
             ),
-            # Script 2: False positive -> 3 nodes -> reported (suppressed)
+            # Script 2: False positive -> reported (suppressed)
             (
                 [
+                    "History extracted.",
+                    "Structural index built.",
+                    "Summary generated.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
                     "Found potential buffer overflow.",
+                    "Findings deduplicated.",
                     json.dumps({"route": "false_positive", "reason": "Input is bounded."}),
                     "Calibration score: 0",
+                    "Learnings reflected.",
+                    "Report generated.",
                 ],
                 [
-                    "researcher", "reviewer", "reviewer_classifier"
+                    "history", "structural_index", "summarizer", "architect", "threat_modeler",
+                    "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
+                    "calibrator", "reflector", "reporter"
                 ],
                 "reported"
             ),
             # Script 3: Repro fails, retries once, exceeds max_visits -> calibrator -> static_confirmed
             (
                 [
+                    "History extracted.",
+                    "Structural index built.",
+                    "Summary generated.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
                     "Found logic bug.",
+                    "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
+                    json.dumps({"route": "viable", "reason": "Exploit is viable."}),
                     json.dumps({"route": "failed_repro", "reason": "Exploit attempt 1 failed."}),  # repro 1
                     json.dumps({"route": "failed_repro", "reason": "Exploit attempt 2 failed."}),  # repro 2 (retry)
                     "Calibration score: 15",
+                    "Learnings reflected.",
+                    "Report generated.",
                 ],
                 [
-                    "researcher", "reviewer", "reviewer_classifier",
-                    "reproducer", "repro_classifier",
-                    "reproducer", "repro_classifier",
-                    "calibrator"
+                    "history", "structural_index", "summarizer", "architect", "threat_modeler",
+                    "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
+                    "critic", "critic_classifier", "reproducer", "repro_classifier",
+                    "reproducer", "repro_classifier", "calibrator", "reflector", "reporter"
                 ],
                 "static_confirmed"
             ),
@@ -150,31 +210,61 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         scenarios = [
             (
                 [
+                    "History extracted.",
+                    "Structural index built.",
+                    "Summary generated.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
                     "Analysis done.",
+                    "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
+                    json.dumps({"route": "viable", "reason": "Exploit viable."}),
                     json.dumps({"route": "success", "reason": "Exploit verified."}),
+                    "Exploit chained.",
                     "Patch applied",
                     "Score: 90",
+                    "Learnings reflected.",
+                    "Report generated.",
                 ],
                 "dynamic_confirmed",
                 True,
             ),
             (
                 [
+                    "History extracted.",
+                    "Structural index built.",
+                    "Summary generated.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
                     "Analysis done.",
+                    "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
+                    json.dumps({"route": "viable", "reason": "Exploit viable."}),
                     json.dumps({"route": "failed_repro", "reason": "Exploit failed."}),
                     json.dumps({"route": "failed_repro", "reason": "Exploit failed."}),
                     "Score: 20",
+                    "Learnings reflected.",
+                    "Report generated.",
                 ],
                 "static_confirmed",
                 False,
             ),
             (
                 [
+                    "History extracted.",
+                    "Structural index built.",
+                    "Summary generated.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
                     "Analysis done.",
+                    "Findings deduplicated.",
                     json.dumps({"route": "false_positive", "reason": "Score: 0"}),
                     "Score: 0",
+                    "Learnings reflected.",
+                    "Report generated.",
                 ],
                 "reported",
                 False,
@@ -362,14 +452,14 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             write_findings(db_path, target, [f2], run_id="run-1")
             rows = read_findings(db_path, target, run_id="run-1")
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["severity"], "Critical")
+            self.assertEqual(rows[0]["severity"], "CRITICAL")
 
             # 2. Distinct description creates new row
             f3 = VulnerabilityFinding(title="XSS", severity="Low", description="d2", line_numbers=[10, 20], remediation="r3")
             write_findings(db_path, target, [f3], run_id="run-1")
             self.assertEqual(len(read_findings(db_path, target, run_id="run-1")), 2)
 
-            # 3. Status lifecycle update
+            # 3. Status lifecycle update (file-scoped and repo-scoped)
             update_status(db_path, target, "run-1", "static_confirmed")
             rows_static = read_findings(db_path, target, run_id="run-1", status="static_confirmed")
             self.assertEqual(len(rows_static), 2)
@@ -379,23 +469,165 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             rows_dynamic = read_findings(db_path, target, run_id="run-1", status="dynamic_confirmed")
             self.assertEqual(len(rows_dynamic), 2)
 
-            # 4. None status in finding payload safely defaults to 'reported'
+            # 4. Specific filepath attribution under repo-scoped run
+            f_repo = VulnerabilityFinding(
+                filepath="src/auth.py",
+                title="Auth Bypass",
+                severity="high",
+                description="Token signature omitted",
+                line_numbers=[42],
+                remediation="verify sig",
+            )
+            self.assertEqual(f_repo.severity, "HIGH")
+            self.assertEqual(f_repo.filepath, "src/auth.py")
+            write_findings(db_path, temp_dir, [f_repo], run_id="run-repo")
+            repo_rows = read_findings(db_path, temp_dir, run_id="run-repo")
+            self.assertEqual(len(repo_rows), 1)
+            self.assertEqual(repo_rows[0]["filepath"], "src/auth.py")
+            self.assertEqual(repo_rows[0]["severity"], "HIGH")
+
+            # 5. None status in finding payload safely defaults to 'reported'
             f_none = {"title": "CSRF", "severity": "Medium", "description": "no csrf token", "line_numbers": [5], "remediation": "add token", "status": None}
             write_findings(db_path, target, [f_none], run_id="run-2")
             rows_none = read_findings(db_path, target, run_id="run-2")
             self.assertEqual(len(rows_none), 1)
             self.assertEqual(rows_none[0]["status"], "reported")
+            self.assertEqual(rows_none[0]["severity"], "MEDIUM")
 
-            # 5. Risk scores
-            record_calibration(db_path, target, 85, "High risk flaw", run_id="run-1")
+            # 6. Risk scores (0.1 - 10.0 canonical scale)
+            record_calibration(db_path, target, 8.5, "High risk flaw", run_id="run-1")
             scores = read_risk_scores(db_path, target, run_id="run-1")
             self.assertEqual(len(scores), 1)
-            self.assertEqual(scores[0]["score"], 85)
+            self.assertEqual(scores[0]["score"], 8.5)
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_read_file_jail_security(self):
-        """Tests directory traversal prevention and boundary enforcement in read_file."""
+    def test_database_schema_version_enforcement(self):
+        """Tests that PRAGMA user_version is stamped and mismatched schema versions fail fast with actionable guidance."""
+        from core.database import CURRENT_SCHEMA_VERSION, _db
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "version_test.db")
+            # 1. Fresh init stamps CURRENT_SCHEMA_VERSION
+            init_db(db_path)
+            with _db(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA user_version")
+                self.assertEqual(cursor.fetchone()[0], CURRENT_SCHEMA_VERSION)
+
+            # 2. Outdated version (e.g. version 0 from older schema) raises RuntimeError on init_db
+            with _db(db_path, check_version=False) as conn:
+                conn.cursor().execute("PRAGMA user_version = 0")
+
+            with self.assertRaises(RuntimeError) as ctx_err:
+                init_db(db_path)
+            self.assertIn("Database schema version mismatch", str(ctx_err.exception))
+            self.assertIn("please delete", str(ctx_err.exception))
+
+            # 3. Outdated version also raises fail-fast on read operations
+            with self.assertRaises(RuntimeError) as ctx_read:
+                read_findings(db_path)
+            self.assertIn("Database schema version mismatch", str(ctx_read.exception))
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_update_status_preserves_merged_and_suppressed_findings(self):
+        """Tests that update_status advances candidate findings without resurrecting merged or false positive verdicts."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "test.db")
+            init_db(db_path)
+            target = os.path.join(temp_dir, "app.py")
+
+            f1 = {"title": "SQLi Primary", "severity": "CRITICAL", "description": "query 1", "line_numbers": [10]}
+            f2 = {"title": "SQLi Duplicate", "severity": "CRITICAL", "description": "query 2", "line_numbers": [12]}
+            f3 = {"title": "Test Bug", "severity": "LOW", "description": "sample test code", "line_numbers": [20]}
+            write_findings(db_path, target, [f1, f2, f3], run_id="run-1")
+
+            # Deduplicator marks f2 as duplicate_merged, reviewer marks f3 as false_positive
+            all_findings = read_findings(db_path, target, run_id="run-1")
+            id2 = all_findings[1]["id"]
+            id3 = all_findings[2]["id"]
+
+            with _db(db_path) as conn:
+                conn.cursor().execute("UPDATE findings SET status = 'duplicate_merged' WHERE id = ?", (id2,))
+                conn.cursor().execute("UPDATE findings SET status = 'false_positive' WHERE id = ?", (id3,))
+
+            # Downstream reproducer enters with on_enter_status: static_confirmed
+            update_status(db_path, target, "run-1", "static_confirmed")
+
+            updated = read_findings(db_path, target, run_id="run-1")
+            self.assertEqual(updated[0]["status"], "static_confirmed")
+            # Terminal verdicts are strictly preserved
+            self.assertEqual(updated[1]["status"], "duplicate_merged")
+            self.assertEqual(updated[2]["status"], "false_positive")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_strict_run_id_isolation_and_no_cross_run_bleeds(self):
+        """Tests that runs are strictly isolated and never borrow findings or artifacts from prior runs."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "test.db")
+            init_db(db_path)
+            target = os.path.join(temp_dir, "app.py")
+
+            # Run 1 writes findings and artifacts
+            f1 = {"title": "R1 Finding", "severity": "HIGH", "description": "run 1 flaw"}
+            write_findings(db_path, target, [f1], run_id="run-1")
+            record_artifact(db_path, "run-1", "plan", "workspace/plan.json", "RUN 1 PLAN")
+
+            # Run 2 queries its own findings and artifacts
+            r2_findings = read_findings(db_path, target, run_id="run-2")
+            self.assertEqual(len(r2_findings), 0)
+
+            r2_artifact = read_artifact(db_path, filepath="workspace/plan.json", run_id="run-2")
+            self.assertIsNone(r2_artifact)
+
+            # update_status under Run 2 does NOT mutate Run 1 findings
+            update_status(db_path, target, "run-2", "dynamic_confirmed")
+            r1_findings = read_findings(db_path, target, run_id="run-1")
+            self.assertEqual(r1_findings[0]["status"], "reported")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    async def test_sqlite_session_service_persistence_and_rehydration(self):
+        """Tests that SqliteSessionService persists session trajectories and allows full rehydration."""
+        from google.adk.sessions.sqlite_session_service import SqliteSessionService
+        temp_dir = tempfile.mkdtemp()
+        try:
+            sessions_db = os.path.join(temp_dir, "sessions.db")
+            session_svc = SqliteSessionService(db_path=sessions_db)
+
+            # 1. Create session with custom state
+            session_id = "test_run_session_1"
+            await session_svc.create_session(
+                app_name=APP_NAME,
+                user_id=USER_ID,
+                session_id=session_id,
+                state={"run_id": "run-xyz", "target_file": "app.py"}
+            )
+
+            # 2. Verify tables created in sessions.db
+            conn = sqlite3.connect(sessions_db)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [t[0] for t in cur.fetchall()]
+            self.assertIn("sessions", tables)
+            self.assertIn("events", tables)
+            conn.close()
+
+            # 3. Rehydrate session and verify state
+            rehydrated = await session_svc.get_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
+            self.assertIsNotNone(rehydrated)
+            self.assertEqual(rehydrated.id, session_id)
+            self.assertEqual(rehydrated.state.get("run_id"), "run-xyz")
+            self.assertEqual(rehydrated.state.get("target_file"), "app.py")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    async def test_read_file_jail_security(self):
+        """Tests directory traversal prevention and boundary enforcement in read_file and StaticOnlyEnvironment."""
         temp_dir = tempfile.mkdtemp()
         try:
             jail_dir = os.path.join(temp_dir, "jail")
@@ -409,19 +641,116 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 f.write("secret")
 
             # 1. No context
-            self.assertIn("No active execution context", read_file("inside.txt"))
+            self.assertIn("No active execution context", await read_file("inside.txt"))
 
-            ctx = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file)
-            tok = current_run_context.set(ctx)
+            # 2. Test StaticOnlyEnvironment directly in single-file mode
+            single_file_env = StaticOnlySandbox(target_path=inside_file)
+            # 2a. Requesting the target file succeeds
+            self.assertEqual((await single_file_env.read_file(Path("inside.txt"))).decode("utf-8"), "content_inside")
+            # 2b. Requesting another file raises PermissionError (never silently returns target file)
+            with self.assertRaises(PermissionError):
+                await single_file_env.read_file(Path("other.txt"))
+            # 2c. Requesting an absolute path outside raises PermissionError
+            with self.assertRaises(PermissionError):
+                await single_file_env.read_file(Path(outside_file))
+
+            # 3. Test StaticOnlyEnvironment in directory mode
+            dir_env = StaticOnlySandbox(target_path=jail_dir)
+            self.assertEqual((await dir_env.read_file(Path("inside.txt"))).decode("utf-8"), "content_inside")
+            with self.assertRaises(PermissionError):
+                await dir_env.read_file(Path("../outside.txt"))
+            with self.assertRaises(PermissionError):
+                await dir_env.read_file(Path(outside_file))
+            with self.assertRaises(FileNotFoundError):
+                await dir_env.read_file(Path("missing.txt"))
+
+            # 4. Test read_file tool with active sandbox attached
+            ctx_sb = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file, sandbox=dir_env)
+            tok = current_run_context.set(ctx_sb)
             try:
-                # 2. Inside jail
-                self.assertEqual(read_file("inside.txt"), "content_inside")
-                # 3. Path traversal escape
-                self.assertIn("Permission denied", read_file("../outside.txt"))
-                # 4. Absolute path outside jail
-                self.assertIn("Permission denied", read_file(outside_file))
-                # 5. Non-existent file
-                self.assertIn("File not found", read_file("missing.txt"))
+                self.assertEqual(await read_file("inside.txt"), "content_inside")
+                self.assertIn("Permission denied", await read_file("../outside.txt"))
+                self.assertIn("Permission denied", await read_file(outside_file))
+                self.assertIn("File not found", await read_file("missing.txt"))
+            finally:
+                current_run_context.reset(tok)
+
+            # 5. Test read_file tool with direct host fallback (no sandbox)
+            ctx_host = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file, sandbox=None)
+            tok = current_run_context.set(ctx_host)
+            try:
+                self.assertEqual(await read_file("inside.txt"), "content_inside")
+                self.assertIn("Permission denied", await read_file("../outside.txt"))
+                self.assertIn("Permission denied", await read_file(outside_file))
+                self.assertIn("File not found", await read_file("missing.txt"))
+            finally:
+                current_run_context.reset(tok)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    async def test_list_files_jail_security(self):
+        """Tests file listing, directory traversal prevention, and failure reporting across sandboxes."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            jail_dir = os.path.join(temp_dir, "jail")
+            os.makedirs(os.path.join(jail_dir, "src"))
+            file_a = os.path.join(jail_dir, "src", "app.py")
+            with open(file_a, "w") as f:
+                f.write("print('app')")
+            file_b = os.path.join(jail_dir, "README.md")
+            with open(file_b, "w") as f:
+                f.write("# README")
+
+            outside_dir = os.path.join(temp_dir, "outside")
+            os.makedirs(outside_dir)
+            with open(os.path.join(outside_dir, "secret.py"), "w") as f:
+                f.write("secret")
+
+            # 1. No context
+            self.assertIn("No active execution context", await list_files())
+
+            # 2. StaticOnlySandbox in directory mode
+            dir_env = StaticOnlySandbox(target_path=jail_dir)
+            files = await dir_env.list_files()
+            self.assertEqual(files, ["README.md", "src/app.py"])
+
+            # 2a. Subdirectory listing
+            sub_files = await dir_env.list_files("src")
+            self.assertEqual(sub_files, ["src/app.py"])
+
+            # 2b. Out-of-scope traversal raises PermissionError
+            with self.assertRaises(PermissionError):
+                await dir_env.list_files("../outside")
+
+            # 2c. Non-existent directory raises FileNotFoundError
+            with self.assertRaises(FileNotFoundError):
+                await dir_env.list_files("non_existent_subdir")
+
+            # 3. StaticOnlySandbox in single-file mode
+            single_env = StaticOnlySandbox(target_path=file_a)
+            self.assertEqual(await single_env.list_files(), ["app.py"])
+            with self.assertRaises(PermissionError):
+                await single_env.list_files("../outside")
+
+            # 4. list_files tool with active sandbox attached
+            ctx_sb = RunContext(jail_dir=jail_dir, db_path="", target_file=file_a, sandbox=dir_env)
+            tok = current_run_context.set(ctx_sb)
+            try:
+                res_json = await list_files()
+                self.assertEqual(json.loads(res_json), ["README.md", "src/app.py"])
+                self.assertIn("Permission denied", await list_files("../outside"))
+                self.assertIn("Directory not found", await list_files("missing"))
+            finally:
+                current_run_context.reset(tok)
+
+            # 5. list_files tool with direct host fallback (no sandbox)
+            ctx_host = RunContext(jail_dir=jail_dir, db_path="", target_file=file_a, sandbox=None)
+            tok = current_run_context.set(ctx_host)
+            try:
+                res_host = await list_files()
+                self.assertEqual(json.loads(res_host), ["README.md", "src/app.py"])
+                self.assertIn("Permission denied", await list_files("../outside"))
+                self.assertIn("Directory not found", await list_files("missing"))
             finally:
                 current_run_context.reset(tok)
         finally:
@@ -472,7 +801,9 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         static_sb = build_sandbox({"type": "static-only"})
         self.assertIsInstance(static_sb, StaticOnlySandbox)
         await static_sb.preflight()
-        self.assertIn("SANDBOX-UNAVAILABLE", await static_sb.execute("whoami"))
+        res_st = await static_sb.execute("whoami")
+        self.assertEqual(res_st.exit_code, 127)
+        self.assertIn("SANDBOX-UNAVAILABLE", res_st.stderr)
 
         class CustomSeam:
             def __init__(self, target_path: str = "", **_): pass
@@ -540,22 +871,21 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             # Mocked containerized gVisor execution test
             gv = GvisorSandbox(container_tool="docker")
             gv._run_cmd = MagicMock()
-            # 1. create -> 0, start -> 0
             gv._run_cmd.side_effect = [
                 (0, "container_id"),
                 (0, ""),
-                (0, "hello gvisor\n"),
                 (0, "patch applied\n"),
                 (0, ""),
             ]
-            out_exec = await gv.execute("echo hello")
-            self.assertIn("hello gvisor", out_exec)
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="hello gvisor\n", stderr="")):
+                out_exec = await gv.execute("echo hello")
+                self.assertEqual(out_exec.exit_code, 0)
+                self.assertIn("hello gvisor", out_exec.stdout)
             out_patch = await gv.apply_patch("diff_text")
             self.assertIn("patch applied", out_patch)
             await gv.aclose()
 
         # 3. Microsandbox KVM access check on Linux
-        from core.sandboxes.microsandbox import MicrosandboxSandbox
         from microsandbox import ImageNotFoundError
         with patch("sys.platform", "linux"):
             with patch("os.access", return_value=False):
@@ -593,6 +923,589 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(kwargs_create.get("pull_policy"), PullPolicy.NEVER)
                     self.assertEqual(kwargs_create.get("image"), "mantis-sandbox:latest")
 
+    async def test_gce_sandbox_lifecycle_and_security_hardening(self):
+        """Tests GceEnvironment dispatch, security hardening flags, IAP tunneling, host isolation, and execution."""
+        # 1. Dispatch via build_sandbox
+        gce_sb = build_sandbox({
+            "type": "gce",
+            "options": {
+                "project": "test-project-123",
+                "zone": "us-west1-b",
+                "source_machine_image": "mantis-golden-image-v1",
+                "subnet": "mantis-isolated-subnet",
+                "timeout_seconds": 45,
+            }
+        })
+        self.assertIsInstance(gce_sb, GceSandbox)
+        self.assertEqual(gce_sb.project, "test-project-123")
+        self.assertEqual(gce_sb.zone, "us-west1-b")
+        self.assertEqual(gce_sb.source_machine_image, "mantis-golden-image-v1")
+        self.assertEqual(gce_sb.subnet, "mantis-isolated-subnet")
+
+        # 2. Preflight validations
+        # 2a. Fails when gcloud binary is missing
+        with patch("shutil.which", return_value=None):
+            with patch("os.path.exists", return_value=False):
+                sb_no_bin = GceSandbox(gcloud_bin="missing_gcloud_xyz")
+                with self.assertRaises(ValueError) as ctx_err:
+                    await sb_no_bin.preflight()
+                self.assertIn("requires 'missing_gcloud_xyz' on PATH", str(ctx_err.exception))
+
+        # 2b. Fails when GCP project is not specified
+        with patch.dict(os.environ, {}, clear=True):
+            sb_no_proj = GceSandbox(project="", gcloud_bin="/usr/bin/gcloud")
+            sb_no_proj._run_gcloud = MagicMock(return_value=(1, "unset"))
+            with patch("shutil.which", return_value="/usr/bin/gcloud"):
+                with self.assertRaises(ValueError) as ctx_proj:
+                    await sb_no_proj.preflight()
+                self.assertIn("GCP project not specified", str(ctx_proj.exception))
+
+        # 2c. Fails when no active gcloud authentication
+        sb_auth_fail = GceSandbox(project="test-proj", gcloud_bin="/usr/bin/gcloud")
+        sb_auth_fail._run_gcloud = MagicMock(return_value=(0, ""))
+        with patch("shutil.which", return_value="/usr/bin/gcloud"):
+            with self.assertRaises(RuntimeError) as ctx_auth:
+                await sb_auth_fail.preflight()
+            self.assertIn("No active Google Cloud authentication found", str(ctx_auth.exception))
+
+        # 2d. Preflight passes when active account is found
+        sb_pass = GceSandbox(project="test-proj", gcloud_bin="/usr/bin/gcloud")
+        sb_pass._run_gcloud = MagicMock(return_value=(0, "user@example.com\n"))
+        with patch("shutil.which", return_value="/usr/bin/gcloud"):
+            await sb_pass.preflight()
+
+        # 3. Instance Creation & Security Invariants Verification
+        created_cmds = []
+        def mock_run_gcloud(argv, **kwargs):
+            cmd_str = " ".join(argv)
+            created_cmds.append(argv)
+            if "instances create" in cmd_str:
+                return 0, "Created [https://www.googleapis.com/compute/v1/projects/...]."
+            elif "compute ssh" in cmd_str:
+                return 0, "workspace ready"
+            elif "instances delete" in cmd_str:
+                return 0, "Deleted instance"
+            return 0, "ok"
+
+        gce_test = GceSandbox(
+            project="sec-proj",
+            zone="us-central1-a",
+            image="projects/sec-proj/global/images/dev-disk-v1",
+            subnet="mantis-isolated-subnet",
+            no_service_account=True,
+            no_external_ip=True,
+            tunnel_through_iap=True,
+        )
+        gce_test._run_gcloud = MagicMock(side_effect=mock_run_gcloud)
+
+        await gce_test._ensure()
+        self.assertTrue(gce_test.is_initialized)
+
+        # Inspect the 'instances create' command
+        create_argv = next(cmd for cmd in created_cmds if cmd[0] == "compute" and cmd[1] == "instances" and cmd[2] == "create")
+        self.assertIn("--no-service-account", create_argv)
+        self.assertIn("--no-scopes", create_argv)
+        self.assertIn("--no-address", create_argv)
+        self.assertIn("--image=projects/sec-proj/global/images/dev-disk-v1", create_argv)
+        self.assertIn("--subnet=mantis-isolated-subnet", create_argv)
+        self.assertIn("--shielded-secure-boot", create_argv)
+        self.assertIn("--shielded-vtpm", create_argv)
+        self.assertIn("--shielded-integrity-monitoring", create_argv)
+        self.assertIn("--metadata=disable-legacy-endpoints=TRUE,block-project-ssh-keys=TRUE", create_argv)
+        self.assertNotIn("--maintenance-policy=TERMINATE", create_argv)
+        self.assertIn("--max-run-duration=30m", create_argv)
+        self.assertIn("--instance-termination-action=DELETE", create_argv)
+        self.assertIn("--labels=mantis-sandbox=true,created-by=mantis", create_argv)
+
+        # 4. Command Execution & Host Isolation (shell=False)
+        with patch("subprocess.run") as mock_subproc:
+            mock_subproc.return_value = MagicMock(returncode=0, stdout="guest_output\n", stderr="")
+            res = await gce_test.execute("echo 'hello payload'")
+            self.assertEqual(res.exit_code, 0)
+            self.assertEqual(res.stdout, "guest_output\n")
+            self.assertFalse(res.timed_out)
+
+            # Verify subprocess.run call on host has shell=False and --tunnel-through-iap
+            mock_subproc.assert_called_once()
+            called_args, called_kwargs = mock_subproc.call_args
+            self.assertFalse(called_kwargs.get("shell", True))
+            host_argv = called_args[0]
+            self.assertIn("--tunnel-through-iap", host_argv)
+            self.assertIn("--command", host_argv)
+            self.assertIn("cd /workspace && echo 'hello payload'", host_argv)
+
+        # 5. Stdin Streaming Patch Application (Unbounded by argv)
+        with patch("subprocess.run") as mock_subproc_patch:
+            mock_subproc_patch.return_value = MagicMock(returncode=0, stdout="patch applied cleanly\n", stderr="")
+            out_patch = await gce_test.apply_patch("diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
+            self.assertIn("patch applied cleanly", out_patch)
+            mock_subproc_patch.assert_called_once()
+            self.assertEqual(mock_subproc_patch.call_args[1].get("input"), b"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
+
+        # 6. Base64 File Read & Stdin Streaming File Write (Untruncated Large File Test > 20,000 bytes)
+        import base64
+        large_payload = b"SECURE_VULN_PAYLOAD_LINE_" * 800  # 20,000 bytes (> 16,000 char MAX_OUTPUT limit)
+        b64_large = base64.b64encode(large_payload)
+        with patch("subprocess.run") as mock_subproc_read:
+            mock_subproc_read.return_value = MagicMock(returncode=0, stdout=b64_large, stderr=b"")
+            read_bytes = await gce_test.read_file(Path("src/don't_break.py"))  # tests shlex.quote with apostrophe
+            self.assertEqual(len(read_bytes), 20000)
+            self.assertEqual(read_bytes, large_payload)
+
+        with patch("subprocess.run") as mock_subproc_write:
+            mock_subproc_write.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            await gce_test.write_file(Path("src/config.json"), '{"env": "test"}')
+            mock_subproc_write.assert_called_once()
+            self.assertEqual(mock_subproc_write.call_args[1].get("input"), b'{"env": "test"}')
+
+        # 7. File Listing
+        with patch("subprocess.run") as mock_subproc_list:
+            mock_subproc_list.return_value = MagicMock(returncode=0, stdout="src/app.py\nsrc/utils.py\n", stderr="")
+            file_list = await gce_test.list_files("src")
+            self.assertEqual(file_list, ["src/app.py", "src/utils.py"])
+
+        # 8. Teardown & Ephemeral Cleanup
+        await gce_test.close()
+        self.assertFalse(gce_test.is_initialized)
+        delete_argv = next(cmd for cmd in created_cmds if cmd[0] == "compute" and cmd[1] == "instances" and cmd[2] == "delete")
+        self.assertIn(gce_test.instance_name, delete_argv)
+        self.assertIn("--quiet", delete_argv)
+
+        # 9. Provisioning Failure Cleanup (No Deadlock on Error Path)
+        gce_fail = GceSandbox(project="sec-proj", zone="us-central1-a")
+        gce_fail._run_gcloud = MagicMock(side_effect=[(1, "ERROR: Quota exceeded"), (0, "Deleted")])
+        with self.assertRaises(RuntimeError) as ctx_fail:
+            await gce_fail._ensure()
+        self.assertIn("Failed to create GCE VM instance", str(ctx_fail.exception))
+        self.assertFalse(gce_fail.is_initialized)
+
+        # 10. Active Isolation Verification Failure (Fail-Closed on DNS/Network/IAM Leaks)
+        # 10a. Statically verify that ISOLATION_PROBE_SCRIPT compiles with zero syntax errors
+        code_obj = compile(ISOLATION_PROBE_SCRIPT, "<probe>", "exec")
+        self.assertIsNotNone(code_obj)
+
+        # 10b. Runtime audit failure (exit code 42)
+        gce_iso_fail = GceSandbox(project="sec-proj", zone="us-central1-a", verify_isolation=True)
+        gce_iso_fail._run_gcloud = MagicMock(side_effect=[
+            (0, "Created instance"),
+            (0, "mkdir ready"),
+            (42, "ISOLATION_FAILURE: DNS: Public DNS recursion resolved example.com to 93.184.216.34 (attach Cloud DNS Response Policy *. -> 0.0.0.0)"),
+            (0, "Deleted instance"),
+        ])
+        with self.assertRaises(RuntimeError) as ctx_iso:
+            await gce_iso_fail._ensure()
+        self.assertIn("failed security isolation audit", str(ctx_iso.exception))
+        self.assertIn("Public DNS recursion resolved", str(ctx_iso.exception))
+        self.assertFalse(gce_iso_fail.is_initialized)
+
+        # 11. Probe Execution Failure (e.g. python3 missing from golden image)
+        gce_probe_err = GceSandbox(project="sec-proj", zone="us-central1-a", verify_isolation=True)
+        gce_probe_err._run_gcloud = MagicMock(side_effect=[
+            (0, "Created instance"),
+            (0, "mkdir ready"),
+            (127, "bash: python3: command not found"),
+            (0, "Deleted instance"),
+        ])
+        with self.assertRaises(RuntimeError) as ctx_probe_err:
+            await gce_probe_err._ensure()
+        self.assertIn("failed to execute isolation probe (ensure python3 is installed", str(ctx_probe_err.exception))
+        self.assertFalse(gce_probe_err.is_initialized)
+
+    def test_isolation_probe_script_syntax_and_ast_compilation(self):
+        """Tests that ISOLATION_PROBE_SCRIPT compiles cleanly and parses as valid Python AST."""
+        import ast
+        from core.environments.gce_env import ISOLATION_PROBE_SCRIPT
+
+        # Assert clean compile without SyntaxError
+        code_obj = compile(ISOLATION_PROBE_SCRIPT, "<isolation_probe>", "exec")
+        self.assertIsNotNone(code_obj)
+
+        # Assert valid AST tree structure
+        tree = ast.parse(ISOLATION_PROBE_SCRIPT)
+        self.assertIsInstance(tree, ast.Module)
+        self.assertGreater(len(tree.body), 0)
+
+    async def test_gce_preflight_machine_image_and_no_service_account_mutual_exclusion(self):
+        """Tests that GceEnvironment preflight rejects source_machine_image when no_service_account=True."""
+        gce_invalid = GceSandbox(
+            project="test-proj",
+            zone="us-central1-a",
+            source_machine_image="projects/test-proj/global/machineImages/my-image",
+            no_service_account=True,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            await gce_invalid.preflight()
+        self.assertIn("GCP Machine Images ('source_machine_image') lock the source VM's IAM service account", str(ctx.exception))
+        self.assertIn("capture a custom disk image instead", str(ctx.exception))
+
+    async def test_research_tools_write_file_sandbox_sync_error_logging(self):
+        """Tests that write_file handles and logs sandbox sync failures gracefully without NameError."""
+        import logging
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_sync_log.db")
+        init_db(db_file)
+        try:
+            mock_sandbox = MagicMock()
+            mock_sandbox.write_file = AsyncMock(side_effect=RuntimeError("IAP SSH connection reset"))
+            ctx = RunContext(
+                jail_dir=temp_dir,
+                db_path=db_file,
+                target_file="app.py",
+                run_id="test-log-run",
+                sandbox=mock_sandbox,
+            )
+            tok = current_run_context.set(ctx)
+            try:
+                with self.assertLogs("tools.research_tools", level=logging.DEBUG) as cm:
+                    res = await write_file("workspace/plan.json", '{"pass_number": 1}')
+                    self.assertIn("SUCCESS: Recorded artifact", res)
+                    self.assertTrue(any("Failed to sync workspace artifact" in log_line for log_line in cm.output))
+            finally:
+                current_run_context.reset(tok)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_database_lineage_and_signature_persistence_and_inheritance(self):
+        """Tests that findings preserve signature/lineage_id and inherit lineage across runs."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_lineage.db")
+        try:
+            init_db(db_file)
+
+            # Pass 1: Initial discovery
+            f1 = {
+                "title": "Path Traversal in /view",
+                "severity": "HIGH",
+                "description": "User input passed to open() directly",
+                "line_numbers": [42, 43],
+                "cwe": "CWE-22",
+                "remediation": "Validate path containment using os.path.abspath",
+            }
+            write_findings(db_file, "src/handler.py", [f1], run_id="run-pass-1", status="reported")
+
+            findings_p1 = read_findings(db_file, filepath="src/handler.py", run_id="run-pass-1")
+            self.assertEqual(len(findings_p1), 1)
+            sig1 = findings_p1[0]["signature"]
+            lineage1 = findings_p1[0]["lineage_id"]
+            self.assertTrue(sig1)
+            self.assertTrue(lineage1)
+            self.assertEqual(findings_p1[0]["cwe"], "CWE-22")
+
+            # Pass 2: Subsequent discovery of the same bug in a new run -> inherits lineage1!
+            f2 = {
+                "title": "Path Traversal in /view",
+                "severity": "HIGH",
+                "description": "User input passed to open() directly",
+                "line_numbers": [42, 43],
+                "cwe": "CWE-22",
+            }
+            write_findings(db_file, "src/handler.py", [f2], run_id="run-pass-2", status="dynamic_confirmed")
+
+            findings_p2 = read_findings(db_file, filepath="src/handler.py", run_id="run-pass-2")
+            self.assertEqual(len(findings_p2), 1)
+            self.assertEqual(findings_p2[0]["signature"], sig1)
+            self.assertEqual(findings_p2[0]["lineage_id"], lineage1)
+
+            # Query historical lineage across all runs
+            history = query_historical_lineage(db_file, lineage_id=lineage1)
+            self.assertEqual(len(history), 2)
+            self.assertEqual(history[0]["run_id"], "run-pass-1")
+            self.assertEqual(history[1]["run_id"], "run-pass-2")
+
+            # Tool query_lineage output
+            ctx = RunContext(jail_dir=temp_dir, db_path=db_file, run_id="run-pass-2")
+            tok = current_run_context.set(ctx)
+            try:
+                res = query_lineage(lineage_id=lineage1)
+                self.assertIn("Lineage History (2 record(s))", res)
+                self.assertIn("CWE-22", res)
+            finally:
+                current_run_context.reset(tok)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_stable_lineage_matching_across_title_phrasing_and_line_shifts(self):
+        """Tests that backticks, title paraphrasing, and line insertions all resolve to the same lineage."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_stable_sig.db")
+        try:
+            init_db(db_file)
+
+            # 1. First run: "SQL Injection in `get_user`", line 9
+            f1 = {
+                "title": "SQL Injection in `get_user`",
+                "severity": "HIGH",
+                "description": "User input passed to database query in get_user()",
+                "line_numbers": [9],
+                "cwe": "CWE-89",
+            }
+            write_findings(db_file, "app.py", [f1], run_id="run-1")
+            r1 = read_findings(db_file, filepath="app.py", run_id="run-1")
+            lineage_root = r1[0]["lineage_id"]
+            self.assertTrue(lineage_root)
+
+            # 2. Second run: "SQL Injection in get_user" (no backticks), line 9
+            f2 = {
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "description": "User input passed to database query in get_user()",
+                "line_numbers": [9],
+            }
+            write_findings(db_file, "app.py", [f2], run_id="run-2")
+            r2 = read_findings(db_file, filepath="app.py", run_id="run-2")
+            self.assertEqual(r2[0]["lineage_id"], lineage_root)
+
+            # 3. Third run: "SQL Injection in get_user", line 11 (two lines added above it)
+            f3 = {
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "description": "User input passed to database query in get_user()",
+                "line_numbers": [11],
+            }
+            write_findings(db_file, "app.py", [f3], run_id="run-3")
+            r3 = read_findings(db_file, filepath="app.py", run_id="run-3")
+            self.assertEqual(r3[0]["lineage_id"], lineage_root)
+
+            # 4. Fourth run: LLM rephrases: "SQL Injection via Unsanitized Query Parameter" (in get_user)
+            f4 = {
+                "title": "SQL Injection via Unsanitized Query Parameter",
+                "severity": "CRITICAL",
+                "description": "Unsanitized parameter in function get_user allows SQL injection",
+                "line_numbers": [11],
+            }
+            write_findings(db_file, "app.py", [f4], run_id="run-4")
+            r4 = read_findings(db_file, filepath="app.py", run_id="run-4")
+            self.assertEqual(r4[0]["lineage_id"], lineage_root)
+
+            # 5. Fifth run: LLM rephrases: "SQL Injection via Unsanitized User Input" (in get_user)
+            f5 = {
+                "title": "SQL Injection via Unsanitized User Input",
+                "severity": "HIGH",
+                "description": "User input passed directly into query string in get_user()",
+                "line_numbers": [15],
+            }
+            write_findings(db_file, "app.py", [f5], run_id="run-5")
+            r5 = read_findings(db_file, filepath="app.py", run_id="run-5")
+            self.assertEqual(r5[0]["lineage_id"], lineage_root)
+
+            # Query lineage history -> exactly 5 occurrences under the same lineage!
+            history = query_historical_lineage(db_file, lineage_id=lineage_root)
+            self.assertEqual(len(history), 5)
+
+            # 6. NEGATIVE CONTROL: Distinct function in same file must NOT share lineage!
+            f_distinct = {
+                "title": "SQL Injection in list_orders",
+                "severity": "HIGH",
+                "description": "User input passed to database query in list_orders()",
+                "line_numbers": [42],
+                "cwe": "CWE-89",
+            }
+            write_findings(db_file, "app.py", [f_distinct], run_id="run-6")
+            r6 = read_findings(db_file, filepath="app.py", run_id="run-6")
+            distinct_lineage = r6[0]["lineage_id"]
+            self.assertNotEqual(distinct_lineage, lineage_root)
+
+            # Assert 2 distinct lineages on app.py
+            all_rows = read_findings(db_file, filepath="app.py")
+            unique_lineages = set(r["lineage_id"] for r in all_rows)
+            self.assertEqual(len(unique_lineages), 2)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_synthetic_dataset_lineage_resolution_benchmark(self):
+        """Tests that synthetic dataset negative controls have 0 false merges in lineage resolution."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_eval_lineage.db")
+        try:
+            init_db(db_file)
+            dataset_path = os.path.join(os.path.dirname(__file__), "evals", "synthetic_dataset.json")
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                syn = json.load(f)
+
+            id_to_finding = {f["id"]: f for f in syn["findings"]}
+
+            # Write findings in separate passes simulating successive discoveries
+            for f in syn["findings"]:
+                write_findings(db_file, f.get("filepath", ""), [f], run_id=f"run-{f['id']}")
+
+            # Verify negative controls have 0 false merges
+            for cname, cinfo in syn["ground_truth_clusters"].items():
+                fids = cinfo["finding_ids"]
+                relation = cinfo.get("relation", "DUPLICATE")
+                if relation == "DISTINCT":
+                    # Distinct findings must NEVER share a lineage_id
+                    lineages = []
+                    for fid in fids:
+                        fobj = id_to_finding[fid]
+                        rows = read_findings(db_file, filepath=fobj["filepath"], run_id=f"run-{fid}")
+                        self.assertEqual(len(rows), 1)
+                        lineages.append(rows[0]["lineage_id"])
+                    self.assertEqual(
+                        len(set(lineages)),
+                        len(fids),
+                        f"Safety violation: Negative control cluster '{cname}' had false merge: {lineages}",
+                    )
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_filepath_directory_isolation_and_advisory_scoping(self):
+        """Tests that api/app.py and admin/app.py maintain strict directory isolation in lineage and advisory."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_path_isolation.db")
+        try:
+            init_db(db_file)
+
+            # 1. Finding in api/app.py
+            f_api = {
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "description": "User input passed to database query in get_user()",
+                "line_numbers": [10],
+                "cwe": "CWE-89",
+            }
+            write_findings(db_file, "api/app.py", [f_api], run_id="run-api")
+
+            # 2. Same-named function and vulnerability in admin/app.py
+            f_admin = {
+                "title": "SQL Injection in get_user",
+                "severity": "CRITICAL",
+                "description": "Admin query string concatenation in get_user()",
+                "line_numbers": [10],
+                "cwe": "CWE-89",
+            }
+            write_findings(db_file, "admin/app.py", [f_admin], run_id="run-admin")
+
+            # 3. Same file in a subsequent pass reported with absolute path /repo/api/app.py under target /repo
+            f_api_abs = {
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "description": "User input passed to database query in get_user()",
+                "line_numbers": [10],
+                "cwe": "CWE-89",
+                "filepath": "/repo/api/app.py",
+            }
+            write_findings(db_file, "/repo", [f_api_abs], run_id="run-api-abs")
+
+            # Assert absolute /repo/api/app.py inherits lineage from api/app.py
+            r_api_abs = read_findings(db_file, filepath="api/app.py", run_id="run-api-abs")
+            self.assertEqual(len(r_api_abs), 1)
+            self.assertEqual(r_api_abs[0]["filepath"], "api/app.py")
+
+            # Assert 2 distinct lineages overall (api/app.py unified, admin/app.py isolated)
+            r_api = read_findings(db_file, filepath="api/app.py", run_id="run-api")
+            r_admin = read_findings(db_file, filepath="admin/app.py", run_id="run-admin")
+            self.assertEqual(len(r_api), 1)
+            self.assertEqual(len(r_admin), 1)
+            self.assertEqual(r_api_abs[0]["lineage_id"], r_api[0]["lineage_id"])
+            self.assertNotEqual(r_api[0]["lineage_id"], r_admin[0]["lineage_id"])
+            self.assertNotEqual(r_api[0]["signature"], r_admin[0]["signature"])
+
+            # Assert advisory scoping is strictly isolated
+            guidance_api = query_security_guidance(db_file, filepath="api/app.py")
+            self.assertEqual(len(guidance_api["confirmed_vulnerabilities"]), 2)
+            self.assertEqual(guidance_api["confirmed_vulnerabilities"][0]["filepath"], "api/app.py")
+
+            guidance_admin = query_security_guidance(db_file, filepath="admin/app.py")
+            self.assertEqual(len(guidance_admin["confirmed_vulnerabilities"]), 1)
+            self.assertEqual(guidance_admin["confirmed_vulnerabilities"][0]["filepath"], "admin/app.py")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_query_security_guidance_aggregation(self):
+        """Tests that query_security_guidance and get_security_guidance aggregate full advisory context."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_guidance.db")
+        try:
+            init_db(db_file)
+
+            # 1. Threat Model
+            record_artifact(
+                db_file,
+                run_id="run-test",
+                artifact_type="threat_model",
+                filepath="workspace/kb/THREAT_MODEL.md",
+                content="### Trust Boundaries\n- Zone 1: Public Internet\n- Zone 2: Vault Worker Backend",
+            )
+
+            # 2. Confirmed Vulnerability with verified patch
+            confirmed_f = {
+                "title": "OS Command Injection in /backup",
+                "severity": "CRITICAL",
+                "description": "Unsanitized user parameter passed to os.system",
+                "cwe": "CWE-78",
+                "remediation": "Use subprocess.run(['tar', ...]) without shell=True",
+                "status": "dynamic_confirmed",
+                "patch_status": "VERIFIED_SECURE",
+                "patch_diff": "--- a/app.py\n+++ b/app.py\n@@ -10 +10 @@\n-os.system(cmd)\n+subprocess.run(['tar', target])",
+            }
+            write_findings(db_file, "app.py", [confirmed_f], run_id="run-test")
+
+            # 3. Triaged False Positive
+            fp_f = {
+                "title": "Potential SSRF in /metrics",
+                "severity": "LOW",
+                "description": "Hardcoded metrics fetch endpoint",
+                "cwe": "CWE-918",
+                "reasoning": "Endpoint is fixed to loopback 127.0.0.1:9090 and cannot be manipulated by users",
+                "status": "false_positive",
+            }
+            write_findings(db_file, "app.py", [fp_f], run_id="run-test")
+
+            # 4. Learning Invariant
+            record_learning(
+                db_file,
+                run_id="run-test",
+                category="SANDBOX_ISOLATION",
+                learning="All sandbox file operations must validate containment within jail_dir",
+                tags=["jail", "security"],
+            )
+
+            # Query guidance
+            guidance = query_security_guidance(db_file, filepath="app.py", run_id="run-test")
+            self.assertEqual(guidance["filepath"], "app.py")
+            self.assertIn("Vault Worker Backend", guidance["threat_model"])
+            self.assertEqual(len(guidance["confirmed_vulnerabilities"]), 1)
+            self.assertEqual(len(guidance["false_positives"]), 1)
+            self.assertEqual(len(guidance["learned_invariants"]), 1)
+
+            # Test tool invocation
+            ctx = RunContext(jail_dir=temp_dir, db_path=db_file, target_file="app.py", run_id="run-test")
+            tok = current_run_context.set(ctx)
+            try:
+                summary = get_security_guidance("app.py")
+                self.assertIn("# Security Advisory & Development Guidance for: app.py", summary)
+                self.assertIn("Zone 2: Vault Worker Backend", summary)
+                self.assertIn("OS Command Injection in /backup", summary)
+                self.assertIn("Verified Patch Diff", summary)
+                self.assertIn("Potential SSRF in /metrics", summary)
+                self.assertIn("SANDBOX_ISOLATION", summary)
+            finally:
+                current_run_context.reset(tok)
+
+            # Test CLI script execution
+            import subprocess
+            import sys
+            cli_script = os.path.join(os.path.dirname(__file__), "scripts", "advise.py")
+            cli_res = subprocess.run(
+                [sys.executable, cli_script, "--file=app.py", f"--db={db_file}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("# Security Advisory & Development Guidance for: app.py", cli_res.stdout)
+            self.assertIn("OS Command Injection in /backup", cli_res.stdout)
+
+            cli_json = subprocess.run(
+                [sys.executable, cli_script, "--file=app.py", f"--db={db_file}", "--json"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed_json = json.loads(cli_json.stdout)
+            self.assertEqual(parsed_json["filepath"], "app.py")
+            self.assertEqual(len(parsed_json["confirmed_vulnerabilities"]), 1)
+        finally:
+            shutil.rmtree(temp_dir)
 
     def test_get_llm_kwargs_resolution_and_precedence(self):
         """Tests LLM resolution precedence for model_id and api_base across all tiers."""
@@ -604,6 +1517,11 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["vertex_project"], "proj-1")
             self.assertEqual(kwargs["vertex_location"], "loc-1")
             self.assertNotIn("api_base", kwargs)
+
+        # 1b. Default location falls back to global
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-1"}, clear=True):
+            mid, kwargs = get_llm_kwargs()
+            self.assertEqual(kwargs["vertex_location"], "global")
 
         # 2. MODEL_ID environment variable
         with patch.dict(os.environ, {"MODEL_ID": "openai/gpt-4o", "VERTEXAI_PROJECT": "proj-1"}, clear=True):
@@ -790,7 +1708,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             f2 = p_dir / "utils.py"
             f2.write_text("def helper(): pass")
 
-            db_file = p_dir / "findings.db"
+            db_file = p_dir / "knowledge.db"
             db_file.write_bytes(b"SQLite format 3\x00")
 
             discovered = discover_files(p_dir, db_path=str(db_file))
@@ -816,13 +1734,25 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
 
         # Test execute_sub_task dynamic_confirmed gating when sandbox_executed is False vs True
         workflow_path = os.path.join(os.path.dirname(__file__), "workflow.json")
-        queue = [
+        full_queue = [
+            "History extracted.",
+            "Structural index built.",
+            "Summary generated.",
+            "Architecture KB created.",
+            "Threat model created.",
+            "Plan created.",
             "Analysis done.",
+            "Findings deduplicated.",
             json.dumps({"route": "confirmed", "reason": "Analysis done."}),
+            json.dumps({"route": "viable", "reason": "Exploit viable."}),
             json.dumps({"route": "success", "reason": "Exploit verified."}),
+            "Exploit chained.",
             "Patch applied",
             "Score: 90",
+            "Learnings reflected.",
+            "Report generated.",
         ]
+        queue = list(full_queue)
 
         class ScriptedLlm(BaseLlm):
             async def generate_content_async(self, llm_request, stream: bool = False):
@@ -868,13 +1798,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 current_run_context.reset(tok)
 
             # 2. When sandbox_executed is True in RunContext, finding status is elevated to dynamic_confirmed
-            queue = [
-                "Analysis done.",
-                json.dumps({"route": "confirmed", "reason": "Analysis done."}),
-                json.dumps({"route": "success", "reason": "Exploit verified."}),
-                "Patch applied",
-                "Score: 90",
-            ]
+            queue = list(full_queue)
             run_id_dyn = "run-gated-dyn"
             write_findings(db_path, target_file, [f], run_id=run_id_dyn)
             ctx_dyn = RunContext(jail_dir=temp_dir, db_path=db_path, target_file=target_file, run_id=run_id_dyn, sandbox_executed=True)
@@ -895,13 +1819,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 current_run_context.reset(tok)
 
             # 3. When current_run_context is None (no context), finding status is NOT elevated to dynamic_confirmed
-            queue = [
-                "Analysis done.",
-                json.dumps({"route": "confirmed", "reason": "Analysis done."}),
-                json.dumps({"route": "success", "reason": "Exploit verified."}),
-                "Patch applied",
-                "Score: 90",
-            ]
+            queue = list(full_queue)
             run_id_noctx = "run-gated-noctx"
             write_findings(db_path, target_file, [f], run_id=run_id_noctx)
             err = await execute_sub_task(
@@ -919,7 +1837,605 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             await runner.close()
             shutil.rmtree(temp_dir)
 
+    async def test_domain_tools_and_database_persistence(self):
+        """Tests all domain tools for planning, threat modeling, summarizing, chaining, learning, deduplication, and reporting."""
+        from tools.research_tools import (
+            record_plan,
+            record_threat_model,
+            record_summary,
+            record_exploit_chain,
+            record_learning,
+            dedupe_findings,
+            generate_report,
+            write_file,
+            score_risk,
+        )
+        from core.database import read_learnings, read_risk_scores
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "test_domain.db")
+            init_db(db_path)
+            run_id = "test-domain-run"
+            ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file="app.py", run_id=run_id)
+            tok = current_run_context.set(ctx)
+            try:
+                # 1. record_plan, verify no disk file created, read_file('workspace/plan.json'), get_plan()
+                res_plan = record_plan({
+                    "pass_number": 1,
+                    "investigations": [
+                        {"title": "Auth review", "target_files": ["auth.py"], "focus_areas": ["IDOR"]}
+                    ],
+                    "rationale": "Audit auth first."
+                })
+                self.assertIn("SUCCESS", res_plan)
+                # Confirm no physical file was written to disk (DB-only storage)
+                self.assertFalse(os.path.exists(os.path.join(temp_dir, "workspace", "plan.json")))
+                read_plan_text = await read_file("workspace/plan.json")
+                self.assertIn("Auth review", read_plan_text)
+                self.assertIn("auth.py", get_plan())
+
+                # Invalid plan schema raises clean error
+                bad_plan = record_plan({"invalid_field": 123})
+                self.assertIn("ERROR", bad_plan)
+
+                # 2. record_threat_model, read_file('workspace/kb/THREAT_MODEL.md'), get_threat_model()
+                res_tm = record_threat_model({
+                    "threat_actors": ["Anonymous Remote Attacker"],
+                    "trust_boundaries": ["HTTP Request Gateway"],
+                    "entry_points": ["/api/v1/auth/login"],
+                    "key_risks": ["Account takeover"]
+                })
+                self.assertIn("SUCCESS", res_tm)
+                read_tm_text = await read_file("workspace/kb/THREAT_MODEL.md")
+                self.assertIn("Anonymous Remote Attacker", read_tm_text)
+                self.assertIn("HTTP Request Gateway", get_threat_model())
+
+                # 3. record_summary, read_file('mantis-summary.md'), get_summary()
+                res_sum = record_summary({
+                    "overview": "Authentication service backend.",
+                    "key_modules": ["auth", "models", "api"],
+                    "tech_stack": ["Python", "FastAPI", "PostgreSQL"]
+                })
+                self.assertIn("SUCCESS", res_sum)
+                read_sum_text = await read_file("mantis-summary.md")
+                self.assertIn("Authentication service backend.", read_sum_text)
+                self.assertIn("FastAPI", get_summary())
+
+                # 4. record_exploit_chain, read_file('workspace/chains/...')
+                res_chain = record_exploit_chain({
+                    "chain_title": "auth-bypass-to-rce",
+                    "finding_titles": ["IDOR in user profile", "Unsafe deserialization"],
+                    "attack_path": "Abuse IDOR to gain admin session, then trigger pickle payload.",
+                    "combined_impact": "Full Remote Code Execution as root."
+                })
+                self.assertIn("SUCCESS", res_chain)
+                read_chain_text = await read_file("workspace/chains/auth-bypass-to-rce.json")
+                self.assertIn("Full Remote Code Execution", read_chain_text)
+
+                # 5. record_learning
+                res_learn = record_learning({
+                    "category": "false_positive_filter",
+                    "learning": "Framework middleware validates CSRF token globally.",
+                    "tags": ["csrf", "fastapi"]
+                })
+                self.assertIn("SUCCESS", res_learn)
+                learnings = read_learnings(db_path, run_id=run_id)
+                self.assertEqual(len(learnings), 1)
+                self.assertEqual(learnings[0]["category"], "false_positive_filter")
+
+                # 6. dedupe_findings
+                f1 = VulnerabilityFinding(title="SQL Injection A", severity="High", description="raw query A", line_numbers=[10])
+                f2 = VulnerabilityFinding(title="SQL Injection B", severity="High", description="raw query B", line_numbers=[12])
+                write_findings(db_path, "app.py", [f1, f2], run_id=run_id)
+                res_dedupe = dedupe_findings(
+                    primary_title="SQL Injection A",
+                    duplicate_titles=["SQL Injection B"],
+                    reason="Identical vulnerability root cause."
+                )
+                self.assertIn("SUCCESS", res_dedupe)
+                findings = read_findings(db_path, "app.py", run_id=run_id)
+                self.assertEqual(len(findings), 2)
+                f2_updated = [f for f in findings if f["title"] == "SQL Injection B"][0]
+                self.assertEqual(f2_updated["status"], "duplicate_merged")
+
+                # 7. generate_report
+                res_rpt = generate_report({
+                    "executive_summary": "Comprehensive security review identified 1 critical chain.",
+                    "critical_findings_count": 1,
+                    "recommendations": ["Fix IDOR check in auth.py", "Migrate from pickle to JSON"]
+                })
+                self.assertIn("SUCCESS", res_rpt)
+
+                # 8. report_findings directly with canonical findings and alias keys
+                from tools.research_tools import report_findings
+                res_rf1 = report_findings({
+                    "findings": [{
+                        "filepath": "src/crypto.py",
+                        "title": "Hardcoded Secret Key",
+                        "severity": "high",
+                        "description": "AES key hardcoded in source.",
+                        "line_numbers": [88],
+                        "mitigation": "Load from environment variables."
+                    }]
+                })
+                self.assertIn("SUCCESS: Saved 1 finding", res_rf1)
+
+                res_rf2 = report_findings({
+                    "vulnerabilities": [{
+                        "filepath": "src/api.py",
+                        "title": "Missing Rate Limit",
+                        "severity": "medium",
+                        "description": "Unthrottled endpoint allows brute force.",
+                        "remediation": "Apply TokenBucket rate limiter."
+                    }]
+                })
+                self.assertIn("SUCCESS: Saved 1 finding", res_rf2)
+
+                # 9. get_findings fail-closed and data paths (both run-wide fallback and explicit file filtering)
+                res_get = get_findings()
+                self.assertIn("SQL Injection A", res_get)
+                self.assertIn("Hardcoded Secret Key", res_get)
+                self.assertIn("Missing Rate Limit", res_get)
+
+                # Explicitly filtered query for adjacent file
+                res_get_crypto = get_findings("src/crypto.py")
+                self.assertIn("Hardcoded Secret Key", res_get_crypto)
+                self.assertNotIn("SQL Injection A", res_get_crypto)
+
+                # 10. Dual-channel document unshadowing: write_file document vs record_* structured metadata
+                rich_doc = "# Deep Threat Model\n\nFull 3.3KB architectural threat analysis with trust boundaries and STRIDE matrices."
+                await write_file("workspace/kb/THREAT_MODEL.md", rich_doc)
+                # read_file returns the rich document written by write_file, NOT the structured record_* JSON
+                read_doc = await read_file("workspace/kb/THREAT_MODEL.md")
+                self.assertEqual(read_doc, rich_doc)
+                # get_threat_model still returns the structured harness metadata
+                self.assertIn("Anonymous Remote Attacker", get_threat_model())
+
+                # 11. Graph status stamping and canonical filepath joinability
+                target_file = ctx.target_file
+                f_prov = {
+                    "filepath": "app.py",
+                    "title": "SQLi in get_user",
+                    "severity": "CRITICAL",
+                    "description": "f-string SQL query",
+                    "status": "PROVISIONALLY_VALID"  # LLM skill prose status
+                }
+                report_findings({"findings": [f_prov]})
+                score_risk(9.0, "Critical SQL injection vulnerability")
+
+                findings_rows = read_findings(db_path, filepath=target_file, run_id=run_id)
+                scores_rows = read_risk_scores(db_path, filepath=target_file, run_id=run_id)
+                # Graph status authority: initialized to 'reported'
+                self.assertEqual(findings_rows[0]["status"], "reported")
+                # Canonical filepaths match between findings and risk_scores (joinable)
+                self.assertEqual(findings_rows[0]["filepath"], scores_rows[0]["filepath"])
+                self.assertEqual(findings_rows[0]["filepath"], target_file)
+                self.assertEqual(scores_rows[0]["score"], 9.0)
+
+                # update_status updates findings correctly using canonical target_file
+                update_status(db_path, target_file, run_id, "static_confirmed")
+                updated_findings = read_findings(db_path, filepath=target_file, run_id=run_id)
+                self.assertEqual(updated_findings[0]["status"], "static_confirmed")
+
+                # 12. Per-finding calibration tool and schema persistence
+                from tools.research_tools import calibrate_finding
+                finding_id = updated_findings[0]["id"]
+                res_cal = calibrate_finding(
+                    finding_id=finding_id,
+                    mantis_risk_score=6.4,
+                    impact_score=5,
+                    likelihood_score=3,
+                    priority="HIGH",
+                    reasoning="Unauthenticated RCE under static confirmation multiplier."
+                )
+                self.assertIn("SUCCESS: Calibrated finding", res_cal)
+                calibrated_rows = read_findings(db_path, filepath=target_file, run_id=run_id)
+                target_finding = [f for f in calibrated_rows if f["id"] == finding_id][0]
+                self.assertEqual(target_finding["mantis_risk_score"], 6.4)
+                self.assertEqual(target_finding["impact_score"], 5)
+                self.assertEqual(target_finding["likelihood_score"], 3)
+                self.assertEqual(target_finding["priority"], "HIGH")
+            finally:
+                current_run_context.reset(tok)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_get_findings_error_and_no_data_paths(self):
+        """Validates that get_findings returns explicit ERROR or NO_DATA on missing DB / zero records."""
+        # 1. No context
+        tok = current_run_context.set(None)
+        try:
+            self.assertIn("Error", get_findings())
+        finally:
+            current_run_context.reset(tok)
+
+        # 2. Non-existent DB file
+        ctx_missing = RunContext(jail_dir="/tmp", db_path="/tmp/non_existent_db_12345.db", target_file="app.py", run_id="r1")
+        tok = current_run_context.set(ctx_missing)
+        try:
+            self.assertIn("ERROR: Database file not found", get_findings())
+        finally:
+            current_run_context.reset(tok)
+
+        # 3. Valid DB with zero records
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "empty.db")
+            init_db(db_path)
+            ctx_empty = RunContext(jail_dir=temp_dir, db_path=db_path, target_file="empty_file.py", run_id="r1")
+            tok = current_run_context.set(ctx_empty)
+            try:
+                self.assertIn("NO_DATA: Zero findings recorded", get_findings())
+            finally:
+                current_run_context.reset(tok)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_schema_codegen_single_source_of_truth(self):
+        """Verifies that schema.json is the single source of truth and codegen produces valid Pydantic models."""
+        from scripts.generate_schemas import SCHEMA_JSON_PATH, generate_pydantic_code
+        self.assertTrue(SCHEMA_JSON_PATH.exists(), f"schema.json must exist at {SCHEMA_JSON_PATH}")
+
+        with open(SCHEMA_JSON_PATH, "r", encoding="utf-8") as f:
+            schema_data = json.load(f)
+
+        self.assertIn("$defs", schema_data)
+        self.assertIn("finding", schema_data["$defs"])
+        self.assertIn("plan", schema_data["$defs"])
+        self.assertIn("learning_entry", schema_data["$defs"])
+
+        code = generate_pydantic_code(schema_data)
+        self.assertIn("class FindingSchema(BaseModel):", code)
+        self.assertIn("class PlanSchema(BaseModel):", code)
+        self.assertIn("VulnerabilityFinding = FindingSchema", code)
+        self.assertIn("ReviewPlan = PlanSchema", code)
+        self.assertIn("LearningEntry = LearningEntrySchema", code)
+        self.assertIn("class ReviewVerdict(BaseModel):", code)
+
+    def test_schema_codegen_ast_and_property_coverage(self):
+        """Verifies that generated code parses into valid Python AST and covers all schema.json $defs."""
+        from scripts.generate_schemas import SCHEMA_JSON_PATH, generate_pydantic_code
+        with open(SCHEMA_JSON_PATH, "r", encoding="utf-8") as f:
+            schema_data = json.load(f)
+
+        code = generate_pydantic_code(schema_data)
+        parsed_ast = ast.parse(code)
+        self.assertIsNotNone(parsed_ast)
+
+        # Verify class definitions generated from $defs
+        class_names = [node.name for node in ast.walk(parsed_ast) if isinstance(node, ast.ClassDef)]
+        expected_classes = [
+            "FindingSchema",
+            "PlanSchema",
+            "LearningEntrySchema",
+            "HistoryEntrySchema",
+            "TriageChecklistSchema",
+            "CalibrationChecklistSchema",
+            "StateSchema",
+            "TxLogEntrySchema",
+            "ExecutionLogEntrySchema",
+            "InvestigationTargetSchema",
+            "VulnerabilityReport",
+            "ReviewVerdict",
+            "CriticVerdict",
+            "ReproVerdict",
+            "ThreatModel",
+            "CodebaseSummary",
+            "ExploitChain",
+            "ExecutiveReport",
+        ]
+        for cls_name in expected_classes:
+            self.assertIn(cls_name, class_names, f"Expected {cls_name} to be generated by codegen")
+
+    def test_schema_model_round_trip_serialization(self):
+        """Verifies serialization, deserialization, alias choices, and normalization across generated models."""
+        from core.schemas import (
+            FindingSchema,
+            VulnerabilityFinding,
+            LearningEntrySchema,
+            LearningEntry,
+            HistoryEntrySchema,
+            StateSchema,
+            ReviewPlan,
+            TriageChecklistSchema,
+            CalibrationChecklistSchema,
+        )
+
+        # 1. FindingSchema & VulnerabilityFinding alias round-trip
+        finding_raw = {
+            "id": "f-12345",
+            "title": "SQL Injection in User Login",
+            "description": "Direct parameter interpolation in SQL query.",
+            "code_paths": ["src/db/auth.py:42"],
+            "impact": "Account takeover",
+            "severity": "low",  # Lowercase test for uppercase normalization
+            "remediation": "Use parameterized queries.",  # Alias test for mitigation
+            "filepath": "src/db/auth.py",
+            "line_numbers": [42],
+            "score": 85,
+        }
+        f_obj = FindingSchema.model_validate(finding_raw)
+        self.assertEqual(f_obj.severity, "LOW")  # Verified normalization
+        self.assertEqual(f_obj.remediation, "Use parameterized queries.")
+        self.assertEqual(f_obj.mitigation, "Use parameterized queries.")
+
+        dumped = f_obj.model_dump()
+        f_obj_reloaded = VulnerabilityFinding.model_validate(dumped)
+        self.assertEqual(f_obj_reloaded.id, "f-12345")
+        self.assertEqual(f_obj_reloaded.severity, "LOW")
+
+        # 2. HistoryEntrySchema alias round-trip ('pass' -> 'pass_num' / 'pass_number')
+        hist_raw = {
+            "stage": "researcher",
+            "pass": 2,
+            "action": "discovered",
+            "details": "Found flaw",
+            "timestamp": "2026-08-23T10:00:00Z",
+        }
+        hist_obj = HistoryEntrySchema.model_validate(hist_raw)
+        self.assertEqual(hist_obj.pass_number, 2)
+        self.assertEqual(hist_obj.stage, "researcher")
+
+        # 3. LearningEntrySchema & LearningEntry alias round-trip ('learning' -> 'insight')
+        learn_raw = {
+            "type": "trajectory_insight",
+            "action": "add",
+            "target_entity": "auth.py",
+            "learning": "Auth bypass flaw requires active session.",
+            "category": "security_insight",
+            "tags": ["auth", "idor"],
+        }
+        learn_obj = LearningEntry.model_validate(learn_raw)
+        self.assertEqual(learn_obj.insight, "Auth bypass flaw requires active session.")
+        self.assertEqual(learn_obj.learning, "Auth bypass flaw requires active session.")
+        learn_dumped = learn_obj.model_dump()
+        self.assertIn("Auth bypass", str(learn_dumped))
+
+        # 4. StateSchema round-trip
+        state_raw = {
+            "pass": 1,
+            "last_updated": "2026-08-23T10:00:00Z",
+            "vcs_info": {"vcs_type": "git", "commit_hash": "abc1234", "branch": "main", "dirty": False},
+        }
+        state_obj = StateSchema.model_validate(state_raw)
+        self.assertEqual(state_obj.pass_number, 1)
+
+    def test_schema_codegen_dynamic_schema_evolution(self):
+        """Verifies that adding new definitions or properties to schema.json dynamically generates matching models."""
+        from scripts.generate_schemas import generate_pydantic_code
+        mock_schema_data = {
+            "$defs": {
+                "finding": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "exploit_maturity": {"type": "string", "enum": ["poc", "functional", "high"]}
+                    }
+                },
+                "custom_diagnostic_result": {
+                    "type": "object",
+                    "description": "Diagnostic evaluation metric generated during custom audit stages.",
+                    "properties": {
+                        "check_id": {"type": "string"},
+                        "passed": {"type": "boolean"},
+                        "score": {"type": "number"}
+                    },
+                    "required": ["check_id", "passed"]
+                }
+            }
+        }
+        gen_code = generate_pydantic_code(mock_schema_data)
+        parsed = ast.parse(gen_code)
+        self.assertIsNotNone(parsed)
+
+        # Verify dynamic class generation from the new definition
+        self.assertIn("class CustomDiagnosticResultSchema(BaseModel):", gen_code)
+        self.assertIn("check_id: str = Field()", gen_code)
+        self.assertIn("passed: bool = Field()", gen_code)
+        self.assertIn("score: Optional[float] = Field(default=None)", gen_code)
+        # Verify dynamic property generation on finding
+        self.assertIn("exploit_maturity: Optional[Literal[\"poc\", \"functional\", \"high\"]]", gen_code)
+
+    def test_schema_json_definitions_registry(self):
+        """Verifies that SCHEMA_DEFINITIONS maps canonical schema names to the generated classes."""
+        from core.schemas import (
+            SCHEMA_DEFINITIONS,
+            FindingSchema,
+            PlanSchema,
+            LearningEntrySchema,
+            StateSchema,
+            TriageChecklistSchema,
+            CalibrationChecklistSchema,
+        )
+        self.assertEqual(SCHEMA_DEFINITIONS.get("finding"), FindingSchema)
+        self.assertEqual(SCHEMA_DEFINITIONS.get("plan"), PlanSchema)
+        self.assertEqual(SCHEMA_DEFINITIONS.get("learning_entry"), LearningEntrySchema)
+        self.assertEqual(SCHEMA_DEFINITIONS.get("state"), StateSchema)
+        self.assertEqual(SCHEMA_DEFINITIONS.get("triage_checklist"), TriageChecklistSchema)
+        self.assertEqual(SCHEMA_DEFINITIONS.get("calibration_checklist"), CalibrationChecklistSchema)
+
+    async def test_execute_sub_task_tool_error_detection(self):
+        """Verifies that tool-level error strings in function responses are captured by execute_sub_task."""
+        mock_runner = MagicMock()
+        mock_ss = AsyncMock()
+
+        # Mock an event with a failing tool response
+        mock_event_fail = MagicMock()
+        mock_event_fail.error_code = None
+        mock_event_fail.node_info.path = "root/researcher"
+        mock_event_fail.actions.route = None
+
+        mock_part_fn_call = MagicMock()
+        mock_part_fn_call.text = None
+        mock_part_fn_call.function_call = MagicMock(name="report_findings", args={"report": {}})
+        mock_part_fn_call.function_response = None
+
+        mock_part_fn_resp = MagicMock()
+        mock_part_fn_resp.text = None
+        mock_part_fn_resp.function_call = None
+        mock_part_fn_resp.function_response = MagicMock(
+            name="report_findings",
+            response={"response": "ERROR SAVING DB: table findings is locked"}
+        )
+
+        mock_event_fail.content.parts = [mock_part_fn_call, mock_part_fn_resp]
+
+        async def _run_async_gen(**_):
+            yield mock_event_fail
+
+        mock_runner.run_async = _run_async_gen
+
+        # Should return True (indicating failure / error detected)
+        task_failed = await execute_sub_task(
+            runner=mock_runner,
+            session_service=mock_ss,
+            filepath="test_file.py",
+            run_id="test-run",
+        )
+        self.assertTrue(task_failed)
+
+        # Mock an event with a successful tool response
+        mock_event_ok = MagicMock()
+        mock_event_ok.error_code = None
+        mock_event_ok.node_info.path = "root/researcher"
+        mock_event_ok.actions.route = None
+
+        mock_part_ok_resp = MagicMock()
+        mock_part_ok_resp.text = None
+        mock_part_ok_resp.function_call = None
+        mock_part_ok_resp.function_response = MagicMock(
+            name="report_findings",
+            response={"response": "SUCCESS: Saved 1 finding(s) to database."}
+        )
+        mock_event_ok.content.parts = [mock_part_ok_resp]
+
+        async def _run_async_ok(**_):
+            yield mock_event_ok
+
+        mock_runner.run_async = _run_async_ok
+
+        # Should return False (indicating clean success)
+        task_ok = await execute_sub_task(
+            runner=mock_runner,
+            session_service=mock_ss,
+            filepath="test_file.py",
+            run_id="test-run",
+        )
+        self.assertFalse(task_ok)
+
+    def test_model_tiering_and_reasoning_effort_propagation(self):
+        """Verifies that model tiering and adaptive reasoning effort levels propagate accurately."""
+        from core.config import get_llm_kwargs
+        from core.graph_loader import load_workflow_from_json
+
+        # Test get_llm_kwargs directly with global and node overrides
+        model_id, kwargs_default = get_llm_kwargs(
+            model_id=None,
+            default_model="vertex_ai/gemini-3.7-flash",
+            default_reasoning_effort="medium",
+        )
+        self.assertEqual(model_id, "vertex_ai/gemini-3.7-flash")
+        self.assertEqual(kwargs_default.get("reasoning_effort"), "medium")
+
+        # Test node override
+        model_id_node, kwargs_node = get_llm_kwargs(
+            model_id="vertex_ai/gemini-3.5-flash-lite",
+            default_model="vertex_ai/gemini-3.7-flash",
+            reasoning_effort="low",
+            default_reasoning_effort="medium",
+        )
+        self.assertEqual(model_id_node, "vertex_ai/gemini-3.5-flash-lite")
+        self.assertEqual(kwargs_node.get("reasoning_effort"), "low")
+
+        # Test loading workflow.json and verifying DAG compilation
+        wf_path = os.path.join(os.path.dirname(__file__), "workflow.json")
+        wf, wf_config = load_workflow_from_json(wf_path)
+        self.assertIsNotNone(wf)
+        self.assertEqual(wf_config.get("default_model"), "vertex_ai/gemini-3.7-flash")
+        self.assertEqual(wf_config.get("reasoning_effort"), "medium")
+        self.assertEqual(wf_config.get("on_enter_status", {}).get("reproducer"), "static_confirmed")
+        self.assertEqual(wf_config.get("on_enter_status", {}).get("patcher"), "dynamic_confirmed")
+
+    def test_adk_evaluation_suite_schemas_and_eval_cases(self):
+        """Verifies that ADK evaluation dataset and config files adhere to Google ADK EvalSet schema."""
+        import json
+        from google.adk.evaluation.eval_set import EvalSet
+        from google.adk.evaluation.eval_config import EvalConfig
+
+        eval_dir = os.path.join(os.path.dirname(__file__), "evals")
+        dataset_path = os.path.join(eval_dir, "deduplication.test.json")
+        synthetic_path = os.path.join(eval_dir, "synthetic_dataset.json")
+        config_path = os.path.join(eval_dir, "test_config.json")
+
+        self.assertTrue(os.path.exists(dataset_path), f"Eval dataset missing at {dataset_path}")
+        self.assertTrue(os.path.exists(synthetic_path), f"Synthetic dataset missing at {synthetic_path}")
+        self.assertTrue(os.path.exists(config_path), f"Eval config missing at {config_path}")
+
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+        eval_set = EvalSet.model_validate(raw_data)
+        self.assertEqual(eval_set.eval_set_id, "mantis_synthetic_webapp_deduplication_bench")
+        self.assertGreaterEqual(len(eval_set.eval_cases), 4)
+
+        with open(synthetic_path, "r", encoding="utf-8") as f:
+            raw_syn = json.load(f)
+        self.assertIn("findings", raw_syn)
+        self.assertIn("ground_truth_clusters", raw_syn)
+        self.assertGreaterEqual(len(raw_syn["findings"]), 8)
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = json.load(f)
+        eval_config = EvalConfig.model_validate(raw_cfg)
+        self.assertIn("tool_trajectory_avg_score", eval_config.criteria)
+        self.assertIn("response_match_score", eval_config.criteria)
+
+    def test_advise_cli_script_execution(self):
+        """Tests that scripts/advise.py executes standalone without active run context and formats guidance."""
+        import subprocess
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_advise_cli.db")
+        try:
+            init_db(db_file)
+            record_artifact(db_file, "run-1", "threat_model", "workspace/kb/THREAT_MODEL.md", "# Threat Model\nAdmin trust boundary.")
+            write_findings(db_file, "src/auth.py", [{
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "description": "Unsanitized query parameter in get_user()",
+                "cwe": "CWE-89",
+                "patch_status": "VERIFIED_SECURE",
+                "patch_diff": "--- a\n+++ b\n+ safe_query()",
+            }], run_id="run-1")
+
+            script_path = os.path.join(os.path.dirname(__file__), "scripts", "advise.py")
+
+            # 1. Test markdown advisory output
+            proc = subprocess.run(
+                [sys.executable, script_path, "--db", db_file, "--file", "src/auth.py"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("# Security Advisory & Development Guidance for: src/auth.py", proc.stdout)
+            self.assertIn("SQL Injection in get_user", proc.stdout)
+            self.assertIn("VERIFIED_SECURE", proc.stdout)
+
+            # 2. Test JSON advisory output
+            proc_json = subprocess.run(
+                [sys.executable, script_path, "--db", db_file, "--file", "src/auth.py", "--json"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_json.returncode, 0)
+            data = json.loads(proc_json.stdout)
+            self.assertEqual(data["filepath"], "src/auth.py")
+            self.assertEqual(len(data["confirmed_vulnerabilities"]), 1)
+        finally:
+            shutil.rmtree(temp_dir)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -5,3 +5,9 @@ workspace/
 __pycache__/
 *.pyc
 .venv/
+
+# Exclude local sqlite databases
+*.db
+sessions.db
+findings.db
+knowledge.db

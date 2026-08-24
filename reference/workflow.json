@@ -1,30 +1,94 @@
 {
   "name": "mantis_vulnerability_pipeline",
   "config": {
-    "db_path": "findings.db",
+    "db_path": "knowledge.db",
     "retry_attempts": 3,
-    "default_model": "vertex_ai/gemini-3.6-flash",
+    "default_model": "vertex_ai/gemini-3.7-flash",
+    "reasoning_effort": "medium",
     "seed_prompt": "Initial Task Input: Evaluate {filepath}",
     "sandbox": {
-      "type": "microsandbox",
+      "type": "gce",
       "options": {
-        "image": "mantis-sandbox:latest",
-        "timeout_seconds": 30
+        "project": "YOUR_PROJECT_ID",
+        "zone": "us-central1-b",
+        "image": "mantis-sandbox-image",
+        "subnet": "mantis-isolated-subnet",
+        "workdir": "/workspace",
+        "tunnel_through_iap": true,
+        "no_service_account": true,
+        "no_external_ip": true,
+        "verify_isolation": true,
+        "timeout_seconds": 60
       }
     }
   },
   "nodes": [
     {
+      "id": "history",
+      "type": "agent",
+      "skill": "../mantis-history",
+      "model": "vertex_ai/gemini-3.5-flash-lite",
+      "reasoning_effort": "low",
+      "tools": ["read_file", "write_file", "list_files", "record_summary", "get_summary"]
+    },
+    {
+      "id": "structural_index",
+      "type": "agent",
+      "skill": "../mantis-structural-index",
+      "model": "vertex_ai/gemini-3.5-flash-lite",
+      "reasoning_effort": "low",
+      "tools": ["read_file", "write_file", "list_files", "run_sandbox"]
+    },
+    {
+      "id": "summarizer",
+      "type": "agent",
+      "skill": "../mantis-summarize",
+      "model": "vertex_ai/gemini-3.5-flash-lite",
+      "reasoning_effort": "low",
+      "tools": ["read_file", "write_file", "list_files", "record_summary", "get_summary"]
+    },
+    {
+      "id": "architect",
+      "type": "agent",
+      "skill": "../mantis-architecture",
+      "reasoning_effort": "medium",
+      "tools": ["read_file", "write_file", "list_files", "get_summary"]
+    },
+    {
+      "id": "threat_modeler",
+      "type": "agent",
+      "skill": "../mantis-threat-model",
+      "reasoning_effort": "medium",
+      "tools": ["read_file", "write_file", "list_files", "get_summary", "record_threat_model", "get_threat_model"]
+    },
+    {
+      "id": "planner",
+      "type": "agent",
+      "skill": "../mantis-plan",
+      "reasoning_effort": "medium",
+      "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "record_plan", "get_plan"]
+    },
+    {
       "id": "researcher",
       "type": "agent",
-      "system_prompt": "prompts/system-researcher.md",
-      "tools": ["read_file", "report_findings"]
+      "skill": "../mantis-researcher",
+      "reasoning_effort": "medium",
+      "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings"]
+    },
+    {
+      "id": "deduplicator",
+      "type": "agent",
+      "skill": "../mantis-dedupe",
+      "model": "vertex_ai/gemini-3.5-flash-lite",
+      "reasoning_effort": "low",
+      "tools": ["read_file", "write_file", "get_findings", "report_findings", "dedupe_findings"]
     },
     {
       "id": "reviewer",
       "type": "agent",
-      "system_prompt": "prompts/system-reviewer.md",
-      "tools": ["read_file", "get_findings"],
+      "skill": "../mantis-review",
+      "reasoning_effort": "medium",
+      "tools": ["read_file", "get_findings", "get_threat_model", "get_summary"],
       "output_schema": "ReviewVerdict",
       "output_key": "verdict"
     },
@@ -34,10 +98,26 @@
       "routes": ["confirmed"]
     },
     {
+      "id": "critic",
+      "type": "agent",
+      "skill": "../mantis-critic",
+      "reasoning_effort": "high",
+      "tools": ["read_file", "get_findings", "get_threat_model"],
+      "output_schema": "CriticVerdict",
+      "output_key": "verdict"
+    },
+    {
+      "id": "critic_classifier",
+      "type": "classifier",
+      "routes": ["viable"]
+    },
+    {
       "id": "reproducer",
       "type": "agent",
-      "system_prompt": "prompts/system-reproducer.md",
-      "tools": ["run_sandbox", "get_findings"],
+      "skill": "../mantis-reproduce",
+      "reasoning_effort": "high",
+      "timeout": 180.0,
+      "tools": ["run_sandbox", "get_findings", "get_threat_model", "read_file", "write_file"],
       "on_enter_status": "static_confirmed",
       "output_schema": "ReproVerdict",
       "output_key": "verdict"
@@ -49,28 +129,66 @@
       "max_visits": 2
     },
     {
+      "id": "chainer",
+      "type": "agent",
+      "skill": "../mantis-chain",
+      "reasoning_effort": "high",
+      "tools": ["read_file", "write_file", "get_findings", "get_threat_model", "record_exploit_chain"]
+    },
+    {
       "id": "patcher",
       "type": "agent",
-      "system_prompt": "prompts/system-patcher.md",
-      "tools": ["apply_patch", "read_file", "get_findings"],
+      "skill": "../mantis-patch",
+      "reasoning_effort": "high",
+      "timeout": 180.0,
+      "tools": ["apply_patch", "run_sandbox", "read_file", "write_file", "get_findings"],
       "on_enter_status": "dynamic_confirmed"
     },
     {
       "id": "calibrator",
       "type": "agent",
-      "system_prompt": "prompts/system-calibrator.md",
-      "tools": ["score_risk", "get_findings"]
+      "skill": "../mantis-calibrate",
+      "reasoning_effort": "medium",
+      "tools": ["score_risk", "calibrate_finding", "get_findings", "get_threat_model", "read_file"]
+    },
+    {
+      "id": "reflector",
+      "type": "agent",
+      "skill": "../mantis-reflect",
+      "reasoning_effort": "medium",
+      "tools": ["read_file", "write_file", "get_findings", "record_learning"]
+    },
+    {
+      "id": "reporter",
+      "type": "agent",
+      "skill": "../mantis-report",
+      "reasoning_effort": "medium",
+      "tools": ["read_file", "write_file", "get_findings", "get_plan", "get_threat_model", "get_summary", "generate_report"]
     }
   ],
   "edges": [
-    {"from": "START", "to": "researcher"},
-    {"from": "researcher", "to": "reviewer"},
+    {"from": "START", "to": "history"},
+    {"from": "history", "to": "structural_index"},
+    {"from": "structural_index", "to": "summarizer"},
+    {"from": "summarizer", "to": "architect"},
+    {"from": "architect", "to": "threat_modeler"},
+    {"from": "threat_modeler", "to": "planner"},
+    {"from": "planner", "to": "researcher"},
+    {"from": "researcher", "to": "deduplicator"},
+    {"from": "deduplicator", "to": "reviewer"},
     {"from": "reviewer", "to": "reviewer_classifier"},
-    {"from": "reviewer_classifier", "to": "reproducer", "on": "confirmed"},
+    {"from": "reviewer_classifier", "to": "critic", "on": "confirmed"},
+    {"from": "reviewer_classifier", "to": "calibrator", "on": "__DEFAULT__"},
+    {"from": "critic", "to": "critic_classifier"},
+    {"from": "critic_classifier", "to": "reproducer", "on": "viable"},
+    {"from": "critic_classifier", "to": "calibrator", "on": "__DEFAULT__"},
     {"from": "reproducer", "to": "repro_classifier"},
-    {"from": "repro_classifier", "to": "patcher", "on": "success"},
+    {"from": "repro_classifier", "to": "chainer", "on": "success"},
     {"from": "repro_classifier", "to": "reproducer", "on": "__DEFAULT__"},
     {"from": "repro_classifier", "to": "calibrator", "on": "exceeded"},
-    {"from": "patcher", "to": "calibrator"}
+    {"from": "chainer", "to": "patcher"},
+    {"from": "patcher", "to": "calibrator"},
+    {"from": "calibrator", "to": "reflector"},
+    {"from": "reflector", "to": "reporter"}
   ]
 }
