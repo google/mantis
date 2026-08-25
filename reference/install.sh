@@ -29,7 +29,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 echo "Installing dependencies..."
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.txt
 
 # --- Sandbox image (optional: enables dynamic reproduction) ---
 TAG="mantis-sandbox:latest"
