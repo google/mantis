@@ -10,6 +10,11 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
+# Ensure reference root is on sys.path
+sys_ref_dir = str(Path(__file__).resolve().parent.parent)
+if sys_ref_dir not in sys.path:
+    sys.path.insert(0, sys_ref_dir)
+
 
 def find_default_db(custom_path: str = "") -> Optional[str]:
     """Auto-discovers knowledge.db across standard workspace and repository locations."""
@@ -78,20 +83,44 @@ def query_guidance_standalone(db_path: str, filepath: str) -> Dict[str, Any]:
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    # 1. Threat Model
-    threat_model_content = ""
+    # 1. OKF Concepts & Scoped Threat Context
+    scoped_okf = []
     try:
-        cursor.execute("SELECT content FROM campaign_artifacts WHERE artifact_type = 'threat_model' ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
-        if row and row["content"]:
-            threat_model_content = row["content"]
-        else:
-            cursor.execute("SELECT content FROM campaign_artifacts WHERE filepath LIKE '%THREAT_MODEL%' ORDER BY id DESC LIMIT 1")
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='okf_concepts'")
+        if cursor.fetchone():
+            if norm_fp:
+                cursor.execute("""
+                    SELECT * FROM okf_concepts
+                    WHERE resource = ?
+                    ORDER BY id ASC
+                """, (norm_fp,))
+            else:
+                cursor.execute("SELECT * FROM okf_concepts ORDER BY id ASC")
+            scoped_okf = [dict(r) for r in cursor.fetchall()]
+    except Exception:
+        pass
+
+    threat_concepts = [c for c in scoped_okf if c.get("type") in ("Threat Boundary", "Threat Model")]
+    entity_concepts = [c for c in scoped_okf if c.get("type") in ("Component Entity", "Software Entity", "Hardware Entity", "Architecture Summary")]
+    invariant_concepts = [c for c in scoped_okf if c.get("type") in ("Security Invariant", "Guardrail")]
+
+    # 1. Threat Model & Trust Boundaries
+    threat_model_content = ""
+    if threat_concepts:
+        threat_model_content = "\n\n".join(f"### {c.get('title')}\n{c.get('body_markdown', '').strip()}" for c in threat_concepts)
+    else:
+        try:
+            cursor.execute("SELECT content FROM campaign_artifacts WHERE artifact_type = 'threat_model' ORDER BY id DESC LIMIT 1")
             row = cursor.fetchone()
             if row and row["content"]:
                 threat_model_content = row["content"]
-    except Exception:
-        pass
+            else:
+                cursor.execute("SELECT content FROM campaign_artifacts WHERE filepath LIKE '%THREAT_MODEL%' ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+                if row and row["content"]:
+                    threat_model_content = row["content"]
+        except Exception:
+            pass
 
     # 2. Confirmed Vulnerabilities & Verified Patches
     confirmed_rows = []
@@ -173,9 +202,17 @@ def query_guidance_standalone(db_path: str, filepath: str) -> Dict[str, Any]:
 
     conn.close()
 
+    # Derive Highest Trust Tier per OKF v0.2 §5.3
+    trust_badge = "HEURISTIC"
+    if any(c.get("trust_tier") == "human_reviewed" for c in scoped_okf):
+        trust_badge = "HUMAN-REVIEWED"
+    elif any(c.get("trust_tier") == "machine_confirmed" for c in scoped_okf) or any(f.get("status") in ("patch_verified", "dynamic_confirmed", "reproduced") for f in confirmed_rows):
+        trust_badge = "SANDBOX-CONFIRMED"
+
     # Format Guidance Markdown
     guidance_lines = [
         f"# Security Advisory & Development Guidance for: {norm_fp or 'Repository Scope'}",
+        f"**[OKF TRUST TIER: {trust_badge}]**",
         "",
         "## 1. Threat Model & Trust Boundaries Context",
     ]
@@ -184,7 +221,28 @@ def query_guidance_standalone(db_path: str, filepath: str) -> Dict[str, Any]:
     else:
         guidance_lines.append("No active threat model recorded. Treat all external network inputs as untrusted.")
 
-    guidance_lines.extend(["", "## 2. Historical Vulnerabilities & Verified Patches"])
+    # Entity context
+    if entity_concepts:
+        guidance_lines.extend(["", "## 2. Component Architecture & Known Constraints"])
+        for ent in entity_concepts:
+            badge = f"[{ent.get('trust_tier', 'unverified').upper().replace('_', '-')}]"
+            guidance_lines.append(f"### {ent.get('title')} {badge}")
+            if ent.get("description"):
+                guidance_lines.append(f"*{ent.get('description')}*")
+            if ent.get("body_markdown"):
+                guidance_lines.append(f"{ent.get('body_markdown').strip()}\n")
+
+    # Invariants & Guardrails
+    if invariant_concepts or learnings:
+        guidance_lines.extend(["", "## 3. Verified Security Guardrails & Invariants"])
+        for inv in invariant_concepts:
+            tier = inv.get("trust_tier", "unverified").upper().replace("_", "-")
+            guidance_lines.append(f"- ⛔ **[{tier}] {inv.get('title')}**: {inv.get('description') or inv.get('body_markdown', '').strip()}")
+        for l in learnings:
+            cat = f"[{l.get('category')}] " if l.get("category") else ""
+            guidance_lines.append(f"- ℹ️ **{cat}{l.get('learning')}**")
+
+    guidance_lines.extend(["", "## 4. Historical Vulnerabilities & Verified Remediation Patterns"])
     if confirmed_rows:
         for f in confirmed_rows:
             cwe_tag = f"[{f.get('cwe')}] " if f.get("cwe") else ""
@@ -198,12 +256,12 @@ def query_guidance_standalone(db_path: str, filepath: str) -> Dict[str, Any]:
             if f.get("patch_status"):
                 guidance_lines.append(f"- **Patch Status**: `{f.get('patch_status')}`")
             if f.get("patch_diff"):
-                guidance_lines.append(f"- **Verified Patch Diff**:\n```diff\n{f.get('patch_diff').strip()}\n```")
+                guidance_lines.append(f"- **Verified Patch Diff (Few-Shot Pattern)**:\n```diff\n{f.get('patch_diff').strip()}\n```")
             guidance_lines.append("")
     else:
         guidance_lines.append("No confirmed vulnerabilities previously recorded for this target.")
 
-    guidance_lines.extend(["", "## 3. Triaged False Positives (Intentional / Safe Patterns)"])
+    guidance_lines.extend(["", "## 5. Triaged False Positives (Intentional / Safe Patterns)"])
     if fp_rows:
         for f in fp_rows:
             cwe_tag = f"[{f.get('cwe')}] " if f.get("cwe") else ""
@@ -217,27 +275,19 @@ def query_guidance_standalone(db_path: str, filepath: str) -> Dict[str, Any]:
     else:
         guidance_lines.append("No false positive exemptions recorded for this target.")
 
-    guidance_lines.extend(["", "## 4. Recurrent Vulnerability Lineages"])
     if recurrent_lineages:
+        guidance_lines.extend(["", "## 6. Recurrent Pitfalls & Lineage Regressions"])
         for rec in recurrent_lineages:
             guidance_lines.append(
                 f"- **Lineage `{rec.get('lineage_id')}`** (Seen {rec.get('occurrence_count')}x across passes): "
                 f"`{rec.get('title')}` (Statuses: {rec.get('observed_statuses')})"
             )
-    else:
-        guidance_lines.append("No repeat/recurrent vulnerability patterns recorded.")
-
-    guidance_lines.extend(["", "## 5. Verified Security Guardrails & Invariants"])
-    if learnings:
-        for l in learnings:
-            cat = f"[{l.get('category')}] " if l.get("category") else ""
-            guidance_lines.append(f"- **{cat}{l.get('learning')}**")
-    else:
-        guidance_lines.append("No learned trajectory invariants recorded.")
 
     return {
         "filepath": norm_fp,
+        "trust_tier": trust_badge,
         "threat_model": threat_model_content,
+        "okf_concepts": scoped_okf,
         "confirmed_vulnerabilities": confirmed_rows,
         "false_positives": fp_rows,
         "recurrent_lineages": recurrent_lineages,
@@ -277,7 +327,7 @@ def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Mantis Security Advisor: Query threat models, verified patches, false positives, and lineage from knowledge.db."
+        description="Mantis Security Advisor: Query threat models, OKF concepts, verified patches, false positives, and lineage from knowledge.db."
     )
     parser.add_argument(
         "--file", "-f", "--target", "-t",
@@ -305,16 +355,56 @@ def main():
         action="store_true",
         help="Emit raw structured JSON instead of human-readable markdown."
     )
+    parser.add_argument(
+        "--export-okf",
+        default="",
+        metavar="DIR",
+        help="Export all knowledge concepts to an OKF v0.2 directory bundle on disk."
+    )
+    parser.add_argument(
+        "--import-okf",
+        default="",
+        metavar="DIR",
+        help="Import an OKF v0.2 directory bundle from disk into knowledge.db."
+    )
 
     args = parser.parse_args()
 
     db_path = find_default_db(args.db)
-    if not db_path:
+    if not db_path and not args.import_okf:
         sys.stderr.write(
             f"Error: Database file not found (specified: '{args.db}'). "
             f"Searched knowledge.db and workspace/knowledge.db in working directory.\n"
         )
         sys.exit(1)
+
+    if not db_path and args.import_okf:
+        db_path = args.db or "knowledge.db"
+        try:
+            from core.database import init_db
+            init_db(db_path)
+        except Exception:
+            pass
+
+    if args.export_okf:
+        try:
+            from core.database import export_okf_bundle
+            files = export_okf_bundle(db_path, args.export_okf)
+            print(f"Exported {len(files)} OKF v0.2 concept files to '{args.export_okf}'.")
+            return
+        except Exception as e:
+            sys.stderr.write(f"Error exporting OKF bundle: {e}\n")
+            sys.exit(1)
+
+    if args.import_okf:
+        try:
+            from core.database import import_okf_bundle
+            count = import_okf_bundle(db_path, args.import_okf)
+            print(f"Imported {count} OKF v0.2 concept files into '{db_path}'.")
+            return
+        except Exception as e:
+            sys.stderr.write(f"Error importing OKF bundle: {e}\n")
+            sys.exit(1)
 
     if args.lineage or args.signature:
         records = query_lineage_standalone(db_path, lineage_id=args.lineage, signature=args.signature, filepath=args.file)
@@ -338,7 +428,12 @@ def main():
                     if r.get("patch_diff"):
                         print(f"  - **Patch Diff**:\n```diff\n{r.get('patch_diff').strip()}\n```")
     else:
-        guidance = query_guidance_standalone(db_path, filepath=args.file)
+        try:
+            from core.database import query_security_guidance
+            guidance = query_security_guidance(db_path, filepath=args.file)
+        except (ImportError, ModuleNotFoundError):
+            guidance = query_guidance_standalone(db_path, filepath=args.file)
+
         if args.json:
             print(json.dumps(guidance, indent=2))
         else:

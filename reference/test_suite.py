@@ -5,6 +5,7 @@ import json
 import sqlite3
 import shutil
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch, AsyncMock, MagicMock
 from pydantic import Field
@@ -2502,8 +2503,376 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(temp_dir)
 
+    def test_okf_markdown_parsing_and_trust_tiers(self):
+        """Tests that parse_okf_markdown accurately extracts OKF v0.2 frontmatter and infers trust tiers."""
+        from core.database import parse_okf_markdown
+
+        # 1. Human verified -> human_reviewed trust tier
+        human_md = """---
+type: Component Entity
+title: Authentication Module
+description: Handles JWT verification and session state.
+resource: src/auth/jwt.py
+tags: [auth, jwt, critical]
+status: stable
+verified:
+  - by: human:security-lead
+    at: 2026-08-27T12:00:00Z
+sources:
+  - id: jwt-src
+    resource: src/auth/jwt.py
+---
+
+# Details
+Module validates signatures before forwarding claims.
+"""
+        parsed_human = parse_okf_markdown(human_md, default_concept_id="entities/auth_module.md")
+        self.assertIsNotNone(parsed_human)
+        self.assertEqual(parsed_human["type"], "Component Entity")
+        self.assertEqual(parsed_human["title"], "Authentication Module")
+        self.assertEqual(parsed_human["resource"], "src/auth/jwt.py")
+        self.assertEqual(parsed_human["trust_tier"], "human_reviewed")
+        self.assertEqual(parsed_human["tags"], ["auth", "jwt", "critical"])
+        self.assertIn("Module validates signatures", parsed_human["body_markdown"])
+
+        # 2. Process verified -> machine_confirmed trust tier
+        proc_md = """---
+type: Threat Boundary
+title: Public Ingress Perimeter
+resource: api/routes.py
+verified:
+  - by: process:runsc-reproduce
+    at: 2026-08-27T12:00:00Z
+---
+Unauthenticated route boundary.
+"""
+        parsed_proc = parse_okf_markdown(proc_md, default_concept_id="threats/ingress.md")
+        self.assertIsNotNone(parsed_proc)
+        self.assertEqual(parsed_proc["trust_tier"], "machine_confirmed")
+
+        # 3. No verifier -> unverified trust tier
+        unver_md = """---
+type: Security Invariant
+title: Input Sanitization Invariant
+resource: src/parser.py
+---
+All XML input must disable external entity resolution.
+"""
+        parsed_unver = parse_okf_markdown(unver_md, default_concept_id="invariants/xml.md")
+        self.assertIsNotNone(parsed_unver)
+        self.assertEqual(parsed_unver["trust_tier"], "unverified")
+
+        # 4. Fallback when no frontmatter is provided
+        raw_md = "# Core Database Architecture\nHandles relational persistence."
+        parsed_raw = parse_okf_markdown(raw_md, default_concept_id="workspace/kb/entities/db.md")
+        self.assertIsNotNone(parsed_raw)
+        self.assertEqual(parsed_raw["type"], "Component Entity")
+        self.assertEqual(parsed_raw["title"], "Core Database Architecture")
+        self.assertEqual(parsed_raw["trust_tier"], "unverified")
+
+        # 5. Patch diffs starting with '--- a/file.py' and containing '--- a/file2.py' are NOT eaten
+        multi_file_patch = """--- a/src/auth.py
++++ b/src/auth.py
+@@ -1,3 +1,3 @@
+- old_code()
++ new_code()
+--- a/src/payment.py
++++ b/src/payment.py
+@@ -10,2 +10,2 @@
+- charge()
++ verify_and_charge()
+"""
+        parsed_patch = parse_okf_markdown(multi_file_patch, default_concept_id="patches/auth_patch.md")
+        self.assertIsNotNone(parsed_patch)
+        self.assertEqual(parsed_patch["body_markdown"].strip(), multi_file_patch.strip())
+        self.assertIn("--- a/src/auth.py", parsed_patch["body_markdown"])
+        self.assertIn("--- a/src/payment.py", parsed_patch["body_markdown"])
+        self.assertIn("new_code()", parsed_patch["body_markdown"])
+
+    def test_okf_concept_crud_and_queries(self):
+        """Tests SQLite CRUD and indexed queries for OKF concepts."""
+        from core.database import init_db, record_okf_concept, read_okf_concepts
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "okf_test.db")
+            init_db(db_path)
+
+            concept1 = {
+                "concept_id": "entities/auth",
+                "type": "Component Entity",
+                "title": "Auth Entity",
+                "resource": "src/auth.py",
+                "tags": ["auth", "crypto"],
+                "status": "stable",
+                "trust_tier": "human_reviewed",
+                "verified_by": [{"by": "human:lead"}],
+                "description": "Auth component",
+                "body_markdown": "Body text for auth",
+            }
+            concept2 = {
+                "concept_id": "threats/db_boundary",
+                "type": "Threat Boundary",
+                "title": "Database Boundary",
+                "resource": "src/db.py",
+                "tags": ["storage"],
+                "status": "stable",
+                "trust_tier": "machine_confirmed",
+                "verified_by": [{"by": "process:scanner"}],
+                "description": "DB trust boundary",
+                "body_markdown": "Body text for db",
+            }
+
+            record_okf_concept(db_path, "run-1", concept1)
+            record_okf_concept(db_path, "run-1", concept2)
+
+            # Query by resource
+            auth_concepts = read_okf_concepts(db_path, resource="src/auth.py")
+            self.assertEqual(len(auth_concepts), 1)
+            self.assertEqual(auth_concepts[0]["concept_id"], "entities/auth")
+            self.assertEqual(auth_concepts[0]["trust_tier"], "human_reviewed")
+            self.assertIn("auth", auth_concepts[0]["tags"])
+
+            # Query by type
+            threats = read_okf_concepts(db_path, concept_type="Threat Boundary")
+            self.assertEqual(len(threats), 1)
+            self.assertEqual(threats[0]["title"], "Database Boundary")
+
+            # Exact matching does not match wildcards like src/myXfile.py or vendor/src/my_file.py
+            concept3 = {
+                "concept_id": "entities/my_file",
+                "type": "Component Entity",
+                "title": "My File",
+                "resource": "src/my_file.py",
+                "trust_tier": "unverified",
+            }
+            concept4 = {
+                "concept_id": "entities/my_other_file",
+                "type": "Component Entity",
+                "title": "My X File",
+                "resource": "src/myXfile.py",
+                "trust_tier": "unverified",
+            }
+            concept5 = {
+                "concept_id": "entities/vendor_my_file",
+                "type": "Component Entity",
+                "title": "Vendor My File",
+                "resource": "vendor/src/my_file.py",
+                "trust_tier": "unverified",
+            }
+            record_okf_concept(db_path, "run-1", concept3)
+            record_okf_concept(db_path, "run-1", concept4)
+            record_okf_concept(db_path, "run-1", concept5)
+
+            exact_lookup = read_okf_concepts(db_path, resource="src/my_file.py")
+            self.assertEqual(len(exact_lookup), 1)
+            self.assertEqual(exact_lookup[0]["concept_id"], "entities/my_file")
+            self.assertEqual(exact_lookup[0]["resource"], "src/my_file.py")
+
+            # Query by tag
+            storage_tagged = read_okf_concepts(db_path, tag="storage")
+            self.assertEqual(len(storage_tagged), 1)
+            self.assertEqual(storage_tagged[0]["concept_id"], "threats/db_boundary")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_okf_auto_indexing_from_record_artifact(self):
+        """Tests that record_artifact automatically indexes markdown files with OKF frontmatter into okf_concepts."""
+        from core.database import init_db, record_artifact, read_okf_concepts
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "auto_index.db")
+            init_db(db_path)
+
+            okf_content = """---
+type: Component Entity
+title: Payment Router
+resource: src/payment.py
+tags: [pci, payment]
+verified:
+  - by: human:security-auditor
+---
+Routes tokenized charges to gateway.
+"""
+            record_artifact(db_path, "run-1", "entity", "workspace/kb/entities/payment.md", okf_content)
+
+            # Confirm stored in okf_concepts
+            concepts = read_okf_concepts(db_path, resource="src/payment.py")
+            self.assertEqual(len(concepts), 1)
+            self.assertEqual(concepts[0]["title"], "Payment Router")
+            self.assertEqual(concepts[0]["trust_tier"], "human_reviewed")
+            self.assertEqual(concepts[0]["tags"], ["pci", "payment"])
+
+            # Test architecture.md without frontmatter maps to Architecture Summary
+            arch_content = "# High Level System Architecture\nExplains microservice topology."
+            record_artifact(db_path, "run-1", "summary", "workspace/kb/architecture.md", arch_content)
+            arch_concepts = read_okf_concepts(db_path, concept_type="Architecture Summary")
+            self.assertEqual(len(arch_concepts), 1)
+            self.assertEqual(arch_concepts[0]["title"], "High Level System Architecture")
+
+            # Test non-markdown artifact (e.g. raw diff/binary) does not create junk concepts
+            record_artifact(db_path, "run-1", "patch", "workspace/temp.bin", "BINARY_DATA_BLOB")
+            bin_concepts = read_okf_concepts(db_path, resource="workspace/temp.bin")
+            self.assertEqual(len(bin_concepts), 0)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_okf_bundle_export_and_import(self):
+        """Tests exporting concepts from SQLite to an OKF directory bundle and re-importing into another database."""
+        from core.database import init_db, record_okf_concept, export_okf_bundle, import_okf_bundle, read_okf_concepts
+        temp_dir = tempfile.mkdtemp()
+        try:
+            src_db = os.path.join(temp_dir, "src.db")
+            dst_db = os.path.join(temp_dir, "dst.db")
+            export_dir = os.path.join(temp_dir, "okf_bundle")
+            init_db(src_db)
+            init_db(dst_db)
+
+            concept = {
+                "concept_id": "entities/crypto_vault",
+                "type": "Component Entity",
+                "title": "Crypto Vault",
+                "resource": "src/vault.py",
+                "tags": ["crypto", "vault"],
+                "status": "stable",
+                "trust_tier": "human_reviewed",
+                "verified_by": [{"by": "human:lead"}],
+                "description": "AES-GCM key storage",
+                "body_markdown": "# Crypto Vault\nImplements hardware-backed key derivation.",
+            }
+            record_okf_concept(src_db, "run-1", concept)
+
+            # Export to OKF bundle directory
+            exported_files = export_okf_bundle(src_db, export_dir)
+            self.assertTrue(os.path.exists(os.path.join(export_dir, "index.md")))
+            self.assertTrue(os.path.exists(os.path.join(export_dir, "entities", "crypto_vault.md")))
+
+            # Check index.md content
+            with open(os.path.join(export_dir, "index.md"), "r", encoding="utf-8") as fh:
+                idx_txt = fh.read()
+            self.assertIn('okf_version: "0.2"', idx_txt)
+            self.assertIn("Crypto Vault", idx_txt)
+
+            # Import bundle into dst_db
+            imported_count = import_okf_bundle(dst_db, export_dir, run_id="imported_run")
+            self.assertGreaterEqual(imported_count, 1)
+
+            # Verify concept exists in dst_db
+            dst_concepts = read_okf_concepts(dst_db, resource="src/vault.py")
+            self.assertEqual(len(dst_concepts), 1)
+            self.assertEqual(dst_concepts[0]["title"], "Crypto Vault")
+            self.assertEqual(dst_concepts[0]["trust_tier"], "human_reviewed")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_advise_guidance_with_okf_and_diff_injection(self):
+        """Tests that query_security_guidance combines scoped OKF concepts, trust tiers, and verified few-shot diffs."""
+        from core.database import init_db, record_okf_concept, write_findings, query_security_guidance
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "advise_okf.db")
+            init_db(db_path)
+
+            # Add scoped OKF threat boundary & invariant
+            record_okf_concept(db_path, "run-1", {
+                "concept_id": "threats/auth_ingress",
+                "type": "Threat Boundary",
+                "title": "Auth Ingress Perimeter",
+                "resource": "src/auth.py",
+                "trust_tier": "human_reviewed",
+                "verified_by": [{"by": "human:lead"}],
+                "body_markdown": "Accepts unauthenticated bearer tokens from public clients.",
+            })
+            record_okf_concept(db_path, "run-1", {
+                "concept_id": "invariants/token_sanitize",
+                "type": "Security Invariant",
+                "title": "Token Sanitization",
+                "resource": "src/auth.py",
+                "trust_tier": "machine_confirmed",
+                "description": "Must strip control characters from username claims.",
+            })
+
+            # Add verified patch finding
+            write_findings(db_path, "src/auth.py", [{
+                "title": "Unsanitized Token Header",
+                "filepath": "src/auth.py",
+                "severity": "HIGH",
+                "status": "patch_verified",
+                "cwe": "CWE-79",
+                "description": "Header injection in token parser.",
+                "remediation": "Sanitize header before forwarding.",
+                "patch_status": "applied",
+                "patch_diff": "--- a/src/auth.py\n+++ b/src/auth.py\n@@ -10,2 +10,2 @@\n- hdr = req.header\n+ hdr = sanitize(req.header)\n",
+            }], run_id="run-1")
+
+            guidance = query_security_guidance(db_path, filepath="src/auth.py")
+            summary = guidance["guidance_summary"]
+
+            self.assertEqual(guidance["trust_tier"], "HUMAN-REVIEWED")
+            self.assertIn("[OKF TRUST TIER: HUMAN-REVIEWED]", summary)
+            self.assertIn("Auth Ingress Perimeter", summary)
+            self.assertIn("Token Sanitization", summary)
+            self.assertIn("Verified Patch Diff (Few-Shot Pattern)", summary)
+            self.assertIn("hdr = sanitize(req.header)", summary)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_advise_cli_execution_with_okf_features(self):
+        """Tests that scripts/advise.py runs as a CLI command supporting --file, --json, and --export-okf."""
+        from core.database import init_db, record_okf_concept
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "cli_test.db")
+            init_db(db_path)
+            record_okf_concept(db_path, "run-1", {
+                "concept_id": "entities/crypto",
+                "type": "Component Entity",
+                "title": "Crypto Engine",
+                "resource": "src/crypto.py",
+                "trust_tier": "machine_confirmed",
+                "description": "AES operations",
+                "body_markdown": "Uses 256-bit keys.",
+            })
+
+            advise_script = os.path.join(os.path.dirname(__file__), "scripts", "advise.py")
+
+            # 1. Test CLI query --json
+            res_json = subprocess.run(
+                [sys.executable, advise_script, "--db", db_path, "--file", "src/crypto.py", "--json"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            data = json.loads(res_json.stdout)
+            self.assertEqual(data["filepath"], "src/crypto.py")
+            self.assertEqual(data["trust_tier"], "SANDBOX-CONFIRMED")
+            self.assertIn("Crypto Engine", data["guidance_summary"])
+
+            # 2. Test CLI --export-okf
+            export_target = os.path.join(temp_dir, "cli_export_bundle")
+            res_exp = subprocess.run(
+                [sys.executable, advise_script, "--db", db_path, "--export-okf", export_target],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            self.assertIn("Exported", res_exp.stdout)
+            self.assertTrue(os.path.exists(os.path.join(export_target, "index.md")))
+
+            # 3. Test CLI --import-okf into a fresh db
+            imported_db = os.path.join(temp_dir, "imported_via_cli.db")
+            res_imp = subprocess.run(
+                [sys.executable, advise_script, "--db", imported_db, "--import-okf", export_target],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            self.assertIn("Imported", res_imp.stdout)
+        finally:
+            shutil.rmtree(temp_dir)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

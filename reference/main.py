@@ -252,37 +252,39 @@ async def pipeline(scan_target: str, workflow_path: str = ""):
                 await sandbox.aclose()
     finally:
         await runner.close()
-        findings = read_findings(db_path, run_id=run_id)
-        scores = read_risk_scores(db_path, run_id=run_id)
-        print(f"\n📊 Summary: {len(findings)} vulnerability finding(s) recorded.")
-        for f in findings:
-            lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""
-            mark = " (suppressed at review)" if f.get("status") == "reported" else ""
-            print(f"  - [{f.get('severity', 'Unknown')}] {f.get('filepath')}: {f.get('title')}{lines_str}{mark}")
-        if scores:
-            print("\n🎯 Risk Calibration Scores:")
-            for s in scores:
-                score_val = float(s.get('score', 0))
-                print(f"  - {s.get('filepath')}: {score_val:.1f}/10.0 - {s.get('reasoning')}")
 
-        if failures > 0:
-            print(f"\n⚠️ Pipeline completed with {failures} failure(s).")
-            return 1
-        elif len(findings) == 0:
-            print(f"\nℹ️ Pipeline Execution Completed: No vulnerability findings recorded.")
-            return 0
-        else:
-            print(f"\n🎉 Pipeline Execution Completed: Processed {len(findings)} vulnerability finding(s).")
-            return 0
+    findings = read_findings(db_path, run_id=run_id)
+    scores = read_risk_scores(db_path, run_id=run_id)
+    print(f"\n📊 Summary: {len(findings)} vulnerability finding(s) recorded.")
+    for f in findings:
+        lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""
+        mark = " (suppressed at review)" if f.get("status") == "reported" else ""
+        print(f"  - [{f.get('severity', 'Unknown')}] {f.get('filepath')}: {f.get('title')}{lines_str}{mark}")
+    if scores:
+        print("\n🎯 Risk Calibration Scores:")
+        for s in scores:
+            score_val = float(s.get('score', 0))
+            print(f"  - {s.get('filepath')}: {score_val:.1f}/10.0 - {s.get('reasoning')}")
+
+    if failures > 0:
+        print(f"\n⚠️ Pipeline completed with {failures} failure(s).")
+        return 1
+    elif len(findings) == 0:
+        print(f"\nℹ️ Pipeline Execution Completed: No vulnerability findings recorded.")
+        return 0
+    else:
+        print(f"\n🎉 Pipeline Execution Completed: Processed {len(findings)} vulnerability finding(s).")
+        return 0
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: ./run.sh <directory_or_file_to_scan>")
+        print("Usage: ./run.sh <directory_or_file_to_scan> [workflow.json]")
         sys.exit(1)
         
     target = sys.argv[1]
+    wf = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("MANTIS_WORKFLOW", "")
     try:
-        exit_code = asyncio.run(pipeline(target))
+        exit_code = asyncio.run(pipeline(target, workflow_path=wf))
         sys.exit(exit_code)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")

@@ -6,7 +6,7 @@ import uuid
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 @contextmanager
 def _db(db_path: str, check_version: bool = True):
@@ -171,6 +171,32 @@ def init_db(db_path: str):
                 tags TEXT DEFAULT '[]'
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS okf_concepts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                concept_id TEXT,
+                type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                resource TEXT,
+                tags TEXT DEFAULT '[]',
+                status TEXT DEFAULT 'stable',
+                trust_tier TEXT NOT NULL DEFAULT 'unverified',
+                verified_by TEXT DEFAULT '[]',
+                generated_by TEXT,
+                snapshot_id TEXT,
+                description TEXT,
+                sources TEXT DEFAULT '[]',
+                body_markdown TEXT,
+                raw_markdown TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(run_id, concept_id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_okf_resource ON okf_concepts(resource)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_okf_type ON okf_concepts(type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_okf_concept_id ON okf_concepts(concept_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_okf_trust_tier ON okf_concepts(trust_tier)")
         cursor.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
 
@@ -560,6 +586,342 @@ def read_risk_scores(db_path: str, filepath: Optional[str] = None, run_id: Optio
         cursor.execute(query, params)
         return [dict(r) for r in cursor.fetchall()]
 
+def parse_okf_markdown(content: str, default_concept_id: str = "") -> Optional[Dict[str, Any]]:
+    """Parses an OKF v0.2 markdown document (YAML frontmatter + markdown body) into a structured concept dictionary."""
+    if not content or not isinstance(content, str):
+        return None
+
+    content_clean = content.strip()
+    frontmatter_dict: Dict[str, Any] = {}
+    body = content_clean
+
+    # 1. Match YAML frontmatter delimited strictly by '---' on its own line at the start of the file
+    # and closed by '---' on its own line. Never split on '---' substrings inside diffs (e.g. '--- a/foo.py').
+    lines = content_clean.splitlines(keepends=True)
+    if lines and lines[0].strip() == "---":
+        closing_idx = -1
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                closing_idx = i
+                break
+        if closing_idx != -1:
+            fm_raw = "".join(lines[1:closing_idx]).strip()
+            body = "".join(lines[closing_idx + 1:]).strip()
+            try:
+                import yaml
+                loaded = yaml.safe_load(fm_raw)
+                if isinstance(loaded, dict):
+                    frontmatter_dict = loaded
+            except Exception:
+                # Robust fallback for key-value pairs, lists, and dicts
+                current_list_key = None
+                for line in fm_raw.splitlines():
+                    line_str = line.strip()
+                    if not line_str or line_str.startswith("#"):
+                        continue
+                    if line_str.startswith("- ") and current_list_key:
+                        item_str = line_str[2:].strip()
+                        if ":" in item_str:
+                            sub_dict = {}
+                            for sub_part in item_str.split(","):
+                                if ":" in sub_part:
+                                    sk, sv = sub_part.split(":", 1)
+                                    sub_dict[sk.strip().strip("{}")] = sv.strip().strip("'\"{}")
+                            frontmatter_dict.setdefault(current_list_key, []).append(sub_dict)
+                        else:
+                            frontmatter_dict.setdefault(current_list_key, []).append(item_str.strip("'\""))
+                    elif ":" in line_str:
+                        k, v = line_str.split(":", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if not v:
+                            current_list_key = k
+                            frontmatter_dict[k] = []
+                        else:
+                            current_list_key = None
+                            if v.startswith("[") and v.endswith("]"):
+                                frontmatter_dict[k] = [x.strip().strip("'\"") for x in v[1:-1].split(",") if x.strip()]
+                            else:
+                                frontmatter_dict[k] = v
+
+    # 2. Derive concept type and title
+    concept_type = str(frontmatter_dict.get("type") or "").strip()
+    title = str(frontmatter_dict.get("title") or "").strip()
+
+    if not concept_type:
+        clean_cid = default_concept_id.replace("\\", "/")
+        if clean_cid.startswith("workspace/kb/entities/") or "/entities/" in clean_cid:
+            concept_type = "Component Entity"
+        elif "THREAT_MODEL" in clean_cid or "threat_model" in clean_cid:
+            concept_type = "Threat Model"
+        elif "architecture" in clean_cid.lower() or "summary" in clean_cid.lower():
+            concept_type = "Architecture Summary"
+        elif clean_cid.startswith("workspace/kb/vulnerabilities/") or "/vulnerabilities/" in clean_cid:
+            concept_type = "Vulnerability Pattern"
+        elif "invariant" in clean_cid or "guardrail" in clean_cid:
+            concept_type = "Security Invariant"
+        else:
+            concept_type = "Generic Concept"
+
+    if not title:
+        for line in body.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("# ") and not line_str.startswith("##"):
+                title = line_str.removeprefix("# ").strip()
+                break
+        if not title:
+            title = os.path.basename(default_concept_id).removesuffix(".md") if default_concept_id else "Untitled Concept"
+
+    # 3. Derive Trust Tier per OKF v0.2 §5.3
+    verified_val = frontmatter_dict.get("verified") or []
+    if isinstance(verified_val, dict):
+        verified_list = [verified_val]
+    elif isinstance(verified_val, list):
+        verified_list = verified_val
+    else:
+        verified_list = []
+
+    trust_tier = "unverified"
+    if verified_list:
+        has_human = False
+        has_verifier = False
+        for v in verified_list:
+            if isinstance(v, dict):
+                by_actor = str(v.get("by") or "")
+                if by_actor.startswith("human:"):
+                    has_human = True
+                if by_actor:
+                    has_verifier = True
+            elif isinstance(v, str):
+                if v.startswith("human:"):
+                    has_human = True
+                if v:
+                    has_verifier = True
+        if has_human:
+            trust_tier = "human_reviewed"
+        elif has_verifier:
+            trust_tier = "machine_confirmed"
+
+    # Parse tags
+    tags_val = frontmatter_dict.get("tags") or []
+    if isinstance(tags_val, str):
+        tags_list = [t.strip() for t in tags_val.strip("[]").split(",") if t.strip()]
+    elif isinstance(tags_val, list):
+        tags_list = [str(t).strip() for t in tags_val]
+    else:
+        tags_list = []
+
+    # Parse generated
+    gen_val = frontmatter_dict.get("generated")
+    if isinstance(gen_val, dict):
+        gen_by = str(gen_val.get("by") or "")
+    elif isinstance(gen_val, str):
+        gen_by = gen_val
+    else:
+        gen_by = ""
+
+    # Parse resource (canonical target file)
+    raw_resource = str(frontmatter_dict.get("resource") or "").strip()
+    norm_resource = canonical_filepath(raw_resource, target_file=raw_resource) if raw_resource else ""
+
+    concept_id = default_concept_id or frontmatter_dict.get("id") or title.lower().replace(" ", "_")
+
+    return {
+        "concept_id": concept_id,
+        "type": concept_type,
+        "title": title,
+        "resource": norm_resource,
+        "tags": tags_list,
+        "status": str(frontmatter_dict.get("status") or "stable"),
+        "trust_tier": trust_tier,
+        "verified_by": verified_list,
+        "generated_by": gen_by,
+        "snapshot_id": str(frontmatter_dict.get("snapshot_id") or ""),
+        "description": str(frontmatter_dict.get("description") or ""),
+        "sources": frontmatter_dict.get("sources") if isinstance(frontmatter_dict.get("sources"), list) else [],
+        "body_markdown": body,
+        "raw_markdown": content_clean,
+    }
+
+
+def record_okf_concept(db_path: str, run_id: str, concept: Dict[str, Any]):
+    """Records or updates a structured OKF v0.2 concept in the okf_concepts table."""
+    with _db(db_path) as conn:
+        cursor = conn.cursor()
+        concept_id = concept.get("concept_id") or concept.get("title") or "concept"
+        c_type = concept.get("type") or "Generic Concept"
+        title = concept.get("title") or concept_id
+        res = concept.get("resource") or ""
+        tags_str = json.dumps(concept.get("tags") or [])
+        status = concept.get("status") or "stable"
+        trust_tier = concept.get("trust_tier") or "unverified"
+        ver_str = json.dumps(concept.get("verified_by") or [])
+        gen_by = concept.get("generated_by") or ""
+        snap_id = concept.get("snapshot_id") or ""
+        desc = concept.get("description") or ""
+        sources_str = json.dumps(concept.get("sources") or [])
+        body = concept.get("body_markdown") or ""
+        raw = concept.get("raw_markdown") or ""
+
+        cursor.execute("DELETE FROM okf_concepts WHERE run_id = ? AND concept_id = ?", (run_id, concept_id))
+        cursor.execute("""
+            INSERT OR REPLACE INTO okf_concepts (
+                run_id, concept_id, type, title, resource, tags, status,
+                trust_tier, verified_by, generated_by, snapshot_id, description,
+                sources, body_markdown, raw_markdown
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            run_id, concept_id, c_type, title, res, tags_str, status,
+            trust_tier, ver_str, gen_by, snap_id, desc,
+            sources_str, body, raw
+        ))
+
+
+def read_okf_concepts(
+    db_path: str,
+    resource: str = "",
+    concept_type: str = "",
+    tag: str = "",
+    trust_tier: str = "",
+    run_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Queries OKF concepts from the database by resource, type, tag, trust_tier, or run_id."""
+    with _db(db_path) as conn:
+        cursor = conn.cursor()
+        query = "SELECT * FROM okf_concepts WHERE 1=1"
+        params = []
+        if resource:
+            norm_res = canonical_filepath(resource, target_file=resource)
+            query += " AND resource = ?"
+            params.append(norm_res)
+        if concept_type:
+            query += " AND type = ?"
+            params.append(concept_type)
+        if trust_tier:
+            query += " AND trust_tier = ?"
+            params.append(trust_tier)
+        if run_id:
+            query += " AND (run_id = ? OR run_id = '')"
+            params.append(run_id)
+        query += " ORDER BY id ASC"
+        cursor.execute(query, params)
+        rows = []
+        for r in cursor.fetchall():
+            row_dict = dict(r)
+            for json_field in ("tags", "verified_by", "sources"):
+                try:
+                    row_dict[json_field] = json.loads(row_dict.get(json_field) or "[]")
+                except Exception:
+                    row_dict[json_field] = []
+            if tag and tag not in row_dict.get("tags", []):
+                continue
+            rows.append(row_dict)
+        return rows
+
+
+def export_okf_bundle(db_path: str, output_dir: str, run_id: Optional[str] = None) -> List[str]:
+    """Exports all okf_concepts from SQLite into a fully conformant OKF v0.2 directory bundle on disk."""
+    concepts = read_okf_concepts(db_path, run_id=run_id)
+    os.makedirs(output_dir, exist_ok=True)
+    exported_files = []
+
+    # Write root index.md catalog
+    index_path = os.path.join(output_dir, "index.md")
+    index_lines = [
+        "---",
+        'okf_version: "0.2"',
+        "title: Mantis Knowledge Base Catalog",
+        "---",
+        "",
+        "# Mantis Knowledge Base Concepts",
+        ""
+    ]
+
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for c in concepts:
+        by_type.setdefault(c.get("type", "General"), []).append(c)
+
+    for c_type, items in by_type.items():
+        index_lines.append(f"## {c_type}")
+        for item in items:
+            cid = item.get("concept_id") or "concept"
+            rel_file = cid if cid.endswith(".md") else f"{cid}.md"
+            if rel_file.startswith("workspace/kb/"):
+                rel_file = rel_file.removeprefix("workspace/kb/")
+            desc = item.get("description") or item.get("title")
+            index_lines.append(f"* [{item.get('title')}]({rel_file}) - {desc}")
+        index_lines.append("")
+
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(index_lines))
+    exported_files.append(index_path)
+
+    for c in concepts:
+        cid = c.get("concept_id") or "concept"
+        rel_path = cid if cid.endswith(".md") else f"{cid}.md"
+        if rel_path.startswith("workspace/kb/"):
+            rel_path = rel_path.removeprefix("workspace/kb/")
+        full_dest = os.path.join(output_dir, rel_path)
+        os.makedirs(os.path.dirname(full_dest), exist_ok=True)
+
+        fm = {
+            "type": c.get("type"),
+            "title": c.get("title"),
+            "status": c.get("status", "stable"),
+        }
+        if c.get("resource"):
+            fm["resource"] = c.get("resource")
+        if c.get("tags"):
+            fm["tags"] = c.get("tags")
+        if c.get("description"):
+            fm["description"] = c.get("description")
+        if c.get("snapshot_id"):
+            fm["snapshot_id"] = c.get("snapshot_id")
+        if c.get("generated_by"):
+            fm["generated"] = {"by": c.get("generated_by")}
+        if c.get("verified_by"):
+            fm["verified"] = c.get("verified_by")
+        if c.get("sources"):
+            fm["sources"] = c.get("sources")
+
+        try:
+            import yaml
+            fm_yaml = yaml.dump(fm, sort_keys=False).strip()
+        except Exception:
+            fm_yaml = f"type: {fm.get('type')}\ntitle: {fm.get('title')}"
+
+        file_content = f"---\n{fm_yaml}\n---\n\n{c.get('body_markdown', '').strip()}\n"
+        with open(full_dest, "w", encoding="utf-8") as f:
+            f.write(file_content)
+        exported_files.append(full_dest)
+
+    return exported_files
+
+
+def import_okf_bundle(db_path: str, bundle_dir: str, run_id: str = "imported") -> int:
+    """Imports an OKF v0.2 directory bundle from disk into the SQLite okf_concepts table."""
+    imported_count = 0
+    if not os.path.isdir(bundle_dir):
+        return 0
+
+    for root, _, files in os.walk(bundle_dir):
+        for f in files:
+            if f.endswith(".md") and f != "index.md":
+                full_p = os.path.join(root, f)
+                rel_p = os.path.relpath(full_p, bundle_dir).replace("\\", "/")
+                try:
+                    with open(full_p, "r", encoding="utf-8") as fh:
+                        content = fh.read()
+                    parsed = parse_okf_markdown(content, default_concept_id=rel_p)
+                    if parsed:
+                        record_okf_concept(db_path, run_id, parsed)
+                        record_artifact(db_path, run_id, parsed.get("type", "okf_concept"), rel_p, content)
+                        imported_count += 1
+                except Exception:
+                    pass
+    return imported_count
+
+
 def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str, content: str, metadata: Optional[dict] = None):
     """Record a campaign artifact in the database, replacing prior rows for the same filepath in this run."""
     with _db(db_path) as conn:
@@ -570,6 +932,24 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
             INSERT OR REPLACE INTO campaign_artifacts (run_id, artifact_type, filepath, content, metadata_json)
             VALUES (?, ?, ?, ?, ?)
         """, (run_id, artifact_type, filepath, content, meta_str))
+
+    # Also automatically index into okf_concepts if the artifact is markdown/KB documentation
+    if (
+        filepath.endswith((".md", ".markdown"))
+        or "workspace/kb/" in filepath
+        or artifact_type in ("threat_model", "summary", "entity", "architecture")
+        or content.strip().startswith(("---", "#"))
+    ):
+        try:
+            parsed = parse_okf_markdown(content, default_concept_id=filepath)
+            if parsed:
+                if artifact_type == "threat_model" and parsed["type"] in ("Generic Concept", "Untitled Concept"):
+                    parsed["type"] = "Threat Model"
+                elif artifact_type in ("summary", "architecture") and parsed["type"] in ("Generic Concept", "Untitled Concept"):
+                    parsed["type"] = "Architecture Summary"
+                record_okf_concept(db_path, run_id, parsed)
+        except Exception:
+            pass
 
 def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> Optional[str]:
     """Retrieve an artifact's content from the database by filepath or artifact_type strictly scoped to run_id when provided."""
@@ -682,17 +1062,29 @@ def query_historical_lineage(
 
 
 def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] = None) -> Dict[str, Any]:
-    """Aggregates active threat models, historical vulnerabilities, triaged false positives,
-    recurrent lineages, and learned invariants into actionable security guidance for a target file.
+    """Aggregates active threat models, OKF concepts, historical vulnerabilities, triaged false positives,
+    recurrent lineages, and verified remediation patterns into actionable security guidance for a target file.
     """
     with _db(db_path) as conn:
         cursor = conn.cursor()
         norm_fp = canonical_filepath(filepath, target_file=filepath)
 
-        # 1. Threat Model & Trust Boundaries
-        threat_model_content = read_artifact(db_path, artifact_type="threat_model", run_id=run_id)
-        if not threat_model_content:
-            threat_model_content = read_artifact(db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=run_id)
+        # 1. OKF Concepts (Scoped to Target File)
+        scoped_okf = read_okf_concepts(db_path, resource=norm_fp, run_id=run_id) if norm_fp else read_okf_concepts(db_path, run_id=run_id)
+        
+        # Extract scoped threat boundaries, component entities, architecture summaries, and security invariants
+        threat_concepts = [c for c in scoped_okf if c.get("type") in ("Threat Boundary", "Threat Model")]
+        entity_concepts = [c for c in scoped_okf if c.get("type") in ("Component Entity", "Software Entity", "Hardware Entity", "Architecture Summary")]
+        invariant_concepts = [c for c in scoped_okf if c.get("type") in ("Security Invariant", "Guardrail")]
+
+        # Fallback to system-wide threat model if no scoped threat boundary exists
+        threat_model_content = ""
+        if threat_concepts:
+            threat_model_content = "\n\n".join(f"### {c.get('title')}\n{c.get('body_markdown', '').strip()}" for c in threat_concepts)
+        else:
+            threat_model_content = read_artifact(db_path, artifact_type="threat_model", run_id=run_id) or ""
+            if not threat_model_content:
+                threat_model_content = read_artifact(db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=run_id) or ""
 
         # 2. Confirmed & Active Vulnerabilities (with verified patches)
         if norm_fp:
@@ -761,9 +1153,17 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
         # 5. Learned Invariants & Trajectory Rules
         learnings = read_learnings(db_path)
 
+        # Derive Highest Trust Tier for target file per OKF v0.2 §5.3
+        trust_badge = "HEURISTIC"
+        if any(c.get("trust_tier") == "human_reviewed" for c in scoped_okf):
+            trust_badge = "HUMAN-REVIEWED"
+        elif any(c.get("trust_tier") == "machine_confirmed" for c in scoped_okf) or any(f.get("status") in ("patch_verified", "dynamic_confirmed", "reproduced") for f in confirmed_rows):
+            trust_badge = "SANDBOX-CONFIRMED"
+
         # Build guidance summary
         guidance_lines = [
             f"# Security Advisory & Development Guidance for: {norm_fp or 'Repository Scope'}",
+            f"**[OKF TRUST TIER: {trust_badge}]**",
             "",
             "## 1. Threat Model & Trust Boundaries Context",
         ]
@@ -772,19 +1172,41 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
         else:
             guidance_lines.append("No active threat model recorded. Treat all external network inputs as untrusted.")
 
-        guidance_lines.extend(["", "## 2. Historical Vulnerabilities & Verified Remediation Patterns"])
+        # Entity context if available
+        if entity_concepts:
+            guidance_lines.extend(["", "## 2. Component Architecture & Known Constraints"])
+            for ent in entity_concepts:
+                badge = f"[{ent.get('trust_tier', 'unverified').upper().replace('_', '-')}]"
+                guidance_lines.append(f"### {ent.get('title')} {badge}")
+                if ent.get("description"):
+                    guidance_lines.append(f"*{ent.get('description')}*")
+                if ent.get("body_markdown"):
+                    guidance_lines.append(f"{ent.get('body_markdown').strip()}\n")
+
+        # Security Invariants / Guardrails
+        if invariant_concepts or learnings:
+            guidance_lines.extend(["", "## 3. Verified Security Guardrails & Invariants"])
+            for inv in invariant_concepts:
+                tier = inv.get("trust_tier", "unverified").upper().replace("_", "-")
+                guidance_lines.append(f"- ⛔ **[{tier}] {inv.get('title')}**: {inv.get('description') or inv.get('body_markdown', '').strip()}")
+            for l in learnings:
+                guidance_lines.append(f"- ℹ️ **[{l.get('category', 'GENERAL')}]**: {l.get('learning')}")
+
+        guidance_lines.extend(["", "## 4. Historical Vulnerabilities & Verified Remediation Patterns"])
         if confirmed_rows:
             for c in confirmed_rows:
                 guidance_lines.append(f"- **[{c.get('severity', 'UNKNOWN')}] {c.get('title')}** (CWE: {c.get('cwe', 'N/A')}, Status: `{c.get('status')}`)")
                 guidance_lines.append(f"  - **Description**: {c.get('description', '').strip()}")
                 if c.get("remediation"):
                     guidance_lines.append(f"  - **Remediation Invariant**: {c.get('remediation').strip()}")
+                if c.get("patch_status"):
+                    guidance_lines.append(f"  - **Patch Status**: `{c.get('patch_status')}`")
                 if c.get("patch_diff"):
-                    guidance_lines.append(f"  - **Verified Patch Diff**:\n```diff\n{c.get('patch_diff').strip()}\n```")
+                    guidance_lines.append(f"  - **Verified Patch Diff (Few-Shot Pattern)**:\n```diff\n{c.get('patch_diff').strip()}\n```")
         else:
             guidance_lines.append("No historical vulnerabilities recorded for this file.")
 
-        guidance_lines.extend(["", "## 3. Triaged False Positives & Legitimate Intentional Patterns"])
+        guidance_lines.extend(["", "## 5. Triaged False Positives & Legitimate Intentional Patterns"])
         if fp_rows:
             for fp_item in fp_rows:
                 reason = fp_item.get("triage_reasoning") or "Triaged as intentional / safe functionality."
@@ -793,24 +1215,17 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
         else:
             guidance_lines.append("No historical false positive records for this file.")
 
-        guidance_lines.extend(["", "## 4. Recurrent Pitfalls & Regression Alerts"])
         if recurrent_lineages:
+            guidance_lines.extend(["", "## 6. Recurrent Pitfalls & Regression Alerts"])
             for rec in recurrent_lineages:
                 guidance_lines.append(f"- **Lineage `{rec.get('lineage_id')}` ({rec.get('title')})**: recurred **{rec.get('occurrence_count')} times** across passes/runs.")
                 guidance_lines.append(f"  - First seen: {rec.get('first_seen')}, Last seen: {rec.get('last_seen')}, Observed statuses: `{rec.get('observed_statuses')}`")
-        else:
-            guidance_lines.append("No recurring regressions detected.")
-
-        guidance_lines.extend(["", "## 5. Verified Security Guardrails & Invariants"])
-        if learnings:
-            for l in learnings:
-                guidance_lines.append(f"- **[{l.get('category', 'GENERAL')}]**: {l.get('learning')}")
-        else:
-            guidance_lines.append("No learned trajectory invariants recorded.")
 
         return {
             "filepath": norm_fp,
+            "trust_tier": trust_badge,
             "threat_model": threat_model_content,
+            "okf_concepts": scoped_okf,
             "confirmed_vulnerabilities": confirmed_rows,
             "false_positives": fp_rows,
             "recurrent_lineages": recurrent_lineages,
