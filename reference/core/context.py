@@ -10,6 +10,7 @@ class RunContext:
     sandbox: object = None
     run_id: str = ""
     sandbox_executed: bool = False
+    snapshot_id: str = ""
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

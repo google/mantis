@@ -751,6 +751,38 @@ vector embedding infrastructure for finding embeddings. The finding embedding is
 a different payload (finding JSON, not KB chunks) but the same embedding
 capability can serve both.
 
+#### D. Enterprise Vector Architecture & Cloud Scalability
+
+For enterprise deployments tracking hundreds of thousands of vulnerabilities
+across distributed codebases and multi-tenant audit pipelines, SQLite vector
+storage can be swapped for managed cloud vector engines:
+
+- **Cloud Spanner Vector Search:**
+  - *Best For*: Mission-critical enterprise pipelines requiring global ACID
+    consistency, 99.999% availability, and synchronized finding lineage
+    tracking.
+  - *Architecture*: Store findings and `lineage_vectors` in Spanner with
+    `ARRAY<FLOAT32>` vector columns. Utilize `COSINE_DISTANCE` with KNN search
+    indexes for real-time finding deduplication during parallel scan passes.
+- **Cloud SQL for PostgreSQL (`pgvector`):**
+  - *Best For*: Standard enterprise relational backends needing ACID compliance
+    with low operational complexity.
+  - *Architecture*: Enable the `vector` extension. Store finding embeddings in a
+    `vector(768)` or `vector(256)` column with HNSW (`vector_cosine_ops`) or
+    IVFFlat indexes for sub-millisecond similarity queries.
+- **AlloyDB for PostgreSQL:**
+  - *Best For*: High-throughput multi-agent audit farms running concurrent
+    research waves.
+  - *Architecture*: Leverage AlloyDB's columnar vector engine and ScaNN-based
+    approximate nearest neighbor indexing for up to 10x faster vector queries
+    over standard PostgreSQL.
+- **BigQuery Vector Search:**
+  - *Best For*: Batch analytical processing, organization-wide threat
+    intelligence clustering, and cross-campaign vulnerability lineage analysis.
+  - *Architecture*: Ingest finding embeddings into BigQuery and execute
+    `VECTOR_SEARCH(TABLE findings, 'embedding', ...)` with `COSINE` distance for
+    serverless batch deduplication and historical regression analytics.
+
 ______________________________________________________________________
 
 ### 8. SAST Seeding (External Tool Ingestion)

@@ -8,3 +8,12 @@ repos:
           - mdformat-gfm
           - mdformat-frontmatter
 
+  - repo: local
+    hooks:
+      - id: check-workflow-unconfigured
+        name: Ensure workflow.json uses default placeholders
+        entry: python3 reference/scripts/configure.py --check-clean
+        language: system
+        files: ^reference/workflow\.json$
+        pass_filenames: false
+

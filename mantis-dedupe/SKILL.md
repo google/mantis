@@ -244,18 +244,66 @@ Execute your task as follows:
      resolved-archived finding paired with a NOT_MATCHED current finding is
      ALWAYS kept active (never trashed), regardless of mode.
 
-3. **Filter Duplicate Findings in Current Batch:** Check the current findings
+3. **3-Tier Deduplication Ladder (Deterministic & Semantic Matching):** When
+   resolving finding lineages and evaluating deduplication candidates, the
+   deduplicator uses a hierarchical 3-tier ladder designed for sub-millisecond
+   fast-path execution with semantic RAG fallback:
+
+   - **Tier 1 (Fast-Path Exact Heuristic Anchors — < 1ms, 0 tokens):**
+
+     1. Exact content identity signature match:
+        `hashlib.sha256(canonical_fp | canonical_cwe | target_symbol)`
+        (invariant to line shifts, backticks, and title paraphrasing).
+     2. Exact `canonical_filepath + normalized CWE + target_symbol` match.
+     3. Strict line proximity window ($\\le 3$ lines) on exact canonical
+        filepath when target symbol is empty.
+
+     - *Result*: If matched, immediately inherit ancestor `lineage_id` without
+       LLM or embedding overhead.
+
+   - **Tier 2 (RCA Normalization):** If Tier 1 heuristic matching does not
+     produce an exact anchor, synthesize a standardized 5-line Root Cause
+     Analysis (RCA) summary:
+
+     - `Component`: Normalized canonical filepath and symbol.
+     - `Vulnerability Class`: Canonical CWE taxonomy identifier and name.
+     - `Root Cause Mechanism`: Underlying programming or logic defect.
+     - `Failure Condition`: Specific input, state, or boundary condition.
+     - `Taint Dataflow`: Source-to-sink dataflow trajectory.
+
+   - **Tier 3 (Vector Embedding & Cosine Similarity Scan):**
+
+     - Project the standardized RCA summary into dense vector embeddings using
+       the configured multi-provider embedding engine (default:
+       `vertex_ai/gemini-embedding-001`).
+     - Perform nearest-neighbor scan over historical `lineage_vectors` in the
+       database using bounded cosine similarity.
+     - **CWE Family & Class Structural Guard:** When comparing query finding
+       vectors against candidate lineage records, if both findings have explicit
+       CWE classifications (e.g. CWE-89 vs CWE-78), normalize them. If they
+       belong to distinct, incompatible CWE IDs, skip candidate vector
+       comparison entirely to structurally prevent false-merging distinct
+       vulnerability classes regardless of cosine score.
+     - **Positive threshold ($\\ge 0.90$):** Semantically equivalent findings
+       with differing phrasing, scanner labels, or line shifts merge into the
+       same ancestor `lineage_id` (default: 0.90, configurable via
+       `EMBEDDING_SIMILARITY_THRESHOLD`).
+     - **Negative threshold ($< 0.70$):** Distinct vulnerability classes (e.g.,
+       SQLi vs Command Injection, Stored vs Reflected XSS) maintain low
+       similarity and fail closed, minting a fresh unique `lineage_id`.
+
+4. **Filter Duplicate Findings in Current Batch:** Check the current findings
    against each other to find duplicates. Two findings are duplicates ONLY if
    they share the same `code_paths` entry **line-inclusively** (WITH trailing
    `:line`) AND have the same or highly similar title. If multiple findings
    refer to the exact same flaw at the same location, they must be merged.
    Findings at different lines in the same file are DISTINCT — never merge them.
 
-4. **Map/Reduce Chunking Strategy (For Scale):** If there are many finding files
+5. **Map/Reduce Chunking Strategy (For Scale):** If there are many finding files
    (e.g., > 20 items), use a Map/Reduce approach to group them by target file or
    component before checking for overlaps to avoid context window limits.
 
-5. **Token-Optimized Consolidation and Merging:** To minimize LLM output tokens
+6. **Token-Optimized Consolidation and Merging:** To minimize LLM output tokens
    and prevent data loss, **do not manually rewrite or output the merged JSON
    files in your response.** Instead, follow this pattern:
 
@@ -301,7 +349,7 @@ Execute your task as follows:
    3. **Execute the Script:** Run your script to update the primary finding's
       file (`workspace/findings/<primary_id>.json`) on disk.
 
-6. **Transactional Staged Clean Up:** Do not permanently delete redundant files.
+7. **Transactional Staged Clean Up:** Do not permanently delete redundant files.
    Ensure the trash directory exists (e.g.,
    `mkdir -p workspace/findings/.trash/`). Before moving, the script must update
    the duplicate finding files, setting `"status": "DUPLICATE"` and

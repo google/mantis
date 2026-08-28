@@ -21,4 +21,4 @@ if [ ! -d ".venv" ]; then
 fi
 
 source .venv/bin/activate
-python3 main.py "$TARGET" "$@"
+python3 scripts/launch.py "$TARGET" "$@"

@@ -1,3 +1,6 @@
 .venv/
 findings.db
 knowledge.db
+workflow.local.json
+*.local.json
+.workflow.local.json

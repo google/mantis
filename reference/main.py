@@ -5,6 +5,7 @@ import uuid
 import dataclasses
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 from google.genai import types
 from google.adk.runners import Runner
@@ -159,17 +160,65 @@ def discover_files(target: Path, db_path: str = "") -> list[str]:
         if p.is_file() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
     ]
 
-async def pipeline(scan_target: str, workflow_path: str = ""):
+async def pipeline(
+    scan_target: str,
+    workflow_path: str = "",
+    model_override: Optional[str] = None,
+    api_base_override: Optional[str] = None,
+    sandbox_override: Optional[dict | str] = None,
+    db_override: Optional[str] = None,
+    timeout_override: Optional[float] = None,
+    reasoning_effort_override: Optional[str] = None,
+    auto_configure: bool = True,
+):
     """Main pipeline loop compiled declaratively from JSON specification."""
     if not workflow_path:
         pipeline_dir = os.path.realpath(os.path.dirname(__file__))
         workflow_path = os.path.join(pipeline_dir, "workflow.json")
 
+    # Auto-resolve unconfigured placeholders if enabled
+    if auto_configure:
+        try:
+            from scripts.configure import ensure_configured_async
+            overrides = {}
+            if model_override:
+                overrides["default_model"] = model_override
+            if api_base_override:
+                overrides["api_base"] = api_base_override
+            if sandbox_override:
+                overrides["sandbox"] = sandbox_override
+            if db_override:
+                overrides["db_path"] = db_override
+            if timeout_override is not None:
+                overrides["timeout"] = timeout_override
+            if reasoning_effort_override:
+                overrides["reasoning_effort"] = reasoning_effort_override
+            await ensure_configured_async(workflow_path, auto=True, overrides=overrides if overrides else None)
+        except Exception as ce:
+            print(f"[CONFIG WARNING] Auto-configuration check: {ce}", file=sys.stderr)
+
     try:
-        workflow, config = load_workflow_from_json(workflow_path)
+        workflow, config = load_workflow_from_json(
+            workflow_path,
+            model_override=model_override,
+            api_base_override=api_base_override,
+            sandbox_override=sandbox_override,
+            db_override=db_override,
+            timeout_override=timeout_override,
+            reasoning_effort_override=reasoning_effort_override,
+        )
     except ValueError as e:
         print(f"Workflow Specification Error: {e}", file=sys.stderr)
         return 1
+
+    try:
+        from scripts.configure import run_preflight_checks_async
+        ok, msgs = await run_preflight_checks_async(config)
+        if not ok:
+            for m in msgs:
+                print(f"[PREFLIGHT WARNING] {m}", file=sys.stderr)
+    except Exception:
+        pass
 
     target_path = Path(scan_target).resolve()
     if not target_path.exists():
@@ -193,7 +242,7 @@ async def pipeline(scan_target: str, workflow_path: str = ""):
         jail_dir = str(target_path)
 
     print(f"Compiling Graph Pipeline. Target: {target_path} ({len(discovered_files)} source file(s) indexed)")
-    
+
     try:
         test_sandbox = build_sandbox(config.get("sandbox", {}), targets_to_scan[0])
         await test_sandbox.preflight()
@@ -206,7 +255,7 @@ async def pipeline(scan_target: str, workflow_path: str = ""):
         name=APP_NAME,
         root_agent=workflow
     )
-    
+
     sessions_db_path = config.get("sessions_db_path") or os.environ.get("MANTIS_SESSIONS_DB") or "sessions.db"
     session_service = SqliteSessionService(db_path=sessions_db_path)
     runner = Runner(
@@ -215,15 +264,17 @@ async def pipeline(scan_target: str, workflow_path: str = ""):
     )
 
     run_id = str(uuid.uuid4())
+    snapshot_id = config.get("kb_snapshot_id") or ""
     base_ctx = RunContext(
         jail_dir=jail_dir,
         db_path=db_path,
         target_file="",
-        run_id=run_id
+        run_id=run_id,
+        snapshot_id=snapshot_id,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
-    
+
     failures = 0
     successes = 0
     try:
@@ -276,15 +327,57 @@ async def pipeline(scan_target: str, workflow_path: str = ""):
         print(f"\n🎉 Pipeline Execution Completed: Processed {len(findings)} vulnerability finding(s).")
         return 0
 
+
+def parse_cli_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Mantis Vulnerability Review Pipeline")
+    parser.add_argument("target", help="Directory or file to scan")
+    parser.add_argument("--workflow", "-w", type=str, default="", help="Path to workflow.json")
+    parser.add_argument(
+        "--sandbox",
+        "-s",
+        type=str,
+        choices=["static-only", "static", "gvisor", "microsandbox", "gce"],
+        help="Sandbox override",
+    )
+    parser.add_argument("--model", "-m", type=str, help="Global LLM model override")
+    parser.add_argument("--api-base", type=str, help="Custom LLM API Base URL")
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        choices=["low", "medium", "high"],
+        help="Reasoning effort override",
+    )
+    parser.add_argument("--timeout", type=float, help="LLM timeout in seconds")
+    parser.add_argument("--db", "-d", type=str, help="Knowledge SQLite DB path")
+    parser.add_argument(
+        "--no-auto-configure",
+        action="store_true",
+        help="Disable auto-configuration of unconfigured placeholders",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: ./run.sh <directory_or_file_to_scan> [workflow.json]")
+        print("Usage: ./run.sh <directory_or_file_to_scan> [flags...]")
         sys.exit(1)
-        
-    target = sys.argv[1]
-    wf = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("MANTIS_WORKFLOW", "")
+
+    args = parse_cli_args()
     try:
-        exit_code = asyncio.run(pipeline(target, workflow_path=wf))
+        exit_code = asyncio.run(
+            pipeline(
+                scan_target=args.target,
+                workflow_path=args.workflow,
+                model_override=args.model,
+                api_base_override=args.api_base,
+                sandbox_override=args.sandbox,
+                db_override=args.db,
+                timeout_override=args.timeout,
+                reasoning_effort_override=args.reasoning_effort,
+                auto_configure=not args.no_auto_configure,
+            )
+        )
         sys.exit(exit_code)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")

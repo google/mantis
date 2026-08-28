@@ -3,9 +3,19 @@ import os
 import sqlite3
 import json
 import uuid
+import re
 from contextlib import contextmanager
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
+from core.embeddings import (
+    compute_embedding,
+    vector_to_blob,
+    blob_to_vector,
+    cosine_similarity,
+    find_nearest_lineage,
+    DEFAULT_SIMILARITY_THRESHOLD,
+    _parse_similarity_threshold,
+)
 CURRENT_SCHEMA_VERSION = 3
 
 @contextmanager
@@ -130,6 +140,8 @@ def init_db(db_path: str):
                 triage_reasoning TEXT,
                 patch_diff TEXT,
                 patch_status TEXT,
+                rca_summary TEXT,
+                embedding BLOB,
                 UNIQUE(filepath, title, description, line_numbers, run_id)
             )
         """)
@@ -137,6 +149,22 @@ def init_db(db_path: str):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_lineage ON findings(lineage_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_signature ON findings(signature)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS lineage_vectors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lineage_id TEXT NOT NULL UNIQUE,
+                filepath TEXT,
+                cwe TEXT,
+                rca_summary TEXT,
+                model TEXT DEFAULT '',
+                dimension INTEGER DEFAULT 0,
+                embedding BLOB NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_lineage_vectors_lineage ON lineage_vectors(lineage_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_lineage_vectors_filepath ON lineage_vectors(filepath)")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS risk_scores (
@@ -240,32 +268,41 @@ def extract_target_symbol(title: str = "", description: str = "", code_paths: Op
     """Extracts the target function, endpoint, or sink identifier invariant to title formatting and backticks."""
     import re
     title_clean = title.strip()
+    code_exts = (
+        ".py", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".js", ".jsx", ".ts", ".tsx",
+        ".go", ".java", ".rs", ".rb", ".php", ".cs", ".kt", ".swift", ".m", ".scala", ".sh", ".sql"
+    )
 
-    # 1. Backticked symbol anywhere in title: `get_user` -> get_user
+    # 1. Backticked symbol anywhere in title: `get_user` -> get_user (skip file paths like `src/auth.py`)
     backtick_match = re.search(r"`([a-zA-Z0-9_\-/\.]+)(?:\(\))?`", title_clean)
     if backtick_match:
-        return backtick_match.group(1).strip("/.()").lower()
+        sym = backtick_match.group(1).strip("/.()").lower()
+        if not sym.endswith(code_exts) and "/" not in sym and "\\" not in sym:
+            return sym
 
-    # 2. Endpoint notation: /view, /api/cart, /backup
-    ep_match = re.search(r"(/[a-zA-Z0-9_\-]+(?:/[a-zA-Z0-9_\-]+)*)", title_clean)
+    # 2. Endpoint notation: /view, /api/cart, /backup (not file paths like src/parser.c)
+    ep_match = re.search(r"(?:^|[\s`])(/[a-zA-Z0-9_\-]+(?:/[a-zA-Z0-9_\-]+)*)", title_clean)
     if ep_match:
-        return ep_match.group(1).strip("/").replace("/", "_").lower()
+        ep_cand = ep_match.group(1).strip("/.()").replace("/", "_").lower()
+        if not ep_cand.endswith(code_exts) and len(ep_cand) >= 2:
+            return ep_cand
 
     # 3. Explicit symbol following preposition in title: 'in get_user', 'in list_orders', 'in function hydrate'
     prep_match = re.search(
-        r"\b(?:in|at|within|inside|for)\s+(?:function\s+|method\s+|routine\s+|handler\s+|endpoint\s+|def\s+)?([a-zA-Z_][a-zA-Z0-9_]+)(?:\(\))?",
+        r"\b(?:in|at|within|inside|for)\s+(?:function\s+|method\s+|routine\s+|handler\s+|endpoint\s+|def\s+)?`?([a-zA-Z_][a-zA-Z0-9_/\.]+)(?:\(\))?`?",
         title_clean,
         re.IGNORECASE
     )
     if prep_match:
-        sym = prep_match.group(1).lower()
-        stopwords_sym = {
-            "the", "a", "an", "this", "all", "user", "file", "path", "order", "query", "input",
-            "database", "system", "memory", "header", "comment", "token", "session", "request",
-            "response", "cart", "service", "views", "controllers", "api"
-        }
-        if sym not in stopwords_sym and len(sym) >= 3:
-            return sym
+        raw_sym = prep_match.group(1).strip("/.()").lower()
+        if not raw_sym.endswith(code_exts) and "/" not in raw_sym and "\\" not in raw_sym:
+            stopwords_sym = {
+                "the", "a", "an", "this", "all", "user", "file", "path", "order", "query", "input",
+                "database", "system", "memory", "header", "comment", "token", "session", "request",
+                "response", "cart", "service", "views", "controllers", "api"
+            }
+            if raw_sym not in stopwords_sym and len(raw_sym) >= 3:
+                return raw_sym
 
     # 4. Function call notation in title: get_user(), list_orders()
     fn_match = re.search(r"\b([a-zA-Z_][a-zA-Z0-9_]+)\(\)", title_clean)
@@ -276,7 +313,7 @@ def extract_target_symbol(title: str = "", description: str = "", code_paths: Op
     desc_backtick = re.search(r"`([a-zA-Z0-9_\-/\.]+)(?:\(\))?`", description)
     if desc_backtick:
         sym = desc_backtick.group(1).strip("/.()").lower()
-        if len(sym) >= 3 and not sym.isdigit():
+        if len(sym) >= 3 and not sym.isdigit() and not sym.endswith(code_exts) and "/" not in sym and "\\" not in sym:
             return sym
 
     desc_fn = re.search(r"\b(?:function|method|handler|routine|def)\s+`?([a-zA-Z_][a-zA-Z0-9_]+)`?(?:\(\))?", description, re.IGNORECASE)
@@ -287,9 +324,23 @@ def extract_target_symbol(title: str = "", description: str = "", code_paths: Op
     if code_paths and isinstance(code_paths, list):
         for cp in code_paths:
             if isinstance(cp, str) and not cp.startswith("http"):
-                clean_cp = cp.split(":")[0].strip()
-                if clean_cp and not os.path.isfile(clean_cp):
-                    return clean_cp.strip("/.()").lower()
+                parts = cp.split(":")
+                # Case 1: file:line:symbol (e.g. auth.py:42:authenticate_user)
+                if len(parts) > 2:
+                    cand = parts[2].strip().strip("/.()").lower()
+                    if cand and re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", cand):
+                        return cand
+                # Case 2: symbol directly in code_paths (no slashes, no code extension)
+                clean_cp = parts[0].strip()
+                if clean_cp and not clean_cp.endswith(code_exts) and "/" not in clean_cp and "\\" not in clean_cp:
+                    if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", clean_cp):
+                        return clean_cp.lower()
+            elif isinstance(cp, dict):
+                cand = cp.get("symbol") or cp.get("function") or cp.get("target_symbol")
+                if cand and isinstance(cand, str):
+                    clean_cand = cand.strip().strip("/.()").lower()
+                    if clean_cand and not clean_cand.endswith(code_exts) and "/" not in clean_cand:
+                        return clean_cand
 
     # 7. Fallback: Normalized significant tokens (excluding vulnerability taxonomy and grammatical words)
     stopwords = {
@@ -325,6 +376,91 @@ def compute_stable_signature(
     return hashlib.sha256(sig_content.encode("utf-8")).hexdigest()[:16]
 
 
+def generate_rca_summary(finding: Union[dict, Any], model: Optional[str] = None, **kwargs) -> str:
+    """Generates a standardized Root Cause Analysis (RCA) summary for a finding.
+
+    Extracts:
+    1. Component (canonical filepath / symbol)
+    2. Vulnerability Class (canonical CWE)
+    3. Root Cause Mechanism
+    4. Failure Condition
+    5. Taint Dataflow
+    """
+    f = finding.model_dump() if hasattr(finding, "model_dump") else (finding if isinstance(finding, dict) else dict(finding))
+
+    # If already populated, return as-is
+    if f.get("rca_summary") and str(f["rca_summary"]).strip():
+        return str(f["rca_summary"]).strip()
+
+    raw_fp = str(f.get("filepath") or "")
+    norm_fp = canonical_filepath(raw_fp, target_file=raw_fp)
+    raw_title = str(f.get("title") or "")
+    raw_desc = str(f.get("description") or "")
+    raw_cwe = str(f.get("cwe") or "")
+    canonical_cwe = extract_canonical_cwe(raw_cwe, raw_title, raw_desc)
+    target_symbol = extract_target_symbol(raw_title, raw_desc, f.get("code_paths"))
+
+    # Check if live LLM extraction should be attempted
+    should_use_llm = (
+        not (
+            os.environ.get("MOCK_EMBEDDINGS") == "1"
+            or os.environ.get("MANTIS_OFFLINE_EMBEDDINGS") == "1"
+            or os.environ.get("MANTIS_MOCK_EMBEDDINGS") == "1"
+            or model in ("mock", "offline")
+        )
+        and bool(os.environ.get("VERTEXAI_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GEMINI_API_KEY"))
+    )
+
+    if should_use_llm:
+        try:
+            from core.config import get_llm_kwargs
+            import litellm
+            resolved_model, llm_kwargs = get_llm_kwargs(model_id=model)
+            prompt = (
+                "You are an expert security analyst. Extract a concise, standardized Root Cause Analysis (RCA) summary "
+                "for this vulnerability finding. Output EXACTLY these 5 lines:\n"
+                "Component: <filepath or function>\n"
+                "Vulnerability Class: <canonical CWE and name>\n"
+                "Root Cause Mechanism: <underlying programming/logic flaw>\n"
+                "Failure Condition: <what specific input or state causes failure>\n"
+                "Taint Dataflow: <source to sink flow>\n\n"
+                f"Finding Details:\n"
+                f"Title: {raw_title}\n"
+                f"Filepath: {norm_fp}\n"
+                f"CWE: {canonical_cwe}\n"
+                f"Symbol: {target_symbol}\n"
+                f"Description: {raw_desc}\n"
+                f"Remediation: {f.get('remediation', '')}\n"
+            )
+            response = litellm.completion(
+                model=resolved_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.0,
+                **llm_kwargs,
+            )
+            content = response.choices[0].message.content.strip()
+            if "Component:" in content and "Vulnerability Class:" in content:
+                return content
+        except Exception:
+            pass
+
+    # Deterministic structural RCA extraction (fail-safe and offline)
+    comp = norm_fp or target_symbol or "unknown_component"
+    vuln_class = canonical_cwe if canonical_cwe != "CWE-UNKNOWN" else "CWE-SecurityFlaw"
+    mechanism = raw_title or "Unspecified vulnerability mechanism"
+    failure = raw_desc or f.get("remediation") or raw_title
+    taint = f"{target_symbol} in {norm_fp}" if target_symbol else (norm_fp or "untrusted input")
+
+    return (
+        f"Component: {comp}\n"
+        f"Vulnerability Class: {vuln_class}\n"
+        f"Root Cause Mechanism: {mechanism}\n"
+        f"Failure Condition: {failure}\n"
+        f"Taint Dataflow: {taint}"
+    )
+
+
 def resolve_ancestor_lineage(
     cursor: sqlite3.Cursor,
     filepath: str,
@@ -334,24 +470,37 @@ def resolve_ancestor_lineage(
     title: str = "",
     description: str = "",
     line_numbers: str = "[]",
+    rca_summary: str = "",
+    embedding: Optional[Union[bytes, List[float]]] = None,
+    threshold: Optional[float] = None,
 ) -> str:
-    """Resolves ancestor lineage_id using a strict, fail-closed matching ladder that preserves negative controls."""
+    """Resolves ancestor lineage_id using the 3-Tier Deduplication Ladder.
+
+    - Tier 1: Fast-Path Exact Heuristic Anchors (< 1ms, 0 tokens)
+    - Tier 2: RCA Normalization (standardized Root Cause Analysis)
+    - Tier 3: Vector Embedding & Cosine Similarity (nearest-neighbor scan >= threshold)
+    """
+    eff_threshold = _parse_similarity_threshold(threshold)
     norm_fp = canonical_filepath(filepath, target_file=filepath)
     base_name = os.path.basename(norm_fp)
     norm_cwe = extract_canonical_cwe(cwe, title, description)
     norm_sym = symbol.lower() if symbol else extract_target_symbol(title, description)
 
-    # Tier 1: Exact Stable Signature Match
-    cursor.execute("""
-        SELECT lineage_id FROM findings
-        WHERE signature = ? AND lineage_id IS NOT NULL AND lineage_id != ''
-        ORDER BY id DESC LIMIT 1
-    """, (signature,))
-    row = cursor.fetchone()
-    if row and row[0]:
-        return row[0]
+    # -------------------------------------------------------------------------
+    # Tier 1: Fast-Path Exact Heuristic Anchors
+    # -------------------------------------------------------------------------
+    # 1a. Exact Stable Content Signature Match (< 1ms, 0 tokens)
+    if signature:
+        cursor.execute("""
+            SELECT lineage_id FROM findings
+            WHERE signature = ? AND lineage_id IS NOT NULL AND lineage_id != ''
+            ORDER BY id DESC LIMIT 1
+        """, (signature,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
 
-    # Tier 2: File + Normalized CWE + Exact Target Symbol Match (Fail-closed: requires exact filepath match)
+    # 1b. File + Normalized CWE + Exact Target Symbol Match
     if norm_sym and norm_fp:
         cursor.execute("""
             SELECT lineage_id FROM findings
@@ -365,7 +514,7 @@ def resolve_ancestor_lineage(
         if row and row[0]:
             return row[0]
 
-    # Tier 3: Strict Line Proximity Match on exact filepath if and only if symbol is empty
+    # 1c. Strict Line Proximity Match on exact filepath if and only if symbol is empty
     if not norm_sym and norm_fp and line_numbers and line_numbers != "[]":
         try:
             curr_lines = json.loads(line_numbers)
@@ -389,12 +538,57 @@ def resolve_ancestor_lineage(
         except Exception:
             pass
 
-    # Tier 4: Fallback -> Fail closed, mint fresh UUIDv4 (never merge distinct functions or flaws)
-    return str(uuid.uuid4())
+    # -------------------------------------------------------------------------
+    # Tier 2 & Tier 3: RCA Normalization & Vector Embedding Cosine Similarity
+    # -------------------------------------------------------------------------
+    if not rca_summary:
+        rca_summary = generate_rca_summary({
+            "filepath": norm_fp,
+            "title": title,
+            "description": description,
+            "cwe": norm_cwe,
+            "symbol": norm_sym,
+            "line_numbers": line_numbers,
+        })
+
+    if embedding is None:
+        emb_vec = compute_embedding(rca_summary)
+        emb_blob = vector_to_blob(emb_vec)
+    elif isinstance(embedding, bytes):
+        emb_blob = embedding
+        emb_vec = blob_to_vector(emb_blob)
+    else:
+        emb_vec = list(embedding)
+        emb_blob = vector_to_blob(emb_vec)
+
+    # Scan lineage vectors with cosine similarity >= eff_threshold
+    matched_lineage = find_nearest_lineage(
+        cursor=cursor,
+        query_vector=emb_vec,
+        threshold=eff_threshold,
+        filepath=norm_fp,
+        cwe=norm_cwe,
+    )
+    if matched_lineage:
+        return matched_lineage
+
+    # Tier 3 Fallback -> Fail closed, mint fresh UUIDv4 and register lineage vector
+    new_lineage_id = str(uuid.uuid4())
+    if emb_blob:
+        try:
+            emb_dim = len(emb_vec) if emb_vec else len(emb_blob) // 4
+            cursor.execute("""
+                INSERT OR REPLACE INTO lineage_vectors (lineage_id, filepath, cwe, rca_summary, model, dimension, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (new_lineage_id, norm_fp, norm_cwe, rca_summary, os.environ.get("EMBEDDING_MODEL", "vertex_ai/gemini-embedding-001"), emb_dim, emb_blob))
+        except Exception:
+            pass
+
+    return new_lineage_id
 
 
 def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = ""):
-    """Write structured findings to the database contextually associated with their canonical filepaths, stable signatures, and lineages."""
+    """Write structured findings to the database contextually associated with their canonical filepaths, stable signatures, lineages, RCA summaries, and vector embeddings."""
     with _db(db_path) as conn:
         cursor = conn.cursor()
         for obj in findings:
@@ -432,6 +626,34 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     description=raw_desc,
                 )
 
+            # Compute or inherit standardized RCA summary and vector embedding
+            rca_summary = str(finding.get("rca_summary") or "").strip()
+            if not rca_summary:
+                rca_summary = generate_rca_summary({
+                    "filepath": finding_filepath,
+                    "title": raw_title,
+                    "description": raw_desc,
+                    "cwe": canonical_cwe,
+                    "symbol": target_symbol,
+                    "line_numbers": line_numbers,
+                    "remediation": finding.get("remediation"),
+                    "code_paths": finding.get("code_paths"),
+                })
+
+            raw_emb = finding.get("embedding")
+            if raw_emb is None:
+                emb_vec = compute_embedding(rca_summary)
+                emb_blob = vector_to_blob(emb_vec)
+            elif isinstance(raw_emb, bytes):
+                emb_blob = raw_emb
+                emb_vec = blob_to_vector(emb_blob)
+            elif isinstance(raw_emb, (list, tuple)):
+                emb_vec = list(raw_emb)
+                emb_blob = vector_to_blob(emb_vec)
+            else:
+                emb_vec = compute_embedding(rca_summary)
+                emb_blob = vector_to_blob(emb_vec)
+
             # Compute or inherit cross-pass lineage identifier via multi-tier ladder
             lineage_id = str(finding.get("lineage_id") or "").strip()
             if not lineage_id:
@@ -444,7 +666,20 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     title=raw_title,
                     description=raw_desc,
                     line_numbers=line_numbers,
+                    rca_summary=rca_summary,
+                    embedding=emb_vec,
                 )
+
+            # Ensure lineage vector is recorded in lineage_vectors table
+            if lineage_id and emb_blob:
+                try:
+                    emb_dim = len(emb_vec) if emb_vec else len(emb_blob) // 4
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO lineage_vectors (lineage_id, filepath, cwe, rca_summary, model, dimension, embedding)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (lineage_id, finding_filepath, canonical_cwe, rca_summary, os.environ.get("EMBEDDING_MODEL", "vertex_ai/gemini-embedding-001"), emb_dim, emb_blob))
+                except Exception:
+                    pass
 
             triage_reasoning = str(finding.get("reasoning") or finding.get("triage_reasoning") or finding.get("critic_reasoning") or "")
             patch_diff = str(finding.get("patch_diff") or "")
@@ -454,9 +689,10 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 INSERT OR REPLACE INTO findings (
                     run_id, filepath, title, severity, description, line_numbers,
                     remediation, status, mantis_risk_score, impact_score, likelihood_score,
-                    priority, signature, lineage_id, cwe, triage_reasoning, patch_diff, patch_status
+                    priority, signature, lineage_id, cwe, triage_reasoning, patch_diff, patch_status,
+                    rca_summary, embedding
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 run_id,
                 finding_filepath,
@@ -476,6 +712,8 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 triage_reasoning,
                 patch_diff,
                 patch_status,
+                rca_summary,
+                emb_blob,
             ))
 
 def update_finding_calibration(
@@ -521,6 +759,42 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str):
                   {terminal_clause}
             """, (status, run_id))
 
+        # Upgrade OKF concepts trust tier on dynamic sandbox confirmation strictly for this specific resource
+        if status in ("dynamic_confirmed", "patch_verified") and norm_fp and not os.path.isdir(norm_fp):
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cursor.execute(
+                "SELECT id, trust_tier, verified_by FROM okf_concepts WHERE run_id = ? AND resource = ?",
+                (run_id, norm_fp),
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+            for r in rows:
+                c_id = r["id"]
+                current_tier = r.get("trust_tier") or "unverified"
+                try:
+                    ver_list = json.loads(r.get("verified_by") or "[]")
+                except Exception:
+                    ver_list = []
+                by_key = f"process:sandbox_{status}"
+                existing_entry = next((e for e in ver_list if isinstance(e, dict) and e.get("by") == by_key), None)
+                if existing_entry is not None:
+                    existing_entry["status"] = status
+                    existing_entry["at"] = now_iso
+                else:
+                    ver_list.append({
+                        "by": by_key,
+                        "status": status,
+                        "at": now_iso,
+                    })
+                # Never lower an existing tier (e.g. human_reviewed stays human_reviewed)
+                new_tier = "human_reviewed" if current_tier == "human_reviewed" else "machine_confirmed"
+                cursor.execute("""
+                    UPDATE okf_concepts
+                    SET trust_tier = ?,
+                        verified_by = ?
+                    WHERE id = ?
+                """, (new_tier, json.dumps(ver_list), c_id))
+
 
 def read_findings(
     db_path: str,
@@ -556,6 +830,8 @@ def read_findings(
                     row_dict["line_numbers"] = None
             else:
                 row_dict["line_numbers"] = None
+            if row_dict.get("embedding") is not None and isinstance(row_dict["embedding"], bytes):
+                row_dict["embedding"] = blob_to_vector(row_dict["embedding"]) if row_dict["embedding"] else None
             rows.append(row_dict)
         return rows
 
@@ -751,15 +1027,16 @@ def record_okf_concept(db_path: str, run_id: str, concept: Dict[str, Any]):
         concept_id = concept.get("concept_id") or concept.get("title") or "concept"
         c_type = concept.get("type") or "Generic Concept"
         title = concept.get("title") or concept_id
-        res = concept.get("resource") or ""
-        tags_str = json.dumps(concept.get("tags") or [])
+        _iso_default = lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o)
+        res = canonical_filepath(concept.get("resource") or "", target_file=concept.get("resource") or "") if concept.get("resource") else ""
+        tags_str = json.dumps(concept.get("tags") or [], default=_iso_default)
         status = concept.get("status") or "stable"
         trust_tier = concept.get("trust_tier") or "unverified"
-        ver_str = json.dumps(concept.get("verified_by") or [])
+        ver_str = json.dumps(concept.get("verified_by") or [], default=_iso_default)
         gen_by = concept.get("generated_by") or ""
         snap_id = concept.get("snapshot_id") or ""
         desc = concept.get("description") or ""
-        sources_str = json.dumps(concept.get("sources") or [])
+        sources_str = json.dumps(concept.get("sources") or [], default=_iso_default)
         body = concept.get("body_markdown") or ""
         raw = concept.get("raw_markdown") or ""
 
@@ -783,7 +1060,8 @@ def read_okf_concepts(
     concept_type: str = "",
     tag: str = "",
     trust_tier: str = "",
-    run_id: Optional[str] = None
+    run_id: Optional[str] = None,
+    include_repo_wide: bool = False,
 ) -> List[Dict[str, Any]]:
     """Queries OKF concepts from the database by resource, type, tag, trust_tier, or run_id."""
     with _db(db_path) as conn:
@@ -792,7 +1070,10 @@ def read_okf_concepts(
         params = []
         if resource:
             norm_res = canonical_filepath(resource, target_file=resource)
-            query += " AND resource = ?"
+            if include_repo_wide:
+                query += " AND (resource = ? OR resource = '' OR resource IS NULL)"
+            else:
+                query += " AND resource = ?"
             params.append(norm_res)
         if concept_type:
             query += " AND type = ?"
@@ -933,12 +1214,21 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
             VALUES (?, ?, ?, ?, ?)
         """, (run_id, artifact_type, filepath, content, meta_str))
 
-    # Also automatically index into okf_concepts if the artifact is markdown/KB documentation
+    clean_fp = filepath.replace("\\", "/")
+    base_name = os.path.basename(clean_fp).lower()
+
+    # Skip reserved catalog/log files, archived passes, and non-markdown files
     if (
-        filepath.endswith((".md", ".markdown"))
-        or "workspace/kb/" in filepath
-        or artifact_type in ("threat_model", "summary", "entity", "architecture")
-        or content.strip().startswith(("---", "#"))
+        "workspace/archive/" in clean_fp
+        or "/archive/" in clean_fp
+        or base_name in ("index.md", "log.md")
+    ):
+        return
+
+    # Index into okf_concepts only for markdown documentation under workspace/kb/ or explicit semantic artifact types
+    if clean_fp.endswith((".md", ".markdown")) and (
+        "workspace/kb/" in clean_fp
+        or artifact_type in ("threat_model", "summary", "entity", "architecture", "vulnerability")
     ):
         try:
             parsed = parse_okf_markdown(content, default_concept_id=filepath)
@@ -947,6 +1237,25 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
                     parsed["type"] = "Threat Model"
                 elif artifact_type in ("summary", "architecture") and parsed["type"] in ("Generic Concept", "Untitled Concept"):
                     parsed["type"] = "Architecture Summary"
+
+                if metadata:
+                    candidate_resource = metadata.get("resource", "")
+                    doc_type = parsed.get("type", "")
+                    # Attach resource only for file-scoped documents (like Component Entity).
+                    # Leave resource empty ("") for repo-wide documents (Threat Model, Architecture Summary).
+                    is_file_scoped = (
+                        doc_type in ("Component Entity", "Software Entity", "Hardware Entity", "Security Invariant", "Guardrail")
+                        or "workspace/kb/entities/" in filepath
+                        or artifact_type == "entity"
+                    ) and doc_type not in ("Threat Model", "Architecture Summary", "Threat Boundary")
+                    if not parsed.get("resource") and candidate_resource and is_file_scoped:
+                        parsed["resource"] = canonical_filepath(candidate_resource, target_file=candidate_resource)
+                    if not parsed.get("snapshot_id") and metadata.get("snapshot_id"):
+                        parsed["snapshot_id"] = metadata["snapshot_id"]
+                    if not parsed.get("trust_tier") and metadata.get("trust_tier"):
+                        parsed["trust_tier"] = metadata["trust_tier"]
+                    if metadata.get("verified_by") and not parsed.get("verified_by"):
+                        parsed["verified_by"] = metadata["verified_by"]
                 record_okf_concept(db_path, run_id, parsed)
         except Exception:
             pass
@@ -1057,11 +1366,112 @@ def query_historical_lineage(
                     row_dict["line_numbers"] = parsed if parsed else None
                 except Exception:
                     row_dict["line_numbers"] = None
+            if row_dict.get("embedding") is not None and isinstance(row_dict["embedding"], bytes):
+                row_dict["embedding"] = blob_to_vector(row_dict["embedding"]) if row_dict["embedding"] else None
             rows.append(row_dict)
         return rows
 
 
-def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+def _compact_threat_model(content: str) -> str:
+    """Extracts a high-level summary and trust boundaries from a verbose threat model document."""
+    if not content:
+        return ""
+    if len(content) < 1500:
+        return content.strip()
+
+    lines = []
+    capture = False
+    for line in content.splitlines():
+        ls = line.strip()
+        if any(ls.startswith(f"## {k}") for k in ("System Overview", "Overview", "Summary")):
+            capture = True
+            lines.append(line)
+            continue
+        if capture and ls.startswith("## ") and not any(k in ls for k in ("Trust Boundary", "Trust Boundaries", "Boundary", "Actor")):
+            break
+        if capture:
+            lines.append(line)
+            if len(lines) >= 30:
+                break
+    if lines:
+        return "\n".join(lines).strip()
+    return "\n".join([l for l in content.splitlines() if l.strip()][:20])
+
+
+def _extract_first_sentence_or_bullet(text: str) -> str:
+    """Extracts the first complete sentence or bullet from text, never truncating mid-sentence."""
+    if not text:
+        return ""
+    text = " ".join(text.strip().split())
+    if text.startswith(("- ", "* ", "• ")):
+        text = text[2:].strip()
+    match = re.search(r'(?<=[.!?])\s+', text)
+    if match:
+        return text[:match.start() + 1].strip()
+    return text
+
+
+def _compact_vulnerability_pattern(body: str, desc: str = "") -> str:
+    """Extracts a concise description and complete remediation invariant from a Vulnerability Pattern concept."""
+    overview = ""
+    remediation = ""
+    sections = {"header": []}
+    current_sec = "header"
+
+    for line in (body or "").splitlines():
+        ls = line.strip()
+        if ls.startswith("## "):
+            h = ls.removeprefix("## ").strip().lower()
+            if "overview" in h or "description" in h:
+                current_sec = "overview"
+            elif "remediation" in h or "fix" in h:
+                current_sec = "remediation"
+            else:
+                current_sec = h
+            sections[current_sec] = []
+            continue
+        sections[current_sec].append(line)
+
+    if desc:
+        overview = desc
+    elif "overview" in sections:
+        raw_ov = "\n".join(sections["overview"]).strip()
+        paragraphs = [p.strip() for p in raw_ov.split("\n\n") if p.strip() and not p.strip().startswith(("#", "|"))]
+        if paragraphs:
+            p0 = paragraphs[0]
+            if p0.startswith("**") and p0.endswith("**") and len(paragraphs) > 1:
+                overview = _extract_first_sentence_or_bullet(paragraphs[1])
+            else:
+                overview = _extract_first_sentence_or_bullet(p0)
+
+    if "remediation" in sections:
+        raw_rem = "\n".join(sections["remediation"]).strip()
+        paragraphs = [p.strip() for p in raw_rem.split("\n\n") if p.strip() and not p.strip().startswith(("#", "|"))]
+        for idx, p in enumerate(paragraphs):
+            if p.startswith("```"):
+                continue
+            first_sent = _extract_first_sentence_or_bullet(p)
+            if first_sent:
+                clean_sent = re.sub(r'^\*\*(?:Best fix|Remediation|Fix|Use parameterized queries):?\*\*\s*', '', first_sent, flags=re.IGNORECASE).strip()
+                if not clean_sent:
+                    label = first_sent.strip("*:").strip()
+                    if idx + 1 < len(paragraphs) and paragraphs[idx + 1].startswith("```"):
+                        code_lines = [l.strip() for l in paragraphs[idx + 1].splitlines() if l.strip() and not l.startswith("```")]
+                        if code_lines:
+                            clean_sent = f"{label}: `{code_lines[0]}`"
+                    elif idx + 1 < len(paragraphs):
+                        clean_sent = f"{label}: {_extract_first_sentence_or_bullet(paragraphs[idx + 1])}"
+                if clean_sent:
+                    remediation = clean_sent
+                    break
+
+    res = overview
+    if remediation:
+        res += ("\n  -> **Remediation**: " + remediation)
+    return res.strip()
+
+
+def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] = None, full: bool = False) -> Dict[str, Any]:
     """Aggregates active threat models, OKF concepts, historical vulnerabilities, triaged false positives,
     recurrent lineages, and verified remediation patterns into actionable security guidance for a target file.
     """
@@ -1070,21 +1480,26 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
         norm_fp = canonical_filepath(filepath, target_file=filepath)
 
         # 1. OKF Concepts (Scoped to Target File)
-        scoped_okf = read_okf_concepts(db_path, resource=norm_fp, run_id=run_id) if norm_fp else read_okf_concepts(db_path, run_id=run_id)
+        scoped_okf = read_okf_concepts(db_path, resource=norm_fp, run_id=run_id, include_repo_wide=True) if norm_fp else read_okf_concepts(db_path, run_id=run_id)
         
-        # Extract scoped threat boundaries, component entities, architecture summaries, and security invariants
+        # Extract scoped threat boundaries, component entities, architecture summaries, security invariants, and vulnerability patterns
         threat_concepts = [c for c in scoped_okf if c.get("type") in ("Threat Boundary", "Threat Model")]
         entity_concepts = [c for c in scoped_okf if c.get("type") in ("Component Entity", "Software Entity", "Hardware Entity", "Architecture Summary")]
         invariant_concepts = [c for c in scoped_okf if c.get("type") in ("Security Invariant", "Guardrail")]
+        pattern_concepts = [c for c in scoped_okf if c.get("type") in ("Vulnerability Pattern", "Weakness Pattern")]
 
-        # Fallback to system-wide threat model if no scoped threat boundary exists
+        # Threat model content (compact or full)
         threat_model_content = ""
         if threat_concepts:
-            threat_model_content = "\n\n".join(f"### {c.get('title')}\n{c.get('body_markdown', '').strip()}" for c in threat_concepts)
+            if full:
+                threat_model_content = "\n\n".join(f"### {c.get('title')}\n{c.get('body_markdown', '').strip()}" for c in threat_concepts)
+            else:
+                threat_model_content = "\n\n".join(f"### {c.get('title')}\n{_compact_threat_model(c.get('body_markdown', ''))}" for c in threat_concepts)
         else:
-            threat_model_content = read_artifact(db_path, artifact_type="threat_model", run_id=run_id) or ""
-            if not threat_model_content:
-                threat_model_content = read_artifact(db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=run_id) or ""
+            raw_tm = read_artifact(db_path, artifact_type="threat_model", run_id=run_id) or ""
+            if not raw_tm:
+                raw_tm = read_artifact(db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=run_id) or ""
+            threat_model_content = raw_tm.strip() if full else _compact_threat_model(raw_tm)
 
         # 2. Confirmed & Active Vulnerabilities (with verified patches)
         if norm_fp:
@@ -1103,6 +1518,9 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
             """
             cursor.execute(query_confirmed)
         confirmed_rows = [dict(r) for r in cursor.fetchall()]
+        for c in confirmed_rows:
+            if c.get("embedding") is not None and isinstance(c["embedding"], bytes):
+                c["embedding"] = blob_to_vector(c["embedding"]) if c["embedding"] else None
 
         # 3. Triaged False Positives (to prevent re-introducing or mis-triaging known safe patterns)
         if norm_fp:
@@ -1121,6 +1539,9 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
             """
             cursor.execute(query_fp)
         fp_rows = [dict(r) for r in cursor.fetchall()]
+        for fp_item in fp_rows:
+            if fp_item.get("embedding") is not None and isinstance(fp_item["embedding"], bytes):
+                fp_item["embedding"] = blob_to_vector(fp_item["embedding"]) if fp_item["embedding"] else None
 
         # 4. Recurrent Lineages (lineage_ids appearing >= 2 times)
         if norm_fp:
@@ -1177,11 +1598,17 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
             guidance_lines.extend(["", "## 2. Component Architecture & Known Constraints"])
             for ent in entity_concepts:
                 badge = f"[{ent.get('trust_tier', 'unverified').upper().replace('_', '-')}]"
-                guidance_lines.append(f"### {ent.get('title')} {badge}")
-                if ent.get("description"):
-                    guidance_lines.append(f"*{ent.get('description')}*")
-                if ent.get("body_markdown"):
-                    guidance_lines.append(f"{ent.get('body_markdown').strip()}\n")
+                is_scoped = bool(norm_fp and ent.get("resource") == norm_fp)
+                if full or is_scoped:
+                    guidance_lines.append(f"### {ent.get('title')} {badge}")
+                    if ent.get("description"):
+                        guidance_lines.append(f"*{ent.get('description')}*")
+                    if ent.get("body_markdown"):
+                        guidance_lines.append(f"{ent.get('body_markdown').strip()}\n")
+                else:
+                    desc = ent.get("description") or "Component entity"
+                    ref_id = ent.get("concept_id") or "workspace/kb/entities"
+                    guidance_lines.append(f"- **{ent.get('title')}** {badge}: {desc} *(See `{ref_id}`)*")
 
         # Security Invariants / Guardrails
         if invariant_concepts or learnings:
@@ -1190,9 +1617,23 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
                 tier = inv.get("trust_tier", "unverified").upper().replace("_", "-")
                 guidance_lines.append(f"- ⛔ **[{tier}] {inv.get('title')}**: {inv.get('description') or inv.get('body_markdown', '').strip()}")
             for l in learnings:
-                guidance_lines.append(f"- ℹ️ **[{l.get('category', 'GENERAL')}]**: {l.get('learning')}")
+                cat = f"**[{l.get('category')}]**: " if l.get("category") else ""
+                l_text = l.get("learning", "") if full else _extract_first_sentence_or_bullet(l.get("learning", ""))
+                guidance_lines.append(f"- ℹ️ {cat}{l_text}")
 
         guidance_lines.extend(["", "## 4. Historical Vulnerabilities & Verified Remediation Patterns"])
+        if pattern_concepts:
+            for p in pattern_concepts:
+                guidance_lines.append(f"- ⚠️ **[KNOWN PATTERN] {p.get('title')}**")
+                if full:
+                    if p.get("description"):
+                        guidance_lines.append(f"  *{p.get('description')}*")
+                    if p.get("body_markdown"):
+                        guidance_lines.append(f"  {p.get('body_markdown').strip()}\n")
+                else:
+                    p_summary = _compact_vulnerability_pattern(p.get("body_markdown", ""), p.get("description", ""))
+                    if p_summary:
+                        guidance_lines.append(f"  {p_summary}")
         if confirmed_rows:
             for c in confirmed_rows:
                 guidance_lines.append(f"- **[{c.get('severity', 'UNKNOWN')}] {c.get('title')}** (CWE: {c.get('cwe', 'N/A')}, Status: `{c.get('status')}`)")
@@ -1202,8 +1643,13 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
                 if c.get("patch_status"):
                     guidance_lines.append(f"  - **Patch Status**: `{c.get('patch_status')}`")
                 if c.get("patch_diff"):
-                    guidance_lines.append(f"  - **Verified Patch Diff (Few-Shot Pattern)**:\n```diff\n{c.get('patch_diff').strip()}\n```")
-        else:
+                    diff_content = c.get("patch_diff", "").strip()
+                    if not full and diff_content.count("\n") > 12:
+                        diff_lines = diff_content.splitlines()[:12]
+                        guidance_lines.append(f"  - **Verified Patch Diff (Few-Shot Pattern)**:\n```diff\n" + "\n".join(diff_lines) + "\n... (truncated; use --full to view entire patch diff)\n```")
+                    else:
+                        guidance_lines.append(f"  - **Verified Patch Diff (Few-Shot Pattern)**:\n```diff\n{diff_content}\n```")
+        elif not pattern_concepts:
             guidance_lines.append("No historical vulnerabilities recorded for this file.")
 
         guidance_lines.extend(["", "## 5. Triaged False Positives & Legitimate Intentional Patterns"])
@@ -1226,6 +1672,7 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
             "trust_tier": trust_badge,
             "threat_model": threat_model_content,
             "okf_concepts": scoped_okf,
+            "vulnerability_patterns": pattern_concepts,
             "confirmed_vulnerabilities": confirmed_rows,
             "false_positives": fp_rows,
             "recurrent_lineages": recurrent_lineages,

@@ -5,6 +5,7 @@ import json
 import sqlite3
 import shutil
 import tempfile
+import asyncio
 import subprocess
 import unittest
 from unittest.mock import patch, AsyncMock, MagicMock
@@ -18,7 +19,7 @@ from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.apps.app import App
 from google.adk.workflow import DEFAULT_ROUTE
 
-from core.config import get_llm_kwargs, DEFAULT_MODEL
+from core.config import get_llm_kwargs, DEFAULT_MODEL, DEFAULT_EMBEDDING_MODEL
 from core.context import RunContext, current_run_context
 from core.database import (
     init_db,
@@ -32,7 +33,21 @@ from core.database import (
     record_learning,
     query_historical_lineage,
     query_security_guidance,
+    generate_rca_summary,
+    resolve_ancestor_lineage,
+    extract_target_symbol,
     _db,
+)
+from core.embeddings import (
+    vector_to_blob,
+    blob_to_vector,
+    cosine_similarity,
+    compute_embedding,
+    compute_mock_embedding,
+    get_embedding_kwargs,
+    find_nearest_lineage,
+    DEFAULT_SIMILARITY_THRESHOLD,
+    normalize_cwe,
 )
 from core.schemas import VulnerabilityFinding
 from core.graph_loader import (
@@ -1419,6 +1434,606 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(temp_dir)
 
+    def test_vector_serialization_deserialization_roundtrip(self):
+        """Tests vector serialization to blob and deserialization back to floats across boundary conditions."""
+        # 1. Standard float vector
+        orig = [0.123456, -0.789012, 0.0, 1.5, -3.14159, 42.0]
+        blob = vector_to_blob(orig)
+        self.assertIsInstance(blob, bytes)
+        self.assertEqual(len(blob), len(orig) * 4)
+        restored = blob_to_vector(blob)
+        self.assertEqual(len(restored), len(orig))
+        for a, b in zip(orig, restored):
+            self.assertAlmostEqual(a, b, places=5)
+
+        # 2. Large dimensional vector (768 & 256 dims)
+        for dim in (256, 768):
+            large_vec = [float(i) * 0.001 for i in range(dim)]
+            blob_large = vector_to_blob(large_vec)
+            restored_large = blob_to_vector(blob_large)
+            self.assertEqual(len(restored_large), dim)
+            for a, b in zip(large_vec, restored_large):
+                self.assertAlmostEqual(a, b, places=5)
+
+        # 3. Tuple and iterable inputs
+        tup_orig = (1.0, 2.5, -3.0)
+        blob_tup = vector_to_blob(tup_orig)
+        self.assertEqual(blob_to_vector(blob_tup), [1.0, 2.5, -3.0])
+
+        # 4. Empty vector and None
+        self.assertEqual(vector_to_blob([]), b"")
+        self.assertEqual(vector_to_blob(None), b"")
+        self.assertEqual(blob_to_vector(b""), [])
+        self.assertEqual(blob_to_vector(None), [])
+
+        # 5. Malformed or truncated byte sequences (e.g. 1, 3, 5, 7 bytes) - must not raise struct.error
+        for bad_len in (1, 2, 3, 5, 6, 7, 9):
+            corrupt_blob = b"\x00" * bad_len
+            parsed = blob_to_vector(corrupt_blob)
+            self.assertIsInstance(parsed, list)
+            self.assertEqual(len(parsed), bad_len // 4)
+
+    def test_cosine_similarity_computation(self):
+        """Tests fast in-process cosine similarity calculation across boundary and error conditions."""
+        # Identical vectors -> 1.0
+        v1 = [1.0, 2.0, 3.0, 4.0]
+        self.assertAlmostEqual(cosine_similarity(v1, v1), 1.0, places=5)
+
+        # Scaled identical direction -> 1.0
+        v2 = [2.0, 4.0, 6.0, 8.0]
+        self.assertAlmostEqual(cosine_similarity(v1, v2), 1.0, places=5)
+
+        # Orthogonal vectors -> 0.0
+        v_ortho_a = [1.0, 0.0]
+        v_ortho_b = [0.0, 1.0]
+        self.assertAlmostEqual(cosine_similarity(v_ortho_a, v_ortho_b), 0.0, places=5)
+
+        # Opposite vectors -> -1.0
+        v_opp_a = [1.0, -2.0]
+        v_opp_b = [-1.0, 2.0]
+        self.assertAlmostEqual(cosine_similarity(v_opp_a, v_opp_b), -1.0, places=5)
+
+        # Degenerate cases (empty, zero norm, dimension mismatch) -> 0.0
+        self.assertEqual(cosine_similarity([], [1.0]), 0.0)
+        self.assertEqual(cosine_similarity([0.0, 0.0], [1.0, 1.0]), 0.0)
+        self.assertEqual(cosine_similarity([1.0, 2.0], [1.0, 2.0, 3.0]), 0.0)
+
+        # NaN and Inf resilience -> 0.0
+        self.assertEqual(cosine_similarity([float("nan"), 1.0], [1.0, 1.0]), 0.0)
+        self.assertEqual(cosine_similarity([float("inf"), 1.0], [1.0, 1.0]), 0.0)
+
+    def test_get_embedding_kwargs_precedence_and_config(self):
+        """Tests embedding model and client parameter resolution across function args, config dict, and environment variables."""
+        # 1. Default model
+        with patch.dict(os.environ, {}, clear=True):
+            model, kwargs = get_embedding_kwargs()
+            self.assertEqual(model, DEFAULT_EMBEDDING_MODEL)
+
+        # 2. Config dictionary precedence
+        cfg = {
+            "embedding_model": "vertex_ai/gemini-custom-emb",
+            "api_base": "http://localhost:8000/v1",
+            "timeout": 45.0,
+            "api_key": "test-key-123",
+            "vertex_project": "proj-cfg",
+            "vertex_location": "us-east4",
+        }
+        with patch.dict(os.environ, {"EMBEDDING_MODEL": "env-model"}):
+            model, kwargs = get_embedding_kwargs(config=cfg)
+            self.assertEqual(model, "vertex_ai/gemini-custom-emb")
+            self.assertEqual(kwargs["api_base"], "http://localhost:8000/v1")
+            self.assertEqual(kwargs["timeout"], 45.0)
+            self.assertEqual(kwargs["api_key"], "test-key-123")
+            self.assertEqual(kwargs["vertex_project"], "proj-cfg")
+            self.assertEqual(kwargs["vertex_location"], "us-east4")
+
+        # 3. Direct function argument overrides config dict
+        model, kwargs = get_embedding_kwargs(
+            model="openai/text-embedding-3-small",
+            api_base="http://custom:9000/v1",
+            timeout=10.0,
+            api_key="override-key",
+            config=cfg,
+        )
+        self.assertEqual(model, "openai/text-embedding-3-small")
+        self.assertEqual(kwargs["api_base"], "http://custom:9000/v1")
+        self.assertEqual(kwargs["timeout"], 10.0)
+        self.assertEqual(kwargs["api_key"], "override-key")
+
+        # 4. Bare gemini embedding model auto-routes to vertex_ai when GCP project is available
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "gcp-proj", "GOOGLE_CLOUD_PROJECT": "gcp-proj"}):
+            model, kwargs = get_embedding_kwargs(model="gemini-embedding-001")
+            self.assertEqual(model, "vertex_ai/gemini-embedding-001")
+            self.assertEqual(kwargs["vertex_project"], "gcp-proj")
+
+    def test_extract_target_symbol_resilience(self):
+        """Tests that extract_target_symbol cleanly differentiates target symbols from file paths and handles varied formats."""
+        # 1. code_paths with filepath and line number does NOT extract the filepath as a symbol
+        sym = extract_target_symbol(
+            title="Missing rate limit on login endpoint",
+            description="Unchecked login attempts",
+            code_paths=["api/login.py:50"],
+        )
+        self.assertNotIn("api/login.py", sym)
+        self.assertNotIn(".py", sym)
+
+        # 2. code_paths with file:line:symbol extracts the symbol segment
+        sym_part = extract_target_symbol(
+            title="Authentication bypass",
+            description="Token check omitted",
+            code_paths=["auth/service.py:100:authenticate_jwt"],
+        )
+        self.assertEqual(sym_part, "authenticate_jwt")
+
+        # 3. code_paths with dict item extracts symbol/function
+        sym_dict = extract_target_symbol(
+            title="SQL Injection",
+            description="Raw query",
+            code_paths=[{"symbol": "fetch_user_records", "file": "db.py"}],
+        )
+        self.assertEqual(sym_dict, "fetch_user_records")
+
+        # 4. Backticks with a filepath (e.g. `src/auth.py`) is skipped, backticks with function name is preserved
+        sym_fn = extract_target_symbol(title="Buffer overflow in `parse_header`")
+        self.assertEqual(sym_fn, "parse_header")
+        sym_fp = extract_target_symbol(title="Vulnerability in `src/parser.c`", description="Flaw in function parse_tokens")
+        self.assertEqual(sym_fp, "parse_tokens")
+
+    def test_semantic_embeddings_positive_controls(self):
+        """Tests that semantically equivalent findings with different phrasing/logs merge into the same lineage (similarity >= 0.88)."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_pos_controls.db")
+        try:
+            init_db(db_file)
+
+            # Positive Control 1: SQL Injection phrasing variations in services/user/routes.py
+            f1_pos = {
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "filepath": "services/user/routes.py",
+                "description": "User input passed to database query in get_user() without parameterization",
+                "line_numbers": [42],
+                "cwe": "CWE-89",
+            }
+            f2_pos = {
+                "title": "SQL Injection via Unsanitized Query Parameter",
+                "severity": "CRITICAL",
+                "filepath": "services/user/routes.py",
+                "description": "Unsanitized parameter in function get_user allows SQL injection into raw database query string",
+                "line_numbers": [45],
+                "cwe": "CWE-89",
+            }
+
+            rca1 = generate_rca_summary(f1_pos)
+            rca2 = generate_rca_summary(f2_pos)
+            v1 = compute_embedding(rca1, mock_mode=True)
+            v2 = compute_embedding(rca2, mock_mode=True)
+            sim_pos = cosine_similarity(v1, v2)
+            self.assertGreaterEqual(sim_pos, 0.88, f"Positive control failed threshold 0.88 (got {sim_pos})")
+
+            # Positive Control 2: Insecure Deserialization phrasing variations in services/cart/session.py
+            f1_deser = {
+                "title": "Insecure Deserialization in hydrate_session",
+                "severity": "CRITICAL",
+                "filepath": "services/cart/session.py",
+                "description": "Unconstrained pickle deserialization in hydrate_session leads to remote code execution",
+                "line_numbers": [88],
+                "cwe": "CWE-502",
+            }
+            f2_deser = {
+                "title": "Untrusted Object Deserialization in hydrate_session handler",
+                "severity": "CRITICAL",
+                "filepath": "services/cart/session.py",
+                "description": "Arbitrary code execution via untrusted serialized payload passed to hydrate_session",
+                "line_numbers": [92],
+                "cwe": "CWE-502",
+            }
+            rca_d1 = generate_rca_summary(f1_deser)
+            rca_d2 = generate_rca_summary(f2_deser)
+            v_d1 = compute_embedding(rca_d1, mock_mode=True)
+            v_d2 = compute_embedding(rca_d2, mock_mode=True)
+            sim_deser = cosine_similarity(v_d1, v_d2)
+            self.assertGreaterEqual(sim_deser, 0.88, f"Deserialization positive control failed threshold 0.88 (got {sim_deser})")
+
+            # Verify end-to-end lineage resolution merges positive controls into same lineage_id
+            write_findings(db_file, f1_pos["filepath"], [f1_pos], run_id="run-pos-1")
+            write_findings(db_file, f2_pos["filepath"], [f2_pos], run_id="run-pos-2")
+
+            r1 = read_findings(db_file, filepath="services/user/routes.py", run_id="run-pos-1")
+            r2 = read_findings(db_file, filepath="services/user/routes.py", run_id="run-pos-2")
+            self.assertEqual(len(r1), 1)
+            self.assertEqual(len(r2), 1)
+            self.assertEqual(r1[0]["lineage_id"], r2[0]["lineage_id"])
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_semantic_embeddings_negative_controls(self):
+        """Tests that distinct vulnerability classes maintain low similarity (< 0.70) and never false-merge."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_neg_controls.db")
+        try:
+            init_db(db_file)
+
+            # Negative Control 1: SQL Injection vs Command Injection in the same file
+            f_sqli = {
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "filepath": "services/user/routes.py",
+                "description": "User input passed to database query in get_user()",
+                "line_numbers": [20],
+                "cwe": "CWE-89",
+            }
+            f_cmdi = {
+                "title": "Command Injection in execute_backup",
+                "severity": "CRITICAL",
+                "filepath": "services/user/routes.py",
+                "description": "Unescaped shell argument passed to os.system in execute_backup()",
+                "line_numbers": [95],
+                "cwe": "CWE-78",
+            }
+
+            rca_sqli = generate_rca_summary(f_sqli)
+            rca_cmdi = generate_rca_summary(f_cmdi)
+            v_sqli = compute_embedding(rca_sqli, mock_mode=True)
+            v_cmdi = compute_embedding(rca_cmdi, mock_mode=True)
+            sim_distinct = cosine_similarity(v_sqli, v_cmdi)
+            self.assertLess(sim_distinct, 0.70, f"Negative control failed: similarity {sim_distinct} >= 0.70")
+
+            # Negative Control 2: Stored XSS vs Reflected XSS in same file (Finding 301 vs 302)
+            dataset_path = os.path.join(os.path.dirname(__file__), "evals", "synthetic_dataset.json")
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                syn = json.load(f)
+            id_to_finding = {f["id"]: f for f in syn["findings"]}
+
+            f301 = id_to_finding[301]
+            f302 = id_to_finding[302]
+            rca301 = generate_rca_summary(f301)
+            rca302 = generate_rca_summary(f302)
+            v301 = compute_embedding(rca301, mock_mode=True)
+            v302 = compute_embedding(rca302, mock_mode=True)
+            sim_xss = cosine_similarity(v301, v302)
+            self.assertLess(sim_xss, 0.70, f"XSS negative control failed: similarity {sim_xss} >= 0.70")
+
+            # Negative Control 3: Timing side-channel vs Token expiration in auth/token.py (Finding 401 vs 402)
+            f401 = id_to_finding[401]
+            f402 = id_to_finding[402]
+            rca401 = generate_rca_summary(f401)
+            rca402 = generate_rca_summary(f402)
+            v401 = compute_embedding(rca401, mock_mode=True)
+            v402 = compute_embedding(rca402, mock_mode=True)
+            sim_auth = cosine_similarity(v401, v402)
+            self.assertLess(sim_auth, 0.70, f"Auth negative control failed: similarity {sim_auth} >= 0.70")
+
+            # Verify in SQLite database: they produce distinct lineage IDs and never false-merge
+            write_findings(db_file, f_sqli["filepath"], [f_sqli], run_id="run-neg-1")
+            write_findings(db_file, f_cmdi["filepath"], [f_cmdi], run_id="run-neg-2")
+
+            r_sqli = read_findings(db_file, filepath="services/user/routes.py", run_id="run-neg-1")
+            r_cmdi = read_findings(db_file, filepath="services/user/routes.py", run_id="run-neg-2")
+            self.assertNotEqual(r_sqli[0]["lineage_id"], r_cmdi[0]["lineage_id"])
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_offline_mock_embedding_mode_deterministic_execution(self):
+        """Tests deterministic embedding computation in offline/mock mode without network or credentials."""
+        text = (
+            "Component: api/v1/auth.py\n"
+            "Vulnerability Class: CWE-287\n"
+            "Root Cause Mechanism: Missing JWT signature validation\n"
+            "Failure Condition: Attacker supplies unsigned token\n"
+            "Taint Dataflow: token -> verify_token -> auth_context"
+        )
+        # Compute multiple times in mock mode
+        v1 = compute_embedding(text, mock_mode=True)
+        v2 = compute_embedding(text, mock_mode=True)
+        self.assertEqual(len(v1), 256)
+        self.assertEqual(v1, v2)
+
+        # Verify environment variable override
+        with patch.dict(os.environ, {"MOCK_EMBEDDINGS": "1"}):
+            v_env = compute_embedding(text)
+            self.assertEqual(v_env, v1)
+
+        with patch.dict(os.environ, {"MANTIS_OFFLINE_EMBEDDINGS": "1"}):
+            v_offline = compute_embedding(text)
+            self.assertEqual(v_offline, v1)
+
+    def test_3_tier_deduplication_ladder_integration(self):
+        """Tests end-to-end integration across Tier 1 (Exact Anchors), Tier 2 (RCA), and Tier 3 (Vector Similarity)."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_3tier_ladder.db")
+        try:
+            init_db(db_file)
+
+            # Tier 1 exact match test
+            f_base = {
+                "title": "SQL Injection in get_user",
+                "severity": "HIGH",
+                "filepath": "app.py",
+                "description": "User input passed to database query in get_user()",
+                "line_numbers": [10],
+                "cwe": "CWE-89",
+            }
+            write_findings(db_file, "app.py", [f_base], run_id="run-base")
+            r_base = read_findings(db_file, filepath="app.py", run_id="run-base")
+            base_lineage = r_base[0]["lineage_id"]
+            self.assertTrue(base_lineage)
+            self.assertTrue(r_base[0]["rca_summary"])
+            self.assertTrue(r_base[0]["embedding"])
+
+            # Verify lineage_vectors table was populated
+            with _db(db_file) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT lineage_id, rca_summary, embedding FROM lineage_vectors WHERE lineage_id = ?", (base_lineage,))
+                lv_row = cursor.fetchone()
+                self.assertIsNotNone(lv_row)
+                self.assertEqual(lv_row["lineage_id"], base_lineage)
+                self.assertTrue(len(lv_row["embedding"]) > 0)
+
+            # Tier 3 vector nearest neighbor match
+            with _db(db_file) as conn:
+                cursor = conn.cursor()
+                query_vec = r_base[0]["embedding"]
+                nearest_lid = find_nearest_lineage(cursor, query_vec, threshold=0.90, filepath="app.py")
+                self.assertEqual(nearest_lid, base_lineage)
+
+                # Path normalization resilience (./app.py and None)
+                nearest_rel = find_nearest_lineage(cursor, query_vec, threshold=0.90, filepath="./app.py")
+                self.assertEqual(nearest_rel, base_lineage)
+                nearest_none_fp = find_nearest_lineage(cursor, query_vec, threshold=0.90, filepath=None)
+                self.assertEqual(nearest_none_fp, base_lineage)
+
+                # Dimension mismatch between query vector and DB vector returns None safely
+                dim_mismatch_vec = [1.0] * 512
+                self.assertIsNone(find_nearest_lineage(cursor, dim_mismatch_vec, threshold=0.90, filepath="app.py"))
+
+                # Query with distinct vector -> should return None
+                dummy_vec = [-x for x in query_vec]
+                none_lid = find_nearest_lineage(cursor, dummy_vec, threshold=0.90, filepath="app.py")
+                self.assertIsNone(none_lid)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_embedding_fallback_explicit_warning(self):
+        """Tests that live embedding failures emit a visible ⚠️ [EMBEDDING FALLBACK] warning to stderr and degrade cleanly to mock."""
+        import io
+        from contextlib import redirect_stderr
+        import core.embeddings as emb_mod
+
+        # Reset warned state for test
+        emb_mod._WARNED_FALLBACK = False
+
+        err_stream = io.StringIO()
+        with redirect_stderr(err_stream):
+            with patch("litellm.embedding", side_effect=RuntimeError("Simulated network/auth timeout")):
+                vec = compute_embedding("Component: app.py\nRoot Cause: Test flaw", mock_mode=False)
+        
+        err_output = err_stream.getvalue()
+        self.assertIn("⚠️  [EMBEDDING FALLBACK]", err_output)
+        self.assertIn("Simulated network/auth timeout", err_output)
+        self.assertEqual(len(vec), 256)
+
+    def test_embedding_dimension_mismatch_warning(self):
+        """Tests that dimension mismatches between query and stored vectors emit ⚠️ [EMBEDDING MISMATCH] warning."""
+        import io
+        from contextlib import redirect_stderr
+        import core.embeddings as emb_mod
+
+        emb_mod._WARNED_DIM_MISMATCH = False
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_dim_mismatch.db")
+        try:
+            init_db(db_file)
+            with _db(db_file) as conn:
+                cur = conn.cursor()
+                # Insert a 256-dim mock vector
+                mock_blob = vector_to_blob([0.1] * 256)
+                cur.execute(
+                    "INSERT INTO lineage_vectors (lineage_id, filepath, model, dimension, embedding) VALUES (?, ?, ?, ?, ?)",
+                    ("lin-old", "app.py", "mock", 256, mock_blob),
+                )
+                
+                # Query with 512-dim vector
+                err_stream = io.StringIO()
+                with redirect_stderr(err_stream):
+                    res = find_nearest_lineage(cur, [0.1] * 512, filepath="app.py")
+                
+                self.assertIsNone(res)
+                err_output = err_stream.getvalue()
+                self.assertIn("⚠️  [EMBEDDING MISMATCH]", err_output)
+                self.assertIn("Stored lineage vectors have dimension 256", err_output)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_cwe_structural_guard_prevents_false_merge(self):
+        """Tests that distinct, incompatible CWE classifications skip vector comparison and prevent false merges even with 0.99+ similarity."""
+        # Verify normalize_cwe helper directly across various representations
+        self.assertEqual(normalize_cwe("CWE-89"), "CWE-89")
+        self.assertEqual(normalize_cwe("cwe-89"), "CWE-89")
+        self.assertEqual(normalize_cwe("cwe_89"), "CWE-89")
+        self.assertEqual(normalize_cwe("cwe 89"), "CWE-89")
+        self.assertEqual(normalize_cwe("89"), "CWE-89")
+        self.assertEqual(normalize_cwe(89), "CWE-89")
+        self.assertEqual(normalize_cwe("CWE-0089"), "CWE-89")
+        self.assertEqual(normalize_cwe("CWE-79: Reflected XSS"), "CWE-79")
+        self.assertIsNone(normalize_cwe(None))
+        self.assertIsNone(normalize_cwe(""))
+        self.assertIsNone(normalize_cwe("CWE-UNKNOWN"))
+        self.assertIsNone(normalize_cwe("unknown"))
+        self.assertIsNone(normalize_cwe("NONE"))
+        self.assertIsNone(normalize_cwe("NULL"))
+        self.assertIsNone(normalize_cwe("N/A"))
+
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_cwe_guard.db")
+        try:
+            init_db(db_file)
+            f_sqli = {
+                "title": "SQL Injection in get_user",
+                "severity": "CRITICAL",
+                "description": "Raw string concatenation in SQL query",
+                "cwe": "CWE-89",
+            }
+            write_findings(db_file, "app.py", [f_sqli], run_id="run-1")
+            findings = read_findings(db_file, filepath="app.py", run_id="run-1")
+            sqli_lid = findings[0]["lineage_id"]
+            self.assertTrue(sqli_lid)
+
+            with _db(db_file) as conn:
+                cur = conn.cursor()
+                query_vec = findings[0]["embedding"]
+                # Query with exact same vector (cosine similarity 1.0 > 0.99) but distinct CWE-78 (Command Injection)
+                res_diff_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-78")
+                self.assertIsNone(res_diff_cwe)
+
+                # Query with distinct Deserialization CWE-502
+                res_deser_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-502")
+                self.assertIsNone(res_deser_cwe)
+
+                # Query with matching CWE-89 succeeds
+                res_same_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-89")
+                self.assertEqual(res_same_cwe, sqli_lid)
+
+                # Query with case/format variant cwe-89 succeeds
+                res_norm_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="cwe-89")
+                self.assertEqual(res_norm_cwe, sqli_lid)
+
+                # Query with integer 89 succeeds
+                res_int_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe=89)
+                self.assertEqual(res_int_cwe, sqli_lid)
+
+                # Query with unknown CWE allows fallback to vector similarity
+                res_unknown_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-UNKNOWN")
+                self.assertEqual(res_unknown_cwe, sqli_lid)
+
+                # Test resolve_ancestor_lineage end-to-end: distinct CWE mints new lineage ID
+                new_lid = resolve_ancestor_lineage(
+                    cur,
+                    filepath="app.py",
+                    signature="diff_sig_cmdi",
+                    cwe="CWE-78",
+                    symbol="exec_cmd",
+                    title="Command Injection in exec_cmd",
+                    description="Unsanitized command execution",
+                    embedding=query_vec,
+                )
+                self.assertNotEqual(new_lid, sqli_lid)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_dynamic_embedding_similarity_threshold_env(self):
+        """Tests that EMBEDDING_SIMILARITY_THRESHOLD dynamically affects resolve_ancestor_lineage and find_nearest_lineage."""
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_dynamic_threshold.db")
+        try:
+            init_db(db_file)
+            vec_a = [1.0] + [0.0] * 255
+            # Orthogonal / slightly correlated vector with cosine similarity ~ 0.707
+            vec_b = [0.7071, 0.7071] + [0.0] * 254
+
+            with _db(db_file) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO lineage_vectors (lineage_id, filepath, cwe, model, dimension, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("lid-baseline", "app.py", "CWE-89", "mock", 256, vector_to_blob(vec_a)),
+                )
+
+                # 1. Under default threshold (0.90), similarity ~0.707 does NOT match
+                res_default = find_nearest_lineage(cur, vec_b, filepath="app.py", cwe="CWE-89")
+                self.assertIsNone(res_default)
+
+                # 2. Dynamically set EMBEDDING_SIMILARITY_THRESHOLD to 0.50 -> matches
+                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "0.50"}):
+                    res_low = find_nearest_lineage(cur, vec_b, filepath="app.py", cwe="CWE-89")
+                    self.assertEqual(res_low, "lid-baseline")
+
+                    # Also verify resolve_ancestor_lineage inherits under dynamic threshold
+                    res_resolve = resolve_ancestor_lineage(
+                        cur,
+                        filepath="app.py",
+                        signature="sig-b",
+                        cwe="CWE-89",
+                        symbol="sym_b",
+                        title="SQL flaw",
+                        description="desc",
+                        embedding=vec_b,
+                    )
+                    self.assertEqual(res_resolve, "lid-baseline")
+
+                # 3. Explicit parameter overrides environment variable
+                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "0.50"}):
+                    res_explicit = find_nearest_lineage(cur, vec_b, threshold=0.95, filepath="app.py", cwe="CWE-89")
+                    self.assertIsNone(res_explicit)
+
+                # 4. Invalid / malformed environment variable gracefully falls back to default
+                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "invalid_float"}):
+                    res_invalid = find_nearest_lineage(cur, vec_b, filepath="app.py", cwe="CWE-89")
+                    self.assertIsNone(res_invalid)
+
+                # 5. Module-level import resilience when EMBEDDING_SIMILARITY_THRESHOLD='high' or out of range (-3, 2.5)
+                import importlib
+                import io
+                from contextlib import redirect_stderr
+                import core.embeddings as emb_mod
+                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "high"}):
+                    err_stream = io.StringIO()
+                    with redirect_stderr(err_stream):
+                        importlib.reload(emb_mod)
+                    self.assertEqual(emb_mod.DEFAULT_SIMILARITY_THRESHOLD, 0.90)
+                    self.assertIn("Invalid EMBEDDING_SIMILARITY_THRESHOLD='high'", err_stream.getvalue())
+
+                # Out-of-range negative threshold (-3) must warn and fall back to 0.90 (never clamp to -1.0)
+                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "-3"}):
+                    err_stream = io.StringIO()
+                    with redirect_stderr(err_stream):
+                        importlib.reload(emb_mod)
+                    self.assertEqual(emb_mod.DEFAULT_SIMILARITY_THRESHOLD, 0.90)
+                    self.assertIn("is outside valid range [0.0, 1.0]", err_stream.getvalue())
+
+                # Out-of-range positive threshold (2.5) must warn and fall back to 0.90
+                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "2.5"}):
+                    err_stream = io.StringIO()
+                    with redirect_stderr(err_stream):
+                        importlib.reload(emb_mod)
+                    self.assertEqual(emb_mod.DEFAULT_SIMILARITY_THRESHOLD, 0.90)
+                    self.assertIn("is outside valid range [0.0, 1.0]", err_stream.getvalue())
+
+                # Restore default module state
+                importlib.reload(emb_mod)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_warn_dim_mismatch_outputs_model_name_from_sqlite(self):
+        """Tests that _warn_dim_mismatch accurately prints the stored model name from SQLite records."""
+        import io
+        from contextlib import redirect_stderr
+        import core.embeddings as emb_mod
+
+        emb_mod._WARNED_DIM_MISMATCH = False
+        temp_dir = tempfile.mkdtemp()
+        db_file = os.path.join(temp_dir, "test_model_mismatch.db")
+        try:
+            init_db(db_file)
+            with _db(db_file) as conn:
+                cur = conn.cursor()
+                mock_blob = vector_to_blob([0.1] * 3072)
+                cur.execute(
+                    "INSERT INTO lineage_vectors (lineage_id, filepath, cwe, model, dimension, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("lin-vertex", "app.py", "CWE-89", "vertex_ai/gemini-embedding-001", 3072, mock_blob),
+                )
+
+                err_stream = io.StringIO()
+                with redirect_stderr(err_stream):
+                    res = find_nearest_lineage(cur, [0.1] * 256, filepath="app.py", cwe="CWE-89")
+
+                self.assertIsNone(res)
+                err_output = err_stream.getvalue()
+                self.assertIn("⚠️  [EMBEDDING MISMATCH]", err_output)
+                self.assertIn("Stored lineage vectors have dimension 3072 (model: 'vertex_ai/gemini-embedding-001')", err_output)
+                self.assertIn("while query vector has dimension 256", err_output)
+        finally:
+            shutil.rmtree(temp_dir)
+
     def test_query_security_guidance_aggregation(self):
         """Tests that query_security_guidance and get_security_guidance aggregate full advisory context."""
         temp_dir = tempfile.mkdtemp()
@@ -2359,7 +2974,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
 
         # Test loading workflow.json and verifying DAG compilation
         wf_path = os.path.join(os.path.dirname(__file__), "workflow.json")
-        wf, wf_config = load_workflow_from_json(wf_path)
+        wf, wf_config = load_workflow_from_json(wf_path, load_local=False)
         self.assertIsNotNone(wf)
         self.assertEqual(wf_config.get("default_model"), "vertex_ai/gemini-3.7-flash")
         self.assertEqual(wf_config.get("reasoning_effort"), "medium")
@@ -2713,8 +3328,166 @@ Routes tokenized charges to gateway.
             record_artifact(db_path, "run-1", "patch", "workspace/temp.bin", "BINARY_DATA_BLOB")
             bin_concepts = read_okf_concepts(db_path, resource="workspace/temp.bin")
             self.assertEqual(len(bin_concepts), 0)
+
+            # Test markdown artifact without frontmatter inherits resource and snapshot_id from metadata
+            from core.database import update_status, query_security_guidance
+            entity_no_fm = "# Auth Controller\nValidates incoming JWT tokens."
+            record_artifact(
+                db_path,
+                "run-1",
+                "entity",
+                "workspace/kb/entities/auth.md",
+                entity_no_fm,
+                metadata={"resource": "src/auth.py", "snapshot_id": "snap-987"}
+            )
+            auth_c = read_okf_concepts(db_path, resource="src/auth.py")
+            self.assertEqual(len(auth_c), 1)
+            self.assertEqual(auth_c[0]["title"], "Auth Controller")
+            self.assertEqual(auth_c[0]["snapshot_id"], "snap-987")
+            self.assertEqual(auth_c[0]["trust_tier"], "unverified")
+
+            # Test repo-wide document (Threat Model) retains resource="" even if metadata carries target_file
+            tm_content = "# System Threat Model\nTop level threat model."
+            record_artifact(
+                db_path,
+                "run-1",
+                "threat_model",
+                "workspace/kb/THREAT_MODEL.md",
+                tm_content,
+                metadata={"resource": "src/auth.py", "snapshot_id": "snap-987"}
+            )
+            tm_c = read_okf_concepts(db_path, concept_type="Threat Model")
+            self.assertEqual(len(tm_c), 1)
+            self.assertEqual(tm_c[0]["resource"], "")  # Must be repo-wide!
+
+            # Add an unrelated concept for src/billing.py
+            record_artifact(
+                db_path,
+                "run-1",
+                "entity",
+                "workspace/kb/entities/billing.md",
+                "# Billing Engine\nProcesses recurring invoices.",
+                metadata={"resource": "src/billing.py", "snapshot_id": "snap-987"}
+            )
+
+            # Add a human-reviewed concept for src/auth.py
+            human_reviewed_c = """---
+type: Component Entity
+title: Auth Token Parser
+resource: src/auth.py
+verified:
+  - by: human:security-lead
+    at: 2026-08-01T00:00:00Z
+---
+Parses JWT claims.
+"""
+            record_artifact(db_path, "run-1", "entity", "workspace/kb/entities/token_parser.md", human_reviewed_c)
+
+            # Test update_status upgrades trust_tier to machine_confirmed ONLY for target_file (src/auth.py)
+            update_status(db_path, "src/auth.py", "run-1", "dynamic_confirmed")
+
+            # 1. src/auth.py unverified concept upgraded
+            auth_c_upgraded = read_okf_concepts(db_path, resource="src/auth.py")
+            auth_ctrl = [c for c in auth_c_upgraded if c["title"] == "Auth Controller"][0]
+            self.assertEqual(auth_ctrl["trust_tier"], "machine_confirmed")
+            self.assertIn("sandbox_dynamic_confirmed", auth_ctrl["verified_by"][0]["by"])
+            self.assertIn("at", auth_ctrl["verified_by"][0])
+
+            # 2. src/auth.py human-reviewed concept NOT demoted, attestation appended
+            token_parser = [c for c in auth_c_upgraded if c["title"] == "Auth Token Parser"][0]
+            self.assertEqual(token_parser["trust_tier"], "human_reviewed")  # Preserved!
+            self.assertEqual(len(token_parser["verified_by"]), 2)  # Appended!
+            self.assertEqual(token_parser["verified_by"][0]["by"], "human:security-lead")
+            self.assertIn("sandbox_dynamic_confirmed", token_parser["verified_by"][1]["by"])
+
+            # 3. Unrelated concept (src/billing.py) NOT attested!
+            billing_c = read_okf_concepts(db_path, resource="src/billing.py")
+            self.assertEqual(len(billing_c), 1)
+            self.assertEqual(billing_c[0]["trust_tier"], "unverified")
+            self.assertEqual(len(billing_c[0]["verified_by"]), 0)
+
+            # 4. Repo-wide Threat Model NOT attested by single-file sandbox run!
+            tm_c_after = read_okf_concepts(db_path, concept_type="Threat Model")
+            self.assertEqual(tm_c_after[0]["trust_tier"], "unverified")
+            self.assertEqual(len(tm_c_after[0]["verified_by"]), 0)
+
+            # 4b. Test idempotency of attestations: repeated confirmation updates timestamp without duplicating entries
+            update_status(db_path, "src/auth.py", "run-1", "dynamic_confirmed")
+            auth_c_second = read_okf_concepts(db_path, resource="src/auth.py")
+            auth_ctrl_second = [c for c in auth_c_second if c["title"] == "Auth Controller"][0]
+            token_parser_second = [c for c in auth_c_second if c["title"] == "Auth Token Parser"][0]
+            self.assertEqual(len(auth_ctrl_second["verified_by"]), 1)
+            self.assertEqual(len(token_parser_second["verified_by"]), 2)
+            self.assertIn("T", token_parser_second["verified_by"][0]["at"])
+
+            # 5. Verify file scoping: query for totally unrelated file gets repo-wide concepts, NOT auth/billing entities!
+            unrelated_guidance = query_security_guidance(db_path, filepath="src/totally_unrelated.py", run_id="run-1")
+            unrelated_titles = [c["title"] for c in unrelated_guidance["okf_concepts"]]
+            self.assertIn("High Level System Architecture", unrelated_titles)
+            self.assertIn("System Threat Model", unrelated_titles)
+            self.assertNotIn("Auth Controller", unrelated_titles)
+            self.assertNotIn("Billing Engine", unrelated_titles)
+
+            # 6. Verify query_security_guidance for src/auth.py gets auth concepts + repo-wide
+            guidance = query_security_guidance(db_path, filepath="src/auth.py", run_id="run-1")
+            self.assertEqual(guidance["trust_tier"], "HUMAN-REVIEWED")
+            auth_guidance_titles = [c["title"] for c in guidance["okf_concepts"]]
+            self.assertIn("Auth Controller", auth_guidance_titles)
+            self.assertIn("Auth Token Parser", auth_guidance_titles)
+            self.assertNotIn("Billing Engine", auth_guidance_titles)
         finally:
             shutil.rmtree(temp_dir)
+
+    async def _async_test_write_file_kb_metadata_scoping(self):
+        from core.context import RunContext, current_run_context
+        from tools.research_tools import write_file
+        from core.database import init_db, read_okf_concepts
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "write_file.db")
+            init_db(db_path)
+            ctx = RunContext(
+                jail_dir=temp_dir,
+                db_path=db_path,
+                target_file="src/auth.py",
+                run_id="run-wf",
+                snapshot_id="snap-abc",
+            )
+            token = current_run_context.set(ctx)
+            try:
+                # 1. Component Entity
+                await write_file("workspace/kb/entities/auth.md", "# Auth Entity\nAuthenticates users.")
+                # 2. Threat Model
+                await write_file("workspace/kb/THREAT_MODEL.md", "# Threat Model\nHigh level threats.")
+                # 3. Architecture Summary
+                await write_file("workspace/kb/architecture.md", "# Architecture\nOverall system topology.")
+            finally:
+                current_run_context.reset(token)
+
+            # Assertions
+            auth_c = read_okf_concepts(db_path, resource="src/auth.py")
+            self.assertEqual(len(auth_c), 1)
+            self.assertEqual(auth_c[0]["title"], "Auth Entity")
+            self.assertEqual(auth_c[0]["resource"], "src/auth.py")
+            self.assertEqual(auth_c[0]["snapshot_id"], "snap-abc")
+
+            tm_c = read_okf_concepts(db_path, concept_type="Threat Model")
+            self.assertEqual(len(tm_c), 1)
+            self.assertEqual(tm_c[0]["title"], "Threat Model")
+            self.assertEqual(tm_c[0]["resource"], "")  # Repo-wide!
+            self.assertEqual(tm_c[0]["snapshot_id"], "snap-abc")
+
+            arch_c = read_okf_concepts(db_path, concept_type="Architecture Summary")
+            self.assertEqual(len(arch_c), 1)
+            self.assertEqual(arch_c[0]["title"], "Architecture")
+            self.assertEqual(arch_c[0]["resource"], "")  # Repo-wide!
+            self.assertEqual(arch_c[0]["snapshot_id"], "snap-abc")
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_write_file_kb_metadata_scoping(self):
+        """Tests that write_file correctly scopes entity documents to target_file while keeping threat models repo-wide."""
+        asyncio.run(self._async_test_write_file_kb_metadata_scoping())
 
     def test_okf_bundle_export_and_import(self):
         """Tests exporting concepts from SQLite to an OKF directory bundle and re-importing into another database."""
@@ -2871,8 +3644,604 @@ Routes tokenized charges to gateway.
             shutil.rmtree(temp_dir)
 
 
+class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
+    """Unit and integration tests for configure.py, launch.py, model routing, and preflight checks."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.sample_wf_path = os.path.join(self.temp_dir, "workflow.json")
+        self.sample_wf_def = {
+            "name": "test_pipeline",
+            "config": {
+                "db_path": "test_knowledge.db",
+                "default_model": "vertex_ai/gemini-3.7-flash",
+                "sandbox": {
+                    "type": "gce",
+                    "options": {
+                        "project": "YOUR_PROJECT_ID",
+                        "zone": "us-central1-b",
+                    }
+                }
+            },
+            "nodes": [
+                {
+                    "id": "agent_node",
+                    "type": "agent",
+                    "system_prompt": "prompt.md",
+                    "tools": ["read_file"]
+                }
+            ],
+            "edges": [
+                {"from": "START", "to": "agent_node"}
+            ]
+        }
+        with open(os.path.join(self.temp_dir, "prompt.md"), "w") as pf:
+            pf.write("Test agent instructions.")
+        with open(self.sample_wf_path, "w") as f:
+            json.dump(self.sample_wf_def, f, indent=2)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_is_placeholder(self):
+        from scripts.configure import is_placeholder
+
+        self.assertTrue(is_placeholder("YOUR_PROJECT_ID"))
+        self.assertTrue(is_placeholder("YOUR_PROJECT"))
+        self.assertTrue(is_placeholder("<YOUR_PROJECT_ID>"))
+        self.assertTrue(is_placeholder("<PROJECT_ID>"))
+        self.assertTrue(is_placeholder("YOUR_API_KEY"))
+        self.assertTrue(is_placeholder("TODO"))
+        self.assertTrue(is_placeholder("CHANGE_ME"))
+        self.assertTrue(is_placeholder("REPLACE_ME"))
+        self.assertTrue(is_placeholder(""))
+        self.assertTrue(is_placeholder(None))
+
+        # Real project / model strings with 'todo' as substring are NOT placeholders
+        self.assertFalse(is_placeholder("todo-app-prod"))
+        self.assertFalse(is_placeholder("acme-todo-svc"))
+        self.assertFalse(is_placeholder("my-gcp-project-123"))
+        self.assertFalse(is_placeholder("vertex_ai/gemini-3.7-flash"))
+        self.assertFalse(is_placeholder("openai/gpt-4o"))
+
+    def test_is_default_or_unconfigured(self):
+        from scripts.configure import is_default_or_unconfigured
+
+        # 1. Unconfigured with default YOUR_PROJECT_ID
+        cfg_unconf = {
+            "default_model": "vertex_ai/gemini-3.7-flash",
+            "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            is_unconf, issues = is_default_or_unconfigured(cfg_unconf)
+            self.assertTrue(is_unconf)
+            self.assertTrue(any("YOUR_PROJECT_ID" in iss for iss in issues))
+
+        # 2. Configured static-only sandbox
+        cfg_static = {
+            "default_model": "gemini-3.7-flash",
+            "sandbox": {"type": "static-only", "options": {}}
+        }
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "valid-proj"}):
+            is_unconf, issues = is_default_or_unconfigured(cfg_static)
+            self.assertFalse(is_unconf)
+            self.assertEqual(len(issues), 0)
+
+        # 3. Configured GCE sandbox with real project
+        cfg_gce = {
+            "default_model": "vertex_ai/gemini-3.7-flash",
+            "sandbox": {"type": "gce", "options": {"project": "my-real-project"}}
+        }
+        with patch("shutil.which", return_value="/usr/bin/gcloud"):
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "my-real-project"}):
+                is_unconf, issues = is_default_or_unconfigured(cfg_gce)
+                self.assertFalse(is_unconf)
+                self.assertEqual(len(issues), 0)
+
+        # 4. Placeholder in model name
+        cfg_bad_model = {
+            "default_model": "openai/YOUR_API_KEY",
+            "sandbox": {"type": "static-only"}
+        }
+        is_unconf, issues = is_default_or_unconfigured(cfg_bad_model)
+        self.assertTrue(is_unconf)
+
+        # 5. gVisor missing docker/podman
+        cfg_gv = {
+            "default_model": "vertex_ai/gemini-3.7-flash",
+            "sandbox": {"type": "gvisor"}
+        }
+        with patch("shutil.which", return_value=None):
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "valid-proj"}):
+                is_unconf, issues = is_default_or_unconfigured(cfg_gv)
+                self.assertTrue(is_unconf)
+                self.assertTrue(any("docker" in iss.lower() for iss in issues))
+
+    def test_detect_capabilities(self):
+        from scripts.configure import detect_capabilities
+
+        caps = detect_capabilities()
+        self.assertIsInstance(caps, dict)
+        self.assertIn("kvm", caps)
+        self.assertIn("docker", caps)
+        self.assertIn("gcloud", caps)
+        self.assertIn("available_sandboxes", caps)
+        self.assertIn("recommended_sandbox", caps)
+        self.assertIn("static-only", caps["available_sandboxes"])
+
+    def test_update_workflow_config(self):
+        from scripts.configure import update_workflow_config, load_workflow_dict, get_local_workflow_path
+
+        updates = {
+            "default_model": "vertex_ai/claude-opus-5",
+            "api_base": "http://localhost:8000/v1",
+            "timeout": 45.0,
+            "reasoning_effort": "high",
+            "db_path": "custom.db",
+            "sandbox": {
+                "type": "gvisor",
+                "options": {"image": "mantis-sandbox:latest"}
+            }
+        }
+        # 1. Default update saves to workflow.local.json overlay
+        updated = update_workflow_config(self.sample_wf_path, updates, save=True, update_all_nodes=True, save_tracked=False)
+        self.assertEqual(updated["config"]["default_model"], "vertex_ai/claude-opus-5")
+        self.assertEqual(updated["config"]["api_base"], "http://localhost:8000/v1")
+        self.assertEqual(updated["config"]["timeout"], 45.0)
+        self.assertEqual(updated["config"]["reasoning_effort"], "high")
+        self.assertEqual(updated["config"]["db_path"], "custom.db")
+        self.assertEqual(updated["config"]["sandbox"]["type"], "gvisor")
+        self.assertEqual(updated["config"]["sandbox"]["options"]["image"], "mantis-sandbox:latest")
+
+        local_path = get_local_workflow_path(self.sample_wf_path)
+        self.assertTrue(os.path.exists(local_path))
+
+        # Base workflow.json on disk remains unchanged
+        base_raw = load_workflow_dict(self.sample_wf_path, load_local=False)
+        self.assertEqual(base_raw["config"]["default_model"], "vertex_ai/gemini-3.7-flash")
+
+        # Merged load reflects overlay
+        reloaded = load_workflow_dict(self.sample_wf_path, load_local=True)
+        self.assertEqual(reloaded["config"]["default_model"], "vertex_ai/claude-opus-5")
+
+        # 2. save_tracked=True updates base workflow.json
+        update_workflow_config(self.sample_wf_path, {"default_model": "vertex_ai/zai_org/glm-5.2-maas"}, save=True, save_tracked=True)
+        base_tracked = load_workflow_dict(self.sample_wf_path, load_local=False)
+        self.assertEqual(base_tracked["config"]["default_model"], "vertex_ai/zai_org/glm-5.2-maas")
+
+        # 3. Sandbox downgrade to static-only cleans options dictionary
+        downgrade_updates = {"sandbox": {"type": "static-only", "options": {}}}
+        cleaned = update_workflow_config(self.sample_wf_path, downgrade_updates, save=True, save_tracked=False)
+        self.assertEqual(cleaned["config"]["sandbox"]["type"], "static-only")
+        self.assertEqual(cleaned["config"]["sandbox"]["options"], {})
+
+    def test_workflow_local_overlay(self):
+        from core.graph_loader import load_workflow_from_json
+        from scripts.configure import get_local_workflow_path
+
+        # Create base workflow.json with placeholder
+        with open(self.sample_wf_path, "w") as f:
+            json.dump({
+                "name": "overlay_workflow",
+                "config": {
+                    "default_model": "vertex_ai/gemini-3.7-flash",
+                    "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
+                },
+                "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
+                "edges": [{"from": "START", "to": "test_agent"}]
+            }, f)
+
+        # Write workflow.local.json overlay
+        local_path = get_local_workflow_path(self.sample_wf_path)
+        with open(local_path, "w") as f:
+            json.dump({
+                "config": {
+                    "sandbox": {"type": "gce", "options": {"project": "my-local-overlay-proj"}}
+                }
+            }, f)
+
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "my-local-overlay-proj"}):
+            wf, cfg = load_workflow_from_json(self.sample_wf_path)
+            self.assertEqual(cfg["sandbox"]["type"], "gce")
+            self.assertEqual(cfg["sandbox"]["options"]["project"], "my-local-overlay-proj")
+
+        # Verify base workflow.json remains untouched on disk
+        with open(self.sample_wf_path, "r") as f:
+            base_disk = json.load(f)
+        self.assertEqual(base_disk["config"]["sandbox"]["options"]["project"], "YOUR_PROJECT_ID")
+
+    def test_run_preflight_checks(self):
+        from scripts.configure import run_preflight_checks, run_preflight_checks_async
+
+        # 1. Static sandbox passes preflight instantly
+        cfg_static = {
+            "default_model": "vertex_ai/gemini-3.7-flash",
+            "sandbox": {"type": "static-only"}
+        }
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+            ok, msgs = run_preflight_checks(cfg_static)
+            self.assertTrue(ok)
+            self.assertTrue(any("PASSED" in m for m in msgs))
+
+        # 2. GCE sandbox with placeholder project fails preflight
+        cfg_gce_bad = {
+            "default_model": "vertex_ai/gemini-3.7-flash",
+            "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
+        }
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+            ok, msgs = run_preflight_checks(cfg_gce_bad)
+            self.assertFalse(ok)
+            self.assertTrue(any("placeholder" in m.lower() for m in msgs))
+
+        # 3. GCE sandbox with valid credentials tests softened preflight message
+        cfg_gce_good = {
+            "default_model": "vertex_ai/gemini-3.7-flash",
+            "sandbox": {"type": "gce", "options": {"project": "my-gce-project"}}
+        }
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "my-gce-project"}):
+            with patch("shutil.which", return_value="/usr/bin/gcloud"):
+                with patch("subprocess.run") as mock_sub:
+                    mock_sub.return_value = MagicMock(returncode=0, stdout="active-user@google.com\n")
+                    ok, msgs = run_preflight_checks(cfg_gce_good)
+                    self.assertTrue(ok)
+                    gce_msg = next((m for m in msgs if "SANDBOX PREFLIGHT" in m), "")
+                    self.assertIn("GCE credentials & project verified (Project: my-gce-project)", gce_msg)
+                    self.assertIn("Note: Ephemeral VM creation requires pre-provisioned VPC/Subnet/Image", gce_msg)
+
+        # 4. Anthropic model without ANTHROPIC_API_KEY fails preflight
+        cfg_anthropic = {
+            "default_model": "anthropic/claude-3-5-sonnet",
+            "sandbox": {"type": "static-only"}
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            ok, msgs = run_preflight_checks(cfg_anthropic)
+            self.assertFalse(ok)
+            self.assertTrue(any("ANTHROPIC_API_KEY" in m for m in msgs))
+
+        # 5. Anthropic model with ANTHROPIC_API_KEY passes preflight
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}):
+            ok, msgs = run_preflight_checks(cfg_anthropic)
+            self.assertTrue(ok)
+
+        # 6. OpenAI-compatible model with api_base passes preflight
+        cfg_openai = {
+            "default_model": "openai/custom-model",
+            "api_base": "http://localhost:8000/v1",
+            "sandbox": {"type": "static-only"}
+        }
+        ok, msgs = run_preflight_checks(cfg_openai)
+        self.assertTrue(ok)
+
+        # 7. Vertex AI OpenAI model passes preflight with api_base or project
+        cfg_vertex_openai = {
+            "default_model": "vertex_ai/openai/custom-model",
+            "api_base": "http://localhost:8000/v1",
+            "sandbox": {"type": "static-only"}
+        }
+        ok, msgs = run_preflight_checks(cfg_vertex_openai)
+        self.assertTrue(ok)
+
+        # 8. GLM 5.2 MaaS model with Vertex AI project passes preflight
+        cfg_glm = {
+            "default_model": "vertex_ai/zai_org/glm-5.2-maas",
+            "sandbox": {"type": "static-only"}
+        }
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+            ok, msgs = run_preflight_checks(cfg_glm)
+            self.assertTrue(ok)
+
+        # 9. Async preflight checks execution
+        async def _test_async():
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+                a_ok, a_msgs = await run_preflight_checks_async(cfg_static)
+                self.assertTrue(a_ok)
+                # Safe sync wrapper inside event loop does not raise RuntimeError
+                s_ok, s_msgs = run_preflight_checks(cfg_static)
+                self.assertTrue(s_ok)
+
+        asyncio.run(_test_async())
+
+    def test_ensure_configured(self):
+        from scripts.configure import ensure_configured, load_workflow_dict, get_local_workflow_path
+
+        # Auto-configure auto-resolves placeholder GCE and saves to workflow.local.json
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "auto-discovered-proj"}):
+            with patch("scripts.configure.detect_capabilities", return_value={
+                "kvm": False, "docker": False, "podman": False, "container_tool": None,
+                "runsc": False, "gcloud": True, "gcp_auth": True, "gcp_account": "user@google.com",
+                "gcp_project": "auto-discovered-proj", "vertex_project": "auto-discovered-proj",
+                "gemini_api_key": False, "anthropic_api_key": False, "openai_api_key": False,
+                "llm_api_base": None, "recommended_sandbox": "gce",
+                "available_sandboxes": ["static-only", "gce"]
+            }):
+                resolved = ensure_configured(self.sample_wf_path, auto=True)
+                self.assertEqual(resolved["sandbox"]["options"]["project"], "auto-discovered-proj")
+
+                # Verify local overlay was created
+                local_path = get_local_workflow_path(self.sample_wf_path)
+                self.assertTrue(os.path.exists(local_path))
+
+                # Base workflow.json on disk is still unmodified placeholder
+                base_raw = load_workflow_dict(self.sample_wf_path, load_local=False)
+                self.assertEqual(base_raw["config"]["sandbox"]["options"]["project"], "YOUR_PROJECT_ID")
+
+        # Auto-configure falls back cleanly to static-only with options={} when GCE is unavailable
+        import io
+        from contextlib import redirect_stdout
+        with patch("scripts.configure.detect_capabilities", return_value={
+            "kvm": False, "docker": False, "podman": False, "container_tool": None,
+            "runsc": False, "gcloud": False, "gcp_auth": False, "gcp_account": None,
+            "gcp_project": None, "vertex_project": None,
+            "gemini_api_key": False, "anthropic_api_key": False, "openai_api_key": False,
+            "llm_api_base": None, "recommended_sandbox": "static-only",
+            "available_sandboxes": ["static-only"]
+        }):
+            f = io.StringIO()
+            with redirect_stdout(f):
+                resolved_fallback = ensure_configured(self.sample_wf_path, auto=True)
+            output = f.getvalue()
+            self.assertIn("⚠️  [REPRO DISABLED]", output)
+            self.assertIn("Downgrading sandbox 'gce' -> 'static-only'. Dynamic exploit reproduction and patch verification will be skipped.", output)
+            self.assertEqual(resolved_fallback["sandbox"]["type"], "static-only")
+            self.assertEqual(resolved_fallback["sandbox"]["options"], {})
+
+            # Also reload from disk with local overlay to verify options={} is cleanly preserved without orphaned options!
+            reloaded = load_workflow_dict(self.sample_wf_path, load_local=True)
+            self.assertEqual(reloaded["config"]["sandbox"]["type"], "static-only")
+            self.assertEqual(reloaded["config"]["sandbox"]["options"], {})
+
+    def test_merge_config_dicts_sandbox_transitions(self):
+        from core.graph_loader import merge_config_dicts
+        from scripts.configure import merge_dicts
+
+        for merge_fn in (merge_config_dicts, merge_dicts):
+            # 1. Downgrading from GCE to static-only replaces options with {}
+            base = {"sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID", "zone": "us-central1-b"}}}
+            overlay = {"sandbox": {"type": "static-only", "options": {}}}
+            merged = merge_fn(base, overlay)
+            self.assertEqual(merged["sandbox"]["type"], "static-only")
+            self.assertEqual(merged["sandbox"]["options"], {})
+
+            # 2. Transition from GCE to gVisor does not leak GCE options
+            overlay_gv = {"sandbox": {"type": "gvisor", "options": {"container_tool": "docker"}}}
+            merged_gv = merge_fn(base, overlay_gv)
+            self.assertEqual(merged_gv["sandbox"]["type"], "gvisor")
+            self.assertEqual(merged_gv["sandbox"]["options"], {"container_tool": "docker"})
+
+            # 3. Same type merges options cleanly
+            overlay_proj = {"sandbox": {"type": "gce", "options": {"project": "my-real-project"}}}
+            merged_gce = merge_fn(base, overlay_proj)
+            self.assertEqual(merged_gce["sandbox"]["type"], "gce")
+            self.assertEqual(merged_gce["sandbox"]["options"]["project"], "my-real-project")
+            self.assertEqual(merged_gce["sandbox"]["options"]["zone"], "us-central1-b")
+
+    def test_configure_cli_operations(self):
+        from scripts.configure import build_parser, main as configure_main, get_local_workflow_path
+
+        # 1. Test CLI status show
+        test_args = ["--workflow", self.sample_wf_path, "--show", "--json"]
+        with patch("sys.argv", ["configure.py"] + test_args):
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+                rc = configure_main()
+                self.assertEqual(rc, 0)
+
+        # 2. Test CLI dry-run update does not write files
+        test_args = ["--workflow", self.sample_wf_path, "--sandbox", "static-only", "--dry-run"]
+        with patch("sys.argv", ["configure.py"] + test_args):
+            rc = configure_main()
+            self.assertEqual(rc, 0)
+
+        # 3. Test CLI --auto --dry-run never mutates workflow.json or workflow.local.json
+        local_path = get_local_workflow_path(self.sample_wf_path)
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        test_args = ["--workflow", self.sample_wf_path, "--auto", "--dry-run"]
+        with patch("sys.argv", ["configure.py"] + test_args):
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+                rc = configure_main()
+                self.assertEqual(rc, 0)
+                self.assertFalse(os.path.exists(local_path))
+
+        # 4. Test CLI test flag on static sandbox
+        test_args = ["--workflow", self.sample_wf_path, "--sandbox", "static-only", "--test"]
+        with patch("sys.argv", ["configure.py"] + test_args):
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+                rc = configure_main()
+                self.assertEqual(rc, 0)
+
+        # 5. Test CLI save-tracked flag modifies base workflow.json
+        test_args = ["--workflow", self.sample_wf_path, "--model", "gemini-3.7-flash", "--save-tracked"]
+        with patch("sys.argv", ["configure.py"] + test_args):
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+                rc = configure_main()
+                self.assertEqual(rc, 0)
+
+    def test_llm_project_resolution_fallback(self):
+        from core.config import get_llm_kwargs
+
+        # When env vars are cleared, get_llm_kwargs falls back to config project or sandbox project
+        with patch.dict(os.environ, {}, clear=True):
+            # 1. Fallback to config["project"]
+            m, kwargs = get_llm_kwargs(
+                model_id="vertex_ai/gemini-3.7-flash",
+                config={"project": "fallback-project-alpha"}
+            )
+            self.assertEqual(kwargs.get("vertex_project"), "fallback-project-alpha")
+
+            # 2. Fallback to config["sandbox"]["options"]["project"]
+            m, kwargs = get_llm_kwargs(
+                model_id="vertex_ai/gemini-3.7-flash",
+                config={"sandbox": {"options": {"project": "fallback-sb-project"}}}
+            )
+            self.assertEqual(kwargs.get("vertex_project"), "fallback-sb-project")
+
+            # 3. Placeholder in config is ignored
+            with patch("google.auth.default", side_effect=Exception("No credentials")):
+                with self.assertRaises(ValueError):
+                    get_llm_kwargs(
+                        model_id="vertex_ai/gemini-3.7-flash",
+                        config={"sandbox": {"options": {"project": "YOUR_PROJECT_ID"}}}
+                    )
+
+            # 4. Placeholder in env var is ignored and falls back to config
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "YOUR_PROJECT_ID", "GOOGLE_CLOUD_PROJECT": ""}):
+                m, kwargs = get_llm_kwargs(
+                    model_id="vertex_ai/gemini-3.7-flash",
+                    config={"project": "fallback-after-env-placeholder"}
+                )
+                self.assertEqual(kwargs.get("vertex_project"), "fallback-after-env-placeholder")
+
+    def test_mythos_scrub_verification(self):
+        from core.config import RECOMMENDED_MODELS, DEFAULT_MODEL
+        import subprocess
+
+        # 1. Check RECOMMENDED_MODELS does not contain mythos
+        for m in RECOMMENDED_MODELS:
+            self.assertNotIn("mythos", m.lower())
+        self.assertNotIn("mythos", DEFAULT_MODEL.lower())
+        self.assertIn("vertex_ai/claude-opus-5", RECOMMENDED_MODELS)
+        self.assertNotIn("anthropic/claude-opus-5", RECOMMENDED_MODELS)
+        self.assertIn("vertex_ai/zai_org/glm-5.2-maas", RECOMMENDED_MODELS)
+
+        # 2. Git grep check across repo to verify 0 mythos occurrences in tracked files
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        res = subprocess.run(
+            ["git", "grep", "-i", "mythos", "--", ":!reference/test_suite.py"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            res.stdout.strip(),
+            "",
+            f"Tracked files contain 'mythos' references:\n{res.stdout}"
+        )
+
+    def test_model_normalization_and_routing(self):
+        from core.config import normalize_model_id, get_llm_kwargs
+
+        # Bare gemini model routes to vertex_ai when GCP env is set
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "proj-123", "GEMINI_API_KEY": ""}):
+            normalized = normalize_model_id("gemini-3.7-flash")
+            self.assertEqual(normalized, "vertex_ai/gemini-3.7-flash")
+
+        # Global model override takes precedence
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-123"}):
+            model_id, kwargs = get_llm_kwargs(
+                model_id="vertex_ai/gemini-3.5-flash-lite",
+                global_model_override="vertex_ai/claude-opus-5",
+            )
+            self.assertEqual(model_id, "vertex_ai/claude-opus-5")
+            self.assertEqual(kwargs["vertex_project"], "proj-123")
+
+        # MANTIS_MODEL env var overrides node model
+        with patch.dict(os.environ, {"MANTIS_MODEL": "openai/custom-vllm", "LLM_API_BASE": "http://localhost:8000/v1"}):
+            model_id, kwargs = get_llm_kwargs(model_id="vertex_ai/gemini-3.7-flash")
+            self.assertEqual(model_id, "openai/custom-vllm")
+            self.assertEqual(kwargs["api_base"], "http://localhost:8000/v1")
+
+        # vertex_ai/zai_org/glm-5.2-maas routing to OpenAPI endpoint
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-123"}):
+            model_id, kwargs = get_llm_kwargs(model_id="vertex_ai/zai_org/glm-5.2-maas")
+            self.assertEqual(model_id, "vertex_ai/openai/zai-org/glm-5.2-maas")
+            self.assertEqual(kwargs["vertex_project"], "proj-123")
+
+        # vertex_ai/openai/{MODEL_ID} with api_base
+        model_id, kwargs = get_llm_kwargs(
+            model_id="vertex_ai/openai/my-model",
+            api_base="http://localhost:8000/v1",
+        )
+        self.assertEqual(model_id, "vertex_ai/openai/my-model")
+        self.assertEqual(kwargs["api_base"], "http://localhost:8000/v1")
+
+    def test_graph_loader_runtime_overrides(self):
+        # Update sample workflow to use static-only sandbox and valid prompt
+        with open(self.sample_wf_path, "w") as f:
+            json.dump({
+                "name": "override_workflow",
+                "config": {"default_model": "vertex_ai/gemini-3.7-flash", "sandbox": {"type": "static-only"}},
+                "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
+                "edges": [{"from": "START", "to": "test_agent"}]
+            }, f)
+
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-123"}):
+            wf, cfg = load_workflow_from_json(
+                self.sample_wf_path,
+                model_override="openai/override-model",
+                api_base_override="http://localhost:9000/v1",
+                sandbox_override="static-only",
+                db_override="runtime.db",
+                timeout_override=120.0,
+                reasoning_effort_override="high",
+            )
+            self.assertEqual(cfg["default_model"], "openai/override-model")
+            self.assertEqual(cfg["api_base"], "http://localhost:9000/v1")
+            self.assertEqual(cfg["db_path"], "runtime.db")
+            self.assertEqual(cfg["timeout"], 120.0)
+            self.assertEqual(cfg["reasoning_effort"], "high")
+
+    def test_launch_script_operations(self):
+        from scripts.launch import run_launch
+
+        # 1. Non-existent target fails with exit code 1
+        rc = run_launch(target="/non/existent/path/xyz.py", workflow_path=self.sample_wf_path)
+        self.assertEqual(rc, 1)
+
+        # 2. Dry run over existing target file returns exit code 0
+        with open(self.sample_wf_path, "w") as f:
+            json.dump({
+                "name": "launch_workflow",
+                "config": {"default_model": "vertex_ai/gemini-3.7-flash", "sandbox": {"type": "static-only"}},
+                "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
+                "edges": [{"from": "START", "to": "test_agent"}]
+            }, f)
+
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-123"}):
+            rc = run_launch(
+                target=os.path.join(self.temp_dir, "prompt.md"),
+                workflow_path=self.sample_wf_path,
+                dry_run=True,
+            )
+            self.assertEqual(rc, 0)
+
+        # 3. Preflight only returns exit code 0
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-123"}):
+            rc = run_launch(
+                target=os.path.join(self.temp_dir, "prompt.md"),
+                workflow_path=self.sample_wf_path,
+                preflight_only=True,
+            )
+            self.assertEqual(rc, 0)
+
+        # 4. Auto-healing on unconfigured placeholder in launch
+        with open(self.sample_wf_path, "w") as f:
+            json.dump({
+                "name": "launch_unconf_workflow",
+                "config": {
+                    "default_model": "vertex_ai/gemini-3.7-flash",
+                    "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
+                },
+                "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
+                "edges": [{"from": "START", "to": "test_agent"}]
+            }, f)
+
+        with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "auto-resolved-proj", "VERTEXAI_PROJECT": "auto-resolved-proj"}):
+            with patch("scripts.configure.detect_capabilities", return_value={
+                "kvm": False, "docker": False, "podman": False, "container_tool": None,
+                "runsc": False, "gcloud": True, "gcp_auth": True, "gcp_account": "user@google.com",
+                "gcp_project": "auto-resolved-proj", "vertex_project": "auto-resolved-proj",
+                "gemini_api_key": False, "anthropic_api_key": False, "openai_api_key": False,
+                "llm_api_base": None, "recommended_sandbox": "gce",
+                "available_sandboxes": ["static-only", "gce"]
+            }):
+                with patch("scripts.configure._check_sandbox_preflight", return_value=(True, "Sandbox ready")):
+                    rc = run_launch(
+                        target=os.path.join(self.temp_dir, "prompt.md"),
+                        workflow_path=self.sample_wf_path,
+                        preflight_only=True,
+                    )
+                    self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-

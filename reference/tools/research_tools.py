@@ -24,7 +24,11 @@ MAX_READ_SIZE = 1024 * 1024  # 1 MiB
 def _persist_artifact(ctx, artifact_type: str, filepath: str, content: str):
     """Persists an artifact solely to the SQLite database campaign_artifacts table."""
     if ctx.db_path:
-        record_artifact(ctx.db_path, ctx.run_id, artifact_type, filepath, content)
+        meta = {
+            "resource": getattr(ctx, "target_file", ""),
+            "snapshot_id": getattr(ctx, "snapshot_id", ""),
+        }
+        record_artifact(ctx.db_path, ctx.run_id, artifact_type, filepath, content, metadata=meta)
 
 
 async def read_file(filepath: str) -> str:
@@ -239,7 +243,11 @@ async def write_file(filepath: str, content: str) -> str:
     clean_fp = filepath.replace("\\", "/").removeprefix("./")
     if clean_fp.startswith("workspace/") or clean_fp in ("mantis-summary.md",):
         if ctx.db_path:
-            record_artifact(ctx.db_path, ctx.run_id, "workspace_file", clean_fp, content)
+            meta = {
+                "resource": getattr(ctx, "target_file", ""),
+                "snapshot_id": getattr(ctx, "snapshot_id", ""),
+            }
+            record_artifact(ctx.db_path, ctx.run_id, "workspace_file", clean_fp, content, metadata=meta)
             # Sync any per-finding calibration updates into the findings table
             if clean_fp.startswith("workspace/findings") or clean_fp == "workspace/findings_update.json":
                 try:

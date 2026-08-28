@@ -1,12 +1,69 @@
 # Mantis Skills: Reference Guide for AI Agents
 
+> [!CAUTION] **USE AT YOUR OWN RISK. BE EXTREMELY CAREFUL.** This suite is
+> designed to generate and execute autonomously generated code that may be
+> unstable or perform unexpected actions. **USE THIS ONLY IN ISOLATED,
+> RESTRICTED ENVIRONMENTS.** Never run this suite on a machine with access to
+> production systems, sensitive data, or internal networks. See the "Advanced /
+> Unattended Cloud Deployment (GCE)" section for mandatory hardening
+> requirements.
+
+> [!IMPORTANT] **RESPONSIBLE USE** AI models are non-deterministic and can
+> hallucinate findings or generate incorrect patches. **All findings must be
+> manually verified by a security expert before being reported.** Do not
+> mass-file unverified, AI-generated reports to open-source maintainers. A
+> failure to automatically reproduce a vulnerability does not definitively mean
+> it is a false positive, nor does a successful reproducer guarantee the bug is
+> exploitable in all contexts. Use these skills responsibly.
+
 This document is the canonical reference guide for AI Agents operating in this
 workspace. It describes the Mantis pipeline architecture, the individual skills
 (stages), the inter-stage data contracts, and the design patterns required to
 run and extend the pipeline.
 
+For more information on securing AI systems, see Google's
+[Secure AI Framework (SAIF)](https://safety.google/safety/saif/).
+
 As an agent, you must adhere to the contracts, file paths, and execution
 patterns defined in this document.
+
+______________________________________________________________________
+
+## Prerequisites and Setup
+
+Before executing any skills, ensure your local CLI environment is fully
+configured. Mantis is platform agnostic and works with Gemini CLI, Antigravity
+CLI, Google ADK, and other coding agent frameworks. Consider:
+
+1. **Docker**: For running testing containers.
+
+2. **gVisor (runsc)**: For enhanced security when executing untrusted
+   AI-generated crash reproducer code, register the `runsc` runtime with
+   networkless execution
+   (`sudo runsc install -- --network=none && sudo systemctl restart docker`) or
+   configure `/etc/docker/daemon.json`:
+
+   ```json
+   {
+     "runtimes": {
+       "runsc": {
+         "path": "runsc",
+         "runtimeArgs": [
+           "--network=none"
+         ]
+       }
+     }
+   }
+   ```
+
+3. **Cloud SDKs**: If running remote cloud sandboxes (e.g. Google Compute
+   Engine) instead of local containers.
+
+To install the skills via CLI:
+
+```shell
+npx skills add google/mantis
+```
 
 ______________________________________________________________________
 
@@ -227,6 +284,80 @@ when unavailable. Consumers query via
     and patch information at `workspace/report/review_packet-latest.md` (and
     archives to `review_packet_pass_<N>.md`).
 
+### Auxiliary & Operational Skills
+
+- **`/mantis-configure` (Configuration & Preflight Wizard):**
+  ([`reference/skills/mantis-configure/SKILL.md`](reference/skills/mantis-configure/SKILL.md))
+  Manages sandbox selection (`static-only`, `microsandbox`, `gvisor`, `gce`),
+  LLM provider options, and fast preflight testing.
+- **`/mantis-launch` (Automated Launch & Healing Supervisor):**
+  ([`reference/skills/mantis-launch/SKILL.md`](reference/skills/mantis-launch/SKILL.md))
+  Validates the environment, performs preflight checks, and executes the
+  pipeline with automatic sandbox downgrade fallback.
+- **`/mantis-advise` (Developer Security Advisor):**
+  ([`mantis-advise/SKILL.md`](mantis-advise/SKILL.md)) Queries threat models,
+  historical vulnerability lineages, verified patch diffs, triaged false
+  positives, and learned trajectory invariants from `knowledge.db` before and
+  during code edits.
+
+### Running the Pipeline (Manual Mode)
+
+You can execute the reviewing stages sequentially from inside your active CLI
+terminal:
+
+```text
+# 0. (Optional) Configure environment models and sandboxes
+/mantis-configure
+
+# 0a. (Optional) Analyze repository's version control system (VCS) history
+/mantis-history
+
+# 0b. (Optional) Build content-addressed semantic-unit index
+/mantis-structural-index
+
+# 1. (Optional) Generate mantis-summary.md directory maps
+/mantis-summarize
+
+# 2. Synthesize codebase structure and historical learnings into Markdown KB
+/mantis-architecture
+
+# 3. Iteratively develop living threat model based on the KB
+/mantis-threat-model
+
+# 4. Map target external boundary and build scanning roadmap
+/mantis-plan
+
+# 5. Run multi-threaded/sequential security flaw sweep
+/mantis-researcher
+
+# 6. Consolidate overlapping files and duplicate bugs
+/mantis-dedupe
+
+# 7. Verify code validity & filter false positives
+/mantis-review
+
+# 8. Eliminate non-viable production issues
+/mantis-critic
+
+# 9. Generate proof-of-concept crash reproducers and run in sandboxes
+/mantis-reproduce
+
+# 10. Combine validated findings into multi-step exploit chains
+/mantis-chain
+
+# 11. Apply minimal fixes and verify they block the crash reproducer
+/mantis-patch
+
+# 12. Calculate final matrix risk ratings and append to findings
+/mantis-calibrate
+
+# 13. Extract insights from execution trajectories to learnings inbox
+/mantis-reflect
+
+# 14. Generate human-readable security review packet report
+/mantis-report
+```
+
 ______________________________________________________________________
 
 ## The Snapshot Model
@@ -425,6 +556,92 @@ for the adapter reference pointer.
 > harness, your orchestrator should override these instructions and provide
 > native tool calls or functions for state management to avoid forcing the LLM
 > to write one-off scripts.
+
+### The ADK Reference Implementation (`reference/`)
+
+This repository includes a production-grade reference harness located in
+[`reference/`](reference/), built directly on top of the **Google Agent
+Development Kit (ADK)**. It serves as an authoritative implementation of the
+Mantis architecture:
+
+1. **Declarative Workflow Graph (`workflow.json` / `core/graph_loader.py`)**:
+
+   - Compiles 16 sequential agent nodes into native ADK `Workflow`, `Agent`, and
+     `Classifier` constructs.
+   - Attaches Mantis skill directories as native `SkillToolset` instances.
+   - Provides full runtime fallback for system prompts via
+     `prompts/system-*.md`.
+
+2. **Layered Configuration Overlay (`workflow.local.json`)**:
+
+   - **`workflow.json` (Tracked)**: Contains template configurations and clean
+     placeholder values (`YOUR_PROJECT_ID`).
+   - **`workflow.local.json` (Gitignored)**: Automatically generated overlay for
+     local developer machines, containing resolved GCP projects, active
+     sandboxes, and model overrides.
+   - Auto-configuration (`scripts/configure.py --auto`) and launch tools
+     (`scripts/launch.py` / `./run.sh`) write strictly to `workflow.local.json`
+     to keep developer git trees clean.
+
+3. **Pluggable Sandboxed Environments (`core/sandboxes/`)**:
+
+   - **`StaticOnlyEnvironment` (`"static-only"`)**: Safe static analysis only;
+     dynamic crash reproduction and patch verification are skipped.
+   - **`GvisorEnvironment` (`"gvisor"`)**: OCI container isolation via
+     Docker/Podman and gVisor `runsc` with `--network=none`.
+   - **`MicrosandboxEnvironment` (`"microsandbox"`)**: In-process hardware
+     microVM isolation via `libkrun` and `Network.none()`.
+   - **`GceEnvironment` (`"gce"`)**: Hardened ephemeral Google Compute Engine VM
+     isolation in a private non-internet VPC with DNS blackholing, IAP
+     tunneling, and IAM token suppression.
+
+4. **3-Tier Deduplication & Lineage Ladder (`core/embeddings.py` /
+   `core/database.py`)**:
+
+   - **Tier 1 (Exact Heuristic Anchors)**: \<1ms stable signature and AST
+     line-shift matching.
+   - **Tier 2 (RCA Normalization)**: Lightweight LLM extraction of standardized
+     root cause summaries.
+   - **Tier 3 (Semantic Vector Embeddings)**: Nearest-neighbor cosine similarity
+     matching via `vertex_ai/gemini-embedding-001` (or configurable model) with
+     calibrated threshold $\\ge 0.90$ and a structural CWE compatibility guard
+     to prevent cross-vulnerability false merges.
+   - **Observability**: Explicit warnings on live embedding fallback
+     (`⚠️  [EMBEDDING FALLBACK]`) and vector dimension mismatch
+     (`⚠️  [EMBEDDING MISMATCH]`).
+
+5. **Operational CLI Tools & Developer Skills**:
+
+   - **`scripts/configure.py` (`mantis-configure`)**: Interactive wizard,
+     auto-detection, and ~1s preflight validation (see
+     [`reference/skills/mantis-configure/SKILL.md`](reference/skills/mantis-configure/SKILL.md)).
+   - **`scripts/launch.py` (`./run.sh` / `mantis-launch`)**: Autonomous runner
+     with preflight sanity checks and graceful sandbox downgrade handling (see
+     [`reference/skills/mantis-launch/SKILL.md`](reference/skills/mantis-launch/SKILL.md)).
+   - **`scripts/advise.py` (`mantis-advise`)**: Developer security advisor
+     querying threat models, historical lineages, and verified patch diffs.
+   - **`scripts/generate_schemas.py`**: Compiles `schema.json` into Pydantic
+     models in `core/schemas.py`.
+
+6. **Open Knowledge Format (OKF v0.2) Semantics (`core/database.py` /
+   `scripts/advise.py`)**:
+
+   - **`okf_concepts` Storage**: SQLite schema version 3 stores scoped concepts,
+     YAML frontmatter, and canonical trust tiers (`unverified`, `heuristic`,
+     `machine_confirmed`, `human_reviewed`) per OKF spec §5.3.
+   - **Bundle Import/Export**: Bi-directional OKF bundle exchange
+     (`export_okf_bundle` / `import_okf_bundle`) with CLI support
+     (`scripts/advise.py --export-okf <dir>` and `--import-okf <dir>`).
+   - **Contextual Advisory Dossiers**: Generates scoped security guidance with
+     trust badges, threat boundaries, guardrail invariants, and few-shot
+     verified patch diffs.
+
+7. **Tamper-Proof Hermetic Dependencies (`requirements.txt` / `install.sh`)**:
+
+   - Pinned and fully hashed dependency manifests compiled via `pip-tools`
+     (`reference/requirements.in` and `reference/sandbox/requirements.in`).
+   - `install.sh` enforces `--require-hashes` during installation to guarantee
+     hash verification and supply-chain integrity.
 
 ### Why Build a Programmatic Harness?
 
@@ -862,3 +1079,63 @@ to do this, including connecting the pipeline to **Google Cloud Pub/Sub**.
    Pub/Sub topic to route the alert payload directly into your team's chat,
    issue tracker, or paging system. This cleanly decouples the isolated scanning
    environment from your internal alerting infrastructure.
+
+______________________________________________________________________
+
+## Roadmap / Future Work
+
+- **Continuous Pipeline (now supported, opt-in):** The pipeline can run as a
+  continuous review of a **living** codebase via the **snapshot-per-pass**
+  model: each pass pins its own immutable snapshot, every finding is stamped
+  with the snapshot it was discovered against, and the target is synced
+  **non-destructively at pass boundaries** only. This is **opt-in and default
+  off** — without `--sync` / snapshot arguments the pipeline behaves exactly
+  like a point-in-time review. Still future work: line/AST re-anchoring of
+  carried findings across code changes (rebasing reproducers/patches instead of
+  re-discovering them). See [The Snapshot Model](#the-snapshot-model).
+- **Skill Self-Improvement (Meta-Learning):** The current
+  `workspace/learnings.jsonl` and Knowledge Base (KB) architecture tracks
+  codebase-specific empirical outcomes to adapt the `THREAT_MODEL.md` and
+  context pointers. Future iterations of the pipeline could take this a step
+  further and use this historical data to reflect on and automatically rewrite
+  its own `SKILL.md` prompts. For example, if a certain type of hallucination is
+  repeatedly caught by the Critic, a self-improvement meta-agent could update
+  the Researcher's `SKILL.md` instructions to explicitly filter out that
+  specific pattern before it even reaches the Review stage. **Security Note:**
+  Committing automated changes to `SKILL.md` files must always be human-gated to
+  prevent an attacker from using prompt injection (e.g., via a malicious payload
+  in a target file) to trick the meta-agent into ignoring a vulnerability class
+  globally.
+- **Software Dark Factory:** Integrate this pipeline into an entirely AI driven
+  software development. Instead of vulnerable discovery for action by humans,
+  Mantis would become the autonomous vulnerability research and release gating
+  component of the dark factory. Before the dark factory can push to production,
+  it must have had N hours of adversarial vulnerability research or "red
+  teaming" by a pipeline like Mantis.
+
+______________________________________________________________________
+
+## Troubleshooting Guide
+
+### 1. Loop Iterations are Re-Evaluating the Same Code
+
+- **Symptom:** The loop keeps reviewing the same files and reporting identical
+  bugs.
+- **Solution:** Ensure `/mantis-architecture` completes successfully and writes
+  its synthesized knowledge to the `workspace/kb/` directory. The `/mantis-plan`
+  strategist checks this Knowledge Base to dynamically skip already analyzed
+  areas. Check that file permissions allow writing to `workspace/kb/`.
+
+### 2. Other Issues
+
+- **Symptom:** Something isn't working.
+- **Solution:** Ask an AI coding tool to review your pipeline and the
+  conversations or trajectories that are leading to the unexpected behavior.
+  They will often give you useful insights.
+
+This is not an officially supported Google product. This project is not eligible
+for the
+[Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security).
+
+This project is intended for demonstration purposes only. It is not intended for
+use in a production environment.

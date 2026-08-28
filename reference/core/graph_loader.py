@@ -148,20 +148,135 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
     return node(_classify, name=node_id)
 
 
-def load_workflow_from_json(json_path: str) -> tuple[Workflow, dict]:
+def merge_config_dicts(base: dict, overlay: dict) -> dict:
+    """Deeply merges overlay dictionary into base dictionary.
+    
+    Cleanly replaces sandbox configurations when switching sandbox mechanisms
+    or resetting options to avoid inheriting incompatible base options.
+    """
+    merged = dict(base)
+    for k, v in overlay.items():
+        if k == "sandbox" and isinstance(v, dict):
+            base_sb = merged.get("sandbox", {}) if isinstance(merged.get("sandbox"), dict) else {}
+            base_type = base_sb.get("type")
+            new_type = v.get("type", base_type)
+            if new_type in ("static-only", "static"):
+                merged["sandbox"] = {"type": new_type, "options": {}}
+            elif new_type != base_type or ("options" in v and v["options"] == {}):
+                merged["sandbox"] = dict(v)
+                if "options" not in merged["sandbox"] or not isinstance(merged["sandbox"]["options"], dict):
+                    merged["sandbox"]["options"] = {}
+            else:
+                merged["sandbox"] = {
+                    "type": new_type,
+                    "options": merge_config_dicts(
+                        base_sb.get("options", {}) if isinstance(base_sb.get("options"), dict) else {},
+                        v.get("options", {}) if isinstance(v.get("options"), dict) else {},
+                    ),
+                }
+        elif k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+            merged[k] = merge_config_dicts(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
+def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> tuple[dict, str]:
+    """Loads workflow JSON and merges local overlay (e.g. workflow.local.json) if present."""
     if not os.path.exists(json_path):
-        raise ValueError(f"Cannot find layout definition at {json_path}")
-        
+        raise FileNotFoundError(f"Workflow layout JSON not found at: {json_path}")
+
     with open(json_path, 'r', encoding='utf-8') as f:
         raw_json = json.load(f)
 
     if not isinstance(raw_json, dict):
         raise ValueError(f"Workflow layout JSON at {json_path} must be a dictionary.")
 
+    base_dir = os.path.dirname(os.path.abspath(json_path))
+    local_candidates = [
+        os.path.join(base_dir, "workflow.local.json"),
+        os.path.join(base_dir, ".workflow.local.json"),
+    ]
+
+    abs_json = os.path.abspath(json_path)
+    if load_local:
+        for cand in local_candidates:
+            if os.path.exists(cand) and os.path.abspath(cand) != abs_json:
+                try:
+                    with open(cand, 'r', encoding='utf-8') as lf:
+                        local_data = json.load(lf)
+                    if isinstance(local_data, dict):
+                        if "config" in local_data and isinstance(local_data["config"], dict):
+                            raw_json["config"] = merge_config_dicts(
+                                raw_json.get("config", {}), local_data["config"]
+                            )
+                        # Also check top-level config keys placed directly at root of overlay
+                        for top_k in (
+                            "sandbox",
+                            "default_model",
+                            "api_base",
+                            "timeout",
+                            "reasoning_effort",
+                            "db_path",
+                            "seed_prompt",
+                        ):
+                            if top_k in local_data and (
+                                "config" not in local_data
+                                or top_k not in local_data.get("config", {})
+                            ):
+                                if top_k == "sandbox" and isinstance(local_data[top_k], dict):
+                                    raw_json.setdefault("config", {})["sandbox"] = merge_config_dicts(
+                                        {"sandbox": raw_json.get("config", {}).get("sandbox", {})},
+                                        {"sandbox": local_data["sandbox"]},
+                                    )["sandbox"]
+                                elif isinstance(local_data[top_k], dict) and isinstance(raw_json.get("config", {}).get(top_k), dict):
+                                    raw_json.setdefault("config", {})[top_k] = merge_config_dicts(
+                                        raw_json.get("config", {}).get(top_k, {}), local_data[top_k]
+                                    )
+                                else:
+                                    raw_json.setdefault("config", {})[top_k] = local_data[top_k]
+                        for k in ("name", "nodes", "edges"):
+                            if k in local_data:
+                                raw_json[k] = local_data[k]
+                    break
+                except Exception as e:
+                    print(f"[CONFIG WARNING] Could not load local overlay {cand}: {e}")
+
+    return raw_json, base_dir
+
+
+def load_workflow_from_json(
+    json_path: str,
+    model_override: Optional[str] = None,
+    api_base_override: Optional[str] = None,
+    sandbox_override: Optional[dict | str] = None,
+    db_override: Optional[str] = None,
+    timeout_override: Optional[float] = None,
+    reasoning_effort_override: Optional[str] = None,
+    load_local: bool = True,
+) -> tuple[Workflow, dict]:
+    raw_json, base_dir = load_raw_workflow_with_overlay(json_path, load_local=load_local)
+
     spec = WorkflowSpec.model_validate(raw_json)
 
+    # Apply global runtime overrides if provided
+    if model_override:
+        spec.config.default_model = model_override
+    if api_base_override:
+        spec.config.api_base = api_base_override
+    if timeout_override is not None:
+        spec.config.timeout = timeout_override
+    if reasoning_effort_override:
+        spec.config.reasoning_effort = reasoning_effort_override
+    if db_override:
+        spec.config.db_path = db_override
+    if sandbox_override:
+        if isinstance(sandbox_override, str):
+            spec.config.sandbox = SandboxConfig(type=sandbox_override)
+        elif isinstance(sandbox_override, dict):
+            spec.config.sandbox = SandboxConfig.model_validate(sandbox_override)
+
     errors = []
-    base_dir = os.path.dirname(os.path.abspath(json_path))
 
     if spec.config.sandbox.type not in SANDBOXES and spec.config.sandbox.type not in ENVIRONMENTS:
         errors.append(
@@ -207,6 +322,8 @@ def load_workflow_from_json(json_path: str) -> tuple[Workflow, dict]:
                     default_timeout=spec.config.timeout,
                     reasoning_effort=node_cfg.reasoning_effort,
                     default_reasoning_effort=spec.config.reasoning_effort,
+                    global_model_override=model_override,
+                    config=spec.config.model_dump(),
                 )
             except Exception as e:
                 errors.append(f"Node {node_id}: {str(e)}")

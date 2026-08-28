@@ -7,18 +7,52 @@ top of the **Agent Development Kit (ADK)** using the full suite of canonical
 ## Getting Started
 
 First, install python3-venv such as with `sudo apt install python3-venv`, then
-run the install script, and the Mantis pipeline as below. Before you do that,
-consider whether you want to use the default isolated GCE VM reproduction
-pipeline or whether you'd prefer another mechanism like gVisor/microsandbox or
-even static. Update `workflow.json` based on your choices. Ask a coding agent
-like antigravity or opencode or anything else to help you write a workflow
-configuration that works for you.
+run the install script. Mantis comes with automated configuration and launcher
+tools (`mantis-configure` and `mantis-launch`):
 
 ```bash
 cd reference && ./install.sh
-export GOOGLE_CLOUD_PROJECT=your-gcp-project   # required: default model is vertex_ai/*
-gcloud auth application-default login  # if using ADC credentials
+
+# 0. Authenticate Google Cloud Application Default Credentials (ADC) if using Vertex AI
+gcloud auth application-default login
+
+# 1. Fast Configuration & Capability Auto-Detection (or --interactive wizard)
+python3 scripts/configure.py --auto
+
+# 2. Fast Preflight Validation (~1s)
+python3 scripts/configure.py --test
+
+# 3. Launch Vulnerability Review Campaign (file or repository)
 ./run.sh path/to/code            # a file or a directory
+```
+
+### Local Configuration Overlay (`workflow.local.json`)
+
+Mantis uses a layered configuration pattern:
+
+- **`workflow.json` (Tracked)**: Contains base pipeline definitions, nodes,
+  edges, and default placeholder configurations (`YOUR_PROJECT_ID`).
+- **`workflow.local.json` (Gitignored)**: Contains machine-specific settings
+  (such as auto-resolved GCP projects, custom sandbox paths, and model
+  configurations). When present, it automatically merges on top of
+  `workflow.json`.
+
+When you run `./run.sh` or `scripts/configure.py --auto`, Mantis auto-heals
+unconfigured placeholders and writes the resolved settings into
+`workflow.local.json`. This ensures your `git status` remains clean after
+running campaigns. To opt out of auto-healing, pass `--no-auto-configure`. To
+explicitly save changes to the base tracked `workflow.json`, use
+`--save-tracked` (or `--global`).
+
+You can customize the sandbox execution mechanism (`static-only`, `gvisor`,
+`microsandbox`, `gce`) or AI model at any time:
+
+```bash
+# Switch to Static-only (zero host virtualization requirements)
+python3 scripts/configure.py --sandbox static-only
+
+# Or pass runtime overrides directly to launch:
+./run.sh path/to/code --sandbox static-only --model gemini-3.7-flash
 ```
 
 Once you have run it you can add the mantis-advise skill to your favorite coding
@@ -28,6 +62,25 @@ to create fewer vulnerabilities. To try it manually you can run the script:
 ```
 python3 scripts/advise.py --file path/to/file.py   # query accumulated knowledge
 ```
+
+## Configuration & Launch Skills
+
+- **`mantis-configure`**
+  ([`skills/mantis-configure/SKILL.md`](skills/mantis-configure/SKILL.md) /
+  [`scripts/configure.py`](scripts/configure.py)): Manages pipeline settings via
+  `workflow.local.json` overlay or base `workflow.json`, auto-detects host
+  virtualization and cloud capabilities, configures sandboxes and LLM providers,
+  and executes instantaneous (~1s) preflight sanity checks.
+- **`mantis-launch`**
+  ([`skills/mantis-launch/SKILL.md`](skills/mantis-launch/SKILL.md) /
+  [`scripts/launch.py`](scripts/launch.py)): Autonomous campaign launcher.
+  Auto-heals unconfigured placeholders (e.g. `YOUR_PROJECT_ID`) into
+  `workflow.local.json`, validates preflight readiness, accepts CLI overrides,
+  and executes the 16-agent review graph over target files or repositories.
+- **`mantis-advise`** ([`mantis-advise/SKILL.md`](../mantis-advise/SKILL.md) /
+  [`scripts/advise.py`](scripts/advise.py)): Developer security advisor. Queries
+  threat models, historical lineages, verified patch diffs, and triaged false
+  positives from `knowledge.db`.
 
 ## Core Pipeline Stages
 

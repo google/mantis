@@ -11,3 +11,8 @@ __pycache__/
 sessions.db
 findings.db
 knowledge.db
+
+# Local workflow configuration overlay
+workflow.local.json
+*.local.json
+.workflow.local.json
