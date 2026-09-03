@@ -3976,19 +3976,25 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             "llm_api_base": None, "recommended_sandbox": "static-only",
             "available_sandboxes": ["static-only"]
         }):
-            f = io.StringIO()
-            with redirect_stdout(f):
-                resolved_fallback = ensure_configured(self.sample_wf_path, auto=True)
-            output = f.getvalue()
-            self.assertIn("⚠️  [REPRO DISABLED]", output)
-            self.assertIn("Downgrading sandbox 'gce' -> 'static-only'. Dynamic exploit reproduction and patch verification will be skipped.", output)
-            self.assertEqual(resolved_fallback["sandbox"]["type"], "static-only")
-            self.assertEqual(resolved_fallback["sandbox"]["options"], {})
+            # 1. By default without MANTIS_ALLOW_SANDBOX_DOWNGRADE=1, ensure_configured fails closed
+            with self.assertRaises(SystemExit) as cm:
+                ensure_configured(self.sample_wf_path, auto=True)
+            self.assertEqual(cm.exception.code, 2)
 
-            # Also reload from disk with local overlay to verify options={} is cleanly preserved without orphaned options!
-            reloaded = load_workflow_dict(self.sample_wf_path, load_local=True)
-            self.assertEqual(reloaded["config"]["sandbox"]["type"], "static-only")
-            self.assertEqual(reloaded["config"]["sandbox"]["options"], {})
+            # 2. When operator explicitly allows downgrade, it proceeds session-only
+            with patch.dict(os.environ, {"MANTIS_ALLOW_SANDBOX_DOWNGRADE": "1"}):
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    resolved_fallback = ensure_configured(self.sample_wf_path, auto=True)
+                output = f.getvalue()
+                self.assertIn("⚠️  [REPRO DISABLED]", output)
+                self.assertIn("Operator-approved downgrade", output)
+                self.assertEqual(resolved_fallback["sandbox"]["type"], "static-only")
+                self.assertEqual(resolved_fallback["sandbox"]["options"], {})
+
+                # Also verify downgrade was NEVER persisted to workflow.local.json!
+                reloaded = load_workflow_dict(self.sample_wf_path, load_local=True)
+                self.assertNotEqual(reloaded["config"]["sandbox"]["type"], "static-only")
 
     def test_merge_config_dicts_sandbox_transitions(self):
         from core.graph_loader import merge_config_dicts

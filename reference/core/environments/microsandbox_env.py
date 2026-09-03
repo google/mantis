@@ -1,4 +1,5 @@
 import os
+import shlex
 import sys
 import uuid
 from pathlib import Path
@@ -117,34 +118,45 @@ class MicrosandboxEnvironment(BaseEnvironment):
                 timed_out="timeout" in str(e).lower(),
             )
 
+    def _confine_to_workdir(self, candidate: Path, original: Union[Path, str]) -> Path:
+        """Lexically normalizes candidate and requires it to stay inside the workdir."""
+        norm = Path(os.path.normpath(str(candidate)))
+        if norm != self._workdir and self._workdir not in norm.parents:
+            raise PermissionError(
+                f"Path '{original}' escapes the sandbox workspace '{self._workdir}'."
+            )
+        return norm
+
     def _resolve_guest_path(self, path: Union[Path, str]) -> Path:
         p = Path(path)
         if not p.is_absolute():
-            return self._workdir / p
+            return self._confine_to_workdir(self._workdir / p, path)
         try:
             if p == self._workdir or self._workdir in p.parents:
-                return p
+                return self._confine_to_workdir(p, path)
+        except PermissionError:
+            raise
         except Exception:
             pass
         if self.target_path:
             target_p = Path(self.target_path)
             if target_p.is_file():
                 if p == target_p:
-                    return self._workdir / target_p.name
+                    return self._confine_to_workdir(self._workdir / target_p.name, path)
                 if target_p.parent in p.parents or p == target_p.parent:
                     try:
                         rel = p.relative_to(target_p.parent)
-                        return self._workdir / rel
+                        return self._confine_to_workdir(self._workdir / rel, path)
                     except ValueError:
                         pass
             elif target_p.is_dir():
                 if target_p in p.parents or p == target_p:
                     try:
                         rel = p.relative_to(target_p)
-                        return self._workdir / rel
+                        return self._confine_to_workdir(self._workdir / rel, path)
                     except ValueError:
                         pass
-        return self._workdir / p.name
+        return self._confine_to_workdir(self._workdir / p.name, path)
 
     async def read_file(self, path: Union[Path, str]) -> bytes:
         sb = await self._ensure()
@@ -153,7 +165,7 @@ class MicrosandboxEnvironment(BaseEnvironment):
             return await sb.fs.read(str(resolved_path))
         except Exception as e:
             # Fallback to shell read if fs.read encounters an issue
-            exec_res = await self.execute(f"cat '{resolved_path}'")
+            exec_res = await self.execute(f"cat {shlex.quote(str(resolved_path))}")
             if exec_res.exit_code == 0:
                 return exec_res.stdout.encode("utf-8")
             raise FileNotFoundError(f"File not found in sandbox: {path} ({e})")
@@ -174,11 +186,14 @@ class MicrosandboxEnvironment(BaseEnvironment):
             # Fallback to shell write
             import base64
             b64_data = base64.b64encode(data).decode("ascii")
-            await self.execute(f"mkdir -p '{parent_dir}' && echo '{b64_data}' | base64 -d > '{resolved_path}'")
+            await self.execute(
+                f"mkdir -p {shlex.quote(parent_dir)} && echo '{b64_data}' | base64 -d > {shlex.quote(str(resolved_path))}"
+            )
 
     async def list_files(self, directory: str = "") -> List[str]:
         await self._ensure()
-        target_dir = f"'{directory}'" if directory else "."
+        resolved_dir = str(self._resolve_guest_path(directory)) if directory else "."
+        target_dir = shlex.quote(resolved_dir)
         res = await self.execute(f"find {target_dir} -maxdepth 5 -not -path '*/.*' -type f")
         if res.exit_code != 0:
             raise RuntimeError(f"Failed to list files in MicroSandbox: {res.stderr or res.stdout}")

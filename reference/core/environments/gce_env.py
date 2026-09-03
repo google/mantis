@@ -57,6 +57,33 @@ try:
 except Exception:
     pass
 
+# 5. Probe Direct IPv6 Internet Egress (dual-stack subnets)
+for v6 in ('2606:4700:4700::1111', '2001:4860:4860::8888'):
+    try:
+        s = socket.create_connection((v6, 443), timeout=1.5)
+        s.close()
+        errors.append('NETWORK: Direct IPv6 internet egress accessible via ' + v6 + ' (pin --stack-type=IPV4_ONLY / remove external IPv6)')
+        break
+    except Exception:
+        pass
+
+# 6. Probe UDP DNS egress to public resolvers (bypasses TCP-only checks)
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.5)
+    q = bytes([18, 52, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7]) + b'example' + bytes([3]) + b'com' + bytes([0, 0, 1, 0, 1])
+    s.sendto(q, ('8.8.8.8', 53))
+    data, _ = s.recvfrom(512)
+    if data:
+        errors.append('NETWORK: UDP/53 egress to public resolver accessible (add explicit deny-all egress firewall rule)')
+except Exception:
+    pass
+finally:
+    try:
+        s.close()
+    except Exception:
+        pass
+
 if errors:
     print('ISOLATION_FAILURE: ' + ' | '.join(errors))
     sys.exit(42)
@@ -250,6 +277,7 @@ class GceEnvironment(BaseEnvironment):
                 # Hardening: Zero internet access / No external public IP
                 if self.no_external_ip:
                     create_args.append("--no-address")
+                    create_args.append("--stack-type=IPV4_ONLY")
 
                 # Subnet / Network configuration
                 if self.subnet:
@@ -416,34 +444,45 @@ class GceEnvironment(BaseEnvironment):
 
         return await asyncio.to_thread(_exec)
 
+    def _confine_to_workdir(self, candidate: Path, original: Union[Path, str]) -> Path:
+        """Lexically normalizes candidate and requires it to stay inside the workdir."""
+        norm = Path(os.path.normpath(str(candidate)))
+        if norm != self._workdir and self._workdir not in norm.parents:
+            raise PermissionError(
+                f"Path '{original}' escapes the sandbox workspace '{self._workdir}'."
+            )
+        return norm
+
     def _resolve_guest_path(self, path: Union[Path, str]) -> Path:
         p = Path(path)
         if not p.is_absolute():
-            return self._workdir / p
+            return self._confine_to_workdir(self._workdir / p, path)
         try:
             if p == self._workdir or self._workdir in p.parents:
-                return p
+                return self._confine_to_workdir(p, path)
+        except PermissionError:
+            raise
         except Exception:
             pass
         if self.target_path:
             target_p = Path(self.target_path)
             if target_p.is_file():
                 if p == target_p:
-                    return self._workdir / target_p.name
+                    return self._confine_to_workdir(self._workdir / target_p.name, path)
                 if target_p.parent in p.parents or p == target_p.parent:
                     try:
                         rel = p.relative_to(target_p.parent)
-                        return self._workdir / rel
+                        return self._confine_to_workdir(self._workdir / rel, path)
                     except ValueError:
                         pass
             elif target_p.is_dir():
                 if target_p in p.parents or p == target_p:
                     try:
                         rel = p.relative_to(target_p)
-                        return self._workdir / rel
+                        return self._confine_to_workdir(self._workdir / rel, path)
                     except ValueError:
                         pass
-        fallback_target = self._workdir / p.name
+        fallback_target = self._confine_to_workdir(self._workdir / p.name, path)
         logger.info(f"[GCE] Remapping out-of-workdir path '{path}' -> '{fallback_target}'")
         return fallback_target
 
@@ -462,13 +501,16 @@ class GceEnvironment(BaseEnvironment):
         ssh_args.extend(["--command", guest_cmd])
 
         def _read():
-            p = subprocess.run(
-                [self.gcloud_bin] + ssh_args,
-                capture_output=True,
-                text=False,
-                timeout=self.timeout,
-                shell=False,
-            )
+            try:
+                p = subprocess.run(
+                    [self.gcloud_bin] + ssh_args,
+                    capture_output=True,
+                    text=False,
+                    timeout=self.timeout,
+                    shell=False,
+                )
+            except subprocess.TimeoutExpired:
+                raise TimeoutError(f"Read timed out in GCE VM: {path}")
             if p.returncode != 0:
                 stderr = p.stderr.decode("utf-8", errors="replace") if isinstance(p.stderr, bytes) else str(p.stderr)
                 if "No such file" in stderr:

@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import logging
 import os
+import posixpath
 from typing import Optional
 from core.schemas import VulnerabilityReport
 from core.database import (
@@ -102,10 +103,13 @@ async def read_file(filepath: str) -> str:
             return text
         except (PermissionError, FileNotFoundError) as e:
             return f"Error: {e}"
-        except Exception:
-            pass
+        except Exception as e:
+            # SECURITY: When a sandbox is configured, never fall back to the host
+            # filesystem. An in-guest induced error (e.g. FIFO timeout) would
+            # otherwise silently convert sandboxed reads into host reads.
+            return f"Error: sandbox read failed for '{filepath}': {type(e).__name__}: {e}"
 
-    # Host filesystem jail fallback (enforcing boundary check)
+    # Host filesystem jail fallback (static-only mode; enforcing boundary check)
     target_path = Path(ctx.target_file).resolve() if ctx.target_file else Path.cwd()
     jail_dir = target_path if target_path.is_dir() else target_path.parent
     clean_fp = filepath.replace("\\", "/").removeprefix("./")
@@ -118,6 +122,9 @@ async def read_file(filepath: str) -> str:
 
     if not target_path_real.exists():
         return f"Error: File not found at '{filepath}'."
+
+    if target_path.is_file() and target_path_real != target_path:
+        return f"Error: Permission denied. Single-file scans may only read the scanned file '{target_path.name}'."
 
     try:
         with open(target_path_real, "r", encoding="utf-8", errors="replace") as f:
@@ -242,6 +249,22 @@ async def write_file(filepath: str, content: str) -> str:
 
     clean_fp = filepath.replace("\\", "/").removeprefix("./")
     if clean_fp.startswith("workspace/") or clean_fp in ("mantis-summary.md",):
+        if clean_fp != "mantis-summary.md":
+            # SECURITY: Normalize before recording. Un-normalized paths
+            # ("workspace/kb//abs/path.md", "workspace/../..") would become OKF
+            # concept IDs and could escape the export directory.
+            norm_fp = posixpath.normpath(clean_fp)
+            if (
+                not norm_fp.startswith("workspace/")
+                or ".." in norm_fp.split("/")
+                or posixpath.isabs(norm_fp.removeprefix("workspace/"))
+            ):
+                return (
+                    f"Error: Permission denied. Workspace artifact path "
+                    f"'{filepath}' must stay under 'workspace/'."
+                )
+            clean_fp = norm_fp
+
         if ctx.db_path:
             meta = {
                 "resource": getattr(ctx, "target_file", ""),
@@ -287,18 +310,12 @@ async def write_file(filepath: str, content: str) -> str:
             return f"SUCCESS: Wrote {len(content)} characters to {filepath}"
         except Exception as e:
             return f"Error writing file in sandbox: {e}"
-    jail = os.path.realpath(ctx.jail_dir)
-    base_dir = os.path.dirname(jail) if os.path.isfile(jail) else jail
-    target_path = os.path.realpath(os.path.join(base_dir, filepath))
-    try:
-        if os.path.commonpath([jail, target_path]) != jail:
-            return f"Error: Permission denied. Path {filepath} outside allowed scope."
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        with open(target_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"SUCCESS: Wrote {len(content)} characters to {filepath}"
-    except Exception as e:
-        return f"Error writing file: {e}"
+
+    # SECURITY: Outside a dynamic sandbox, do not allow writing directly to the host checkout.
+    return (
+        f"Error: Permission denied. Direct modification of host files '{filepath}' "
+        "is disabled outside a dynamic sandbox. Store artifacts under 'workspace/'."
+    )
 
 
 async def list_files(directory: str = "") -> str:

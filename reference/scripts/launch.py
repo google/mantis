@@ -149,13 +149,21 @@ def run_launch(
     # Preflight Check
     ok, messages = run_preflight_checks(cfg, target_path=str(target_path))
     if not ok and auto_configure and not is_unconf and not interactive:
-        print("⚙️ Preflight check failed on existing configuration, attempting auto-configuration...")
-        cfg = ensure_configured(
-            workflow_path=wf_file,
-            auto=True,
-            overrides=overrides if overrides else None,
-        )
-        ok, messages = run_preflight_checks(cfg, target_path=str(target_path))
+        if os.environ.get("MANTIS_ALLOW_SANDBOX_DOWNGRADE") == "1":
+            print("⚙️ Preflight check failed on existing configuration, attempting approved auto-configuration...")
+            cfg = ensure_configured(
+                workflow_path=wf_file,
+                auto=True,
+                overrides=overrides if overrides else None,
+            )
+            ok, messages = run_preflight_checks(cfg, target_path=str(target_path))
+        else:
+            print(
+                "❌ Preflight failed for the configured sandbox. Refusing to "
+                "auto-downgrade isolation. Set MANTIS_ALLOW_SANDBOX_DOWNGRADE=1 "
+                "to accept a degraded session.",
+                file=sys.stderr,
+            )
 
     if not ok:
         print("\n❌ Preflight Verification Failed:", file=sys.stderr)

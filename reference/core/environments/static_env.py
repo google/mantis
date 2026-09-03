@@ -68,6 +68,12 @@ class StaticOnlyEnvironment(BaseEnvironment):
             return f.read()
 
     async def write_file(self, path: Path, content: Union[str, bytes]) -> None:
+        if os.environ.get("MANTIS_ALLOW_STATIC_WRITE") != "1":
+            raise PermissionError(
+                f"Permission denied: modifying host repository files ('{path}') is disabled in static analysis mode. "
+                "Store campaign artifacts under 'workspace/'."
+            )
+
         if not self.target_path:
             raise PermissionError("Permission denied: target_path is not set")
 
@@ -89,6 +95,15 @@ class StaticOnlyEnvironment(BaseEnvironment):
                     raise PermissionError(f"Permission denied: path '{path}' outside target directory '{real_target}'")
             except ValueError:
                 raise PermissionError(f"Permission denied: path outside target directory '{real_target}'")
+
+        # Refuse writing to VCS metadata even if static writes are explicitly enabled
+        vcs_dirs = {".git", ".hg", ".svn", ".jj"}
+        rel_from_base = os.path.relpath(resolved_target, base_dir)
+        parts = rel_from_base.lower().split(os.sep)
+        if any(d in parts for d in vcs_dirs) or parts[-1] in {
+            ".gitattributes", ".gitmodules", ".gitconfig", ".pre-commit-config.yaml", ".pre-commit-config.yml"
+        }:
+            raise PermissionError(f"Permission denied: refusing to write into version-control metadata ('{rel_from_base}')")
 
         os.makedirs(os.path.dirname(resolved_target), exist_ok=True)
         data = content.encode("utf-8") if isinstance(content, str) else content

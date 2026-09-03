@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -344,6 +345,7 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
                 capture_output=True,
                 text=True,
                 timeout=5,
+                cwd=tempfile.gettempdir(),
             )
             if p.returncode != 0 or not p.stdout.strip():
                 return False, "No active GCP credentials found in gcloud auth list."
@@ -356,7 +358,10 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
             return False, f"GCE gcloud check failed: {e}"
 
     if sb_type == "gvisor":
-        tool = sandbox_cfg.get("options", {}).get("container_tool") or ("docker" if shutil.which("docker") else "podman")
+        raw_tool = sandbox_cfg.get("options", {}).get("container_tool")
+        if raw_tool and raw_tool not in ("docker", "podman"):
+            return False, f"Invalid container_tool '{raw_tool}'. Only 'docker' and 'podman' are allowed."
+        tool = raw_tool or ("docker" if shutil.which("docker") else "podman")
         if not tool or not shutil.which(tool):
             return False, "Docker or Podman not installed for gVisor sandbox."
         try:
@@ -365,6 +370,7 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
                 capture_output=True,
                 text=True,
                 timeout=5,
+                cwd=tempfile.gettempdir(),
             )
             if p.returncode != 0:
                 return False, f"Cannot connect to {tool} daemon."
@@ -570,6 +576,28 @@ def update_workflow_config(
     return wf_data
 
 
+def _refuse_silent_downgrade(reason: str) -> None:
+    """Fails closed instead of silently downgrading a configured sandbox to static-only.
+
+    In static-only mode dynamic isolation is absent. Downgrading must be an
+    explicit operator decision via MANTIS_ALLOW_SANDBOX_DOWNGRADE=1.
+    """
+    if os.environ.get("MANTIS_ALLOW_SANDBOX_DOWNGRADE") == "1":
+        return
+    print(f"ERROR: {reason}", file=sys.stderr)
+    print(
+        "   Refusing to silently downgrade sandbox to 'static-only' "
+        "(dynamic exploit reproduction and patch verification would be skipped).",
+        file=sys.stderr,
+    )
+    print(
+        "   To proceed with a degraded, session-only static scan, re-run with "
+        "MANTIS_ALLOW_SANDBOX_DOWNGRADE=1. Downgrades are never persisted.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
 async def ensure_configured_async(
     workflow_path: str = "",
     auto: bool = True,
@@ -619,23 +647,30 @@ async def ensure_configured_async(
                     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", resolved_proj)
                     os.environ.setdefault("VERTEXAI_PROJECT", resolved_proj)
                 else:
-                    print(
-                        "⚠️  [REPRO DISABLED] GCE sandbox credentials/project not configured or unavailable. "
-                        "Downgrading sandbox 'gce' -> 'static-only'. Dynamic exploit reproduction and patch verification will be skipped."
+                    _refuse_silent_downgrade(
+                        "GCE sandbox credentials/project not configured or unavailable."
                     )
-                    updates["sandbox"] = {"type": "static-only", "options": {}}
+                    print(
+                        "⚠️  [REPRO DISABLED] Operator-approved downgrade 'gce' -> 'static-only' for THIS SESSION ONLY."
+                    )
+                    # Session-only: not added to updates, so never persisted to workflow.local.json
+                    cfg = {**cfg, "sandbox": {"type": "static-only", "options": {}}}
             elif "gce" not in caps.get("available_sandboxes", []):
-                print(
-                    "⚠️  [REPRO DISABLED] Host lacks requirements for 'gce' sandbox (gcloud/auth missing). "
-                    "Downgrading sandbox 'gce' -> 'static-only'. Dynamic exploit reproduction and patch verification will be skipped."
+                _refuse_silent_downgrade(
+                    "Host lacks requirements for 'gce' sandbox (gcloud/auth missing)."
                 )
-                updates["sandbox"] = {"type": "static-only", "options": {}}
+                print(
+                    "⚠️  [REPRO DISABLED] Operator-approved downgrade 'gce' -> 'static-only' for THIS SESSION ONLY."
+                )
+                cfg = {**cfg, "sandbox": {"type": "static-only", "options": {}}}
         elif sb_type not in caps.get("available_sandboxes", []):
-            print(
-                f"⚠️  [REPRO DISABLED] Host lacks requirements for '{sb_type}' sandbox. "
-                f"Downgrading to 'static-only'. Dynamic exploit reproduction and patch verification will be skipped."
+            _refuse_silent_downgrade(
+                f"Host lacks requirements for '{sb_type}' sandbox."
             )
-            updates["sandbox"] = {"type": "static-only", "options": {}}
+            print(
+                f"⚠️  [REPRO DISABLED] Operator-approved downgrade '{sb_type}' -> 'static-only' for THIS SESSION ONLY."
+            )
+            cfg = {**cfg, "sandbox": {"type": "static-only", "options": {}}}
 
         # Auto-resolve Model
         model = cfg.get("default_model", DEFAULT_MODEL)
@@ -654,13 +689,17 @@ async def ensure_configured_async(
 
         if updates or overrides:
             all_updates = {**updates, **overrides}
-            wf_data = update_workflow_config(
-                target_wf,
-                all_updates,
-                save=save,
-                save_tracked=save_tracked,
-            )
-            return wf_data.get("config", {})
+            # Safety net: never allow a downgraded sandbox type to be persisted to disk
+            if all_updates.get("sandbox", {}).get("type") == "static-only" and sb_type not in ("", "static-only"):
+                del all_updates["sandbox"]
+            if all_updates:
+                wf_data = update_workflow_config(
+                    target_wf,
+                    all_updates,
+                    save=save,
+                    save_tracked=save_tracked,
+                )
+                return wf_data.get("config", {})
 
     return cfg
 

@@ -1122,6 +1122,8 @@ def export_okf_bundle(db_path: str, output_dir: str, run_id: Optional[str] = Non
     for c in concepts:
         by_type.setdefault(c.get("type", "General"), []).append(c)
 
+    out_root = os.path.realpath(output_dir)
+
     for c_type, items in by_type.items():
         index_lines.append(f"## {c_type}")
         for item in items:
@@ -1129,8 +1131,15 @@ def export_okf_bundle(db_path: str, output_dir: str, run_id: Optional[str] = Non
             rel_file = cid if cid.endswith(".md") else f"{cid}.md"
             if rel_file.startswith("workspace/kb/"):
                 rel_file = rel_file.removeprefix("workspace/kb/")
+            clean_rel = os.path.normpath(rel_file.lstrip("/\\"))
+            cand_dest = os.path.realpath(os.path.join(out_root, clean_rel))
+            try:
+                if os.path.commonpath([out_root, cand_dest]) != out_root:
+                    continue
+            except ValueError:
+                continue
             desc = item.get("description") or item.get("title")
-            index_lines.append(f"* [{item.get('title')}]({rel_file}) - {desc}")
+            index_lines.append(f"* [{item.get('title')}]({clean_rel}) - {desc}")
         index_lines.append("")
 
     with open(index_path, "w", encoding="utf-8") as f:
@@ -1142,7 +1151,16 @@ def export_okf_bundle(db_path: str, output_dir: str, run_id: Optional[str] = Non
         rel_path = cid if cid.endswith(".md") else f"{cid}.md"
         if rel_path.startswith("workspace/kb/"):
             rel_path = rel_path.removeprefix("workspace/kb/")
-        full_dest = os.path.join(output_dir, rel_path)
+        # SECURITY: Confine destination to output directory to prevent path traversal
+        clean_rel = os.path.normpath(rel_path.lstrip("/\\"))
+        full_dest = os.path.realpath(os.path.join(out_root, clean_rel))
+        try:
+            if os.path.commonpath([out_root, full_dest]) != out_root:
+                logger.warning(f"Skipping unsafe concept_id escaping export directory: {cid}")
+                continue
+        except ValueError:
+            logger.warning(f"Skipping concept_id on different drive/scope: {cid}")
+            continue
         os.makedirs(os.path.dirname(full_dest), exist_ok=True)
 
         fm = {

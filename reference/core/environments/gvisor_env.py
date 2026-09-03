@@ -44,6 +44,8 @@ class GvisorEnvironment(BaseEnvironment):
                 if shutil.which(candidate) is not None:
                     tool = candidate
                     break
+        elif tool not in ("docker", "podman"):
+            raise ValueError(f"Invalid container_tool '{tool}'. Must be 'docker' or 'podman'.")
 
         if not tool or shutil.which(tool) is None:
             raise ValueError(
@@ -170,45 +172,59 @@ class GvisorEnvironment(BaseEnvironment):
 
         return await asyncio.to_thread(_exec)
 
+    def _confine_to_workdir(self, candidate: Path, original: Union[Path, str]) -> Path:
+        """Lexically normalizes candidate and requires it to stay inside the workdir."""
+        norm = Path(os.path.normpath(str(candidate)))
+        if norm != self._workdir and self._workdir not in norm.parents:
+            raise PermissionError(
+                f"Path '{original}' escapes the sandbox workspace '{self._workdir}'."
+            )
+        return norm
+
     def _resolve_guest_path(self, path: Union[Path, str]) -> Path:
         p = Path(path)
         if not p.is_absolute():
-            return self._workdir / p
+            return self._confine_to_workdir(self._workdir / p, path)
         try:
             if p == self._workdir or self._workdir in p.parents:
-                return p
+                return self._confine_to_workdir(p, path)
+        except PermissionError:
+            raise
         except Exception:
             pass
         if self.target_path:
             target_p = Path(self.target_path)
             if target_p.is_file():
                 if p == target_p:
-                    return self._workdir / target_p.name
+                    return self._confine_to_workdir(self._workdir / target_p.name, path)
                 if target_p.parent in p.parents or p == target_p.parent:
                     try:
                         rel = p.relative_to(target_p.parent)
-                        return self._workdir / rel
+                        return self._confine_to_workdir(self._workdir / rel, path)
                     except ValueError:
                         pass
             elif target_p.is_dir():
                 if target_p in p.parents or p == target_p:
                     try:
                         rel = p.relative_to(target_p)
-                        return self._workdir / rel
+                        return self._confine_to_workdir(self._workdir / rel, path)
                     except ValueError:
                         pass
-        return self._workdir / p.name
+        return self._confine_to_workdir(self._workdir / p.name, path)
 
     async def read_file(self, path: Union[Path, str]) -> bytes:
         await self._ensure()
         resolved_path = self._resolve_guest_path(path)
 
         def _read():
-            p_exec = subprocess.run(
-                [self.tool, "exec", self.container_name, "cat", str(resolved_path)],
-                capture_output=True,
-                timeout=self.timeout,
-            )
+            try:
+                p_exec = subprocess.run(
+                    [self.tool, "exec", self.container_name, "cat", str(resolved_path)],
+                    capture_output=True,
+                    timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired:
+                raise TimeoutError(f"Read timed out in gVisor container: {path}")
             if p_exec.returncode != 0:
                 raise FileNotFoundError(f"File not found in gVisor container: {path} ({p_exec.stderr.decode('utf-8', errors='replace')})")
             return p_exec.stdout
@@ -225,7 +241,11 @@ class GvisorEnvironment(BaseEnvironment):
             mkdir_cmd = [self.tool, "exec", self.container_name, "mkdir", "-p", parent_dir]
             subprocess.run(mkdir_cmd, capture_output=True, timeout=self.timeout)
 
-            write_cmd = [self.tool, "exec", "-i", self.container_name, "/bin/sh", "-c", f"cat > '{resolved_path}'"]
+            # SECURITY: Pass destination as positional argument to prevent shell quoting injection
+            write_cmd = [
+                self.tool, "exec", "-i", self.container_name,
+                "/bin/sh", "-c", 'cat > "$1"', "sh", str(resolved_path),
+            ]
             p = subprocess.run(write_cmd, input=data, capture_output=True, timeout=self.timeout)
             if p.returncode != 0:
                 raise RuntimeError(f"Failed to write file to gVisor container: {resolved_path} ({p.stderr.decode('utf-8', errors='replace')})")
@@ -234,7 +254,7 @@ class GvisorEnvironment(BaseEnvironment):
 
     async def list_files(self, directory: str = "") -> List[str]:
         await self._ensure()
-        resolved_dir = str(self._workdir / directory) if directory else str(self._workdir)
+        resolved_dir = str(self._resolve_guest_path(directory)) if directory else str(self._workdir)
 
         def _list():
             find_cmd = [
