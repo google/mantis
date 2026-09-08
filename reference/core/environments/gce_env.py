@@ -7,11 +7,13 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import tempfile
 from typing import Optional, Union, List
 import uuid
 
 from google.adk.environment import ExecutionResult
 from .base import BaseEnvironment
+from .staging import create_vetted_tar_archive
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +145,7 @@ class GceEnvironment(BaseEnvironment):
         gcloud_bin: Optional[str] = None,
     ):
         super().__init__()
-        self.target_path = os.path.realpath(target_path) if target_path else ""
+        self.target_path = os.path.abspath(target_path) if target_path else ""
         self.project = project or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("VERTEXAI_PROJECT") or ""
         self.zone = zone or os.environ.get("GOOGLE_CLOUD_ZONE") or "us-central1-a"
         self.source_machine_image = source_machine_image
@@ -330,30 +332,54 @@ class GceEnvironment(BaseEnvironment):
                         f"GCE VM '{self.instance_name}' failed to initialize guest SSH / workspace: {out}"
                     )
 
-                # 3. Stage target file or directory into guest VM /workspace
+                # 3. Stage target file or directory into guest VM /workspace using vetted tarball
                 if self.target_path and os.path.exists(self.target_path):
-                    scp_args = [
-                        "compute", "scp",
-                    ]
-                    if self.tunnel_through_iap:
-                        scp_args.append("--tunnel-through-iap")
-                    scp_args.extend([
-                        f"--project={self.project}",
-                        f"--zone={self.zone}",
-                    ])
+                    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp_tar:
+                        tmp_tar_path = Path(tmp_tar.name)
+                    try:
+                        file_count = create_vetted_tar_archive(self.target_path, tmp_tar_path)
+                        if file_count > 0:
+                            # SECURITY: unguessable dotfile name. A predictable path lets a
+                            # repository file of the same name collide with (or be extracted
+                            # over) the staging archive inside the guest workspace.
+                            remote_tar = f"{self._workdir}/.mantis-staging-{uuid.uuid4().hex}.tar.gz"
+                            scp_args = [
+                                "compute", "scp",
+                            ]
+                            if self.tunnel_through_iap:
+                                scp_args.append("--tunnel-through-iap")
+                            scp_args.extend([
+                                f"--project={self.project}",
+                                f"--zone={self.zone}",
+                                str(tmp_tar_path),
+                                f"{self.instance_name}:{remote_tar}",
+                            ])
+                            rc, out = self._run_gcloud(scp_args, timeout=60)
+                            if rc != 0:
+                                raise RuntimeError(
+                                    f"Failed to stage files into GCE VM '{self.instance_name}': {out}"
+                                )
 
-                    if os.path.isdir(self.target_path):
-                        scp_args.append("--recurse")
-                        scp_args.append(f"{self.target_path}/.")
-                    else:
-                        scp_args.append(self.target_path)
-
-                    scp_args.append(f"{self.instance_name}:{self._workdir}/")
-                    rc, out = self._run_gcloud(scp_args, timeout=60)
-                    if rc != 0:
-                        raise RuntimeError(
-                            f"Failed to stage files into GCE VM '{self.instance_name}': {out}"
-                        )
+                            extract_cmd = f"tar -xzf {remote_tar} -C {self._workdir} && rm -f {remote_tar}"
+                            ssh_args = [
+                                "compute", "ssh", self.instance_name,
+                                f"--project={self.project}",
+                                f"--zone={self.zone}",
+                            ]
+                            if self.tunnel_through_iap:
+                                ssh_args.append("--tunnel-through-iap")
+                            ssh_args.extend(["--command", extract_cmd])
+                            rc, out = self._run_gcloud(ssh_args, timeout=60)
+                            if rc != 0:
+                                raise RuntimeError(
+                                    f"Failed to unpack staged files in GCE VM '{self.instance_name}': {out}"
+                                )
+                    finally:
+                        try:
+                            if tmp_tar_path.exists():
+                                tmp_tar_path.unlink()
+                        except OSError:
+                            pass
 
                 # 4. Active in-guest isolation verification (if enabled)
                 if self.verify_isolation_flag:
@@ -402,7 +428,7 @@ class GceEnvironment(BaseEnvironment):
         await self._ensure()
         t = timeout or self.timeout
 
-        guest_cmd = f"cd {self._workdir} && {command}"
+        guest_cmd = f"cd {shlex.quote(str(self._workdir))} && {command}"
         ssh_args = [
             "compute", "ssh", self.instance_name,
             f"--project={self.project}",
@@ -615,7 +641,7 @@ class GceEnvironment(BaseEnvironment):
         def _patch():
             p = subprocess.run(
                 [self.gcloud_bin] + ssh_args,
-                input=diff.encode("utf-8"),
+                input=diff,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,

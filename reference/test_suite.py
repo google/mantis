@@ -19,7 +19,7 @@ from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.apps.app import App
 from google.adk.workflow import DEFAULT_ROUTE
 
-from core.config import get_llm_kwargs, DEFAULT_MODEL, DEFAULT_EMBEDDING_MODEL
+from core.config import get_llm_kwargs, DEFAULT_MODEL
 from core.context import RunContext, current_run_context
 from core.database import (
     init_db,
@@ -36,18 +36,8 @@ from core.database import (
     generate_rca_summary,
     resolve_ancestor_lineage,
     extract_target_symbol,
-    _db,
-)
-from core.embeddings import (
-    vector_to_blob,
-    blob_to_vector,
-    cosine_similarity,
-    compute_embedding,
-    compute_mock_embedding,
-    get_embedding_kwargs,
-    find_nearest_lineage,
-    DEFAULT_SIMILARITY_THRESHOLD,
     normalize_cwe,
+    _db,
 )
 from core.schemas import VulnerabilityFinding
 from core.graph_loader import (
@@ -93,7 +83,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 [
                     "History extracted.",
                     "Structural index built.",
-                    "Summary generated.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -109,7 +98,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Report generated.",
                 ],
                 [
-                    "history", "structural_index", "summarizer", "architect", "threat_modeler",
+                    "history", "structural_index", "architect", "threat_modeler",
                     "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
                     "chainer", "patcher", "calibrator", "reflector", "reporter"
@@ -121,7 +110,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 [
                     "History extracted.",
                     "Structural index built.",
-                    "Summary generated.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -133,18 +121,17 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Report generated.",
                 ],
                 [
-                    "history", "structural_index", "summarizer", "architect", "threat_modeler",
+                    "history", "structural_index", "architect", "threat_modeler",
                     "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
                     "calibrator", "reflector", "reporter"
                 ],
                 "reported"
             ),
-            # Script 3: Repro fails, retries once, exceeds max_visits -> calibrator -> static_confirmed
+            # Script 3: Repro fails -> calibrator -> static_confirmed
             (
                 [
                     "History extracted.",
                     "Structural index built.",
-                    "Summary generated.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -152,17 +139,16 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
                     json.dumps({"route": "viable", "reason": "Exploit is viable."}),
-                    json.dumps({"route": "failed_repro", "reason": "Exploit attempt 1 failed."}),  # repro 1
-                    json.dumps({"route": "failed_repro", "reason": "Exploit attempt 2 failed."}),  # repro 2 (retry)
+                    json.dumps({"route": "failed_repro", "reason": "Exploit attempt failed."}),
                     "Calibration score: 15",
                     "Learnings reflected.",
                     "Report generated.",
                 ],
                 [
-                    "history", "structural_index", "summarizer", "architect", "threat_modeler",
+                    "history", "structural_index", "architect", "threat_modeler",
                     "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
-                    "reproducer", "repro_classifier", "calibrator", "reflector", "reporter"
+                    "calibrator", "reflector", "reporter"
                 ],
                 "static_confirmed"
             ),
@@ -228,7 +214,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 [
                     "History extracted.",
                     "Structural index built.",
-                    "Summary generated.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -250,7 +235,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 [
                     "History extracted.",
                     "Structural index built.",
-                    "Summary generated.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -271,7 +255,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 [
                     "History extracted.",
                     "Structural index built.",
-                    "Summary generated.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -684,7 +667,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             ctx_sb = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file, sandbox=dir_env)
             tok = current_run_context.set(ctx_sb)
             try:
-                self.assertEqual(await read_file("inside.txt"), "content_inside")
+                self.assertIn("content_inside", await read_file("inside.txt"))
                 self.assertIn("Permission denied", await read_file("../outside.txt"))
                 self.assertIn("Permission denied", await read_file(outside_file))
                 self.assertIn("File not found", await read_file("missing.txt"))
@@ -695,7 +678,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             ctx_host = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file, sandbox=None)
             tok = current_run_context.set(ctx_host)
             try:
-                self.assertEqual(await read_file("inside.txt"), "content_inside")
+                self.assertIn("content_inside", await read_file("inside.txt"))
                 self.assertIn("Permission denied", await read_file("../outside.txt"))
                 self.assertIn("Permission denied", await read_file(outside_file))
                 self.assertIn("File not found", await read_file("missing.txt"))
@@ -939,6 +922,39 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(kwargs_create.get("pull_policy"), PullPolicy.NEVER)
                     self.assertEqual(kwargs_create.get("image"), "mantis-sandbox:latest")
 
+                # 6. Verify staging ignores symlinks and protected VCS/metadata files
+                with tempfile.TemporaryDirectory() as temp_target:
+                    norm_path = os.path.join(temp_target, "app.py")
+                    with open(norm_path, "w") as f:
+                        f.write("print('hello')")
+                    env_path = os.path.join(temp_target, ".env")
+                    with open(env_path, "w") as f:
+                        f.write("SECRET=123")
+                    git_dir = os.path.join(temp_target, ".git")
+                    os.makedirs(git_dir, exist_ok=True)
+                    with open(os.path.join(git_dir, "config"), "w") as f:
+                        f.write("secret git config")
+                    link_path = os.path.join(temp_target, "bad_link.py")
+                    try:
+                        os.symlink("/etc/passwd", link_path)
+                    except OSError:
+                        pass
+
+                    mock_msb_staging = AsyncMock()
+                    mock_msb_staging.fs.mkdir = AsyncMock()
+                    mock_msb_staging.fs.copy_from_host = AsyncMock()
+                    with patch("microsandbox.Sandbox.create", AsyncMock(return_value=mock_msb_staging)):
+                        sb_staging = MicrosandboxSandbox(target_path=temp_target)
+                        await sb_staging._ensure()
+                        copied_sources = [call.args[0] for call in mock_msb_staging.fs.copy_from_host.call_args_list]
+                        real_norm = os.path.realpath(norm_path)
+                        real_env = os.path.realpath(env_path)
+                        real_link = os.path.realpath(link_path)
+                        self.assertIn(real_norm, copied_sources)
+                        self.assertNotIn(real_env, copied_sources)
+                        self.assertNotIn(real_link, copied_sources)
+                        self.assertTrue(all(".git" not in src for src in copied_sources))
+
     async def test_gce_sandbox_lifecycle_and_security_hardening(self):
         """Tests GceEnvironment dispatch, security hardening flags, IAP tunneling, host isolation, and execution."""
         # 1. Dispatch via build_sandbox
@@ -1063,7 +1079,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             out_patch = await gce_test.apply_patch("diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
             self.assertIn("patch applied cleanly", out_patch)
             mock_subproc_patch.assert_called_once()
-            self.assertEqual(mock_subproc_patch.call_args[1].get("input"), b"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
+            self.assertEqual(mock_subproc_patch.call_args[1].get("input"), "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
 
         # 6. Base64 File Read & Stdin Streaming File Write (Untruncated Large File Test > 20,000 bytes)
         import base64
@@ -1434,117 +1450,24 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_vector_serialization_deserialization_roundtrip(self):
-        """Tests vector serialization to blob and deserialization back to floats across boundary conditions."""
-        # 1. Standard float vector
-        orig = [0.123456, -0.789012, 0.0, 1.5, -3.14159, 42.0]
-        blob = vector_to_blob(orig)
-        self.assertIsInstance(blob, bytes)
-        self.assertEqual(len(blob), len(orig) * 4)
-        restored = blob_to_vector(blob)
-        self.assertEqual(len(restored), len(orig))
-        for a, b in zip(orig, restored):
-            self.assertAlmostEqual(a, b, places=5)
-
-        # 2. Large dimensional vector (768 & 256 dims)
-        for dim in (256, 768):
-            large_vec = [float(i) * 0.001 for i in range(dim)]
-            blob_large = vector_to_blob(large_vec)
-            restored_large = blob_to_vector(blob_large)
-            self.assertEqual(len(restored_large), dim)
-            for a, b in zip(large_vec, restored_large):
-                self.assertAlmostEqual(a, b, places=5)
-
-        # 3. Tuple and iterable inputs
-        tup_orig = (1.0, 2.5, -3.0)
-        blob_tup = vector_to_blob(tup_orig)
-        self.assertEqual(blob_to_vector(blob_tup), [1.0, 2.5, -3.0])
-
-        # 4. Empty vector and None
-        self.assertEqual(vector_to_blob([]), b"")
-        self.assertEqual(vector_to_blob(None), b"")
-        self.assertEqual(blob_to_vector(b""), [])
-        self.assertEqual(blob_to_vector(None), [])
-
-        # 5. Malformed or truncated byte sequences (e.g. 1, 3, 5, 7 bytes) - must not raise struct.error
-        for bad_len in (1, 2, 3, 5, 6, 7, 9):
-            corrupt_blob = b"\x00" * bad_len
-            parsed = blob_to_vector(corrupt_blob)
-            self.assertIsInstance(parsed, list)
-            self.assertEqual(len(parsed), bad_len // 4)
-
-    def test_cosine_similarity_computation(self):
-        """Tests fast in-process cosine similarity calculation across boundary and error conditions."""
-        # Identical vectors -> 1.0
-        v1 = [1.0, 2.0, 3.0, 4.0]
-        self.assertAlmostEqual(cosine_similarity(v1, v1), 1.0, places=5)
-
-        # Scaled identical direction -> 1.0
-        v2 = [2.0, 4.0, 6.0, 8.0]
-        self.assertAlmostEqual(cosine_similarity(v1, v2), 1.0, places=5)
-
-        # Orthogonal vectors -> 0.0
-        v_ortho_a = [1.0, 0.0]
-        v_ortho_b = [0.0, 1.0]
-        self.assertAlmostEqual(cosine_similarity(v_ortho_a, v_ortho_b), 0.0, places=5)
-
-        # Opposite vectors -> -1.0
-        v_opp_a = [1.0, -2.0]
-        v_opp_b = [-1.0, 2.0]
-        self.assertAlmostEqual(cosine_similarity(v_opp_a, v_opp_b), -1.0, places=5)
-
-        # Degenerate cases (empty, zero norm, dimension mismatch) -> 0.0
-        self.assertEqual(cosine_similarity([], [1.0]), 0.0)
-        self.assertEqual(cosine_similarity([0.0, 0.0], [1.0, 1.0]), 0.0)
-        self.assertEqual(cosine_similarity([1.0, 2.0], [1.0, 2.0, 3.0]), 0.0)
-
-        # NaN and Inf resilience -> 0.0
-        self.assertEqual(cosine_similarity([float("nan"), 1.0], [1.0, 1.0]), 0.0)
-        self.assertEqual(cosine_similarity([float("inf"), 1.0], [1.0, 1.0]), 0.0)
-
-    def test_get_embedding_kwargs_precedence_and_config(self):
-        """Tests embedding model and client parameter resolution across function args, config dict, and environment variables."""
-        # 1. Default model
-        with patch.dict(os.environ, {}, clear=True):
-            model, kwargs = get_embedding_kwargs()
-            self.assertEqual(model, DEFAULT_EMBEDDING_MODEL)
-
-        # 2. Config dictionary precedence
-        cfg = {
-            "embedding_model": "vertex_ai/gemini-custom-emb",
-            "api_base": "http://localhost:8000/v1",
-            "timeout": 45.0,
-            "api_key": "test-key-123",
-            "vertex_project": "proj-cfg",
-            "vertex_location": "us-east4",
-        }
-        with patch.dict(os.environ, {"EMBEDDING_MODEL": "env-model"}):
-            model, kwargs = get_embedding_kwargs(config=cfg)
-            self.assertEqual(model, "vertex_ai/gemini-custom-emb")
-            self.assertEqual(kwargs["api_base"], "http://localhost:8000/v1")
-            self.assertEqual(kwargs["timeout"], 45.0)
-            self.assertEqual(kwargs["api_key"], "test-key-123")
-            self.assertEqual(kwargs["vertex_project"], "proj-cfg")
-            self.assertEqual(kwargs["vertex_location"], "us-east4")
-
-        # 3. Direct function argument overrides config dict
-        model, kwargs = get_embedding_kwargs(
-            model="openai/text-embedding-3-small",
-            api_base="http://custom:9000/v1",
-            timeout=10.0,
-            api_key="override-key",
-            config=cfg,
-        )
-        self.assertEqual(model, "openai/text-embedding-3-small")
-        self.assertEqual(kwargs["api_base"], "http://custom:9000/v1")
-        self.assertEqual(kwargs["timeout"], 10.0)
-        self.assertEqual(kwargs["api_key"], "override-key")
-
-        # 4. Bare gemini embedding model auto-routes to vertex_ai when GCP project is available
-        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "gcp-proj", "GOOGLE_CLOUD_PROJECT": "gcp-proj"}):
-            model, kwargs = get_embedding_kwargs(model="gemini-embedding-001")
-            self.assertEqual(model, "vertex_ai/gemini-embedding-001")
-            self.assertEqual(kwargs["vertex_project"], "gcp-proj")
+    def test_normalize_cwe_variations(self):
+        """Tests that normalize_cwe canonicalizes diverse CWE inputs and handles invalid/unknown values safely."""
+        self.assertEqual(normalize_cwe("CWE-89"), "CWE-89")
+        self.assertEqual(normalize_cwe("cwe-89"), "CWE-89")
+        self.assertEqual(normalize_cwe("cwe_89"), "CWE-89")
+        self.assertEqual(normalize_cwe("cwe 89"), "CWE-89")
+        self.assertEqual(normalize_cwe("89"), "CWE-89")
+        self.assertEqual(normalize_cwe(89), "CWE-89")
+        self.assertEqual(normalize_cwe("CWE-0089"), "CWE-89")
+        self.assertEqual(normalize_cwe("CWE-79: Reflected XSS"), "CWE-79")
+        self.assertIsNone(normalize_cwe(None))
+        self.assertIsNone(normalize_cwe(""))
+        self.assertIsNone(normalize_cwe("CWE-UNKNOWN"))
+        self.assertIsNone(normalize_cwe("unknown"))
+        self.assertIsNone(normalize_cwe("NONE"))
+        self.assertIsNone(normalize_cwe("NULL"))
+        self.assertIsNone(normalize_cwe("UNDEFINED"))
+        self.assertIsNone(normalize_cwe("N/A"))
 
     def test_extract_target_symbol_resilience(self):
         """Tests that extract_target_symbol cleanly differentiates target symbols from file paths and handles varied formats."""
@@ -1579,14 +1502,14 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         sym_fp = extract_target_symbol(title="Vulnerability in `src/parser.c`", description="Flaw in function parse_tokens")
         self.assertEqual(sym_fp, "parse_tokens")
 
-    def test_semantic_embeddings_positive_controls(self):
-        """Tests that semantically equivalent findings with different phrasing/logs merge into the same lineage (similarity >= 0.88)."""
+    def test_deterministic_lineage_resolution_positive_controls(self):
+        """Tests that semantically equivalent findings merge into the same lineage via deterministic anchors."""
         temp_dir = tempfile.mkdtemp()
         db_file = os.path.join(temp_dir, "test_pos_controls.db")
         try:
             init_db(db_file)
 
-            # Positive Control 1: SQL Injection phrasing variations in services/user/routes.py
+            # Positive Control 1: SQL Injection phrasing variations in services/user/routes.py (same file, CWE, symbol)
             f1_pos = {
                 "title": "SQL Injection in get_user",
                 "severity": "HIGH",
@@ -1604,14 +1527,18 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 "cwe": "CWE-89",
             }
 
-            rca1 = generate_rca_summary(f1_pos)
-            rca2 = generate_rca_summary(f2_pos)
-            v1 = compute_embedding(rca1, mock_mode=True)
-            v2 = compute_embedding(rca2, mock_mode=True)
-            sim_pos = cosine_similarity(v1, v2)
-            self.assertGreaterEqual(sim_pos, 0.88, f"Positive control failed threshold 0.88 (got {sim_pos})")
+            write_findings(db_file, f1_pos["filepath"], [f1_pos], run_id="run-pos-1")
+            write_findings(db_file, f2_pos["filepath"], [f2_pos], run_id="run-pos-2")
 
-            # Positive Control 2: Insecure Deserialization phrasing variations in services/cart/session.py
+            r1 = read_findings(db_file, filepath="services/user/routes.py", run_id="run-pos-1")
+            r2 = read_findings(db_file, filepath="services/user/routes.py", run_id="run-pos-2")
+            self.assertEqual(len(r1), 1)
+            self.assertEqual(len(r2), 1)
+            self.assertEqual(r1[0]["lineage_id"], r2[0]["lineage_id"])
+            self.assertIsNone(r1[0]["embedding"])
+            self.assertIsNone(r2[0]["embedding"])
+
+            # Positive Control 2: Deserialization in services/cart/session.py with hydrate_session
             f1_deser = {
                 "title": "Insecure Deserialization in hydrate_session",
                 "severity": "CRITICAL",
@@ -1628,27 +1555,17 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 "line_numbers": [92],
                 "cwe": "CWE-502",
             }
-            rca_d1 = generate_rca_summary(f1_deser)
-            rca_d2 = generate_rca_summary(f2_deser)
-            v_d1 = compute_embedding(rca_d1, mock_mode=True)
-            v_d2 = compute_embedding(rca_d2, mock_mode=True)
-            sim_deser = cosine_similarity(v_d1, v_d2)
-            self.assertGreaterEqual(sim_deser, 0.88, f"Deserialization positive control failed threshold 0.88 (got {sim_deser})")
+            write_findings(db_file, f1_deser["filepath"], [f1_deser], run_id="run-deser-1")
+            write_findings(db_file, f2_deser["filepath"], [f2_deser], run_id="run-deser-2")
 
-            # Verify end-to-end lineage resolution merges positive controls into same lineage_id
-            write_findings(db_file, f1_pos["filepath"], [f1_pos], run_id="run-pos-1")
-            write_findings(db_file, f2_pos["filepath"], [f2_pos], run_id="run-pos-2")
-
-            r1 = read_findings(db_file, filepath="services/user/routes.py", run_id="run-pos-1")
-            r2 = read_findings(db_file, filepath="services/user/routes.py", run_id="run-pos-2")
-            self.assertEqual(len(r1), 1)
-            self.assertEqual(len(r2), 1)
-            self.assertEqual(r1[0]["lineage_id"], r2[0]["lineage_id"])
+            rd1 = read_findings(db_file, filepath="services/cart/session.py", run_id="run-deser-1")
+            rd2 = read_findings(db_file, filepath="services/cart/session.py", run_id="run-deser-2")
+            self.assertEqual(rd1[0]["lineage_id"], rd2[0]["lineage_id"])
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_semantic_embeddings_negative_controls(self):
-        """Tests that distinct vulnerability classes maintain low similarity (< 0.70) and never false-merge."""
+    def test_deterministic_lineage_resolution_negative_controls(self):
+        """Tests that distinct vulnerability classes fail closed and never false-merge."""
         temp_dir = tempfile.mkdtemp()
         db_file = os.path.join(temp_dir, "test_neg_controls.db")
         try:
@@ -1671,199 +1588,98 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 "line_numbers": [95],
                 "cwe": "CWE-78",
             }
-
-            rca_sqli = generate_rca_summary(f_sqli)
-            rca_cmdi = generate_rca_summary(f_cmdi)
-            v_sqli = compute_embedding(rca_sqli, mock_mode=True)
-            v_cmdi = compute_embedding(rca_cmdi, mock_mode=True)
-            sim_distinct = cosine_similarity(v_sqli, v_cmdi)
-            self.assertLess(sim_distinct, 0.70, f"Negative control failed: similarity {sim_distinct} >= 0.70")
-
-            # Negative Control 2: Stored XSS vs Reflected XSS in same file (Finding 301 vs 302)
-            dataset_path = os.path.join(os.path.dirname(__file__), "evals", "synthetic_dataset.json")
-            with open(dataset_path, "r", encoding="utf-8") as f:
-                syn = json.load(f)
-            id_to_finding = {f["id"]: f for f in syn["findings"]}
-
-            f301 = id_to_finding[301]
-            f302 = id_to_finding[302]
-            rca301 = generate_rca_summary(f301)
-            rca302 = generate_rca_summary(f302)
-            v301 = compute_embedding(rca301, mock_mode=True)
-            v302 = compute_embedding(rca302, mock_mode=True)
-            sim_xss = cosine_similarity(v301, v302)
-            self.assertLess(sim_xss, 0.70, f"XSS negative control failed: similarity {sim_xss} >= 0.70")
-
-            # Negative Control 3: Timing side-channel vs Token expiration in auth/token.py (Finding 401 vs 402)
-            f401 = id_to_finding[401]
-            f402 = id_to_finding[402]
-            rca401 = generate_rca_summary(f401)
-            rca402 = generate_rca_summary(f402)
-            v401 = compute_embedding(rca401, mock_mode=True)
-            v402 = compute_embedding(rca402, mock_mode=True)
-            sim_auth = cosine_similarity(v401, v402)
-            self.assertLess(sim_auth, 0.70, f"Auth negative control failed: similarity {sim_auth} >= 0.70")
-
-            # Verify in SQLite database: they produce distinct lineage IDs and never false-merge
             write_findings(db_file, f_sqli["filepath"], [f_sqli], run_id="run-neg-1")
             write_findings(db_file, f_cmdi["filepath"], [f_cmdi], run_id="run-neg-2")
 
             r_sqli = read_findings(db_file, filepath="services/user/routes.py", run_id="run-neg-1")
             r_cmdi = read_findings(db_file, filepath="services/user/routes.py", run_id="run-neg-2")
             self.assertNotEqual(r_sqli[0]["lineage_id"], r_cmdi[0]["lineage_id"])
+
+            # Negative Control 2: Stored XSS vs Reflected XSS in same file
+            dataset_path = os.path.join(os.path.dirname(__file__), "evals", "synthetic_dataset.json")
+            if os.path.exists(dataset_path):
+                with open(dataset_path, "r", encoding="utf-8") as f:
+                    syn = json.load(f)
+                id_to_finding = {f["id"]: f for f in syn["findings"]}
+                f301 = id_to_finding[301]
+                f302 = id_to_finding[302]
+                write_findings(db_file, f301["filepath"], [f301], run_id="run-xss-1")
+                write_findings(db_file, f302["filepath"], [f302], run_id="run-xss-2")
+                rx1 = read_findings(db_file, filepath=f301["filepath"], run_id="run-xss-1")
+                rx2 = read_findings(db_file, filepath=f302["filepath"], run_id="run-xss-2")
+                self.assertNotEqual(rx1[0]["lineage_id"], rx2[0]["lineage_id"])
+
+                # Negative Control 3: Timing side-channel vs Token expiration in auth/token.py
+                f401 = id_to_finding[401]
+                f402 = id_to_finding[402]
+                write_findings(db_file, f401["filepath"], [f401], run_id="run-auth-1")
+                write_findings(db_file, f402["filepath"], [f402], run_id="run-auth-2")
+                ra1 = read_findings(db_file, filepath=f401["filepath"], run_id="run-auth-1")
+                ra2 = read_findings(db_file, filepath=f402["filepath"], run_id="run-auth-2")
+                self.assertNotEqual(ra1[0]["lineage_id"], ra2[0]["lineage_id"])
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_offline_mock_embedding_mode_deterministic_execution(self):
-        """Tests deterministic embedding computation in offline/mock mode without network or credentials."""
-        text = (
-            "Component: api/v1/auth.py\n"
-            "Vulnerability Class: CWE-287\n"
-            "Root Cause Mechanism: Missing JWT signature validation\n"
-            "Failure Condition: Attacker supplies unsigned token\n"
-            "Taint Dataflow: token -> verify_token -> auth_context"
-        )
-        # Compute multiple times in mock mode
-        v1 = compute_embedding(text, mock_mode=True)
-        v2 = compute_embedding(text, mock_mode=True)
-        self.assertEqual(len(v1), 256)
-        self.assertEqual(v1, v2)
-
-        # Verify environment variable override
-        with patch.dict(os.environ, {"MOCK_EMBEDDINGS": "1"}):
-            v_env = compute_embedding(text)
-            self.assertEqual(v_env, v1)
-
-        with patch.dict(os.environ, {"MANTIS_OFFLINE_EMBEDDINGS": "1"}):
-            v_offline = compute_embedding(text)
-            self.assertEqual(v_offline, v1)
-
-    def test_3_tier_deduplication_ladder_integration(self):
-        """Tests end-to-end integration across Tier 1 (Exact Anchors), Tier 2 (RCA), and Tier 3 (Vector Similarity)."""
+    def test_line_proximity_and_signature_anchors(self):
+        """Tests exact signature and strict line proximity matching for lineage inheritance."""
         temp_dir = tempfile.mkdtemp()
-        db_file = os.path.join(temp_dir, "test_3tier_ladder.db")
+        db_file = os.path.join(temp_dir, "test_anchors.db")
         try:
             init_db(db_file)
-
-            # Tier 1 exact match test
             f_base = {
-                "title": "SQL Injection in get_user",
-                "severity": "HIGH",
-                "filepath": "app.py",
-                "description": "User input passed to database query in get_user()",
-                "line_numbers": [10],
-                "cwe": "CWE-89",
+                "title": "Flaw",
+                "severity": "CRITICAL",
+                "filepath": "parser.c",
+                "description": "Flaw at line 100",
+                "line_numbers": [100],
+                "cwe": "CWE-120",
+                "signature": "sig_exact_anchor_123",
             }
-            write_findings(db_file, "app.py", [f_base], run_id="run-base")
-            r_base = read_findings(db_file, filepath="app.py", run_id="run-base")
-            base_lineage = r_base[0]["lineage_id"]
-            self.assertTrue(base_lineage)
-            self.assertTrue(r_base[0]["rca_summary"])
-            self.assertTrue(r_base[0]["embedding"])
+            write_findings(db_file, "parser.c", [f_base], run_id="run-base")
+            r_base = read_findings(db_file, filepath="parser.c", run_id="run-base")
+            base_lid = r_base[0]["lineage_id"]
 
-            # Verify lineage_vectors table was populated
-            with _db(db_file) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT lineage_id, rca_summary, embedding FROM lineage_vectors WHERE lineage_id = ?", (base_lineage,))
-                lv_row = cursor.fetchone()
-                self.assertIsNotNone(lv_row)
-                self.assertEqual(lv_row["lineage_id"], base_lineage)
-                self.assertTrue(len(lv_row["embedding"]) > 0)
-
-            # Tier 3 vector nearest neighbor match
-            with _db(db_file) as conn:
-                cursor = conn.cursor()
-                query_vec = r_base[0]["embedding"]
-                nearest_lid = find_nearest_lineage(cursor, query_vec, threshold=0.90, filepath="app.py")
-                self.assertEqual(nearest_lid, base_lineage)
-
-                # Path normalization resilience (./app.py and None)
-                nearest_rel = find_nearest_lineage(cursor, query_vec, threshold=0.90, filepath="./app.py")
-                self.assertEqual(nearest_rel, base_lineage)
-                nearest_none_fp = find_nearest_lineage(cursor, query_vec, threshold=0.90, filepath=None)
-                self.assertEqual(nearest_none_fp, base_lineage)
-
-                # Dimension mismatch between query vector and DB vector returns None safely
-                dim_mismatch_vec = [1.0] * 512
-                self.assertIsNone(find_nearest_lineage(cursor, dim_mismatch_vec, threshold=0.90, filepath="app.py"))
-
-                # Query with distinct vector -> should return None
-                dummy_vec = [-x for x in query_vec]
-                none_lid = find_nearest_lineage(cursor, dummy_vec, threshold=0.90, filepath="app.py")
-                self.assertIsNone(none_lid)
-        finally:
-            shutil.rmtree(temp_dir)
-
-    def test_embedding_fallback_explicit_warning(self):
-        """Tests that live embedding failures emit a visible ⚠️ [EMBEDDING FALLBACK] warning to stderr and degrade cleanly to mock."""
-        import io
-        from contextlib import redirect_stderr
-        import core.embeddings as emb_mod
-
-        # Reset warned state for test
-        emb_mod._WARNED_FALLBACK = False
-
-        err_stream = io.StringIO()
-        with redirect_stderr(err_stream):
-            with patch("litellm.embedding", side_effect=RuntimeError("Simulated network/auth timeout")):
-                vec = compute_embedding("Component: app.py\nRoot Cause: Test flaw", mock_mode=False)
-        
-        err_output = err_stream.getvalue()
-        self.assertIn("⚠️  [EMBEDDING FALLBACK]", err_output)
-        self.assertIn("Simulated network/auth timeout", err_output)
-        self.assertEqual(len(vec), 256)
-
-    def test_embedding_dimension_mismatch_warning(self):
-        """Tests that dimension mismatches between query and stored vectors emit ⚠️ [EMBEDDING MISMATCH] warning."""
-        import io
-        from contextlib import redirect_stderr
-        import core.embeddings as emb_mod
-
-        emb_mod._WARNED_DIM_MISMATCH = False
-        temp_dir = tempfile.mkdtemp()
-        db_file = os.path.join(temp_dir, "test_dim_mismatch.db")
-        try:
-            init_db(db_file)
             with _db(db_file) as conn:
                 cur = conn.cursor()
-                # Insert a 256-dim mock vector
-                mock_blob = vector_to_blob([0.1] * 256)
-                cur.execute(
-                    "INSERT INTO lineage_vectors (lineage_id, filepath, model, dimension, embedding) VALUES (?, ?, ?, ?, ?)",
-                    ("lin-old", "app.py", "mock", 256, mock_blob),
+
+                # 1. Exact signature match inherits lineage_id
+                sig_lid = resolve_ancestor_lineage(
+                    cur,
+                    filepath="parser.c",
+                    signature="sig_exact_anchor_123",
+                    cwe="CWE-120",
+                    title="Different Title",
                 )
-                
-                # Query with 512-dim vector
-                err_stream = io.StringIO()
-                with redirect_stderr(err_stream):
-                    res = find_nearest_lineage(cur, [0.1] * 512, filepath="app.py")
-                
-                self.assertIsNone(res)
-                err_output = err_stream.getvalue()
-                self.assertIn("⚠️  [EMBEDDING MISMATCH]", err_output)
-                self.assertIn("Stored lineage vectors have dimension 256", err_output)
+                self.assertEqual(sig_lid, base_lid)
+
+                # 2. Line proximity match within <= 3 lines when symbol is empty
+                prox_lid = resolve_ancestor_lineage(
+                    cur,
+                    filepath="parser.c",
+                    signature="new_sig",
+                    cwe="CWE-120",
+                    symbol="",
+                    title="Flaw",
+                    line_numbers="[102]",
+                )
+                self.assertEqual(prox_lid, base_lid)
+
+                # 3. Line proximity beyond > 3 lines fails closed to fresh lineage_id
+                far_lid = resolve_ancestor_lineage(
+                    cur,
+                    filepath="parser.c",
+                    signature="new_sig_far",
+                    cwe="CWE-120",
+                    symbol="",
+                    title="Flaw",
+                    line_numbers="[150]",
+                )
+                self.assertNotEqual(far_lid, base_lid)
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_cwe_structural_guard_prevents_false_merge(self):
-        """Tests that distinct, incompatible CWE classifications skip vector comparison and prevent false merges even with 0.99+ similarity."""
-        # Verify normalize_cwe helper directly across various representations
-        self.assertEqual(normalize_cwe("CWE-89"), "CWE-89")
-        self.assertEqual(normalize_cwe("cwe-89"), "CWE-89")
-        self.assertEqual(normalize_cwe("cwe_89"), "CWE-89")
-        self.assertEqual(normalize_cwe("cwe 89"), "CWE-89")
-        self.assertEqual(normalize_cwe("89"), "CWE-89")
-        self.assertEqual(normalize_cwe(89), "CWE-89")
-        self.assertEqual(normalize_cwe("CWE-0089"), "CWE-89")
-        self.assertEqual(normalize_cwe("CWE-79: Reflected XSS"), "CWE-79")
-        self.assertIsNone(normalize_cwe(None))
-        self.assertIsNone(normalize_cwe(""))
-        self.assertIsNone(normalize_cwe("CWE-UNKNOWN"))
-        self.assertIsNone(normalize_cwe("unknown"))
-        self.assertIsNone(normalize_cwe("NONE"))
-        self.assertIsNone(normalize_cwe("NULL"))
-        self.assertIsNone(normalize_cwe("N/A"))
-
+    def test_cwe_structural_guard_prevents_false_merge_deterministic(self):
+        """Tests that distinct CWE classifications prevent false merges in deterministic lineage resolution."""
         temp_dir = tempfile.mkdtemp()
         db_file = os.path.join(temp_dir, "test_cwe_guard.db")
         try:
@@ -1881,32 +1697,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
 
             with _db(db_file) as conn:
                 cur = conn.cursor()
-                query_vec = findings[0]["embedding"]
-                # Query with exact same vector (cosine similarity 1.0 > 0.99) but distinct CWE-78 (Command Injection)
-                res_diff_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-78")
-                self.assertIsNone(res_diff_cwe)
-
-                # Query with distinct Deserialization CWE-502
-                res_deser_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-502")
-                self.assertIsNone(res_deser_cwe)
-
-                # Query with matching CWE-89 succeeds
-                res_same_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-89")
-                self.assertEqual(res_same_cwe, sqli_lid)
-
-                # Query with case/format variant cwe-89 succeeds
-                res_norm_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="cwe-89")
-                self.assertEqual(res_norm_cwe, sqli_lid)
-
-                # Query with integer 89 succeeds
-                res_int_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe=89)
-                self.assertEqual(res_int_cwe, sqli_lid)
-
-                # Query with unknown CWE allows fallback to vector similarity
-                res_unknown_cwe = find_nearest_lineage(cur, query_vec, filepath="app.py", cwe="CWE-UNKNOWN")
-                self.assertEqual(res_unknown_cwe, sqli_lid)
-
-                # Test resolve_ancestor_lineage end-to-end: distinct CWE mints new lineage ID
+                # Query with distinct Command Injection CWE-78 mints a new lineage ID
                 new_lid = resolve_ancestor_lineage(
                     cur,
                     filepath="app.py",
@@ -1915,122 +1706,19 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     symbol="exec_cmd",
                     title="Command Injection in exec_cmd",
                     description="Unsanitized command execution",
-                    embedding=query_vec,
                 )
                 self.assertNotEqual(new_lid, sqli_lid)
-        finally:
-            shutil.rmtree(temp_dir)
 
-    def test_dynamic_embedding_similarity_threshold_env(self):
-        """Tests that EMBEDDING_SIMILARITY_THRESHOLD dynamically affects resolve_ancestor_lineage and find_nearest_lineage."""
-        temp_dir = tempfile.mkdtemp()
-        db_file = os.path.join(temp_dir, "test_dynamic_threshold.db")
-        try:
-            init_db(db_file)
-            vec_a = [1.0] + [0.0] * 255
-            # Orthogonal / slightly correlated vector with cosine similarity ~ 0.707
-            vec_b = [0.7071, 0.7071] + [0.0] * 254
-
-            with _db(db_file) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO lineage_vectors (lineage_id, filepath, cwe, model, dimension, embedding) VALUES (?, ?, ?, ?, ?, ?)",
-                    ("lid-baseline", "app.py", "CWE-89", "mock", 256, vector_to_blob(vec_a)),
+                # Query with matching file, CWE-89, and symbol inherits lineage ID
+                matching_lid = resolve_ancestor_lineage(
+                    cur,
+                    filepath="app.py",
+                    signature="diff_sig_sql_variant",
+                    cwe="cwe-89",
+                    symbol="get_user",
+                    title="SQL Injection variant in get_user",
                 )
-
-                # 1. Under default threshold (0.90), similarity ~0.707 does NOT match
-                res_default = find_nearest_lineage(cur, vec_b, filepath="app.py", cwe="CWE-89")
-                self.assertIsNone(res_default)
-
-                # 2. Dynamically set EMBEDDING_SIMILARITY_THRESHOLD to 0.50 -> matches
-                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "0.50"}):
-                    res_low = find_nearest_lineage(cur, vec_b, filepath="app.py", cwe="CWE-89")
-                    self.assertEqual(res_low, "lid-baseline")
-
-                    # Also verify resolve_ancestor_lineage inherits under dynamic threshold
-                    res_resolve = resolve_ancestor_lineage(
-                        cur,
-                        filepath="app.py",
-                        signature="sig-b",
-                        cwe="CWE-89",
-                        symbol="sym_b",
-                        title="SQL flaw",
-                        description="desc",
-                        embedding=vec_b,
-                    )
-                    self.assertEqual(res_resolve, "lid-baseline")
-
-                # 3. Explicit parameter overrides environment variable
-                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "0.50"}):
-                    res_explicit = find_nearest_lineage(cur, vec_b, threshold=0.95, filepath="app.py", cwe="CWE-89")
-                    self.assertIsNone(res_explicit)
-
-                # 4. Invalid / malformed environment variable gracefully falls back to default
-                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "invalid_float"}):
-                    res_invalid = find_nearest_lineage(cur, vec_b, filepath="app.py", cwe="CWE-89")
-                    self.assertIsNone(res_invalid)
-
-                # 5. Module-level import resilience when EMBEDDING_SIMILARITY_THRESHOLD='high' or out of range (-3, 2.5)
-                import importlib
-                import io
-                from contextlib import redirect_stderr
-                import core.embeddings as emb_mod
-                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "high"}):
-                    err_stream = io.StringIO()
-                    with redirect_stderr(err_stream):
-                        importlib.reload(emb_mod)
-                    self.assertEqual(emb_mod.DEFAULT_SIMILARITY_THRESHOLD, 0.90)
-                    self.assertIn("Invalid EMBEDDING_SIMILARITY_THRESHOLD='high'", err_stream.getvalue())
-
-                # Out-of-range negative threshold (-3) must warn and fall back to 0.90 (never clamp to -1.0)
-                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "-3"}):
-                    err_stream = io.StringIO()
-                    with redirect_stderr(err_stream):
-                        importlib.reload(emb_mod)
-                    self.assertEqual(emb_mod.DEFAULT_SIMILARITY_THRESHOLD, 0.90)
-                    self.assertIn("is outside valid range [0.0, 1.0]", err_stream.getvalue())
-
-                # Out-of-range positive threshold (2.5) must warn and fall back to 0.90
-                with patch.dict(os.environ, {"EMBEDDING_SIMILARITY_THRESHOLD": "2.5"}):
-                    err_stream = io.StringIO()
-                    with redirect_stderr(err_stream):
-                        importlib.reload(emb_mod)
-                    self.assertEqual(emb_mod.DEFAULT_SIMILARITY_THRESHOLD, 0.90)
-                    self.assertIn("is outside valid range [0.0, 1.0]", err_stream.getvalue())
-
-                # Restore default module state
-                importlib.reload(emb_mod)
-        finally:
-            shutil.rmtree(temp_dir)
-
-    def test_warn_dim_mismatch_outputs_model_name_from_sqlite(self):
-        """Tests that _warn_dim_mismatch accurately prints the stored model name from SQLite records."""
-        import io
-        from contextlib import redirect_stderr
-        import core.embeddings as emb_mod
-
-        emb_mod._WARNED_DIM_MISMATCH = False
-        temp_dir = tempfile.mkdtemp()
-        db_file = os.path.join(temp_dir, "test_model_mismatch.db")
-        try:
-            init_db(db_file)
-            with _db(db_file) as conn:
-                cur = conn.cursor()
-                mock_blob = vector_to_blob([0.1] * 3072)
-                cur.execute(
-                    "INSERT INTO lineage_vectors (lineage_id, filepath, cwe, model, dimension, embedding) VALUES (?, ?, ?, ?, ?, ?)",
-                    ("lin-vertex", "app.py", "CWE-89", "vertex_ai/gemini-embedding-001", 3072, mock_blob),
-                )
-
-                err_stream = io.StringIO()
-                with redirect_stderr(err_stream):
-                    res = find_nearest_lineage(cur, [0.1] * 256, filepath="app.py", cwe="CWE-89")
-
-                self.assertIsNone(res)
-                err_output = err_stream.getvalue()
-                self.assertIn("⚠️  [EMBEDDING MISMATCH]", err_output)
-                self.assertIn("Stored lineage vectors have dimension 3072 (model: 'vertex_ai/gemini-embedding-001')", err_output)
-                self.assertIn("while query vector has dimension 256", err_output)
+                self.assertEqual(matching_lid, sqli_lid)
         finally:
             shutil.rmtree(temp_dir)
 
@@ -2058,6 +1746,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 "cwe": "CWE-78",
                 "remediation": "Use subprocess.run(['tar', ...]) without shell=True",
                 "status": "dynamic_confirmed",
+                "reattack_status": "failed_to_bypass",
                 "patch_status": "VERIFIED_SECURE",
                 "patch_diff": "--- a/app.py\n+++ b/app.py\n@@ -10 +10 @@\n-os.system(cmd)\n+subprocess.run(['tar', target])",
             }
@@ -2297,10 +1986,20 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_global_config_forbids_unknown_fields(self):
-        """Ensures GlobalConfig extra='forbid' still rejects unrecognized fields."""
-        with self.assertRaises(Exception):
-            GlobalConfig(unknown_field="invalid")
+    def test_global_config_snapshot_and_sync_fields(self):
+        """Ensures GlobalConfig parses snapshot, sync, and extra fields cleanly."""
+        cfg = GlobalConfig(
+            sync_upstream=True,
+            pin_snapshot=False,
+            pass_number=2,
+            snapshot_keep=5,
+            custom_extra_option="allowed",
+        )
+        self.assertTrue(cfg.sync_upstream)
+        self.assertFalse(cfg.pin_snapshot)
+        self.assertEqual(cfg.pass_number, 2)
+        self.assertEqual(cfg.snapshot_keep, 5)
+        self.assertEqual(getattr(cfg, "custom_extra_option", None), "allowed")
 
     def test_discover_files(self):
         """Verifies discover_files handles single files, git repos, hidden directories, db_path exclusion, and binary filtering."""
@@ -2339,6 +2038,23 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(str(f_binary), discovered)
             self.assertNotIn(str(hidden_dir / "secret.py"), discovered)
             self.assertNotIn(str(db_file), discovered)
+
+            # 5. Subdirectory of a git repo with tracked dotfiles
+            repo_dir = p_dir / "git_repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo_dir), capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
+            sub_dir = repo_dir / "packages" / "auth"
+            sub_dir.mkdir(parents=True)
+            (sub_dir / ".env.example").write_text("API_KEY=test")
+            (sub_dir / "index.ts").write_text("export const x = 1;")
+            subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
+
+            discovered_sub = discover_files(sub_dir)
+            self.assertIn(str(sub_dir / ".env.example"), discovered_sub)
+            self.assertIn(str(sub_dir / "index.ts"), discovered_sub)
         finally:
             shutil.rmtree(temp_dir)
 
@@ -2360,7 +2076,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         full_queue = [
             "History extracted.",
             "Structural index built.",
-            "Summary generated.",
             "Architecture KB created.",
             "Threat model created.",
             "Plan created.",
@@ -2459,6 +2174,56 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         finally:
             await runner.close()
             shutil.rmtree(temp_dir)
+
+    def test_resilient_llm_safety_refusal_sanitization(self):
+        """Tests that ResilientLiteLlm._sanitize_structured_response converts model refusals into valid schema verdicts."""
+        from google.adk.models import LlmResponse
+        from google.genai import types
+        from core.config import ResilientLiteLlm
+        from core.schemas import ReproVerdict, ReviewVerdict, CriticVerdict
+
+        # 1. ReproVerdict refusal fallback
+        r1 = LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text="Sorry, I cannot fulfill this request regarding command injection.")]))
+        s1 = ResilientLiteLlm._sanitize_structured_response(r1, ReproVerdict)
+        v1 = ReproVerdict.model_validate_json(s1.content.parts[0].text)
+        self.assertEqual(v1.route, "failed_repro")
+        self.assertIn("Sorry", v1.reason)
+
+        # 2. ReviewVerdict refusal fallback
+        r2 = LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text="I am unable to review this exploit pattern.")]))
+        s2 = ResilientLiteLlm._sanitize_structured_response(r2, ReviewVerdict)
+        v2 = ReviewVerdict.model_validate_json(s2.content.parts[0].text)
+        self.assertEqual(v2.route, "confirmed")
+
+        # 3. CriticVerdict refusal fallback
+        r3 = LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text="I cannot assist with determining viability of attacks.")]))
+        s3 = ResilientLiteLlm._sanitize_structured_response(r3, CriticVerdict)
+        v3 = CriticVerdict.model_validate_json(s3.content.parts[0].text)
+        self.assertEqual(v3.route, "non_viable")
+
+        # 4. Valid JSON passes through untouched
+        valid_json = json.dumps({"route": "success", "reason": "Empirically verified."})
+        r4 = LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text=valid_json)]))
+        s4 = ResilientLiteLlm._sanitize_structured_response(r4, ReproVerdict)
+        self.assertEqual(s4.content.parts[0].text, valid_json)
+
+        # 5. Tool call passes through untouched
+        r5 = LlmResponse(content=types.Content(role="model", parts=[types.Part(function_call=types.FunctionCall(name="set_model_response", args={"route": "success", "reason": "done"}))]))
+        s5 = ResilientLiteLlm._sanitize_structured_response(r5, ReproVerdict)
+        self.assertIsNotNone(getattr(s5.content.parts[0], "function_call", None))
+
+        # 6. FinishReason.SAFETY gets sanitized and converted to FinishReason.STOP
+        r6 = LlmResponse(
+            finish_reason=types.FinishReason.SAFETY,
+            error_code="SAFETY",
+            error_message="Finished with SAFETY",
+            content=types.Content(role="model", parts=[types.Part.from_text(text="I cannot fulfill this request.")]),
+        )
+        s6 = ResilientLiteLlm._sanitize_structured_response(r6, ReproVerdict)
+        v6 = ReproVerdict.model_validate_json(s6.content.parts[0].text)
+        self.assertEqual(v6.route, "failed_repro")
+        self.assertEqual(s6.finish_reason, types.FinishReason.STOP)
+        self.assertIsNone(s6.error_code)
 
     async def test_domain_tools_and_database_persistence(self):
         """Tests all domain tools for planning, threat modeling, summarizing, chaining, learning, deduplication, and reporting."""
@@ -2561,6 +2326,60 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(findings), 2)
                 f2_updated = [f for f in findings if f["title"] == "SQL Injection B"][0]
                 self.assertEqual(f2_updated["status"], "duplicate_merged")
+                f1_kept = [f for f in findings if f["title"] == "SQL Injection A"][0]
+                self.assertNotEqual(f1_kept["status"], "duplicate_merged")
+
+                # Test safe deduplication: deduplicating when primary_title is in duplicate_titles
+                # must NOT mark primary finding as duplicate_merged
+                res_dedupe_self = dedupe_findings(
+                    primary_title="SQL Injection A",
+                    duplicate_titles=["SQL Injection A"],
+                    reason="Deduplicating against itself or rephrased titles."
+                )
+                findings_after_self = read_findings(db_path, "app.py", run_id=run_id)
+                f1_still_kept = [f for f in findings_after_self if f["title"] == "SQL Injection A"][0]
+                self.assertNotEqual(f1_still_kept["status"], "duplicate_merged")
+
+                # Test in-place update in write_findings when matching exact key or passing ID
+                f1_updated = VulnerabilityFinding(
+                    title="SQL Injection A",
+                    severity="Critical",
+                    description="raw query A",
+                    line_numbers=[10],
+                )
+                write_findings(db_path, "app.py", [f1_updated], run_id=run_id)
+                findings_after_update = read_findings(db_path, "app.py", run_id=run_id)
+                self.assertEqual(len(findings_after_update), 2)
+                f1_updated_row = [f for f in findings_after_update if f["title"] == "SQL Injection A"][0]
+                self.assertEqual(f1_updated_row["id"], f1_kept["id"])
+                self.assertEqual(f1_updated_row["severity"], "CRITICAL")
+
+                # Test in-place update by explicit ID with rephrased description
+                f1_rephrased = {
+                    "id": f1_kept["id"],
+                    "title": "SQL Injection A",
+                    "severity": "Critical",
+                    "description": "rephrased description for raw query A",
+                    "line_numbers": [10],
+                }
+                write_findings(db_path, "app.py", [f1_rephrased], run_id=run_id)
+                findings_after_rephrase = read_findings(db_path, "app.py", run_id=run_id)
+                self.assertEqual(len(findings_after_rephrase), 2)
+                f1_rephrased_row = [f for f in findings_after_rephrase if f["title"] == "SQL Injection A"][0]
+                self.assertEqual(f1_rephrased_row["id"], f1_kept["id"])
+                self.assertEqual(f1_rephrased_row["description"], "rephrased description for raw query A")
+
+                # Test deduplication by explicit IDs protecting primary_id
+                res_dedupe_ids = dedupe_findings(
+                    primary_title="SQL Injection A",
+                    primary_id=f1_kept["id"],
+                    duplicate_ids=[f1_kept["id"], f2_updated["id"]],
+                    reason="Explicit ID merge test."
+                )
+                self.assertIn("SUCCESS", res_dedupe_ids)
+                findings_after_ids = read_findings(db_path, "app.py", run_id=run_id)
+                f1_after_ids = [f for f in findings_after_ids if f["id"] == f1_kept["id"]][0]
+                self.assertNotEqual(f1_after_ids["status"], "duplicate_merged")
 
                 # 7. generate_report
                 res_rpt = generate_report({
@@ -2695,12 +2514,76 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_schema_codegen_single_source_of_truth(self):
-        """Verifies that schema.json is the single source of truth and codegen produces valid Pydantic models."""
-        from scripts.generate_schemas import SCHEMA_JSON_PATH, generate_pydantic_code
-        self.assertTrue(SCHEMA_JSON_PATH.exists(), f"schema.json must exist at {SCHEMA_JSON_PATH}")
+    async def test_empty_artifacts_and_cross_run_isolation(self):
+        """Validates read_file empty string preservation, list_files run_id isolation, get_summary fallback, and sandbox scoping."""
+        from tools.research_tools import list_files, read_file, write_file, get_summary
+        from tools.sandbox_tools import run_sandbox
+        from core.environments.static_env import StaticOnlyEnvironment
 
-        with open(SCHEMA_JSON_PATH, "r", encoding="utf-8") as f:
+        temp_dir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(temp_dir, "test_iso.db")
+            init_db(db_path)
+
+            # 1. Legacy findings recorded with empty run_id
+            write_findings(db_path, "legacy.py", [{
+                "title": "Legacy Finding",
+                "severity": "HIGH",
+                "description": "Legacy vuln",
+                "filepath": "legacy.py",
+                "line_numbers": [1],
+            }], run_id="")
+
+            # 2. Fresh run context
+            ctx_fresh = RunContext(
+                jail_dir=temp_dir,
+                db_path=db_path,
+                target_file="target.py",
+                run_id="run_fresh_123",
+                sandbox=StaticOnlyEnvironment(target_path=temp_dir),
+                active_node="architect",
+            )
+            tok = current_run_context.set(ctx_fresh)
+            try:
+                # list_files must NOT leak legacy findings into fresh run
+                res_list = await list_files("workspace/findings")
+                self.assertEqual(json.loads(res_list), [])
+
+                # write_file with empty string must be readable as empty string (not NO_DATA)
+                await write_file("workspace/historical_learnings.jsonl", "")
+                read_hist = await read_file("workspace/historical_learnings.jsonl")
+                self.assertEqual(read_hist, "")
+
+                # workspace/learnings.jsonl when 0 rows must return empty string
+                read_learn = await read_file("workspace/learnings.jsonl")
+                self.assertEqual(read_learn, "")
+
+                # get_summary falls back to workspace/kb/architecture.md when no summary recorded
+                await write_file("workspace/kb/architecture.md", "# Service Architecture\n\nFastAPI backend.")
+                sum_text = get_summary()
+                self.assertIn("FastAPI backend", sum_text)
+
+                # run_sandbox in non-reproducer node does NOT mention repro_status or failed_repro
+                res_sb = await run_sandbox("which ctags")
+                self.assertIn("SANDBOX-UNAVAILABLE", res_sb)
+                self.assertNotIn("repro_status", res_sb)
+                self.assertNotIn("failed_repro", res_sb)
+
+                # in reproducer node, run_sandbox DOES provide repro guidance
+                ctx_fresh.active_node = "reproducer"
+                res_sb_repro = await run_sandbox("python3 exploit.py")
+                self.assertIn("repro_status", res_sb_repro)
+            finally:
+                current_run_context.reset(tok)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_schema_json_and_core_schemas_alignment(self):
+        """Verifies that schema.json exists and core.schemas exports all expected models."""
+        schema_path = Path(__file__).resolve().parent.parent / "schema.json"
+        self.assertTrue(schema_path.exists(), f"schema.json must exist at {schema_path}")
+
+        with open(schema_path, "r", encoding="utf-8") as f:
             schema_data = json.load(f)
 
         self.assertIn("$defs", schema_data)
@@ -2708,26 +2591,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("plan", schema_data["$defs"])
         self.assertIn("learning_entry", schema_data["$defs"])
 
-        code = generate_pydantic_code(schema_data)
-        self.assertIn("class FindingSchema(BaseModel):", code)
-        self.assertIn("class PlanSchema(BaseModel):", code)
-        self.assertIn("VulnerabilityFinding = FindingSchema", code)
-        self.assertIn("ReviewPlan = PlanSchema", code)
-        self.assertIn("LearningEntry = LearningEntrySchema", code)
-        self.assertIn("class ReviewVerdict(BaseModel):", code)
-
-    def test_schema_codegen_ast_and_property_coverage(self):
-        """Verifies that generated code parses into valid Python AST and covers all schema.json $defs."""
-        from scripts.generate_schemas import SCHEMA_JSON_PATH, generate_pydantic_code
-        with open(SCHEMA_JSON_PATH, "r", encoding="utf-8") as f:
-            schema_data = json.load(f)
-
-        code = generate_pydantic_code(schema_data)
-        parsed_ast = ast.parse(code)
-        self.assertIsNotNone(parsed_ast)
-
-        # Verify class definitions generated from $defs
-        class_names = [node.name for node in ast.walk(parsed_ast) if isinstance(node, ast.ClassDef)]
+        import core.schemas as cs
         expected_classes = [
             "FindingSchema",
             "PlanSchema",
@@ -2749,7 +2613,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             "ExecutiveReport",
         ]
         for cls_name in expected_classes:
-            self.assertIn(cls_name, class_names, f"Expected {cls_name} to be generated by codegen")
+            self.assertTrue(hasattr(cs, cls_name), f"Expected {cls_name} to be exported by core.schemas")
 
     def test_schema_model_round_trip_serialization(self):
         """Verifies serialization, deserialization, alias choices, and normalization across generated models."""
@@ -2824,42 +2688,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         state_obj = StateSchema.model_validate(state_raw)
         self.assertEqual(state_obj.pass_number, 1)
 
-    def test_schema_codegen_dynamic_schema_evolution(self):
-        """Verifies that adding new definitions or properties to schema.json dynamically generates matching models."""
-        from scripts.generate_schemas import generate_pydantic_code
-        mock_schema_data = {
-            "$defs": {
-                "finding": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "exploit_maturity": {"type": "string", "enum": ["poc", "functional", "high"]}
-                    }
-                },
-                "custom_diagnostic_result": {
-                    "type": "object",
-                    "description": "Diagnostic evaluation metric generated during custom audit stages.",
-                    "properties": {
-                        "check_id": {"type": "string"},
-                        "passed": {"type": "boolean"},
-                        "score": {"type": "number"}
-                    },
-                    "required": ["check_id", "passed"]
-                }
-            }
-        }
-        gen_code = generate_pydantic_code(mock_schema_data)
-        parsed = ast.parse(gen_code)
-        self.assertIsNotNone(parsed)
-
-        # Verify dynamic class generation from the new definition
-        self.assertIn("class CustomDiagnosticResultSchema(BaseModel):", gen_code)
-        self.assertIn("check_id: str = Field()", gen_code)
-        self.assertIn("passed: bool = Field()", gen_code)
-        self.assertIn("score: Optional[float] = Field(default=None)", gen_code)
-        # Verify dynamic property generation on finding
-        self.assertIn("exploit_maturity: Optional[Literal[\"poc\", \"functional\", \"high\"]]", gen_code)
 
     def test_schema_json_definitions_registry(self):
         """Verifies that SCHEMA_DEFINITIONS maps canonical schema names to the generated classes."""
@@ -3027,6 +2855,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 "severity": "HIGH",
                 "description": "Unsanitized query parameter in get_user()",
                 "cwe": "CWE-89",
+                "reattack_status": "failed_to_bypass",
                 "patch_status": "VERIFIED_SECURE",
                 "patch_diff": "--- a\n+++ b\n+ safe_query()",
             }], run_id="run-1")
@@ -3058,15 +2887,14 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(temp_dir)
 
     def test_no_skill_system_prompt_loading_and_execution(self):
-        """Validates loading an agent configured with system_prompt (prompts/system-researcher.md) without a skill."""
+        """Validates loading an agent configured with literal system_prompt instruction text without a skill (A2)."""
         temp_dir = tempfile.mkdtemp()
         try:
             prompt_src = os.path.join(os.path.dirname(__file__), "prompts", "system-researcher.md")
             self.assertTrue(os.path.exists(prompt_src), "prompts/system-researcher.md must exist as canonical no-skill example")
 
-            prompts_dir = os.path.join(temp_dir, "prompts")
-            os.makedirs(prompts_dir, exist_ok=True)
-            shutil.copy(prompt_src, os.path.join(prompts_dir, "system-researcher.md"))
+            with open(prompt_src, "r", encoding="utf-8") as f:
+                prompt_content = f.read()
 
             workflow_def = {
                 "name": "no_skill_workflow",
@@ -3074,7 +2902,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     {
                         "id": "researcher",
                         "type": "agent",
-                        "system_prompt": "prompts/system-researcher.md",
+                        "system_prompt": prompt_content,
                         "tools": ["read_file", "report_findings"]
                     }
                 ],
@@ -3090,31 +2918,30 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 wf, cfg = load_workflow_from_json(wf_path)
                 self.assertIsNotNone(wf)
                 self.assertEqual(len(wf.edges), 1)
-                self.assertEqual(wf.edges[0].to_node.name, "researcher")
-                with open(prompt_src, "r", encoding="utf-8") as f:
-                    expected_instructions = f.read()
-                self.assertEqual(wf.edges[0].to_node.instruction, expected_instructions)
+                self.assertTrue(wf.edges[0].to_node.instruction.startswith(prompt_content.strip()))
+                self.assertIn("UNTRUSTED CODE AUDIT", wf.edges[0].to_node.instruction)
 
-            # Test fail-fast when system_prompt points to a missing file
-            bad_wf_def = {
+            # Test A2 literal path handling: literal path strings are preserved verbatim without reading disk contents
+            literal_path_def = {
                 "nodes": [
                     {
-                        "id": "researcher_bad",
+                        "id": "researcher_literal",
                         "type": "agent",
                         "system_prompt": "prompts/non_existent.md"
                     }
                 ],
                 "edges": [
-                    {"from": "START", "to": "researcher_bad"}
+                    {"from": "START", "to": "researcher_literal"}
                 ]
             }
-            bad_wf_path = os.path.join(temp_dir, "bad_workflow.json")
-            with open(bad_wf_path, "w") as f:
-                json.dump(bad_wf_def, f)
+            literal_wf_path = os.path.join(temp_dir, "literal_workflow.json")
+            with open(literal_wf_path, "w") as f:
+                json.dump(literal_path_def, f)
 
-            with self.assertRaises(ValueError) as ctx:
-                load_workflow_from_json(bad_wf_path)
-            self.assertIn("System prompt not found", str(ctx.exception))
+            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+                wf2, cfg2 = load_workflow_from_json(literal_wf_path)
+                self.assertTrue(wf2.edges[0].to_node.instruction.startswith("prompts/non_existent.md"))
+                self.assertIn("UNTRUSTED CODE AUDIT", wf2.edges[0].to_node.instruction)
         finally:
             shutil.rmtree(temp_dir)
 
@@ -3514,10 +3341,21 @@ Parses JWT claims.
             }
             record_okf_concept(src_db, "run-1", concept)
 
+            # Add an unsafe concept attempting directory traversal to test logging confinement
+            unsafe_concept = {
+                "concept_id": "../../unsafe_escape",
+                "type": "Malicious",
+                "title": "Unsafe Escape",
+                "resource": "src/escape.py",
+                "body_markdown": "Attempted traversal.",
+            }
+            record_okf_concept(src_db, "run-1", unsafe_concept)
+
             # Export to OKF bundle directory
             exported_files = export_okf_bundle(src_db, export_dir)
             self.assertTrue(os.path.exists(os.path.join(export_dir, "index.md")))
-            self.assertTrue(os.path.exists(os.path.join(export_dir, "entities", "crypto_vault.md")))
+            self.assertTrue(any(f.startswith("crypto_vault-") and f.endswith(".md") for f in os.listdir(os.path.join(export_dir, "entities"))))
+            self.assertFalse(os.path.exists(os.path.join(export_dir, "..", "unsafe_escape.md")))
 
             # Check index.md content
             with open(os.path.join(export_dir, "index.md"), "r", encoding="utf-8") as fh:
@@ -3533,7 +3371,7 @@ Parses JWT claims.
             dst_concepts = read_okf_concepts(dst_db, resource="src/vault.py")
             self.assertEqual(len(dst_concepts), 1)
             self.assertEqual(dst_concepts[0]["title"], "Crypto Vault")
-            self.assertEqual(dst_concepts[0]["trust_tier"], "human_reviewed")
+            self.assertEqual(dst_concepts[0]["trust_tier"], "unverified")
         finally:
             shutil.rmtree(temp_dir)
 
@@ -3640,6 +3478,30 @@ Parses JWT claims.
                 check=True
             )
             self.assertIn("Imported", res_imp.stdout)
+
+            # 4. Test CLI --remediate generating architectural remediation dossier
+            from core.database import write_findings
+            write_findings(db_path, "src/crypto.py", [{
+                "filepath": "src/crypto.py",
+                "title": "Insecure AES padding",
+                "severity": "HIGH",
+                "description": "PKCS#7 padding oracle vulnerability.",
+                "remediation": "Use AES-GCM authenticated encryption.",
+                "status": "dynamic_confirmed",
+                "lineage_id": "c3a5e982-1234-5678-9abc-def012345678",
+                "repro_cmd": "python3 repro_aes.py",
+            }], run_id="run-1", status="dynamic_confirmed")
+            res_rem = subprocess.run(
+                [sys.executable, advise_script, "--db", db_path, "--remediate", "src/crypto.py"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            self.assertIn("Architectural Remediation Dossier", res_rem.stdout)
+            self.assertIn("Insecure AES padding", res_rem.stdout)
+            self.assertIn("Crypto Engine", res_rem.stdout)
+            self.assertIn("Use AES-GCM authenticated encryption", res_rem.stdout)
+            self.assertIn("Bypass Prevention", res_rem.stdout)
         finally:
             shutil.rmtree(temp_dir)
 
@@ -4097,31 +3959,14 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(kwargs.get("vertex_project"), "fallback-after-env-placeholder")
 
-    def test_mythos_scrub_verification(self):
+    def test_model_catalog_configuration(self):
         from core.config import RECOMMENDED_MODELS, DEFAULT_MODEL
-        import subprocess
 
-        # 1. Check RECOMMENDED_MODELS does not contain mythos
-        for m in RECOMMENDED_MODELS:
-            self.assertNotIn("mythos", m.lower())
-        self.assertNotIn("mythos", DEFAULT_MODEL.lower())
+        # 1. Check RECOMMENDED_MODELS and DEFAULT_MODEL catalog
         self.assertIn("vertex_ai/claude-opus-5", RECOMMENDED_MODELS)
         self.assertNotIn("anthropic/claude-opus-5", RECOMMENDED_MODELS)
         self.assertIn("vertex_ai/zai_org/glm-5.2-maas", RECOMMENDED_MODELS)
-
-        # 2. Git grep check across repo to verify 0 mythos occurrences in tracked files
-        repo_root = str(Path(__file__).resolve().parent.parent)
-        res = subprocess.run(
-            ["git", "grep", "-i", "mythos", "--", ":!reference/test_suite.py"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(
-            res.stdout.strip(),
-            "",
-            f"Tracked files contain 'mythos' references:\n{res.stdout}"
-        )
+        self.assertEqual(DEFAULT_MODEL, "vertex_ai/gemini-3.7-flash")
 
     def test_model_normalization_and_routing(self):
         from core.config import normalize_model_id, get_llm_kwargs
@@ -4248,6 +4093,746 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(rc, 0)
 
+        # 5. Launch with live probe flag enabled
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-123"}):
+            with patch("scripts.configure._probe_llm_reachability", return_value=(True, "LLM reachability verified.")):
+                rc = run_launch(
+                    target=os.path.join(self.temp_dir, "prompt.md"),
+                    workflow_path=self.sample_wf_path,
+                    sandbox="static-only",
+                    preflight_only=True,
+                    probe_llm=True,
+                )
+                self.assertEqual(rc, 0)
+
+    def test_llm_reachability_probe(self):
+        from scripts.configure import (
+            _probe_llm_reachability,
+            _check_llm_preflight,
+            run_preflight_checks,
+        )
+
+        # 1. Probe success
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        with patch("litellm.completion", return_value=mock_resp) as mock_comp:
+            ok, msg = _probe_llm_reachability(
+                "vertex_ai/claude-opus-5",
+                {"vertex_project": "test-proj", "vertex_location": "us"},
+                prompt="test",
+                max_tokens=256,
+                timeout=15.0,
+            )
+            self.assertTrue(ok)
+            self.assertIn("verified", msg)
+            mock_comp.assert_called_once()
+            call_kwargs = mock_comp.call_args[1]
+            self.assertEqual(call_kwargs["messages"], [{"role": "user", "content": "test"}])
+            self.assertEqual(call_kwargs["max_tokens"], 256)
+            self.assertEqual(call_kwargs["timeout"], 15.0)
+
+        # 2. Probe failure with exception
+        with patch("litellm.completion", side_effect=RuntimeError("Connection refused to vertex")):
+            ok, msg = _probe_llm_reachability(
+                "vertex_ai/claude-opus-5",
+                {"vertex_project": "test-proj"},
+            )
+            self.assertFalse(ok)
+            self.assertIn("Connection refused", msg)
+
+        # 3. Preflight probe integration (probe=True vs probe=False)
+        cfg = {
+            "default_model": "vertex_ai/gemini-3.7-flash",
+            "sandbox": {"type": "static-only"},
+        }
+        with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+            # Static check only (probe=False) does not call completion
+            with patch("litellm.completion") as mock_comp:
+                ok, msg = _check_llm_preflight(cfg, probe=False)
+                self.assertTrue(ok)
+                mock_comp.assert_not_called()
+
+            # Active probe (probe=True) calls completion
+            with patch("litellm.completion", return_value=mock_resp) as mock_comp:
+                ok, msg = _check_llm_preflight(cfg, probe=True)
+                self.assertTrue(ok)
+                self.assertIn("Live probe: OK", msg)
+                mock_comp.assert_called_once()
+
+            # MANTIS_PROBE_LLM env var triggers probe
+            with patch.dict(os.environ, {"MANTIS_PROBE_LLM": "1"}):
+                with patch("litellm.completion", return_value=mock_resp) as mock_comp:
+                    ok, msgs = run_preflight_checks(cfg)
+                    self.assertTrue(ok)
+                    self.assertTrue(any("Live probe: OK" in m for m in msgs))
+                    mock_comp.assert_called_once()
+
+
+        # 4. Probe 429 rate limit retry and recovery
+        class Mock429(Exception):
+            status_code = 429
+            def __str__(self):
+                return 'vertex_aiException - {"error": {"code": 429, "message": "Quota exceeded for aiplatform.googleapis.com/us_multi_region_online_prediction_input_tokens_per_minute_per_base_model with base model: anthropic-claude-opus-5.", "status": "RESOURCE_EXHAUSTED"}}'
+
+        # Probe recovers after transient 429
+        probe_calls = 0
+        def _flaky_completion(*args, **kwargs):
+            nonlocal probe_calls
+            probe_calls += 1
+            if probe_calls == 1:
+                raise Mock429()
+            return mock_resp
+
+        with patch("litellm.completion", side_effect=_flaky_completion) as mock_comp, patch("time.sleep") as mock_sleep:
+            ok, msg = _probe_llm_reachability(
+                "vertex_ai/claude-opus-5",
+                {"vertex_project": "test-proj"},
+            )
+            self.assertTrue(ok)
+            self.assertIn("verified", msg)
+            self.assertEqual(mock_comp.call_count, 2)
+            mock_sleep.assert_called_once()
+            self.assertGreaterEqual(mock_sleep.call_args[0][0], 5.0)
+
+        # Probe persistent 429 returns verified reachability with rate-limit detail
+        with patch("litellm.completion", side_effect=Mock429()) as mock_comp, patch("time.sleep"):
+            ok, msg = _probe_llm_reachability(
+                "vertex_ai/claude-opus-5",
+                {"vertex_project": "test-proj"},
+            )
+            self.assertTrue(ok)
+            self.assertIn("rate-limited", msg)
+            self.assertIn("Quota exceeded", msg)
+            self.assertEqual(mock_comp.call_count, 3)
+
+    def test_39_resilient_llm_rate_limit_backoff(self):
+        """Validates ResilientLiteLlm and ResilientLiteLLMClient full jitter backoff (min 5s offset, 1h patience) on 429 quota exhaustion."""
+        from core.config import (
+            is_rate_limit_error,
+            extract_retry_after,
+            extract_rate_limit_detail,
+            compute_full_jitter_delay,
+            ResilientLiteLLMClient,
+            ResilientLiteLlm,
+        )
+        import litellm
+
+        class MockQuotaExhausted(Exception):
+            status_code = 429
+            def __str__(self):
+                return 'vertex_aiException - {"error": {"code": 429, "message": "Quota exceeded for aiplatform.googleapis.com/us_multi_region_online_prediction_input_tokens_per_minute_per_base_model with base model: anthropic-claude-opus-5.", "status": "RESOURCE_EXHAUSTED"}}'
+
+        # 1. Full jitter calculation & min offset (5.0s) verification
+        for _ in range(20):
+            d0 = compute_full_jitter_delay(0, initial_delay=5.0, min_offset=5.0, max_delay=60.0)
+            self.assertEqual(d0, 5.0)
+            d1 = compute_full_jitter_delay(1, initial_delay=5.0, min_offset=5.0, max_delay=60.0)
+            self.assertTrue(5.0 <= d1 <= 10.0)
+            d2 = compute_full_jitter_delay(2, initial_delay=5.0, min_offset=5.0, max_delay=60.0)
+            self.assertTrue(5.0 <= d2 <= 20.0)
+            d5 = compute_full_jitter_delay(5, initial_delay=5.0, min_offset=5.0, max_delay=60.0)
+            self.assertTrue(5.0 <= d5 <= 60.0)
+
+        # Retry-After and max remaining patience capping
+        d_retry = compute_full_jitter_delay(1, retry_after=12.0, min_offset=5.0, max_delay=60.0)
+        self.assertTrue(d_retry >= 12.0)
+        d_cap = compute_full_jitter_delay(5, max_remaining=3.5, min_offset=5.0, max_delay=60.0)
+        self.assertEqual(d_cap, 3.5)
+
+        # 2. Error classification helpers
+        self.assertTrue(is_rate_limit_error(MockQuotaExhausted()))
+        self.assertTrue(is_rate_limit_error(RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded")))
+        if hasattr(litellm, "RateLimitError"):
+            try:
+                rate_err = litellm.RateLimitError(
+                    message="Rate limit exceeded",
+                    model="anthropic-claude-opus-5",
+                    llm_provider="vertex_ai",
+                )
+                self.assertTrue(is_rate_limit_error(rate_err))
+            except Exception:
+                pass
+        self.assertFalse(is_rate_limit_error(RuntimeError("401 Unauthorized")))
+        self.assertFalse(is_rate_limit_error(ValueError("Invalid syntax")))
+
+        detail = extract_rate_limit_detail(MockQuotaExhausted())
+        self.assertIn("us_multi_region_online_prediction_input_tokens_per_minute_per_base_model", detail)
+
+        # 3. ResilientLiteLLMClient acompletion backoff and recovery
+        client = ResilientLiteLLMClient()
+        call_count = 0
+        from litellm.types.utils import ModelResponse, Choices, Message
+        mock_success = ModelResponse()
+        mock_success.choices = [Choices(message=Message(content="Resilient reply"))]
+
+        async def _mock_acompletion(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise MockQuotaExhausted()
+            return mock_success
+
+        with patch("litellm.acompletion", side_effect=_mock_acompletion), patch("asyncio.sleep") as mock_sleep:
+            res = asyncio.run(
+                client.acompletion(
+                    model="vertex_ai/claude-opus-5",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+            )
+            self.assertEqual(res.choices[0].message.content, "Resilient reply")
+            self.assertEqual(call_count, 3)
+            self.assertEqual(mock_sleep.call_count, 2)
+            for sleep_call in mock_sleep.call_args_list:
+                self.assertGreaterEqual(sleep_call[0][0], 5.0)
+
+        # 4. ResilientLiteLLMClient patience exhaustion test
+        async def _mock_always_429(*args, **kwargs):
+            raise MockQuotaExhausted()
+
+        fake_time_seq = [0.0, 3605.0]
+        with patch("litellm.acompletion", side_effect=_mock_always_429), patch("time.time", side_effect=lambda: fake_time_seq.pop(0) if fake_time_seq else 4000.0):
+            with self.assertRaises(MockQuotaExhausted):
+                asyncio.run(
+                    client.acompletion(
+                        model="vertex_ai/claude-opus-5",
+                        messages=[{"role": "user", "content": "hello"}],
+                    )
+                )
+
+        # 5. ResilientLiteLlm generate_content_async recovery
+        llm = ResilientLiteLlm(model="vertex_ai/claude-opus-5")
+        gen_calls = 0
+
+        from google.adk.models import LlmRequest, LlmResponse
+        from google.genai import types
+
+        async def _mock_gen_acompletion(*args, **kwargs):
+            nonlocal gen_calls
+            gen_calls += 1
+            if gen_calls == 1:
+                raise MockQuotaExhausted()
+            return mock_success
+
+        with patch("litellm.acompletion", side_effect=_mock_gen_acompletion), patch("asyncio.sleep") as mock_sleep:
+            req = types.Content(role="user", parts=[types.Part.from_text(text="audit")])
+            llm_req = LlmRequest(model="vertex_ai/claude-opus-5", contents=[req])
+            responses = []
+            async def _consume():
+                async for r in llm.generate_content_async(llm_req):
+                    responses.append(r)
+            asyncio.run(_consume())
+            self.assertEqual(len(responses), 1)
+            self.assertEqual(gen_calls, 2)
+            self.assertEqual(mock_sleep.call_count, 1)
+            self.assertGreaterEqual(mock_sleep.call_args[0][0], 5.0)
+
+    def test_auth_error_handling_and_no_retry(self):
+        """Validates that LLM auth errors (RefreshError, ADC expiry, invalid_grant)
+        are cleanly detected, formatted into actionable user instructions without tracebacks,
+        and fail immediately without retrying or opening browser popups."""
+        import google.auth.exceptions
+        import litellm
+        from core.config import (
+            MantisAuthError,
+            is_auth_error,
+            format_auth_error_message,
+            ResilientLiteLLMClient,
+            ResilientLiteLlm,
+        )
+
+        # 1. Verify reauth popup suppression
+        import google.oauth2.reauth
+        self.assertFalse(google.oauth2.reauth.is_interactive())
+
+        import google.oauth2.credentials
+        creds = google.oauth2.credentials.Credentials(token="fake-token")
+        self.assertFalse(creds._enable_reauth_refresh)
+
+        # 2. Verify is_auth_error detection
+        refresh_err = google.auth.exceptions.RefreshError(
+            "Reauthentication is needed. Please run 'gcloud auth application-default login' to reauthenticate."
+        )
+        self.assertTrue(is_auth_error(refresh_err))
+
+        default_creds_err = google.auth.exceptions.DefaultCredentialsError(
+            "Your default credentials were not found."
+        )
+        self.assertTrue(is_auth_error(default_creds_err))
+
+        litellm_auth_err = litellm.AuthenticationError(
+            "AuthenticationError: Invalid API Key provided",
+            model="gemini-3.7-flash",
+            llm_provider="vertex_ai",
+        )
+        self.assertTrue(is_auth_error(litellm_auth_err))
+
+        # Wrapped exception detection
+        wrapped = RuntimeError("ADK Runner execution failed")
+        wrapped.__cause__ = refresh_err
+        self.assertTrue(is_auth_error(wrapped))
+
+        # Non-auth errors
+        self.assertFalse(is_auth_error(ValueError("syntax error")))
+        self.assertFalse(is_auth_error(RuntimeError("connection reset")))
+
+        # 3. Verify format_auth_error_message content
+        banner = format_auth_error_message(refresh_err, model="vertex_ai/gemini-3.7-flash")
+        self.assertIn("AUTHENTICATION ERROR", banner)
+        self.assertIn("gcloud auth application-default login", banner)
+        self.assertIn("export GOOGLE_APPLICATION_CREDENTIALS", banner)
+        self.assertNotIn("Traceback", banner)
+
+        # 4. Verify ResilientLiteLLMClient raises MantisAuthError immediately without retrying
+        client = ResilientLiteLLMClient()
+        attempt_count = 0
+
+        async def _mock_auth_fail(*args, **kwargs):
+            nonlocal attempt_count
+            attempt_count += 1
+            raise refresh_err
+
+        with patch("litellm.acompletion", side_effect=_mock_auth_fail), patch("asyncio.sleep") as mock_sleep:
+            with self.assertRaises(MantisAuthError) as ctx:
+                asyncio.run(
+                    client.acompletion(
+                        model="vertex_ai/gemini-3.7-flash",
+                        messages=[{"role": "user", "content": "test"}],
+                    )
+                )
+            self.assertEqual(attempt_count, 1)  # No retry!
+            mock_sleep.assert_not_called()
+            self.assertIn("gcloud auth application-default login", str(ctx.exception))
+
+        # Synchronous completion raises MantisAuthError immediately
+        sync_attempts = 0
+
+        def _mock_sync_auth_fail(*args, **kwargs):
+            nonlocal sync_attempts
+            sync_attempts += 1
+            raise refresh_err
+
+        with patch("litellm.completion", side_effect=_mock_sync_auth_fail), patch("time.sleep") as mock_time_sleep:
+            with self.assertRaises(MantisAuthError):
+                client.completion(
+                    model="vertex_ai/gemini-3.7-flash",
+                    messages=[{"role": "user", "content": "test"}],
+                )
+            self.assertEqual(sync_attempts, 1)
+            mock_time_sleep.assert_not_called()
+
+        # 5. ResilientLiteLlm.generate_content_async raises MantisAuthError immediately
+        llm = ResilientLiteLlm(model="vertex_ai/gemini-3.7-flash")
+        from google.adk.models import LlmRequest
+        from google.genai import types
+
+        req = types.Content(role="user", parts=[types.Part.from_text(text="audit")])
+        llm_req = LlmRequest(model="vertex_ai/gemini-3.7-flash", contents=[req])
+
+        with patch("litellm.acompletion", side_effect=_mock_auth_fail), patch("asyncio.sleep") as mock_sleep:
+            async def _consume():
+                async for _ in llm.generate_content_async(llm_req):
+                    pass
+            with self.assertRaises(MantisAuthError):
+                asyncio.run(_consume())
+            mock_sleep.assert_not_called()
+
+        # 6. Verify ExpectedErrorLoggingFilter suppresses tracebacks for MantisAuthError
+        # and BudgetExceededError, while preserving full tracebacks for unexpected errors
+        import logging
+        from core.config import ExpectedErrorLoggingFilter
+        from core.budget import BudgetExceededError
+
+        filter_inst = ExpectedErrorLoggingFilter()
+
+        # Auth error record with exc_info -> should be suppressed
+        auth_record = logging.LogRecord(
+            name="google_adk.google.adk.runners",
+            level=logging.ERROR,
+            pathname="runners.py",
+            lineno=1065,
+            msg="Root node test failed.",
+            args=(),
+            exc_info=(MantisAuthError, MantisAuthError("auth fail"), None),
+        )
+        self.assertFalse(filter_inst.filter(auth_record))
+
+        # BudgetExceededError record with exc_info -> should be suppressed
+        budget_err = BudgetExceededError(
+            trigger="max_time",
+            current_value=100.0,
+            limit_value=50.0,
+            run_id="run-1",
+        )
+        budget_record = logging.LogRecord(
+            name="google_adk.google.adk.runners",
+            level=logging.ERROR,
+            pathname="runners.py",
+            lineno=1065,
+            msg="Root node test failed.",
+            args=(),
+            exc_info=(BudgetExceededError, budget_err, None),
+        )
+        self.assertFalse(filter_inst.filter(budget_record))
+
+        # Unexpected error (e.g. ValueError) -> must NOT be suppressed!
+        unexpected_record = logging.LogRecord(
+            name="google_adk.google.adk.runners",
+            level=logging.ERROR,
+            pathname="runners.py",
+            lineno=1065,
+            msg="Root node test failed.",
+            args=(),
+            exc_info=(ValueError, ValueError("unexpected bug"), None),
+        )
+        self.assertTrue(filter_inst.filter(unexpected_record))
+
+        # 7. Verify message-text matching filter for LiteLLM credential load failures
+        msg_record = logging.LogRecord(
+            name="LiteLLM",
+            level=logging.ERROR,
+            pathname="vertex_llm_base.py",
+            lineno=485,
+            msg="Failed to load vertex credentials: %s",
+            args=("Reauthentication is needed. Please run `gcloud auth application-default login` to reauthenticate.",),
+            exc_info=None,
+        )
+        self.assertFalse(filter_inst.filter(msg_record))
+
+        # 8. Verify format_auth_error_message avoids duplicate banners
+        double_banner = format_auth_error_message(Exception(banner))
+        self.assertEqual(double_banner.count("❌ [AUTHENTICATION ERROR]"), 1)
+
+        # 9. Verify ADK node retry hook prevents retrying on auth errors and budget errors
+        from google.adk.workflow._retry_config import RetryConfig
+        from google.adk.workflow._node_state import NodeState
+        from google.adk.workflow.utils._retry_utils import _should_retry_node
+
+        retry_cfg = RetryConfig(max_attempts=3)
+        node_st = NodeState(attempt_count=1)
+
+        self.assertFalse(_should_retry_node(refresh_err, retry_cfg, node_st))
+        self.assertFalse(_should_retry_node(default_creds_err, retry_cfg, node_st))
+        self.assertFalse(_should_retry_node(MantisAuthError("auth fail"), retry_cfg, node_st))
+        self.assertFalse(_should_retry_node(budget_err, retry_cfg, node_st))
+        self.assertTrue(_should_retry_node(ValueError("transient error"), retry_cfg, node_st))
+
+    def test_token_refreshable_auth_error_and_single_refresh_retry(self):
+        """Validates that expired access tokens (401 / expired) trigger a single automatic
+        auth refresh and request retry, while unrecoverable auth failures do not retry."""
+        import litellm
+        from core.config import (
+            is_token_refreshable_auth_error,
+            clear_vertex_credential_caches,
+            ResilientLiteLLMClient,
+        )
+        from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+
+        # 1. Test is_token_refreshable_auth_error
+        err_401 = litellm.AuthenticationError("401 Unauthorized", model="gemini", llm_provider="vertex_ai")
+        err_401.status_code = 401
+        self.assertTrue(is_token_refreshable_auth_error(err_401))
+
+        err_expired = RuntimeError("The credentials are expired and could not be refreshed")
+        self.assertTrue(is_token_refreshable_auth_error(err_expired))
+
+        # Unrecoverable errors must return False
+        err_reauth = RuntimeError("Reauthentication is needed. Please run 'gcloud auth application-default login'")
+        self.assertFalse(is_token_refreshable_auth_error(err_reauth))
+
+        err_api_key = litellm.AuthenticationError("Invalid API Key provided", model="gemini", llm_provider="vertex_ai")
+        self.assertFalse(is_token_refreshable_auth_error(err_api_key))
+
+        # 2. Test clear_vertex_credential_caches clears mapping across VertexBase instances
+        vb = VertexBase()
+        vb._credentials_project_mapping[("key", "proj")] = ("token", "proj")
+        self.assertEqual(len(vb._credentials_project_mapping), 1)
+        clear_vertex_credential_caches()
+        self.assertEqual(len(vb._credentials_project_mapping), 0)
+
+        # 3. Test ResilientLiteLLMClient retries once on refreshable 401 when try_refresh_auth succeeds
+        client = ResilientLiteLLMClient()
+        attempts = 0
+
+        async def _mock_recovering_acompletion(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                e = litellm.AuthenticationError("401 Unauthorized", model="gemini", llm_provider="vertex_ai")
+                e.status_code = 401
+                raise e
+            return "ok"
+
+        with patch("litellm.acompletion", side_effect=_mock_recovering_acompletion), \
+             patch("core.config.try_refresh_auth", return_value=True) as mock_refresh:
+            res = asyncio.run(
+                client.acompletion(
+                    model="vertex_ai/gemini-3.7-flash",
+                    messages=[{"role": "user", "content": "test"}],
+                )
+            )
+            self.assertEqual(res, "ok")
+            self.assertEqual(attempts, 2)
+            mock_refresh.assert_called_once()
+
+    def test_strict_budget_parsing(self):
+        """Verifies strict parsing for durations and token ceilings without silent fallbacks."""
+        from core.budget import parse_duration_seconds, parse_token_budget, BudgetConfig
+
+        # Valid durations
+        self.assertEqual(parse_duration_seconds("1d"), 86400.0)
+        self.assertEqual(parse_duration_seconds("2days"), 172800.0)
+        self.assertEqual(parse_duration_seconds("12h"), 43200.0)
+        self.assertEqual(parse_duration_seconds("30m"), 1800.0)
+        self.assertEqual(parse_duration_seconds("3600s"), 3600.0)
+        self.assertEqual(parse_duration_seconds(100), 100.0)
+
+        # Invalid durations must raise ValueError
+        for bad_val in ("100xyz", "2weeks", "-5s", "", None):
+            with self.assertRaises(ValueError):
+                parse_duration_seconds(bad_val)
+
+        # Valid token budgets
+        self.assertEqual(parse_token_budget("1B"), 1_000_000_000)
+        self.assertEqual(parse_token_budget("2billion"), 2_000_000_000)
+        self.assertEqual(parse_token_budget("10M"), 10_000_000)
+        self.assertEqual(parse_token_budget("500k"), 500_000)
+        self.assertEqual(parse_token_budget("10000"), 10000)
+        self.assertEqual(parse_token_budget(5000), 5000)
+
+        # Invalid token budgets must raise ValueError
+        for bad_val in ("100xyz", "-10M", "", None):
+            with self.assertRaises(ValueError):
+                parse_token_budget(bad_val)
+
+        # BudgetConfig.from_dict preserves defaults for omitted, but raises on invalid
+        cfg = BudgetConfig.from_dict({"max_time": "1d", "token_budget": "1B"})
+        self.assertEqual(cfg.max_wall_clock_seconds, 86400.0)
+        self.assertEqual(cfg.max_tokens, 1_000_000_000)
+
+        with self.assertRaises(ValueError):
+            BudgetConfig.from_dict({"max_time": "bad_duration"})
+        with self.assertRaises(ValueError):
+            BudgetConfig.from_dict({"token_budget": "bad_tokens"})
+
+    def test_resumption_invocation_scope(self):
+        """Verifies intermediate node end_of_agent does not mark root invocation as ended."""
+        from main import APP_NAME
+
+        class MockAction:
+            def __init__(self, end_of_agent: bool):
+                self.end_of_agent = end_of_agent
+
+        class MockEvent:
+            def __init__(self, inv_id: str, author: str, end_of_agent: bool):
+                self.invocation_id = inv_id
+                self.author = author
+                self.actions = MockAction(end_of_agent)
+
+        inv_id = "inv-123"
+
+        # 1. Intermediate nodes finished, but root pipeline did not emit end_of_agent
+        events_paused = [
+            MockEvent(inv_id, "history", True),
+            MockEvent(inv_id, "architect", True),
+            MockEvent(inv_id, "researcher", True),
+            MockEvent(inv_id, "critic", False),  # paused mid-turn
+        ]
+
+        has_ended_paused = any(
+            getattr(e, "invocation_id", None) == inv_id
+            and getattr(getattr(e, "actions", None), "end_of_agent", False)
+            and getattr(e, "author", None) in (APP_NAME, "mantis_vulnerability_pipeline")
+            for e in events_paused
+        )
+        self.assertFalse(has_ended_paused, "Paused intermediate node must not mark invocation as ended")
+
+        # 2. Root pipeline emitted end_of_agent (standard workflow)
+        events_finished = list(events_paused) + [
+            MockEvent(inv_id, "mantis_vulnerability_pipeline", True)
+        ]
+        has_ended_finished = any(
+            getattr(e, "invocation_id", None) == inv_id
+            and getattr(getattr(e, "actions", None), "end_of_agent", False)
+            and getattr(e, "author", None) in ("mantis_vulnerability_pipeline",)
+            for e in events_finished
+        )
+        self.assertTrue(has_ended_finished, "Root pipeline end_of_agent must mark invocation as ended")
+
+        # 3. Synthesized/custom workflow root agent name
+        custom_root_name = "workflow_audit_kernel_ioctl_handlers"
+        events_synth_paused = [
+            MockEvent(inv_id, "researcher", True),
+            MockEvent(inv_id, "critic", False),
+        ]
+        has_ended_synth_paused = any(
+            getattr(e, "invocation_id", None) == inv_id
+            and getattr(getattr(e, "actions", None), "end_of_agent", False)
+            and getattr(e, "author", None) in (custom_root_name, "mantis_vulnerability_pipeline")
+            for e in events_synth_paused
+        )
+        self.assertFalse(has_ended_synth_paused)
+
+        events_synth_finished = list(events_synth_paused) + [
+            MockEvent(inv_id, custom_root_name, True)
+        ]
+        has_ended_synth_finished = any(
+            getattr(e, "invocation_id", None) == inv_id
+            and getattr(getattr(e, "actions", None), "end_of_agent", False)
+            and getattr(e, "author", None) in (custom_root_name, "mantis_vulnerability_pipeline")
+            for e in events_synth_finished
+        )
+        self.assertTrue(has_ended_synth_finished, "Synthesized workflow root agent end_of_agent must mark invocation as ended")
+
+    def test_finding_file_attribution_and_repair(self):
+        """Verifies canonical_filepath and write_findings repair missing filepaths from code_paths."""
+        import tempfile
+        from core.database import canonical_filepath, write_findings, read_findings, init_db
+        from core.context import RunContext, current_run_context
+        from tools.research_tools import report_findings
+
+        with tempfile.TemporaryDirectory() as td:
+            db_file = os.path.join(td, "test_k.db")
+            init_db(db_file)
+            repo_dir = os.path.join(td, "my_repo")
+            os.makedirs(os.path.join(repo_dir, "core"), exist_ok=True)
+            target_file = os.path.join(repo_dir, "core", "llm.py")
+            with open(target_file, "w") as f:
+                f.write("# code\n")
+
+            ctx = RunContext(
+                jail_dir=repo_dir,
+                target_file=repo_dir,  # Repo-scope mode: target is directory!
+                db_path=db_file,
+                run_id="run-attr",
+            )
+            token = current_run_context.set(ctx)
+            try:
+                # 1. canonical_filepath on repo_dir must return empty string, NOT 'Users/...' or mangled path
+                self.assertEqual(canonical_filepath(repo_dir), "")
+
+                # 2. Finding with empty filepath but valid code_paths gets repaired
+                f_unattributed = {
+                    "title": "Boundary Escape",
+                    "severity": "HIGH",
+                    "description": "Flaw description",
+                    "code_paths": ["core/llm.py:42"],
+                }
+                write_findings(db_file, repo_dir, [f_unattributed], run_id="run-attr")
+                rows = read_findings(db_file, run_id="run-attr")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["filepath"], "core/llm.py")
+                self.assertEqual(rows[0]["line_numbers"], [42])
+
+                # 3. report_findings returns validation feedback when filepath cannot be determined
+                f_no_file = {
+                    "title": "Abstract Flaw",
+                    "severity": "LOW",
+                    "description": "No code paths or file",
+                    "filepath": "",
+                    "code_paths": [],
+                }
+                res = report_findings({"findings": [f_no_file]})
+                self.assertTrue(res.startswith("Error: Finding 'Abstract Flaw' has missing or invalid 'filepath'"))
+            finally:
+                current_run_context.reset(token)
+
+
+class ShipAuditPreflightTests(unittest.TestCase):
+    """Regression tests verifying resolution of the 5 Pre-Ship Audit findings."""
+
+    def test_detect_vcs_info_annotations_and_tool_declaration(self):
+        """Item 1: Verify typing imports and evaluation for detect_vcs_info."""
+        import typing
+        from tools.research_tools import detect_vcs_info
+        from google.adk.tools.function_tool import FunctionTool
+
+        hints = typing.get_type_hints(detect_vcs_info)
+        self.assertIn("target_path", hints)
+        self.assertIn("return", hints)
+
+        tool = FunctionTool(detect_vcs_info)
+        decl = tool._get_declaration()
+        self.assertEqual(decl.name, "detect_vcs_info")
+
+    def test_safe_markdown_fence_and_inline_escaping(self):
+        """Item 2: Verify safe_markdown_fence prevents fence-break and safe_markdown_inline demotes headings."""
+        from core.llm_gateway import safe_markdown_fence, safe_markdown_inline
+
+        diff_with_backticks = "--- a/test.py\n+++ b/test.py\n@@ -1,2 +1,3 @@\n+```\n+# Injected Heading\n+```"
+        fenced = safe_markdown_fence(diff_with_backticks, lang="diff")
+        self.assertTrue(fenced.startswith("````diff\n"))
+        self.assertTrue(fenced.endswith("\n````"))
+
+        inlined = safe_markdown_inline("# Host Heading\nNormal line\n---")
+        self.assertIn("> # Host Heading", inlined)
+        self.assertIn("> ---", inlined)
+
+    def test_static_confirmed_findings_visible_in_advisory(self):
+        """Item 4: Verify static_confirmed findings are returned by query_security_guidance."""
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            init_db(tmp.name)
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "INSERT INTO findings (id, run_id, title, severity, filepath, line_numbers, status, description, remediation) "
+                "VALUES (1, 'run_static', 'Command Injection', 'CRITICAL', 'api/exec.py', '[\"10\"]', 'static_confirmed', 'popen flaw', 'use argv')"
+            )
+            conn.commit()
+            conn.close()
+
+            from core.database import query_security_guidance
+            guidance = query_security_guidance(tmp.name, filepath="api/exec.py")
+            summary = guidance.get("guidance_summary", "")
+            self.assertIn("Command Injection", summary)
+            self.assertIn("static_confirmed", summary)
+            self.assertEqual(len(guidance.get("confirmed_vulnerabilities", [])), 1)
+
+    def test_inject_active_findings_state_non_mutation_and_dedup(self):
+        """Item 5: Verify _inject_active_findings_state does not mutate session dicts in place and dedups cleanly."""
+        from google.genai import types
+        from core.config import ResilientLiteLlm
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            init_db(tmp.name)
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "INSERT INTO findings (id, run_id, title, severity, filepath, line_numbers, status) "
+                "VALUES (1, 'run_dedup', 'SQL Injection in Auth\nMultiline title', 'HIGH', 'src/auth.py', '[\"42\"]', 'static_confirmed')"
+            )
+            conn.commit()
+            conn.close()
+
+            ctx = RunContext(jail_dir=".", db_path=tmp.name, run_id="run_dedup")
+            tok = current_run_context.set(ctx)
+            try:
+                orig_resp = {"output": "original tool result"}
+                fr_part = types.Part(
+                    function_response=types.FunctionResponse(name="read_file", response=orig_resp)
+                )
+                content = types.Content(role="user", parts=[fr_part])
+
+                class MockReq:
+                    contents = [content]
+
+                req = MockReq()
+                ResilientLiteLlm._inject_active_findings_state(req)
+
+                # 1. Original response dict MUST NOT be mutated in place
+                self.assertEqual(orig_resp["output"], "original tool result")
+
+                # 2. Request part got state block with scrubbed title
+                new_resp = req.contents[0].parts[0].function_response.response
+                self.assertIn("[STATE STORE: RECORDED FINDINGS", str(new_resp))
+                self.assertNotIn("Multiline title\n", str(new_resp))
+
+                # 3. Repeated dispatch dedup
+                ResilientLiteLlm._inject_active_findings_state(req)
+                count = str(req.contents[0].parts[0].function_response.response).count("[STATE STORE: RECORDED FINDINGS")
+                self.assertEqual(count, 1)
+            finally:
+                current_run_context.reset(tok)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

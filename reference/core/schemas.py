@@ -1,11 +1,9 @@
-"""
-# AUTO-GENERATED DYNAMICALLY FROM schema.json - DO NOT EDIT DIRECTLY.
-# To regenerate, run: python3 reference/scripts/generate_schemas.py
-"""
+"""Mantis Core Pydantic Schemas and Invariant Enforcers."""
+
 
 from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, Field, ConfigDict, AliasChoices, field_validator
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Canonical Models (Generated Dynamically by Inspecting schema.json $defs)
@@ -123,7 +121,6 @@ class FindingSchema(BaseModel):
     sanity_triage_applied: Optional[str] = Field(default="", description="Semicolon-separated list of sanity triage caps and downgrades that fired.")
     triage_checklist: Optional[TriageChecklistSchema] = Field(default=None)
     calibration_checklist: Optional[CalibrationChecklistSchema] = Field(default=None)
-    outrage_commentary: Optional[str] = Field(default="", description="Reasoning about the outrage factor (Risk = Hazard + Outrage).")
     executive_summary: Optional[str] = Field(default="", description="High-level summary of the risk for stakeholders.")
     constituent_findings: Optional[List[str]] = Field(default_factory=list, description="Array of finding UUIDs that constitute this exploit chain finding.")
     discovery_commit: Optional[str] = Field(default="", description="The SNAPSHOT_ID (see the SNAPSHOT_ID ladder in the top-level description) of the")
@@ -147,6 +144,17 @@ class FindingSchema(BaseModel):
             return v.upper()
         return v
 
+    @model_validator(mode='after')
+    def validate_invariants(self) -> FindingSchema:
+        # INV-1 / INV-2: VERIFIED_SECURE requires failed_to_bypass reattack_status
+        if self.patch_status == "VERIFIED_SECURE":
+            if self.reattack_status != "failed_to_bypass":
+                raise ValueError(
+                    "INV-1/INV-2 violation: patch_status 'VERIFIED_SECURE' strictly requires "
+                    f"reattack_status to be 'failed_to_bypass', got '{self.reattack_status}'"
+                )
+        return self
+
 class LearningEntrySchema(BaseModel):
     """Schema for a single JSON line in workspace/learnings.jsonl (ephemeral inbox) or workspace/historical"""
     model_config = ConfigDict(extra="allow")
@@ -159,7 +167,7 @@ class LearningEntrySchema(BaseModel):
     title: Optional[str] = Field(default="", description="Finding title.")
     code_paths: Optional[List[str]] = Field(default_factory=list)
     status: Optional[Literal["VIABLE", "NON_VIABLE", "SAMPLE_OR_TEST", "CONDITIONAL_VIABLE", "FALSE_POSITIVE", "NEEDS_RESEARCH", "VERIFIED_SECURE", "MITIGATION_PROPOSED", "VERIFICATION_INCOMPLETE", "VERIFICATION_FAILED", "ERROR"]] = Field(default=None)
-    patch_base_snapshot: Optional[str] = Field(default="", description="The SNAPSHOT_ID the patch was verified against; written by mantis-patch (or omit")
+    patch_base_snapshot: Optional[str] = Field(default="", description="The SNAPSHOT_ID the patch was verified against; written by mantis-coder or mantis-patch (or omitted in LEGACY mode).")
     revision_id: Optional[str] = Field(default="")
     description: Optional[str] = Field(default="")
     vuln_type: Optional[str] = Field(default="")
@@ -171,7 +179,7 @@ class LearningEntrySchema(BaseModel):
     tags: Optional[List[str]] = Field(default_factory=list, description="Keywords and tags for indexing.")
 
 class StateSchema(BaseModel):
-    """The mantis state file (workspace/.mantis_state.json) tracks the loop context across rounds."""
+    """The mantis state schema tracks the loop context across rounds."""
     model_config = ConfigDict(extra="allow")
     pass_number: int = Field(validation_alias=AliasChoices('pass', 'pass_number'), description="The current sequential pass number of the pipeline.")
     last_updated: str = Field(description="ISO 8601 timestamp of when the state was last updated.")
@@ -271,7 +279,7 @@ class ThreatModel(BaseModel):
     key_risks: List[str] = Field(default_factory=list, description='Primary business or security risks identified')
 
 class CodebaseSummary(BaseModel):
-    """Codebase summary from /mantis-summarize."""
+    """Codebase summary from structural indexing and research."""
     model_config = ConfigDict(extra="ignore")
     overview: str = Field(default="", description='Executive summary of the codebase purpose and architecture', validation_alias=AliasChoices('overview', 'summary', 'description'))
     key_modules: List[Union[str, Dict[str, Any]]] = Field(default_factory=list, description='Core system components and directories')
@@ -292,6 +300,87 @@ class ExecutiveReport(BaseModel):
     critical_findings_count: int = Field(default=0, description='Total critical findings recorded')
     recommendations: List[str] = Field(default_factory=list, description='Prioritized remediation actions')
 
+class FindingCalibration(BaseModel):
+    """Structured risk calibration for an individual vulnerability finding."""
+    model_config = ConfigDict(extra="ignore")
+    finding_id: int = Field(description="Database ID of the finding being calibrated")
+    mantis_risk_score: float = Field(..., ge=0.1, le=10.0, description="Final calculated risk score (0.1 - 10.0 scale)")
+    priority: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"] = Field(..., description="Qualitative priority bucket")
+    impact_score: int = Field(..., ge=1, le=5, description="Technical impact score on CIA triad (1-5)")
+    likelihood_score: int = Field(..., ge=1, le=5, description="Exploit likelihood score (1-5)")
+    inferred_exposure: Optional[Literal["EXPOSED", "INTERNAL", "PRIVILEGED"]] = Field(default="INTERNAL", description="Resolved network/trust exposure tier")
+    attacker_position: Optional[str] = Field(default="INTERNAL_NETWORK", description="Outer boundary of untrusted attacker")
+    availability_tier: Optional[Literal["CRITICAL", "STANDARD", "LOW_CRITICALITY"]] = Field(default="STANDARD", description="Availability tier if DoS")
+    sanity_triage_applied: Optional[str] = Field(default="", description="Semicolon-separated list of sanity triage caps and downgrades that fired")
+    reasoning: str = Field(default="", description="Technical rationale justifying the impact, likelihood, caps applied, and final risk score")
+    executive_summary: Optional[str] = Field(default="", description="Concise executive summary of the vulnerability risk")
+    calibration_checklist: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Detailed evaluations for fired sanity caps")
+
+    @field_validator("mantis_risk_score", mode="before")
+    @classmethod
+    def normalize_score(cls, v: Any) -> float:
+        val = float(v)
+        if val > 10.0 and val <= 100.0:
+            val = val / 10.0
+        return max(0.1, min(10.0, val))
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, v: Any) -> str:
+        return str(v).upper().strip()
+
+class BatchCalibrationResult(BaseModel):
+    """Aggregated calibration report across all evaluated findings."""
+    model_config = ConfigDict(extra="ignore")
+    calibrated_count: int = Field(default=0)
+    findings: List[FindingCalibration] = Field(default_factory=list)
+    summary: str = Field(default="", description="Overview of calibration results")
+
+class FindingReview(BaseModel):
+    """Structured validation review for an individual candidate vulnerability finding."""
+    model_config = ConfigDict(extra="ignore")
+    finding_id: Optional[int] = Field(default=None, description="Database ID of the finding being reviewed")
+    verdict: Literal["confirmed", "false_positive"] = Field(
+        ...,
+        validation_alias=AliasChoices("verdict", "route", "status"),
+        description="Whether the finding is a confirmed vulnerability or rejected under the 13 triage rules as a false positive."
+    )
+    reason: str = Field(default="", description="One to two sentences justifying the review verdict based on source code.")
+    triage_checklist: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Evaluations of applicable triage rules.")
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def normalize_verdict(cls, v: Any) -> str:
+        if isinstance(v, str):
+            clean = v.strip().lower()
+            if clean in ("confirmed", "valid", "true", "true_positive", "tp"):
+                return "confirmed"
+            if clean in ("false_positive", "fp", "rejected", "invalid", "benign"):
+                return "false_positive"
+        return v
+
+class FindingCriticReview(BaseModel):
+    """Structured viability review for an individual vulnerability finding."""
+    model_config = ConfigDict(extra="ignore")
+    finding_id: Optional[int] = Field(default=None, description="Database ID of the finding being evaluated")
+    verdict: Literal["viable", "non_viable"] = Field(
+        ...,
+        validation_alias=AliasChoices("verdict", "route", "viability", "production_viability"),
+        description="Whether the flaw is triggerable in standard production/release builds (viable) or debug/test-only (non_viable)."
+    )
+    reason: str = Field(default="", description="One to two sentences justifying production viability.")
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def normalize_verdict(cls, v: Any) -> str:
+        if isinstance(v, str):
+            clean = v.strip().lower()
+            if clean in ("viable", "true", "valid", "prod"):
+                return "viable"
+            if clean in ("non_viable", "false", "nonviable", "debug_only", "test_only"):
+                return "non_viable"
+        return v
+
 # Schema.json helper registry
 SCHEMA_DEFINITIONS = {
     'finding': FindingSchema,
@@ -300,4 +389,9 @@ SCHEMA_DEFINITIONS = {
     'state': StateSchema,
     'triage_checklist': TriageChecklistSchema,
     'calibration_checklist': CalibrationChecklistSchema,
+    'finding_calibration': FindingCalibration,
+    'batch_calibration': BatchCalibrationResult,
+    'finding_review': FindingReview,
+    'finding_critic_review': FindingCriticReview,
 }
+

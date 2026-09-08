@@ -27,14 +27,17 @@ runtime overrides before running the pipeline.
   validation campaigns.
 - **Execution Commands:**
   ```bash
-  # From reference/ directory:
-  ./run.sh <target_file_or_dir> [flags...]
-  # or: python3 scripts/launch.py <target_file_or_dir> [flags...]
-
-  # From repository root:
-  ./reference/run.sh <target_file_or_dir> [flags...]
-  # or: python3 reference/scripts/launch.py <target_file_or_dir> [flags...]
+  python3 "${MANTIS_HOME:-/path/to/mantis}/reference/scripts/launch.py" <target_file_or_dir> [flags...]
+  "${MANTIS_HOME:-/path/to/mantis}/reference/run.sh" <target_file_or_dir> [flags...]
   ```
+
+**Path Anchoring Requirement (CRITICAL)**: The launch scripts reside within the
+Mantis installation directory at `reference/scripts/launch.py` and
+`reference/run.sh`. **You MUST invoke these scripts via an absolute path or via
+`$MANTIS_HOME`**. NEVER execute `./reference/run.sh` or
+`python3 reference/scripts/launch.py` using a relative path inside audited
+target repositories.
+
 - **CLI Options:**
   - `target` (positional): Path to a single source file (e.g. `src/auth.py`) or
     a root repository directory (e.g. `.` or `/path/to/repo`).
@@ -52,6 +55,9 @@ runtime overrides before running the pipeline.
   - `--workflow` / `-w`: Path to custom `workflow.json` layout definition.
   - `--preflight-only` / `--test` / `--preflight`: Run preflight checks and exit
     without starting the campaign.
+  - `--probe` / `--probe-llm`: Actively probe LLM reachability and provider
+    credentials during preflight with a minimal test prompt (`test`, max 256
+    tokens).
   - `--interactive`: Launch interactive configuration wizard before execution.
   - `--dry-run`: Display launch plan and indexed files without calling AI
     models.
@@ -77,32 +83,32 @@ Before starting a security campaign, `mantis-launch`:
 
 ```bash
 # Scan a specific file
-./reference/run.sh src/server/auth.py
+"$MANTIS_HOME/reference/run.sh" src/server/auth.py
 
 # Scan an entire repository
-./reference/run.sh .
+"$MANTIS_HOME/reference/run.sh" .
 ```
 
 ### 2. Launch with Static Analysis Only (Zero Sandbox Requirements)
 
 ```bash
-./reference/run.sh . --sandbox static-only
+"$MANTIS_HOME/reference/run.sh" . --sandbox static-only
 ```
 
 ### 3. Launch with Specific Model (e.g. Claude or Custom OpenAI Server)
 
 ```bash
 # Vertex AI Claude
-./reference/run.sh . --model vertex_ai/claude-opus-5
+"$MANTIS_HOME/reference/run.sh" . --model vertex_ai/claude-opus-5
 
 # Local vLLM / Ollama server
-./reference/run.sh . --model openai/custom-model --api-base http://localhost:8000/v1
+"$MANTIS_HOME/reference/run.sh" . --model openai/custom-model --api-base http://localhost:8000/v1
 ```
 
 ### 4. Verify Preflight Readiness Without Scanning
 
 ```bash
-python3 reference/scripts/launch.py . --preflight-only
+python3 "$MANTIS_HOME/reference/scripts/launch.py" . --preflight-only
 ```
 
 ### 5. Inspect Results After Launch
@@ -111,7 +117,7 @@ All findings, exploit reproduction logs, verified patches, and risk calibration
 scores are recorded in `knowledge.db`. Query guidance using `mantis-advise`:
 
 ```bash
-python3 reference/scripts/advise.py --file src/server/auth.py
+python3 "$MANTIS_HOME/reference/scripts/advise.py" --file src/server/auth.py
 ```
 
 ## Input/Output Contract

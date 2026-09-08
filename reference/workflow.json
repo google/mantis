@@ -5,88 +5,70 @@
     "retry_attempts": 3,
     "default_model": "vertex_ai/gemini-3.7-flash",
     "reasoning_effort": "medium",
+    "timeout": 180,
     "seed_prompt": "Initial Task Input: Evaluate {filepath}",
     "sandbox": {
-      "type": "gce",
-      "options": {
-        "project": "YOUR_PROJECT_ID",
-        "zone": "us-central1-b",
-        "image": "mantis-sandbox-image",
-        "subnet": "mantis-isolated-subnet",
-        "workdir": "/workspace",
-        "tunnel_through_iap": true,
-        "no_service_account": true,
-        "no_external_ip": true,
-        "verify_isolation": true,
-        "timeout_seconds": 600
-      }
+      "type": "static-only",
+      "options": {}
     }
+  },
+  "budget": {
+    "max_wall_clock_seconds": 43200,
+    "max_tokens": 10000000,
+    "max_graph_steps": 500,
+    "max_node_visits": 50,
+    "max_llm_calls": 2000,
+    "max_node_tool_calls": 200
   },
   "nodes": [
     {
       "id": "history",
       "type": "agent",
-      "skill": "../mantis-history",
       "model": "vertex_ai/gemini-3.5-flash-lite",
       "reasoning_effort": "low",
-      "tools": ["read_file", "write_file", "list_files", "record_summary", "get_summary"]
+      "tools": ["get_git_log", "get_git_diff", "read_file", "write_file", "list_files", "get_summary"]
     },
     {
       "id": "structural_index",
       "type": "agent",
-      "skill": "../mantis-structural-index",
       "model": "vertex_ai/gemini-3.5-flash-lite",
       "reasoning_effort": "low",
       "tools": ["read_file", "write_file", "list_files", "run_sandbox"]
     },
     {
-      "id": "summarizer",
-      "type": "agent",
-      "skill": "../mantis-summarize",
-      "model": "vertex_ai/gemini-3.5-flash-lite",
-      "reasoning_effort": "low",
-      "tools": ["read_file", "write_file", "list_files", "record_summary", "get_summary"]
-    },
-    {
       "id": "architect",
       "type": "agent",
-      "skill": "../mantis-architecture",
       "reasoning_effort": "medium",
-      "tools": ["read_file", "write_file", "list_files", "get_summary"]
+      "tools": ["read_file", "write_file", "list_files", "record_summary", "get_summary"]
     },
     {
       "id": "threat_modeler",
       "type": "agent",
-      "skill": "../mantis-threat-model",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "list_files", "get_summary", "record_threat_model", "get_threat_model"]
     },
     {
       "id": "planner",
       "type": "agent",
-      "skill": "../mantis-plan",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "record_plan", "get_plan"]
     },
     {
       "id": "researcher",
       "type": "agent",
-      "skill": "../mantis-researcher",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings"]
     },
     {
       "id": "deduplicator",
       "type": "agent",
-      "skill": "../mantis-dedupe",
       "model": "vertex_ai/gemini-3.5-flash-lite",
       "reasoning_effort": "low",
-      "tools": ["read_file", "write_file", "get_findings", "report_findings", "dedupe_findings"]
+      "tools": ["read_file", "write_file", "list_files", "get_findings", "report_findings", "dedupe_findings"]
     },
     {
       "id": "reviewer",
       "type": "agent",
-      "skill": "../mantis-review",
       "reasoning_effort": "medium",
       "tools": ["read_file", "get_findings", "get_threat_model", "get_summary"],
       "output_schema": "ReviewVerdict",
@@ -100,7 +82,6 @@
     {
       "id": "critic",
       "type": "agent",
-      "skill": "../mantis-critic",
       "reasoning_effort": "high",
       "tools": ["read_file", "get_findings", "get_threat_model"],
       "output_schema": "CriticVerdict",
@@ -114,10 +95,8 @@
     {
       "id": "reproducer",
       "type": "agent",
-      "skill": "../mantis-reproduce",
       "reasoning_effort": "high",
-      "timeout": 180.0,
-      "tools": ["run_sandbox", "get_findings", "get_threat_model", "read_file", "write_file"],
+      "tools": ["run_sandbox", "run_sandbox_with_evidence", "get_findings", "get_threat_model", "read_file", "write_file"],
       "on_enter_status": "static_confirmed",
       "output_schema": "ReproVerdict",
       "output_key": "verdict"
@@ -125,43 +104,37 @@
     {
       "id": "repro_classifier",
       "type": "classifier",
-      "routes": ["success"],
-      "max_visits": 2
+      "routes": ["success"]
     },
     {
       "id": "chainer",
       "type": "agent",
-      "skill": "../mantis-chain",
       "reasoning_effort": "high",
       "tools": ["read_file", "write_file", "get_findings", "get_threat_model", "record_exploit_chain"]
     },
     {
       "id": "patcher",
       "type": "agent",
-      "skill": "../mantis-patch",
       "reasoning_effort": "high",
-      "timeout": 180.0,
-      "tools": ["apply_patch", "run_sandbox", "read_file", "write_file", "get_findings"],
+      "tools": ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
       "on_enter_status": "dynamic_confirmed"
     },
     {
       "id": "calibrator",
       "type": "agent",
-      "skill": "../mantis-calibrate",
       "reasoning_effort": "medium",
-      "tools": ["score_risk", "calibrate_finding", "get_findings", "get_threat_model", "read_file"]
+      "tools": ["score_risk", "calibrate_finding", "get_findings", "get_threat_model", "read_file", "write_file"],
+      "output_schema": "FindingCalibration"
     },
     {
       "id": "reflector",
       "type": "agent",
-      "skill": "../mantis-reflect",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "get_findings", "record_learning"]
     },
     {
       "id": "reporter",
       "type": "agent",
-      "skill": "../mantis-report",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "get_findings", "get_plan", "get_threat_model", "get_summary", "generate_report"]
     }
@@ -169,8 +142,7 @@
   "edges": [
     {"from": "START", "to": "history"},
     {"from": "history", "to": "structural_index"},
-    {"from": "structural_index", "to": "summarizer"},
-    {"from": "summarizer", "to": "architect"},
+    {"from": "structural_index", "to": "architect"},
     {"from": "architect", "to": "threat_modeler"},
     {"from": "threat_modeler", "to": "planner"},
     {"from": "planner", "to": "researcher"},
@@ -184,8 +156,7 @@
     {"from": "critic_classifier", "to": "calibrator", "on": "__DEFAULT__"},
     {"from": "reproducer", "to": "repro_classifier"},
     {"from": "repro_classifier", "to": "chainer", "on": "success"},
-    {"from": "repro_classifier", "to": "reproducer", "on": "__DEFAULT__"},
-    {"from": "repro_classifier", "to": "calibrator", "on": "exceeded"},
+    {"from": "repro_classifier", "to": "calibrator", "on": "__DEFAULT__"},
     {"from": "chainer", "to": "patcher"},
     {"from": "patcher", "to": "calibrator"},
     {"from": "calibrator", "to": "reflector"},

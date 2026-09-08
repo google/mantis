@@ -11,11 +11,34 @@ isolated venv — do not run local `mdformat` directly.
 
 If the hook modifies files, stage the changes and amend your commit.
 
-## Verbatim blocks
+## ADK Invariant Architecture & Deterministic Gates
 
-Blocks A/B/C/D/E/F/G are wrapped in ```` ``` ```` fences and must stay
-**character-identical** across all skills. Never insert content *inside* their
-fences — add notes *after* the closing ```` ``` ```` instead.
+Security invariants (INV-1 through INV-6) are enforced deterministically by the
+Google ADK Python runtime, Pydantic schemas, and tool wrappers rather than
+prompt fences:
+
+- **INV-1 & INV-2 (Evidence & Re-attack)**: Enforced by `sandbox_tools.py`
+  reached-sink sentinel verification and `schemas.py` validation. Objective
+  third-party re-attack and strict separation-of-duties role separation are
+  orchestrated by `mantis-patch` to eliminate self-grading confirmation bias.
+- **INV-3 (Regression Tracking)**: Enforced by finding lineage schemas and
+  snapshot-match rules.
+- **INV-4 (Target Immutability & Host Boundary)**: Enforced by
+  `research_tools.py` path bounds checks (strictly read-only on the host target
+  checkout; all mutations constrained to `workspace/` or isolated guest
+  sandboxes).
+- **INV-5 (State Resumption & Monotonic Lineage)**: Enforced by
+  `BudgetController` checkpointing and `database.py` monotonic status
+  preservation across process restarts via `--resume <run_id>`. Upstream
+  repository synchronization and environment provisioning are managed externally
+  before resuming Mantis.
+- **INV-6 (Fail-Safe Backward Compatibility)**: Enforced by schema defaults and
+  fail-closed degradation gates.
+
+Skills must remain clean, dense domain guides focused on vulnerability analysis,
+attack vectors, and remediation. Do not re-embed bash Git commands, manual file
+locking, or ASCII block fences in skill prompts. All invariants are verified by
+`reference/tests/test_adk_invariants.py`.
 
 ## Reference files
 
@@ -37,7 +60,7 @@ Extract a block into a `references/` file only if ALL three hold:
    point to it).
 3. **Clean fail-safe fallback** — if the reference cannot be loaded, the skill
    falls back to safe behavior without the reference (e.g. patch rebasing falls
-   back to fresh patch generation, verified by Block G).
+   back to fresh patch generation, verified by re-attack verification).
 
 `mantis-patch/references/patch_rebasing.md` qualifies (pure mechanics, no
 invariant restated, fails safe to Phase-1). Do not extract content that restates
@@ -46,15 +69,5 @@ a crown-jewel invariant — trim it inline instead.
 ## Structural index spec
 
 The structural index spec lives in **one canonical location**:
-`mantis-structural-index/SKILL.md`. Two other files reference it — the adapter
-blueprint stub (`mantis-pipeline-adapter/references/mantis-structural-index.md`)
-and the adapter Guideline 9 (`mantis-pipeline-adapter/SKILL.md`). Before
-committing changes that touch any of these three files, verify:
-
-1. The blueprint stub is under 50 lines, links to
-   `mantis-structural-index/SKILL.md`, and contains **no**
-   `MANTIS_HELPER_VERSION`.
-2. The adapter Guideline 9 `MANTIS_HELPER_VERSION` matches the canonical
-   `SKILL.md` version.
-3. The Block A verbatim fence (LOCATOR RESOLUTION) appears **only** in the
-   canonical `SKILL.md` — never in the stub or the adapter.
+`mantis-structural-index/SKILL.md`. Locator resolution instructions and semantic
+unit definitions appear only in this canonical skill.

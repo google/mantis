@@ -23,12 +23,15 @@ launching security review campaigns.
   credentials, preflight validation) in `workflow.json`.
 - **Execution Command:**
   ```bash
-  # From reference/ directory:
-  python3 scripts/configure.py [flags...]
-
-  # From repository root:
-  python3 reference/scripts/configure.py [flags...]
+  python3 "${MANTIS_HOME:-/path/to/mantis}/reference/scripts/configure.py" [flags...]
   ```
+
+**Path Anchoring Requirement (CRITICAL)**: The configuration script resides
+within the Mantis installation directory at `reference/scripts/configure.py`.
+**You MUST invoke this script via an absolute path or via `$MANTIS_HOME`**.
+NEVER execute `python3 reference/scripts/configure.py` using a relative path
+inside audited target repositories.
+
 - **CLI Options:**
   - `--sandbox` / `-s`: Sandbox mechanism (`static-only`, `gvisor`,
     `microsandbox`, `gce`).
@@ -53,8 +56,11 @@ launching security review campaigns.
   - `--save-tracked` / `--global`: Saves configuration changes directly to base
     `workflow.json`.
   - `--interactive`: Interactive step-by-step terminal wizard.
-  - `--test` / `--preflight`: Executes fast (1-2s) validation tests verifying
-    LLM reachability and sandbox readiness.
+  - `--test` / `--preflight`: Executes fast (1-2s) static validation tests
+    verifying LLM configuration format and sandbox readiness.
+  - `--probe` / `--probe-llm`: Actively probes LLM reachability, provider
+    credentials, and client dependencies with a minimal test prompt (`test`, max
+    256 tokens).
   - `--show`: Displays current configuration and diagnostic status.
   - `--dry-run`: Simulates configuration changes without modifying files.
   - `--update-nodes`: Updates all agent nodes in `workflow.json` to use the
@@ -86,12 +92,16 @@ launching security review campaigns.
 
 ## Common CLI Workflows
 
-### 1. Fast Preflight Verification (~1s)
+### 1. Fast Preflight Verification (~1s) & Active Reachability Probe
 
-Check if LLM credentials and sandbox requirements are operational:
+Check if LLM configuration and sandbox requirements are operational:
 
 ```bash
-python3 reference/scripts/configure.py --test
+# Fast static validation (~1s):
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --test
+
+# Active live reachability probe against LLM provider:
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --test --probe
 ```
 
 ### 2. Auto-Detect and Configure
@@ -100,41 +110,41 @@ Automatically inspect host capabilities (`/dev/kvm`, `docker/runsc`, `gcloud`)
 and select the best available sandbox:
 
 ```bash
-python3 reference/scripts/configure.py --auto
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --auto
 ```
 
 ### 3. Switch to Static Analysis (Zero Dependencies)
 
 ```bash
-python3 reference/scripts/configure.py --sandbox static-only
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --sandbox static-only
 ```
 
 ### 4. Configure gVisor Container Sandbox
 
 ```bash
-python3 reference/scripts/configure.py --sandbox gvisor --image mantis-sandbox:latest
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --sandbox gvisor --image mantis-sandbox:latest
 ```
 
 ### 5. Configure GCE Ephemeral Cloud Sandbox
 
 ```bash
-python3 reference/scripts/configure.py --sandbox gce --project my-gcp-project --zone us-central1-b
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --sandbox gce --project my-gcp-project --zone us-central1-b
 ```
 
 ### 6. Switch AI Model to Claude or Custom Endpoint
 
 ```bash
 # Vertex AI Claude
-python3 reference/scripts/configure.py --model vertex_ai/claude-opus-5
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --model vertex_ai/claude-opus-5
 
 # Custom Local vLLM / OpenAI server
-python3 reference/scripts/configure.py --model openai/my-model --api-base http://localhost:8000/v1
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --model openai/my-model --api-base http://localhost:8000/v1
 ```
 
 ### 7. Interactive Configuration Wizard
 
 ```bash
-python3 reference/scripts/configure.py --interactive
+python3 "$MANTIS_HOME/reference/scripts/configure.py" --interactive
 ```
 
 ## Python API Reference

@@ -17,3 +17,17 @@ repos:
         files: ^reference/workflow\.json$
         pass_filenames: false
 
+      - id: check-requirements-public-index
+        name: Ensure requirements files do not embed internal package index URLs
+        entry: bash -c 'grep -E "airlock-proxy|uplink\.goog|--index-url|--trusted-host" reference/requirements*.txt reference/sandbox/requirements*.txt; [ $? -eq 1 ]'
+        language: system
+        files: ^reference/.*requirements.*\.txt$
+        pass_filenames: false
+
+      - id: check-skills-path-anchoring
+        name: Ensure skill bash code blocks anchor reference scripts
+        entry: python3 reference/scripts/check_skill_anchoring.py
+        language: system
+        files: ^(mantis-[^/]+/SKILL\.md|reference/skills/[^/]+/SKILL\.md)$
+        pass_filenames: true
+

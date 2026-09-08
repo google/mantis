@@ -9,6 +9,7 @@ from microsandbox import Sandbox as MsbSandbox, PullPolicy
 from microsandbox.types import Network
 
 from .base import BaseEnvironment
+from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 
 MAX_OUTPUT = 16000
 
@@ -35,7 +36,7 @@ class MicrosandboxEnvironment(BaseEnvironment):
                 "Hardware virtualization unavailable: '/dev/kvm' is not readable/writable. "
                 "Ensure KVM is enabled and the user is in the 'kvm' group, or set sandbox.type to 'static-only'."
             )
-        self.target_path = os.path.realpath(target_path) if target_path else ""
+        self.target_path = os.path.abspath(target_path) if target_path else ""
         self.image = image
         self.timeout = timeout_seconds
         self._workdir = Path(workdir)
@@ -61,28 +62,16 @@ class MicrosandboxEnvironment(BaseEnvironment):
             )
             await sb.fs.mkdir(str(self._workdir))
 
-            if self.target_path and os.path.isfile(self.target_path):
-                fname = os.path.basename(self.target_path)
-                guest_dest = f"{self._workdir}/{fname}"
+            if self.target_path and os.path.exists(self.target_path):
+                from .staging import get_vetted_staging_files
                 try:
-                    await sb.fs.copy_from_host(self.target_path, guest_dest)
-                except Exception as e:
-                    self._stage_error = e
-                    self._sb = sb
-                    self._name = name
-                    raise e
-            elif self.target_path and os.path.isdir(self.target_path):
-                # Copy files from directory
-                try:
-                    for root, _, files in os.walk(self.target_path):
-                        for file in files:
-                            src_file = os.path.join(root, file)
-                            rel_file = os.path.relpath(src_file, self.target_path)
-                            dest_file = f"{self._workdir}/{rel_file}"
-                            dest_dir = os.path.dirname(dest_file)
-                            if dest_dir != str(self._workdir):
-                                await sb.fs.mkdir(dest_dir)
-                            await sb.fs.copy_from_host(src_file, dest_file)
+                    vetted_files = get_vetted_staging_files(self.target_path)
+                    for src_file, rel_file in vetted_files:
+                        dest_file = f"{self._workdir}/{rel_file}"
+                        dest_dir = os.path.dirname(dest_file)
+                        if dest_dir != str(self._workdir):
+                            await sb.fs.mkdir(dest_dir)
+                        await sb.fs.copy_from_host(str(src_file), dest_file)
                 except Exception as e:
                     self._stage_error = e
                     self._sb = sb

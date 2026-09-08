@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from typing import Optional, Union, List
 import uuid
 
 from google.adk.environment import ExecutionResult
 from .base import BaseEnvironment
+from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 
 
 class GvisorEnvironment(BaseEnvironment):
@@ -32,7 +34,7 @@ class GvisorEnvironment(BaseEnvironment):
         workdir: str = "/workspace",
     ):
         super().__init__()
-        self.target_path = os.path.realpath(target_path) if target_path else ""
+        self.target_path = os.path.abspath(target_path) if target_path else ""
         self.image = image
         self.runtime = runtime
         self.timeout = timeout_seconds
@@ -84,13 +86,16 @@ class GvisorEnvironment(BaseEnvironment):
                 return
 
             def _init():
-                # 1. Create container with runsc runtime and no network
+                # 1. Create container with runsc runtime, no network, and strict resource ceilings
                 create_cmd = [
                     self.tool, "create",
                     "--pull=never",
                     "--name", self.container_name,
                     f"--runtime={self.runtime}",
                     "--network=none",
+                    "--pids-limit=256",
+                    "--memory=4g",
+                    "--cpus=2.0",
                     "-w", str(self._workdir),
                     self.image,
                     "sleep", "infinity",
@@ -105,26 +110,20 @@ class GvisorEnvironment(BaseEnvironment):
                     self._run_cmd([self.tool, "rm", "-f", self.container_name])
                     raise RuntimeError(f"Failed to start gVisor container '{self.container_name}': {out}")
 
-                # 3. Copy target file if provided
-                if self.target_path and os.path.isfile(self.target_path):
-                    target_name = os.path.basename(self.target_path)
-                    rc, out = self._run_cmd([
-                        self.tool, "cp",
-                        self.target_path,
-                        f"{self.container_name}:{self._workdir}/{target_name}",
-                    ])
-                    if rc != 0:
-                        self._run_cmd([self.tool, "rm", "-f", self.container_name])
-                        raise RuntimeError(f"Failed to stage '{self.target_path}' into gVisor container: {out}")
-                elif self.target_path and os.path.isdir(self.target_path):
-                    rc, out = self._run_cmd([
-                        self.tool, "cp",
-                        f"{self.target_path}/.",
-                        f"{self.container_name}:{self._workdir}/",
-                    ])
-                    if rc != 0:
-                        self._run_cmd([self.tool, "rm", "-f", self.container_name])
-                        raise RuntimeError(f"Failed to stage directory '{self.target_path}' into gVisor container: {out}")
+                # 3. Stage target file or directory using canonical fail-closed staging helper
+                if self.target_path and os.path.exists(self.target_path):
+                    from .staging import stage_to_directory
+                    with tempfile.TemporaryDirectory() as stage_dir:
+                        count = stage_to_directory(self.target_path, stage_dir)
+                        if count > 0:
+                            rc, out = self._run_cmd([
+                                self.tool, "cp",
+                                f"{stage_dir}/.",
+                                f"{self.container_name}:{self._workdir}/",
+                            ])
+                            if rc != 0:
+                                self._run_cmd([self.tool, "rm", "-f", self.container_name])
+                                raise RuntimeError(f"Failed to stage files into gVisor container: {out}")
 
             await asyncio.to_thread(_init)
             self._started = True

@@ -11,6 +11,9 @@ class RunContext:
     run_id: str = ""
     sandbox_executed: bool = False
     snapshot_id: str = ""
+    budget_controller: object = None
+    static_sandbox_attempts: int = 0
+    active_node: str = ""
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

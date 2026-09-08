@@ -1,41 +1,46 @@
 ---
 name: mantis-advise
 description: >-
-  Proactive security advisor and guardrail assistant for secure code development.
-  Use to query threat models, historical vulnerability lineages, verified patch patterns, triaged false positives, and learned trajectory invariants before and during code edits to prevent repeat mistakes.
+  Proactive security advisor and architectural remediation assistant for secure code development.
+  Use to query threat models, historical vulnerability lineages, verified patch patterns, triaged false positives, and learned trajectory invariants before code edits or to generate architectural remediation plans for confirmed findings.
   Don't use for automated multi-pass red-team exploitation or fuzzing.
 ---
 
-# Security Advisor (/mantis-advise)
+# Security Advisor & Remediation Engine (/mantis-advise)
 
 ## System Goal
 
-Proactive Secure Development Advisor. Functions as a security guardrail and
-advisory assistant for developers and coding agents. Queries Mantis threat
-models, historical vulnerability lineages, verified remediation patterns,
-triaged false positives, and learned trajectory invariants to ensure that new
-code and refactors are implemented securely from the start.
+Proactive Secure Development & Architectural Remediation Engine. Functions as a
+security guardrail, advisory assistant, and architectural remediator for
+developers and coding agents. Queries Mantis threat models, historical
+vulnerability lineages, verified remediation patterns, triaged false positives,
+and learned trajectory invariants to ensure that new code and refactors are
+implemented securely from the start, and to synthesize robust architectural
+remediations for confirmed vulnerabilities.
 
 ## Command Definition
 
 - **Command:** `/mantis-advise`
 - **Description:** Queries security knowledge for a given target file or module,
   evaluates proposed changes against known threat boundaries, and provides
-  verified secure implementation guidance.
+  verified secure implementation guidance or architectural remediation plans.
 - **Execution Command:**
   ```bash
-  python3 reference/scripts/advise.py --file <target_file> [--db knowledge.db]
+  python3 "${MANTIS_HOME:-/path/to/mantis}/reference/scripts/advise.py" --file <target_file> [--db knowledge.db]
   ```
 - **Arguments (optional):**
   - `--file` / `-f` (or `--target` / `-t`): Target source file or component path
     (e.g. `src/auth.py` or `api/app.py`). Defaults to repo-wide scope if
     omitted.
+  - `--remediate` / `-r`: Finding ID, lineage UUID, or file to generate an
+    architectural remediation dossier and verification plan for.
   - `--db` / `-d`: Path to Mantis SQLite database (default: auto-discovers
     `knowledge.db` or `workspace/knowledge.db`).
   - `--lineage` / `-l`: Query lifecycle and recurrence for a specific lineage
     UUID.
   - `--signature` / `-s`: Query lifecycle for a specific content signature hash.
   - `--json`: Emit structured JSON output instead of formatted markdown.
+  - `--full`: Emit unabridged OKF markdown bodies and un-truncated diffs.
 
 ## How to Fetch Guidance
 
@@ -46,13 +51,20 @@ triaged false positives, and learned invariants) lives in the SQLite database
 
 ### Mechanism 1: CLI Execution (Recommended for Coding Agents)
 
-Coding agents with standard bash access should run
-`reference/scripts/advise.py`:
+Coding agents with standard bash access should run `advise.py` using its
+installation-anchored absolute path.
+
+**Path Anchoring Requirement (CRITICAL)**: The advisor script resides within the
+Mantis installation directory at `reference/scripts/advise.py`. **You MUST
+invoke this script via an absolute path or via `$MANTIS_HOME`**. NEVER execute
+`python3 reference/scripts/advise.py` using a relative path inside the audited
+target repository, as untrusted repositories could spoof scripts or cause
+command failures.
 
 1. **Query Security Guidance for Target File**:
 
    ```bash
-   python3 reference/scripts/advise.py --file src/auth.py
+   python3 "$MANTIS_HOME/reference/scripts/advise.py" --file src/auth.py
    ```
 
    *Prints*: Actionable security advisory markdown with active threat model,
@@ -62,13 +74,19 @@ Coding agents with standard bash access should run
 2. **Query Specific Bug Lineage & Recurrence**:
 
    ```bash
-   python3 reference/scripts/advise.py --lineage c3a5e982-1234-5678-9abc-def012345678
+   python3 "$MANTIS_HOME/reference/scripts/advise.py" --lineage c3a5e982-1234-5678-9abc-def012345678
    ```
 
 3. **Machine-Readable JSON**:
 
    ```bash
-   python3 reference/scripts/advise.py --file src/auth.py --json
+   python3 "$MANTIS_HOME/reference/scripts/advise.py" --file src/auth.py --json
+   ```
+
+4. **Architectural Remediation Dossier for a Finding**:
+
+   ```bash
+   python3 "$MANTIS_HOME/reference/scripts/advise.py" --remediate <finding_id>
    ```
 
 ### Mechanism 2: Python Tool Invocation (Inside Pipeline / Harness)
@@ -105,7 +123,7 @@ get_security_guidance(filepath="src/auth.py")
 Before authoring code or refactoring an existing module:
 
 1. **Run the Advisor**: Execute
-   `python3 reference/scripts/advise.py --file <target_file>`.
+   `python3 "$MANTIS_HOME/reference/scripts/advise.py" --file <target_file>`.
 2. **Review Advisory Context**:
    - **Trust Boundaries**: Identify who interacts with this module (untrusted
      public internet, authenticated users, internal microservices).
@@ -142,9 +160,36 @@ execution:
 
 1. When fixing a reported vulnerability or refactoring a vulnerable component,
    check the bug's `lineage_id` via
-   `python3 reference/scripts/advise.py --file <target_file>`.
+   `python3 "$MANTIS_HOME/reference/scripts/advise.py" --file <target_file>`.
 2. Ensure the new implementation completely closes all attack vectors
    demonstrated in prior re-attack verification test suites.
+
+### Protocol 4: Architectural Vulnerability Remediation & Sandbox Verification
+
+When resolving a confirmed security flaw (in pipeline or standalone):
+
+1. **Grounding Context**:
+
+   - Query
+     `python3 "$MANTIS_HOME/reference/scripts/advise.py" --remediate <finding_id>`
+     (or `get_security_guidance(filepath=...)`).
+   - Extract active OKF Threat Boundaries and Security Invariants.
+   - Inspect prior verified safe patterns from matching lineage history.
+
+2. **Architectural Synthesis**:
+
+   - Do NOT produce superficial point-hacks (e.g. `return None`, hardcoded
+     `False`, or commenting out endpoints) that lobotomize functionality.
+   - Refactor root-cause sinks using safe idioms (parameterization, strict
+     bounds, array argv, canonicalized paths).
+
+3. **Sandbox Verification (INV-1 & INV-2)**:
+
+   - Apply the unified diff patch to the guest workspace (`apply_patch`).
+   - Run the finding reproducer (`run_sandbox_with_evidence`).
+   - Verify that the attack fails to reach the sink
+     (`reattack_status == "failed_to_bypass"`).
+   - Verify that existing functional test suites pass without regression.
 
 ## Output Format
 

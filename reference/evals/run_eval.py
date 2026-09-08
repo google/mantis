@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.context import RunContext, current_run_context
 from core.database import init_db, write_findings, read_findings
-from evals.stage_agents import build_stage_agent
+from evals.stage_agents import build_stage_agent, install_eval_run_context
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
@@ -74,8 +74,7 @@ async def eval_deduplicator(model_id: str, effort: str, dataset_path: Path) -> D
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_dedupe_")
     db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
     write_findings(db_path, "", syn["findings"])
-    ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file="workspace/app")
-    current_run_context.set(ctx)
+    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
     agent = build_stage_agent("deduplicator", model_id=model_id, reasoning_effort=effort)
     session_service = InMemorySessionService()
     runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
@@ -100,8 +99,7 @@ async def eval_reviewer(model_id: str, effort: str, dataset_path: Path) -> Dict[
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_rev_")
     db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
     write_findings(db_path, "", [c["finding"] for c in rdata["cases"]])
-    ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file="workspace/app")
-    current_run_context.set(ctx)
+    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
     agent = build_stage_agent("reviewer", model_id=model_id, reasoning_effort=effort)
     session_service = InMemorySessionService()
     runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
@@ -143,8 +141,7 @@ async def eval_critic(model_id: str, effort: str, dataset_path: Path) -> Dict[st
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_crit_")
     db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
     write_findings(db_path, "", [c["finding"] for c in cdata["cases"]])
-    ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file="workspace/app")
-    current_run_context.set(ctx)
+    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
     agent = build_stage_agent("critic", model_id=model_id, reasoning_effort=effort)
     session_service = InMemorySessionService()
     runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
@@ -185,8 +182,7 @@ async def eval_calibrator(model_id: str, effort: str, dataset_path: Path) -> Dic
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_cal_")
     db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
     write_findings(db_path, "", [c["finding"] for c in cdata["cases"]])
-    ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file="workspace/app")
-    current_run_context.set(ctx)
+    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
     agent = build_stage_agent("calibrator", model_id=model_id, reasoning_effort=effort)
     session_service = InMemorySessionService()
     runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")

@@ -19,8 +19,8 @@ gcloud auth application-default login
 # 1. Fast Configuration & Capability Auto-Detection (or --interactive wizard)
 python3 scripts/configure.py --auto
 
-# 2. Fast Preflight Validation (~1s)
-python3 scripts/configure.py --test
+# 2. Fast Preflight Validation (~1s) & Live Reachability Probe
+python3 scripts/configure.py --test --probe
 
 # 3. Launch Vulnerability Review Campaign (file or repository)
 ./run.sh path/to/code            # a file or a directory
@@ -70,55 +70,93 @@ python3 scripts/advise.py --file path/to/file.py   # query accumulated knowledge
   [`scripts/configure.py`](scripts/configure.py)): Manages pipeline settings via
   `workflow.local.json` overlay or base `workflow.json`, auto-detects host
   virtualization and cloud capabilities, configures sandboxes and LLM providers,
-  and executes instantaneous (~1s) preflight sanity checks.
+  and executes preflight sanity checks and live reachability probes (`--probe`).
 - **`mantis-launch`**
   ([`skills/mantis-launch/SKILL.md`](skills/mantis-launch/SKILL.md) /
   [`scripts/launch.py`](scripts/launch.py)): Autonomous campaign launcher.
   Auto-heals unconfigured placeholders (e.g. `YOUR_PROJECT_ID`) into
   `workflow.local.json`, validates preflight readiness, accepts CLI overrides,
   and executes the 16-agent review graph over target files or repositories.
-- **`mantis-advise`** ([`mantis-advise/SKILL.md`](../mantis-advise/SKILL.md) /
-  [`scripts/advise.py`](scripts/advise.py)): Developer security advisor. Queries
-  threat models, historical lineages, verified patch diffs, and triaged false
-  positives from `knowledge.db`.
+- **`mantis-advise`** ([`scripts/advise.py`](scripts/advise.py)): Developer
+  security advisor. Queries threat models, historical lineages, verified patch
+  diffs, and triaged false positives from `knowledge.db`.
+
+## Research Graph Synthesis & Evolution Flywheel
+
+Mantis features **research graph synthesis**, enabling autonomous construction
+of tailored multi-agent review topologies for specific vulnerability classes or
+audit objectives:
+
+```bash
+# Synthesize a specialized research graph tailored to an audit objective:
+./run.sh path/to/code --objective "Audit for memory safety, bounds checks, and use-after-free in packet parsers"
+
+# Inspect the synthesized graph structure without executing:
+./run.sh path/to/code --objective "Audit for SSRF in webhook handlers" --inspect --dry-run
+```
+
+### Synthesis Archetypes & Deterministic Gates
+
+Research graph synthesis generates specialized graph specifications validated
+through deterministic architectural gates:
+
+1. **Tool Registry Gate**: Only strictly whitelisted ADK tools (`read_file`,
+   `list_files`, `get_findings`, `report_findings`, etc.) are permitted.
+2. **Topological & Cycle Validation Gate**: Synthesizer ensures connected, valid
+   DAG structures with validated cyclical feedback loops (e.g. patch
+   verification loops).
+3. **Structured Verdict Mapping**: Review, Critic, and Reproducer nodes are
+   automatically bound to structured Pydantic schemas (`ReviewVerdict`,
+   `CriticVerdict`, `ReproVerdict`).
+4. **Sandbox Policy Gate**: Sandbox backends are strictly clamped to operator
+   policy or archetype defaults (`static-only`), preventing untrusted LLM
+   outputs from escalating execution privileges.
+
+### Hardened Budgets & Checkpointing
+
+Mantis enforces multi-dimensional ceilings across every campaign:
+
+- **Wall-Clock Time**: `--max-time 2h` (ISO duration / time format).
+- **Token Budget**: `--token-budget 10M` (raw integer or human-readable format).
+- **Graph Steps & Node Visits**: `--max-steps 500 --max-node-visits 50`.
+- **State Resumption**: `--resume <run_id>` seamlessly resumes paused campaigns
+  from SQLite checkpoints with monotonic status preservation.
 
 ## Core Pipeline Stages
 
-The pipeline in `workflow.json` orchestrates 16 canonical Mantis skills across
-the complete vulnerability campaign lifecycle:
+The pipeline in `workflow.json` orchestrates 15 canonical stages across the
+complete vulnerability campaign lifecycle:
 
-01. **`history`** (`mantis-history`): Extracts commit history, churn hotspots,
-    and developer activity logs.
-02. **`structural_index`** (`mantis-structural-index`): Generates code AST,
-    symbol graphs, and function boundaries.
-03. **`summarizer`** (`mantis-summarize`): Synthesizes codebase structure and
-    high-level functionality overview.
-04. **`architect`** (`mantis-architecture`): Constructs the structured Markdown
-    Knowledge Base (`workspace/kb/`).
-05. **`threat_modeler`** (`mantis-threat-model`): Maps threat actors, entry
-    points, and trust boundaries (`workspace/kb/THREAT_MODEL.md`).
-06. **`planner`** (`mantis-plan`): Formulates prioritized review targets and
-    questions (`workspace/plan.json`).
-07. **`researcher`** (`mantis-researcher`): Executes deep static analysis sweeps
-    and flags potential flaws.
-08. **`deduplicator`** (`mantis-dedupe`): Clusters and deduplicates candidate
-    findings across passes.
-09. **`reviewer`** (`mantis-review`): Filters out false positives and evaluates
-    reachability (`ReviewVerdict`).
-10. **`critic`** (`mantis-critic`): Conducts adversarial viability review
-    (`CriticVerdict`).
-11. **`reproducer`** (`mantis-reproduce`): Synthesizes and runs dynamic exploit
-    PoCs inside the isolated sandbox (`ReproVerdict`).
-12. **`chainer`** (`mantis-chain`): Chains related findings into multi-stage
-    exploit trajectories.
-13. **`patcher`** (`mantis-patch`): Creates remediation patches and tests them
-    via re-attack verification in the sandbox.
-14. **`calibrator`** (`mantis-calibrate`): Calibrates final risk scores (0–100)
-    and justification.
-15. **`reflector`** (`mantis-reflect`): Rotates learnings and feedback into the
-    knowledge base (`workspace/learnings.jsonl`).
-16. **`reporter`** (`mantis-report`): Compiles the final review packet and
-    executive summary (`workspace/report/review_packet-latest.md`).
+01. **`history`**: Extracts commit history, churn hotspots, and developer
+    activity logs.
+02. **`structural_index`**: Generates code AST, symbol graphs, and function
+    boundaries.
+03. **`architect`**: Constructs the structured Markdown Knowledge Base
+    (`workspace/kb/`).
+04. **`threat_modeler`**: Maps threat actors, entry points, and trust boundaries
+    (`workspace/kb/THREAT_MODEL.md`).
+05. **`planner`**: Formulates prioritized review targets and questions
+    (`workspace/plan.json`).
+06. **`researcher`**: Executes deep static analysis sweeps and flags potential
+    flaws.
+07. **`deduplicator`**: Clusters and deduplicates candidate findings across
+    passes.
+08. **`reviewer`**: Filters out false positives and evaluates reachability
+    (`ReviewVerdict`).
+09. **`critic`**: Conducts adversarial viability review (`CriticVerdict`).
+10. **`reproducer`**: Synthesizes and runs dynamic exploit PoCs inside the
+    isolated sandbox (`ReproVerdict`).
+11. **`chainer`**: Chains related findings into multi-stage exploit
+    trajectories.
+12. **`patcher`**: Autonomous remediation conductor with strict separation of
+    duties; delegates code authoring to isolated subagents, commissions
+    independent third-party re-attackers with parallel adversarial trajectory
+    search, and enforces dual-gate sandbox verification.
+13. **`calibrator`**: Calibrates final risk scores (0–100) and justification.
+14. **`reflector`**: Rotates learnings and feedback into the knowledge base
+    (`workspace/learnings.jsonl`).
+15. **`reporter`**: Compiles the final review packet and executive summary
+    (`workspace/report/review_packet-latest.md`).
 
 ## Sandboxing & Isolation
 
@@ -208,6 +246,31 @@ Ephemeral cloud VM in an isolated VPC with link-local DNS blackholing.
 | **`"microsandbox"`** |        ✅         | Hardware virtualization (`/dev/kvm`)                |
 | **`"gce"`**          |        ✅         | GCP Project, Isolated VPC/Subnet, Custom Disk Image |
 
+### Target Boundary & Isolation Model
+
+- **Boundary vs. Filter**: The target repository jail is a strict boundary
+  around the target checkout directory, not an in-tree content filter. Pointing
+  Mantis at a directory exposes the files within that directory to analysis by
+  design. Outside the target directory, access is strictly blocked. Inside the
+  target directory, only protected VCS directories (`.git`, `.hg`, `.svn`,
+  `.jj`) and 11 sensitive metadata/credential filenames (`.gitconfig`,
+  `.gitmodules`, `.gitattributes`, `.git-credentials`, `.netrc`, `.env`,
+  `.env.local`, `.npmrc`, `.pypirc`, `.pre-commit-config.yaml`,
+  `.pre-commit-config.yml`) are denied. Other files inside the target (e.g.
+  `.env.production`, `.aws/credentials`, `secrets.yaml`) are within the analyzed
+  target scope and will be read if requested.
+- **Untrusted Git Hardening**: All host git inspection tools (`get_git_diff`,
+  `get_git_log`, `ls-files`) are hardened with `--no-ext-diff`, `--no-textconv`,
+  `-c diff.external=`, `-c diff.tool=`, `-c core.attributesFile=/dev/null`, and
+  `GIT_CONFIG_NOSYSTEM=1`. This prevents repositories carrying attacker-authored
+  `.git/config` or `.gitattributes` files from executing arbitrary binaries or
+  external diff drivers on the host during commit history or diff analysis.
+- **Workflow Discovery**: By default, Mantis discovers `workflow.json` strictly
+  from the reference package installation paths and will not probe an arbitrary
+  `workflow.json` located in the current working directory, preventing untrusted
+  repository graph hijacking. Custom workflows must be explicitly specified via
+  `--workflow <path>`.
+
 ### Quickstart: Isolated GCE Sandbox Setup
 
 An automated setup script is provided at
@@ -287,52 +350,44 @@ strictly-typed domain tools backed by Pydantic models and SQLite persistence:
 - **`generate_report(report)`**: Validates `ExecutiveReport` and writes
   `review_packet-latest.md`.
 
-## Schema Single-Source-of-Truth & Code Generation
+## Schema Single-Source-of-Truth
 
-All state contracts and Pydantic models in `core/schemas.py` are generated
-directly from the root canonical `schema.json`:
-
-```bash
-python3 reference/scripts/generate_schemas.py
-```
-
-This guarantees 100% schema alignment across all Mantis skills, external
-orchestrators, and the ADK reference harness without manual duplication.
+All state contracts and Pydantic models in `core/schemas.py` implement the root
+canonical `schema.json`, providing runtime type safety and invariant enforcement
+(INV-1 through INV-6) across all Mantis skills, external orchestrators, and the
+ADK reference harness.
 
 ## Integration Pattern
 
-Each agent node in `workflow.json` declares its assigned skill and additional
+Each agent node in `workflow.json` declares its node identifier and attached
 tools:
 
 ```json
 {
   "id": "researcher",
   "type": "agent",
-  "skill": "../mantis-researcher",
   "tools": ["read_file", "write_file", "list_files", "report_findings", "get_findings"]
 }
 ```
 
-When compiled by `core/graph_loader.py`, each skill is loaded via
-`google.adk.skills.load_skill_from_dir` and attached to the agent as a
-`SkillToolset` connected to the active sandboxed environment.
+When compiled by `core/graph_loader.py`, the agent node's `id` automatically
+maps to its high-density system prompt in `core/prompts.py` (or literal
+`system_prompt`), with domain tools attached directly to the agent and stage
+isolation enforced (`include_contents="none"`).
 
-### No-Skill / Custom System Prompt Alternative
+### Custom System Prompt Alternative
 
-As an alternative to loading a canonical Mantis skill directory,
-`core/graph_loader.py` also supports configuring an agent node with a custom
-markdown prompt file via `system_prompt` (such as
-[`prompts/system-researcher.md`](prompts/system-researcher.md)):
+`core/graph_loader.py` also supports configuring an agent node with literal
+instruction text via `system_prompt`:
 
 ```json
 {
-  "id": "researcher",
+  "id": "custom_auditor",
   "type": "agent",
-  "system_prompt": "prompts/system-researcher.md",
-  "tools": ["read_file", "write_file", "list_files", "report_findings", "get_findings"]
+  "system_prompt": "You are a specialized auditor inspecting cryptographic primitives. Focus on key reuse and weak RNG.",
+  "tools": ["read_file", "list_files", "report_findings", "get_findings"]
 }
 ```
 
-When `system_prompt` is specified instead of `skill`, `core/graph_loader.py`
-loads the agent's instructions directly from the given file and attaches the
-specified tools directly to the agent without instantiating a `SkillToolset`.
+When `system_prompt` is specified, `core/graph_loader.py` uses the literal
+instruction text directly rather than resolving the default prompt by `id`.

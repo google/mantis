@@ -1,9 +1,14 @@
+from contextlib import contextmanager
 from pathlib import Path
 import os
+import shutil
+import tempfile
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.skills import load_skill_from_dir
-from core.config import get_llm_kwargs
+from core.config import get_llm_kwargs, ResilientLiteLlm
+
+LiteLlm = ResilientLiteLlm
 from core.schemas import ReviewVerdict, CriticVerdict, ReproVerdict, ExecutiveReport
 from tools import TOOLS
 
@@ -41,7 +46,7 @@ STAGE_CONFIGS = {
         'instruction': 'You are the reproducer stage in the Mantis review pipeline. Execute exploit PoCs in the sandbox. Return ReproVerdict with route="success" if the exploit triggers, or route="failed_repro" if not.'
     },
     'patcher': {
-        'skill': 'mantis-patch',
+        'skill': 'mantis-coder',
         'tools': ['apply_patch', 'run_sandbox', 'read_file', 'write_file', 'get_findings'],
         'instruction': 'You are the patcher stage in the Mantis review pipeline. Synthesize minimal unified diff patches using apply_patch and verify that PoC reattack is blocked (VERIFIED_SECURE).'
     },
@@ -82,3 +87,47 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
         tools=tools_list,
         output_schema=output_schema,
     )
+
+
+@contextmanager
+def eval_run_context(jail_dir=None, db_path=""):
+    """Installs a jailed RunContext for eval harnesses that invoke real tools.
+
+    SECURITY (INV-4): the tools in TOOLS are host-boundary enforcing only while a
+    RunContext is installed; they derive their jail from it. Eval harnesses must not
+    invoke them bare — wrap the run in this context manager so every filesystem and
+    sandbox operation is bounded by a disposable scratch jail rather than $CWD.
+    """
+    from core.context import RunContext, current_run_context
+
+    tmp_dir = None
+    if jail_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix="mantis_eval_jail_")
+        jail_dir = tmp_dir
+
+    ctx, token = install_eval_run_context(jail_dir, db_path)
+    try:
+        yield ctx
+    finally:
+        current_run_context.reset(token)
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def install_eval_run_context(jail_dir, db_path="", target_file=""):
+    """Installs a jailed RunContext and returns ``(ctx, reset_token)``.
+
+    Used directly by run_eval.py, which owns its temp directories, and by the
+    eval_run_context() context manager above. RunContext declares ``jail_dir: str``,
+    so the value is normalized here rather than at each call site.
+    """
+    from core.context import RunContext, current_run_context
+
+    jail_str = str(jail_dir)
+    ctx = RunContext(
+        jail_dir=jail_str,
+        db_path=str(db_path or os.path.join(jail_str, "eval_knowledge.db")),
+        target_file=target_file,
+        run_id="eval",
+    )
+    return ctx, current_run_context.set(ctx)

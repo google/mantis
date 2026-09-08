@@ -7,8 +7,14 @@ if [ -z "$1" ]; then
 fi
 
 TARGET="$1"
-if [ -e "$TARGET" ]; then
-    TARGET="$(realpath "$TARGET")"
+# Anchor relative path to absolute without dereferencing symlinks.
+# POSIX `case` is used instead of bash's [[ ]] so anchoring still applies when the
+# script is invoked as `sh run.sh`, which would otherwise skip this branch entirely.
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+    case "$TARGET" in
+        /*) ;;
+        *) TARGET="$(pwd)/$TARGET" ;;
+    esac
 fi
 shift || true
 
@@ -21,4 +27,5 @@ if [ ! -d ".venv" ]; then
 fi
 
 source .venv/bin/activate
+export PYTHONUNBUFFERED=1
 python3 scripts/launch.py "$TARGET" "$@"

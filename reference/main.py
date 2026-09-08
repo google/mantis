@@ -1,25 +1,52 @@
 import asyncio
+import json
 import sys
 import os
 import uuid
+import hashlib
 import dataclasses
 import subprocess
+import warnings
 from pathlib import Path
 from typing import Optional
 
+# Suppress noisy ADK preview/experimental feature notices
+warnings.filterwarnings("ignore", message=r".*\[EXPERIMENTAL\].*")
+
 from google.genai import types
-from google.adk.runners import Runner
+from google.adk.runners import Runner, RunConfig
+from google.adk.agents.run_config import StreamingMode
+from google.adk.agents.invocation_context import LlmCallsLimitExceededError
 from google.adk.sessions.sqlite_session_service import SqliteSessionService
 from google.adk.sessions.base_session_service import BaseSessionService
-from google.adk.apps.app import App
+from google.adk.apps.app import App, ResumabilityConfig
+from google.adk.apps.compaction import EventsCompactionConfig
+from google.adk.agents.context_cache_config import ContextCacheConfig
 
+from core.budget import BudgetConfig, BudgetController, BudgetExceededError
 from core.database import init_db, read_findings, read_risk_scores, update_status
 from core.sandbox import build_sandbox
 from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
 from core.context import RunContext, current_run_context
+from core.paths import resolve_db_path
+from core.config import MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
+from core.compactor import MantisEventsSummarizer
+from core.llm_gateway import strip_terminal_control
 
 APP_NAME = "mantis_graph"
 USER_ID = "user1"
+
+
+def cprint(*args, **kwargs) -> None:
+    """Console emitter for untrusted content (model text, tool responses, DB rows).
+
+    SECURITY: strips terminal escape sequences and control characters so scanned
+    repository content cannot repaint, reset or relocate the operator's terminal,
+    or forge trusted-looking pipeline banners in the scroll-back.
+    """
+    cleaned = [strip_terminal_control(a) if isinstance(a, str) else a for a in args]
+    print(*cleaned, **kwargs)
+
 
 async def execute_sub_task(
     runner: Runner,
@@ -29,19 +56,63 @@ async def execute_sub_task(
     db_path: str = "",
     status_map: dict[str, str] | None = None,
     seed_prompt_template: str = DEFAULT_SEED_PROMPT,
+    budget_controller: Optional[BudgetController] = None,
 ) -> bool:
     """Executes the workflow graph for a single target file. Returns True if an error was encountered."""
-    session_id = f"session_run_{run_id}_{uuid.uuid4().hex[:8]}"
-    await session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
-    
-    try:
-        query_text = seed_prompt_template.format(filepath=filepath, run_id=run_id)
-    except KeyError:
-        query_text = seed_prompt_template.format(filepath=filepath)
-    new_message = types.Content(
-        parts=[types.Part.from_text(text=query_text)],
-        role="user"
-    )
+    sanitized_filepath = str(filepath).replace("\n", "").replace("\r", "").strip()
+    target_hash = hashlib.sha256(sanitized_filepath.encode("utf-8")).hexdigest()[:8]
+    session_id = f"session_run_{run_id}_{target_hash}"
+    existing_session = await session_service.get_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
+    if existing_session is None:
+        initial_state = {"db_path": db_path, "run_id": run_id, "filepath": sanitized_filepath}
+        await session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id, state=initial_state)
+    elif hasattr(existing_session, "state") and isinstance(existing_session.state, dict):
+        existing_session.state.setdefault("db_path", db_path)
+        existing_session.state.setdefault("run_id", run_id)
+        existing_session.state.setdefault("filepath", sanitized_filepath)
+
+    # Detect and record VCS metadata into SQLite knowledge base for reporting provenance
+    if db_path and os.path.exists(os.path.dirname(os.path.abspath(db_path)) or "."):
+        try:
+            from tools.research_tools import detect_vcs_info
+            from core.database import record_artifact
+            vcs_meta = detect_vcs_info(sanitized_filepath)
+            vcs_json = json.dumps(vcs_meta, indent=2)
+            record_artifact(db_path, run_id, "vcs_info", "workspace/.structured/vcs_info.json", vcs_json)
+        except Exception as e:
+            print(f"[PROVENANCE WARNING] Failed to record VCS provenance: {e}", file=sys.stderr)
+
+    resumed_invocation_id: Optional[str] = None
+    if existing_session and existing_session.events:
+        root_agent_name = getattr(getattr(runner, "agent", None), "name", None) or "mantis_vulnerability_pipeline"
+        for ev in reversed(existing_session.events):
+            inv_id = getattr(ev, "invocation_id", None)
+            if inv_id:
+                has_ended = any(
+                    getattr(e, "invocation_id", None) == inv_id
+                    and getattr(getattr(e, "actions", None), "end_of_agent", False)
+                    and getattr(e, "author", None) in (root_agent_name, "mantis_vulnerability_pipeline")
+                    for e in existing_session.events
+                )
+                if not has_ended:
+                    resumed_invocation_id = inv_id
+                break
+
+    if resumed_invocation_id:
+        new_message = None
+    else:
+        # SECURITY: literal substitution, not str.format(). A template containing a
+        # format spec such as "{filepath:>9999999999}" would otherwise be evaluated
+        # here, and conversion/attribute syntax would traverse object internals.
+        query_text = (
+            str(seed_prompt_template)
+            .replace("{filepath}", str(sanitized_filepath))
+            .replace("{run_id}", str(run_id))
+        )
+        new_message = types.Content(
+            parts=[types.Part.from_text(text=query_text)],
+            role="user"
+        )
     
     print(f"\n[GRAPH EXECUTION] Triggered via: {filepath}")
     print("-" * 60)
@@ -49,19 +120,44 @@ async def execute_sub_task(
     errored: set[str] = set()
     stamped_nodes: set[str] = set()
     last_banner: tuple[str | None, str | None] = (None, None)
+    current_active_node: str | None = None
+    streamed_partial_text: bool = False
+
+    max_calls = 0
+    if budget_controller and budget_controller.config.max_llm_calls > 0:
+        max_calls = budget_controller.config.max_llm_calls
+    run_cfg = RunConfig(
+        max_llm_calls=max_calls,
+        streaming_mode=StreamingMode.NONE,
+    )
 
     try:
-        async for event in runner.run_async(user_id=USER_ID, session_id=session_id, new_message=new_message):
+        async for event in runner.run_async(
+            user_id=USER_ID,
+            session_id=session_id,
+            invocation_id=resumed_invocation_id,
+            new_message=new_message,
+            run_config=run_cfg,
+        ):
             node_path = getattr(getattr(event, "node_info", None), "path", None)
             route = getattr(getattr(event, "actions", None), "route", None)
 
             if node_path:
                 node_name = node_path.split("/")[-1].split("@")[0]
+                if node_name != current_active_node:
+                    current_active_node = node_name
+                    streamed_partial_text = False
+                    ctx = current_run_context.get()
+                    if ctx:
+                        ctx.active_node = node_name
+                    if budget_controller:
+                        budget_controller.record_step(node_name)
+
                 if status_map and db_path and node_name in status_map and node_name not in stamped_nodes:
                     stamped_nodes.add(node_name)
                     new_status = status_map[node_name]
                     ctx = current_run_context.get()
-                    if new_status == "dynamic_confirmed" and not (ctx and ctx.sandbox_executed):
+                    if new_status in ("dynamic_confirmed", "patch_verified") and not (ctx and ctx.sandbox_executed):
                         pass
                     else:
                         update_status(db_path, filepath, run_id, new_status)
@@ -80,19 +176,62 @@ async def execute_sub_task(
                 node_key = node_path or "unknown"
                 errored.add(node_key)
                 err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
+                if event.error_code == "MantisAuthError" or is_auth_error(err_msg):
+                    raise MantisAuthError(err_msg)
+                if event.error_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
+                    limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
+                    raise BudgetExceededError(
+                        trigger="llm_calls_limit" if event.error_code == "LlmCallsLimitExceededError" else "budget_exceeded",
+                        current_value="limit exceeded",
+                        limit_value=limit_val,
+                        run_id=run_id,
+                        details=str(err_msg),
+                    )
                 print(f"\n[EVENT ERROR {event.error_code}] {err_msg}", file=sys.stderr)
             else:
-                if node_path and node_path in errored:
-                    errored.discard(node_path)
+                usage = getattr(event, "usage_metadata", None)
+                if budget_controller and usage and getattr(usage, "total_token_count", None):
+                    total_tokens = int(usage.total_token_count)
+                    cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
+                    budget_controller.record_tokens(total_tokens, cached_count=cached_tokens, cache_discount=0.1)
+
                 if hasattr(event, 'content') and event.content:
+                    is_partial = getattr(event, "partial", False)
                     for part in getattr(event.content, "parts", []) or []:
                         if hasattr(part, 'text') and part.text:
-                            print(part.text, end="", flush=True)
+                            # In streaming mode, print partial chunks incrementally.
+                            # Skip final aggregated non-partial text only if partial text was already streamed.
+                            if is_partial:
+                                cprint(part.text, end="", flush=True)
+                                streamed_partial_text = True
+                            elif not streamed_partial_text or run_cfg.streaming_mode != StreamingMode.SSE:
+                                cprint(part.text, end="", flush=True)
+                            if not is_partial:
+                                streamed_partial_text = False
+                                if budget_controller and not (usage and getattr(usage, "total_token_count", None)):
+                                    budget_controller.record_tokens(len(part.text) // 4)
+                            if current_active_node == "reporter" and db_path and run_id:
+                                try:
+                                    from core.schemas import ExecutiveReport
+                                    from core.database import record_artifact
+                                    rpt_text = part.text.strip()
+                                    if "```json" in rpt_text:
+                                        rpt_text = rpt_text.split("```json", 1)[1].split("```", 1)[0].strip()
+                                    elif "```" in rpt_text:
+                                        rpt_text = rpt_text.split("```", 1)[1].split("```", 1)[0].strip()
+                                    if rpt_text.startswith("{") and rpt_text.endswith("}"):
+                                        rpt_data = json.loads(rpt_text)
+                                        rpt_obj = ExecutiveReport.model_validate(rpt_data)
+                                        record_artifact(db_path, run_id, "report", "workspace/.structured/report.json", rpt_obj.model_dump_json(indent=2))
+                                except Exception:
+                                    pass
                         elif hasattr(part, 'function_call') and part.function_call:
                             call = part.function_call
                             call_name = getattr(call, "name", "unknown_tool")
                             call_args = getattr(call, "args", {})
-                            print(f"\n[TOOL CALL: {call_name}] args={call_args}")
+                            cprint(f"\n[TOOL CALL: {call_name}] args={call_args}", flush=True)
+                            if budget_controller:
+                                budget_controller.record_tool_call(current_active_node or "unknown", call_name)
                         elif hasattr(part, 'function_response') and part.function_response:
                             fn_resp = part.function_response
                             fn_name = getattr(fn_resp, "name", "unknown_tool")
@@ -102,24 +241,48 @@ async def execute_sub_task(
                             else:
                                 resp_text = str(raw_resp)
                             
-                            is_fatal = (
+                            is_untrusted_data = resp_text.startswith("<<<UNTRUSTED_SOURCE_CODE_DATA_START")
+                            is_sandbox_error = fn_name in ("run_sandbox", "run_sandbox_with_evidence") and (
+                                "SANDBOX-ERROR:" in resp_text and not resp_text.startswith("exit=0")
+                            )
+                            is_fatal = not is_untrusted_data and (
                                 resp_text.startswith("SANDBOX-ERROR")
-                                or "ERROR SAVING DB" in resp_text
-                                or "FATAL ERROR" in resp_text
+                                or resp_text.startswith("ERROR SAVING DB")
+                                or resp_text.startswith("FATAL ERROR")
+                                or is_sandbox_error
                             )
                             is_validation_feedback = (
-                                resp_text.startswith("Error")
-                                or resp_text.startswith("ERROR")
-                            ) and "SANDBOX-UNAVAILABLE" not in resp_text
+                                not is_untrusted_data
+                                and not is_fatal
+                                and (
+                                    resp_text.startswith("Error")
+                                    or resp_text.startswith("ERROR")
+                                )
+                                and "SANDBOX-UNAVAILABLE" not in resp_text
+                            )
 
                             if is_fatal:
                                 errored.add(f"tool:{fn_name}")
-                                print(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr)
+                                cprint(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
                             elif is_validation_feedback:
-                                print(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}")
+                                cprint(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
                             else:
-                                errored.discard(f"tool:{fn_name}")
-                                print(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}")
+                                cprint(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}", flush=True)
+    except LlmCallsLimitExceededError as le:
+        limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
+        raise BudgetExceededError(
+            trigger="llm_calls_limit",
+            current_value="limit exceeded",
+            limit_value=limit_val,
+            run_id=run_id,
+            details=f"ADK LLM calls limit of {limit_val} exceeded ({le})",
+        ) from le
+    except MantisAuthError:
+        raise
+    except Exception as e:
+        if is_auth_error(e):
+            raise MantisAuthError(format_auth_error_message(e)) from None
+        raise
     finally:
         # Session trajectories are retained in session_service database for auditability and rehydration
         pass
@@ -141,23 +304,24 @@ def discover_files(target: Path, db_path: str = "") -> list[str]:
     if target.is_file():
         return [str(target)] if not is_binary_file(target) else []
     try:
-        out = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-             "-C", str(target), "ls-files", "-z",
-             "--cached", "--others", "--exclude-standard"],
-            capture_output=True, text=True, timeout=10, check=True
-        ).stdout
-        paths = [target / p for p in out.split("\0") if p]
-        if paths:
-            return [
-                str(p) for p in sorted(paths)
-                if p.is_file() and str(p) != db_path and not is_binary_file(p)
-            ]
+        from tools.research_tools import _run_safe_git_command
+        out, ok = _run_safe_git_command(
+            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            target,
+            ceiling_dir="",
+        )
+        if ok and out:
+            paths = [target / p for p in out.split("\0") if p]
+            if paths:
+                return [
+                    str(p) for p in sorted(paths)
+                    if p.is_file() and not p.is_symlink() and str(p) != db_path and not is_binary_file(p)
+                ]
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     return [
         str(p) for p in sorted(target.rglob("*"))
-        if p.is_file() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
+        if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
     ]
 
 async def pipeline(
@@ -170,6 +334,14 @@ async def pipeline(
     timeout_override: Optional[float] = None,
     reasoning_effort_override: Optional[str] = None,
     auto_configure: bool = True,
+    load_local: bool = True,
+    budget_config: Optional[BudgetConfig] = None,
+    resume_run_id: str = "",
+    objective: str = "",
+    enable_compaction: Optional[bool] = None,
+    enable_context_cache: Optional[bool] = None,
+    max_llm_calls_override: Optional[int] = None,
+    max_node_tool_calls_override: Optional[int] = None,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     if not workflow_path:
@@ -198,6 +370,7 @@ async def pipeline(
             print(f"[CONFIG WARNING] Auto-configuration check: {ce}", file=sys.stderr)
 
     try:
+        effective_load_local = False if (objective or "workflows/recipes" in str(workflow_path)) else load_local
         workflow, config = load_workflow_from_json(
             workflow_path,
             model_override=model_override,
@@ -206,6 +379,7 @@ async def pipeline(
             db_override=db_override,
             timeout_override=timeout_override,
             reasoning_effort_override=reasoning_effort_override,
+            load_local=effective_load_local,
         )
     except ValueError as e:
         print(f"Workflow Specification Error: {e}", file=sys.stderr)
@@ -220,9 +394,12 @@ async def pipeline(
     except Exception:
         pass
 
-    target_path = Path(scan_target).resolve()
-    if not target_path.exists():
-        print(f"Target '{scan_target}' does not exist.", file=sys.stderr)
+    # SECURITY (INV-4): component-wise symlink validation (see core/paths.py).
+    from core.paths import validate_scan_target
+
+    target_path, target_err = validate_scan_target(scan_target)
+    if target_path is None:
+        print(f"Error: {target_err}", file=sys.stderr)
         return 1
 
     db_path = config.get("db_path", "knowledge.db")
@@ -233,13 +410,38 @@ async def pipeline(
         print(f"Error: No source files found in target: {target_path}", file=sys.stderr)
         return 1
 
+    run_id = resume_run_id if resume_run_id else str(uuid.uuid4())
+    # Resolve budget configuration: explicit caller override > workflow.json budget > default BudgetConfig()
+    resolved_budget = budget_config
+    if resolved_budget is None:
+        if "budget" in config and config["budget"]:
+            resolved_budget = BudgetConfig.from_dict(config["budget"])
+        else:
+            resolved_budget = BudgetConfig()
+    if max_llm_calls_override is not None:
+        resolved_budget.max_llm_calls = max_llm_calls_override
+    if max_node_tool_calls_override is not None:
+        resolved_budget.max_node_tool_calls = max_node_tool_calls_override
+    budget_ctrl = BudgetController(config=resolved_budget, run_id=run_id)
+
+    # Target isolation: host target is treated as strictly read-only.
+    # Mutations occur only in isolated guest sandboxes or under workspace/.
+    snapshot_id = config.get("kb_snapshot_id") or ""
     if target_path.is_file():
         targets_to_scan = [str(target_path)]
         jail_dir = str(target_path.parent)
     else:
-        # Repository scope: execute the unified campaign across the entire repository
+        # Repository scope: execute unified campaign across entire repository
         targets_to_scan = [str(target_path)]
         jail_dir = str(target_path)
+
+    if resume_run_id:
+        existing_findings = read_findings(db_path, run_id=run_id)
+        if existing_findings and (not scan_target or scan_target == "."):
+            stored_target = existing_findings[0].get("target_file") or existing_findings[0].get("filepath")
+            if stored_target and os.path.exists(stored_target):
+                target_path = Path(stored_target).resolve()
+        print(f"\n🔄 Resuming Run ID: {run_id} ({len(existing_findings)} existing finding(s) checkpointed)")
 
     print(f"Compiling Graph Pipeline. Target: {target_path} ({len(discovered_files)} source file(s) indexed)")
 
@@ -251,32 +453,56 @@ async def pipeline(
         print(f"Sandbox Configuration Error: {e}", file=sys.stderr)
         return 2
 
+    compaction_config = None
+    use_compaction = config.get("enable_compaction", True) if enable_compaction is None else enable_compaction
+    if use_compaction:
+        comp_model_id = config.get("compaction_model") or config.get("default_model") or "vertex_ai/gemini-3.5-flash-lite"
+        comp_llm = ResilientLiteLlm(model=comp_model_id)
+        compaction_config = EventsCompactionConfig(
+            token_threshold=int(config.get("compaction_token_threshold", 500000)),
+            event_retention_size=int(config.get("compaction_event_retention", 50)),
+            summarizer=MantisEventsSummarizer(llm=comp_llm),
+        )
+
+    context_cache_config = None
+    use_context_cache = config.get("enable_context_cache", True) if enable_context_cache is None else enable_context_cache
+    if use_context_cache:
+        context_cache_config = ContextCacheConfig()
+
     run_app = App(
         name=APP_NAME,
-        root_agent=workflow
+        root_agent=workflow,
+        events_compaction_config=compaction_config,
+        context_cache_config=context_cache_config,
+        resumability_config=ResumabilityConfig(is_resumable=True),
     )
 
-    sessions_db_path = config.get("sessions_db_path") or os.environ.get("MANTIS_SESSIONS_DB") or "sessions.db"
+    # SECURITY (INV-4): a relative session-db name is resolved by sqlite against $CWD,
+    # which during a campaign is the untrusted checkout. Anchor and symlink-check it.
+    sessions_db_path = resolve_db_path(
+        config.get("sessions_db_path") or os.environ.get("MANTIS_SESSIONS_DB") or "",
+        default_name="sessions.db",
+    )
     session_service = SqliteSessionService(db_path=sessions_db_path)
     runner = Runner(
         app=run_app,
         session_service=session_service
     )
 
-    run_id = str(uuid.uuid4())
-    snapshot_id = config.get("kb_snapshot_id") or ""
     base_ctx = RunContext(
         jail_dir=jail_dir,
         db_path=db_path,
         target_file="",
         run_id=run_id,
         snapshot_id=snapshot_id,
+        budget_controller=budget_ctrl,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
 
     failures = 0
     successes = 0
+    paused = False
     try:
         for scan_item in targets_to_scan:
             sandbox = build_sandbox(config.get("sandbox", {}), scan_item)
@@ -290,13 +516,28 @@ async def pipeline(
                     run_id,
                     db_path=db_path,
                     status_map=config.get("on_enter_status", {}),
-                    seed_prompt_template=config.get("seed_prompt", DEFAULT_SEED_PROMPT)
+                    seed_prompt_template=config.get("seed_prompt", DEFAULT_SEED_PROMPT),
+                    budget_controller=budget_ctrl,
                 )
                 if task_failed:
                     failures += 1
                 else:
                     successes += 1
+            except BudgetExceededError as be:
+                print("\n" + budget_ctrl.format_pause_banner(
+                    trigger=be.details,
+                    target=str(scan_target),
+                    workflow=str(workflow_path),
+                ))
+                paused = True
+                break
+            except MantisAuthError as ae:
+                print(f"\n{ae}", file=sys.stderr)
+                return 1
             except Exception as e:
+                if is_auth_error(e):
+                    print(f"\n{format_auth_error_message(e)}", file=sys.stderr)
+                    return 1
                 print(f"PIPELINE CRITICAL ABORT IN TASK ({scan_item}): {e}", file=sys.stderr)
                 failures += 1
             finally:
@@ -306,25 +547,40 @@ async def pipeline(
 
     findings = read_findings(db_path, run_id=run_id)
     scores = read_risk_scores(db_path, run_id=run_id)
-    print(f"\n📊 Summary: {len(findings)} vulnerability finding(s) recorded.")
+    suppressed_statuses = {"duplicate_merged", "false_positive", "non_viable", "sample_or_test", "reported"}
+    active_findings = [f for f in findings if f.get("status") not in suppressed_statuses]
+    print(f"\n📊 Summary: {len(active_findings)} active / {len(findings)} total vulnerability finding(s) recorded.")
     for f in findings:
         lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""
-        mark = " (suppressed at review)" if f.get("status") == "reported" else ""
-        print(f"  - [{f.get('severity', 'Unknown')}] {f.get('filepath')}: {f.get('title')}{lines_str}{mark}")
+        st = f.get("status") or ""
+        if st == "duplicate_merged":
+            mark = " [duplicate_merged]"
+        elif st == "reported":
+            mark = " (suppressed at review)"
+        elif st in ("false_positive", "non_viable", "sample_or_test"):
+            mark = f" [{st}]"
+        else:
+            mark = f" [{st}]" if st else ""
+        cprint(f"  - [{f.get('severity', 'Unknown')}] {f.get('filepath')}: {f.get('title')}{lines_str}{mark}")
     if scores:
         print("\n🎯 Risk Calibration Scores:")
         for s in scores:
             score_val = float(s.get('score', 0))
-            print(f"  - {s.get('filepath')}: {score_val:.1f}/10.0 - {s.get('reasoning')}")
+            cprint(f"  - {s.get('filepath')}: {score_val:.1f}/10.0 - {s.get('reasoning')}")
 
+    if paused:
+        return 2
     if failures > 0:
         print(f"\n⚠️ Pipeline completed with {failures} failure(s).")
         return 1
     elif len(findings) == 0:
         print(f"\nℹ️ Pipeline Execution Completed: No vulnerability findings recorded.")
         return 0
+    elif len(active_findings) == 0:
+        print(f"\nℹ️ Pipeline Execution Completed: No active vulnerability findings recorded ({len(findings)} suppressed/merged).")
+        return 0
     else:
-        print(f"\n🎉 Pipeline Execution Completed: Processed {len(findings)} vulnerability finding(s).")
+        print(f"\n🎉 Pipeline Execution Completed: Processed {len(active_findings)} active vulnerability finding(s).")
         return 0
 
 
@@ -355,6 +611,28 @@ def parse_cli_args():
         action="store_true",
         help="Disable auto-configuration of unconfigured placeholders",
     )
+    parser.add_argument(
+        "--no-compaction",
+        action="store_true",
+        help="Disable ADK event compaction",
+    )
+    parser.add_argument(
+        "--no-context-cache",
+        action="store_true",
+        help="Disable ADK context caching",
+    )
+    parser.add_argument(
+        "--max-llm-calls",
+        type=int,
+        default=None,
+        help="ADK LLM calls limit ceiling override (0 for unbounded, defaults to workflow budget)",
+    )
+    parser.add_argument(
+        "--max-node-tool-calls",
+        type=int,
+        default=None,
+        help="Per-node visit runaway tool loop ceiling override (defaults to workflow budget)",
+    )
     return parser.parse_args()
 
 
@@ -376,9 +654,16 @@ if __name__ == "__main__":
                 timeout_override=args.timeout,
                 reasoning_effort_override=args.reasoning_effort,
                 auto_configure=not args.no_auto_configure,
+                enable_compaction=False if args.no_compaction else None,
+                enable_context_cache=False if args.no_context_cache else None,
+                max_llm_calls_override=args.max_llm_calls,
+                max_node_tool_calls_override=args.max_node_tool_calls,
             )
         )
         sys.exit(exit_code)
+    except MantisAuthError as ae:
+        print(f"\n{ae}", file=sys.stderr)
+        sys.exit(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")
         sys.exit(130)

@@ -107,19 +107,17 @@ shared state stored on disk.
 > pinned copy (so edits made mid-pass are ignored), every finding is stamped
 > with the snapshot it was discovered against, and the target is synced only
 > **non-destructively, at a pass boundary**. Run WITHOUT these arguments and
-> each stage runs in MODE-OFF — byte-for-byte today's behavior (a point-in-time
-> review of the current directory with all verdicts permitted) — rather than
-> stopping. Reserve "non-authoritative" for HALT mode (`--sync` requested but
-> snapshot could not be pinned). See [The Snapshot Model](#the-snapshot-model)
-> for the full contract.
+> each stage runs with default behavior (a point-in-time review of the current
+> directory with all verdicts permitted) — rather than stopping. Reserve
+> "non-authoritative" for HALT mode (`--sync` requested but snapshot could not
+> be pinned). See [The Snapshot Model](#the-snapshot-model) for the full
+> contract.
 
 ```mermaid
 graph TD
     subgraph CoreStages [Pipeline Execution Loop]
-        Meta["/mantis-meta-agent (Supervisor)"] --> Hist["/mantis-history (History Extractor)"]
-        Hist --> SI["/mantis-structural-index (Index Builder)"]
-        SI --> Sum["/mantis-summarize (Summarizer)"]
-        Sum --> Arch["/mantis-architecture (KB Architect)"]
+        Hist["/mantis-history (History Extractor)"] --> SI["/mantis-structural-index (Index Builder)"]
+        SI --> Arch["/mantis-architecture (KB Architect)"]
         Arch --> TM["/mantis-threat-model (Threat Modeler)"]
         TM --> Plan["/mantis-plan (Strategist)"]
         Plan --> Res["/mantis-researcher (Auditor)"]
@@ -137,17 +135,14 @@ graph TD
 
     FileHist[("workspace/historical_learnings.jsonl")]
     FileSI[("workspace/kb/structural_index/")]
-    FileSum[("mantis-summary.md")]
     FileKB[/"workspace/kb/ (Markdown KB)"/]
     FilePlan[("workspace/plan.json")]
     FileFind[("workspace/findings/*.json")]
     FileLearn[("workspace/learnings.jsonl")]
     FileRpt[/"workspace/report/review_packet-latest.md"/]
 
-    Meta --> Hist
     Hist --> SI
-    SI --> Sum
-    Sum --> Arch
+    SI --> Arch
     Arch --> TM
     TM --> Plan
     Plan --> Res
@@ -196,93 +191,87 @@ graph TD
     Rpt -.->|Generates| FileRpt
 ```
 
-1. **`/mantis-meta-agent` (Supervisor):** A persistent, overarching agent that
-   launches the continuous loop, monitors execution, handles errors, reports
-   findings, and archives the `workspace/findings/` directory between loops.
-2. **`/mantis-history` (History Extractor):** An optional pre-processing step
-   that analyzes the repository's version control system (VCS) history to
-   extract past vulnerabilities, security fixes, and vulnerability patterns,
-   saving findings to `workspace/historical_learnings.jsonl`.
+01. **`/mantis-history` (History Extractor):** An optional pre-processing step
+    that analyzes the repository's version control system (VCS) history to
+    extract past vulnerabilities, security fixes, and vulnerability patterns,
+    saving findings to `workspace/historical_learnings.jsonl`.
 
-02b. **`/mantis-structural-index` (Structural Index Builder):** An optional
-stage that builds a content-addressed semantic-unit index from source code,
-writing `workspace/kb/structural_index/manifest.json` + `catalog.sqlite` (with
-`structural_index.jsonl` as a compatibility pointer). It runs immediately after
-the snapshot is pinned and before the first code-reading analysis stage. Uses
-capability-based per-partition backend selection (prebuilt SCIP/Kythe, compiler,
-AST, ctags, regex, grep — degrading gracefully). Supports content-addressed unit
-reuse and incremental overlays. In MODE-OFF it builds against the current
-directory. The index is HINT-only — it never gates findings and degrades to grep
-when unavailable. Consumers query via
-`workspace/helpers/query_structural_index.py` for bounded, paginated results.
+02. **`/mantis-structural-index` (Structural Index Builder):** An optional stage
+    that builds a content-addressed semantic-unit index from source code,
+    writing `workspace/kb/structural_index/manifest.json` + `catalog.sqlite`
+    (with `structural_index.jsonl` as a compatibility pointer). It runs
+    immediately after the snapshot is pinned and before the first code-reading
+    analysis stage. Uses capability-based per-partition backend selection
+    (prebuilt SCIP/Kythe, compiler, AST, ctags, regex, grep — degrading
+    gracefully). Supports content-addressed unit reuse and incremental overlays.
+    When unpinned it builds against the current directory. The index is
+    HINT-only — it never gates findings and degrades to grep when unavailable.
+    Consumers query via `workspace/helpers/query_structural_index.py` for
+    bounded, paginated results.
 
-03. **`/mantis-summarize` (Summarizer):** An optional pre-processing step that
-    generates a `mantis-summary.md` for each directory, reading past
-    vulnerabilities from `workspace/historical_learnings.jsonl` to enrich
-    summaries and provide a quick reference map to optimize downstream planning
-    and research.
-
-04. **`/mantis-architecture` (Knowledge Base Architect):** Analyzes the codebase
+03. **`/mantis-architecture` (Knowledge Base Architect):** Analyzes the codebase
     and clears the `workspace/learnings.jsonl` inbox to synthesize a permanent,
     interlinked Markdown Knowledge Base (`workspace/kb/`) detailing entities,
     data flows, and historical vulnerability classes.
 
-05. **`/mantis-threat-model` (Threat Modeler):** Evaluates the entities and
+04. **`/mantis-threat-model` (Threat Modeler):** Evaluates the entities and
     architecture defined in the KB to establish or refine a living
     `workspace/kb/THREAT_MODEL.md`, focusing on trust boundaries and attacker
     profiles.
 
-06. **`/mantis-plan` (Strategist):** Scans workspace boundaries and reads the KB
+05. **`/mantis-plan` (Strategist):** Scans workspace boundaries and reads the KB
     indices to output a targeted review strategy into `workspace/plan.json`,
     injecting specific `kb_references` file paths for context.
 
-07. **`/mantis-researcher` (Mantis Researcher):** Executes file-by-file triage
+06. **`/mantis-researcher` (Mantis Researcher):** Executes file-by-file triage
     and deep security flaw reviews, outputting hotspots as individual JSON files
     in `workspace/findings/`.
 
-08. **`/mantis-dedupe` (Deduplicator):** Groups index-based duplicate findings,
+07. **`/mantis-dedupe` (Deduplicator):** Groups index-based duplicate findings,
     merging records and deleting redundancies within `workspace/findings/`.
 
-09. **`/mantis-review` (Validator):** Filters out false positives using strict
+08. **`/mantis-review` (Validator):** Filters out false positives using strict
     pragmatic constraints, updating the status in
     `workspace/findings/<id>.json`.
 
-10. **`/mantis-critic` (Critic):** Verifies release-build crash reproducibility
+09. **`/mantis-critic` (Critic):** Verifies release-build crash reproducibility
     (ignoring debug/assert checks), updates production viability in
     `workspace/findings/<id>.json`, and appends false positives/non-viable paths
     to `workspace/learnings.jsonl`.
 
-11. **`/mantis-reproduce` (Proof-of-Concept Developer):** Writes
+10. **`/mantis-reproduce` (Proof-of-Concept Developer):** Writes
     Proof-of-Concept Reproduction Scripts (Repros) or raw payloads, executes
     them using a Tiered Iterative Reproduction strategy (unit micro-harness ->
     functional subsystem -> full sandboxed service) with
     intra/inter-conversation retries in isolated environments (gVisor, VMs,
     QEMU), and updates reproduction status in `workspace/findings/<id>.json`.
 
-12. **`/mantis-chain` (Vulnerability Chainer):** Analyzes individual validated
+11. **`/mantis-chain` (Vulnerability Chainer):** Analyzes individual validated
     findings and knowledge base primitives to identify and construct complex
     multi-step exploit chains, creating new "Super Findings" in
     `workspace/findings/`.
 
-13. **`/mantis-patch` (Patcher):** Generates and applies code fixes, runs
-    post-patch validation tests inside the sandbox, updates patch status in
+12. **`/mantis-patch` (Patcher):** Acts as an impartial remediation conductor
+    with strict separation of duties. Delegates code synthesis to isolated
+    patch-author subagents, commissions objective third-party re-attackers using
+    parallel trajectory search for adversarial attack generation, verifies fixes
+    in isolated sandboxes, updates patch status in
     `workspace/findings/<id>.json`, and appends logs to
     `workspace/learnings.jsonl`.
 
-14. **`/mantis-calibrate` (Risk Calibrator):** Calculates a final numerical
+13. **`/mantis-calibrate` (Risk Calibrator):** Calculates a final numerical
     Mantis Risk Score (1-10) for each finding in the workspace directory based
     on impact, evidence, and viability, appending the results directly to each
     `workspace/findings/<id>.json` file.
 
-15. **`/mantis-reflect` (Reflector):** Parses the execution trajectories of the
+14. **`/mantis-reflect` (Reflector):** Parses the execution trajectories of the
     agents from the current round, extracting false assumptions, tool failures,
     and successes, and appends these structured insights to the
     `workspace/learnings.jsonl` inbox.
 
-16. **`/mantis-report` (Reporter):** Generates a human-readable security review
+15. **`/mantis-report` (Reporter):** Generates a human-readable security review
     packet containing verified/reproduced findings, evidence, risk rationales,
-    and patch information at `workspace/report/review_packet-latest.md` (and
-    archives to `review_packet_pass_<N>.md`).
+    and patch information at `workspace/report/review_packet-latest.md`.
 
 ### Auxiliary & Operational Skills
 
@@ -315,46 +304,43 @@ terminal:
 # 0b. (Optional) Build content-addressed semantic-unit index
 /mantis-structural-index
 
-# 1. (Optional) Generate mantis-summary.md directory maps
-/mantis-summarize
-
-# 2. Synthesize codebase structure and historical learnings into Markdown KB
+# 1. Synthesize codebase structure and historical learnings into Markdown KB
 /mantis-architecture
 
-# 3. Iteratively develop living threat model based on the KB
+# 2. Iteratively develop living threat model based on the KB
 /mantis-threat-model
 
-# 4. Map target external boundary and build scanning roadmap
+# 3. Map target external boundary and build scanning roadmap
 /mantis-plan
 
-# 5. Run multi-threaded/sequential security flaw sweep
+# 4. Run multi-threaded/sequential security flaw sweep
 /mantis-researcher
 
-# 6. Consolidate overlapping files and duplicate bugs
+# 5. Consolidate overlapping files and duplicate bugs
 /mantis-dedupe
 
-# 7. Verify code validity & filter false positives
+# 6. Verify code validity & filter false positives
 /mantis-review
 
-# 8. Eliminate non-viable production issues
+# 7. Eliminate non-viable production issues
 /mantis-critic
 
-# 9. Generate proof-of-concept crash reproducers and run in sandboxes
+# 8. Generate proof-of-concept crash reproducers and run in sandboxes
 /mantis-reproduce
 
-# 10. Combine validated findings into multi-step exploit chains
+# 9. Combine validated findings into multi-step exploit chains
 /mantis-chain
 
-# 11. Apply minimal fixes and verify they block the crash reproducer
+# 10. Apply minimal fixes and verify they block the crash reproducer
 /mantis-patch
 
-# 12. Calculate final matrix risk ratings and append to findings
+# 11. Calculate final matrix risk ratings and append to findings
 /mantis-calibrate
 
-# 13. Extract insights from execution trajectories to learnings inbox
+# 12. Extract insights from execution trajectories to learnings inbox
 /mantis-reflect
 
-# 14. Generate human-readable security review packet report
+# 13. Generate human-readable security review packet report
 /mantis-report
 ```
 
@@ -365,12 +351,12 @@ ______________________________________________________________________
 Mantis can review **living / synced codebases** through a **snapshot-per-pass**
 model. It is **opt-in and default off**: with no `--sync` flag and no snapshot
 arguments, a run behaves byte-for-byte as before — a single, point-in-time
-review of whatever is on disk (see *MODE-OFF / HALT*, below). Enabling it makes
-long-running, continuous reviews of a changing codebase correct instead of
-silently wrong.
+review of whatever is on disk (see *Unpinned / HALT Execution*, below). Enabling
+it makes long-running, continuous reviews of a changing codebase correct instead
+of silently wrong.
 
-**Opt-in, default off.** Passing `--sync` (or instructing `/mantis-meta-agent`
-to sync) enables the model. Without it, `snapshot_pinned` is never set and every
+**Opt-in, default off.** Passing `--sync` (or instructing the orchestrator to
+sync) enables the model. Without it, `snapshot_pinned` is never set and every
 snapshot-aware check falls through to its pre-existing behavior.
 
 **Each pass pins one immutable snapshot.** At the very start of a pass the
@@ -426,17 +412,16 @@ Knowledge Base and directory summaries from the previous snapshot are stale and
 must be **force-refreshed** (re-run `/mantis-architecture`) before planning the
 new pass.
 
-**MODE-OFF / HALT (never deadlocks).** The 3-state snapshot model (per
-`schema.json`) branches on `active_snapshot` presence:
+**Unpinned / HALT Execution (never deadlocks).** The snapshot model branches on
+`active_snapshot` presence:
 
-- **MODE-OFF** (`active_snapshot` ABSENT — plain interactive / manual use, or an
-  orchestrator that does not implement the lifecycle): the stage does **not**
-  stop. It runs byte-for-byte as today's behavior — a point-in-time review of
-  the current directory with **all verdicts permitted** (`VERIFIED_SECURE`,
-  `failed_to_reproduce`, `DUPLICATE`, etc. are all emittable, because MODE-OFF
-  is defined as exactly today's behavior). Every snapshot match check reports
-  "not matched" (no `active_snapshot` to compare against). Mid-run edits are not
-  frozen.
+- **Unpinned / Single-Pass** (`active_snapshot` ABSENT — plain interactive /
+  manual use, or an orchestrator that does not implement multi-pass lifecycle):
+  the stage does **not** stop. It runs as a point-in-time review of the current
+  directory with **all verdicts permitted** (`VERIFIED_SECURE`,
+  `failed_to_reproduce`, `DUPLICATE`, etc. are all emittable). Every snapshot
+  match check reports "not matched" (no `active_snapshot` to compare against).
+  Mid-run edits are not frozen.
 
 - **HALT** (`active_snapshot` PRESENT with `snapshot_pinned = false` — `--sync`
   was requested but the snapshot could not be pinned: live endpoint,
@@ -451,14 +436,13 @@ new pass.
 Any absent / empty / null new field routes to the safe branch: absent
 `discovery_commit` → re-research; absent `snapshot_history` predecessor → treat
 all files as changed; absent reached-sink evidence → `not_attempted` (never a
-negative verdict); absent `active_snapshot` → MODE-OFF (byte-for-byte today's
-behavior; all verdicts permitted). No new `required` field or `allOf` gate is
-added, so existing workspaces and pre-upgrade findings validate and run
-unchanged.
+negative verdict); absent `active_snapshot` → unpinned single-pass execution
+(all verdicts permitted). No new `required` field or `allOf` gate is added, so
+existing workspaces and pre-upgrade findings validate and run unchanged.
 
 **New optional state/finding fields and stage flags.**
 
-- **State** (`workspace/.mantis_state.json`): `active_snapshot`
+- **State**: `active_snapshot`
   `{root, snapshot_id, snapshot_pinned, pass, vcs_type}`; append-only
   `snapshot_history` (one `{pass, snapshot_id, snapshot_pinned, timestamp}`
   entry per pass, never overwritten); `vcs_info` continues to record `vcs_type`
@@ -482,7 +466,7 @@ ______________________________________________________________________
 
 ## Building Deterministic Pipelines (Production-Grade)
 
-While the `/mantis-meta-agent` provides dynamic steering for exploratory
+While an autonomous agent session provides dynamic steering for exploratory
 security research, we highly recommend wrapping the Mantis Skills in a
 **deterministic programmatic pipeline** for use in enterprise or production
 settings.
@@ -516,24 +500,6 @@ machine.
 **Before building your harness, strictly adhere to the inter-stage data
 contracts defined in [schema.json](schema.json).**
 
-### The Pipeline Adapter Skill (/mantis-pipeline-adapter)
-
-To get started on brainstorming your custom pipeline for high reliability, token
-efficiency (such as using UUID-based referencing), and adaptability to custom
-environments (via MCP), see the
-[Pipeline Adapter Guide](mantis-pipeline-adapter/SKILL.md).
-
-### SAST Seeding (External Tool Ingestion)
-
-For teams that want to augment LLM discovery with findings from external SAST
-tools (CodeQL, Semgrep, etc.), the Pipeline Adapter Guide includes a **SAST
-Seeding** pattern (Guideline 8). This opt-in adapter ingests external tool
-findings as `PROVISIONALLY_VALID` / `NEEDS_RESEARCH` candidates that must earn
-their verdict through the unchanged downstream gates. It is purely additive — no
-existing skills are modified. The adapter uses a platform-agnostic JSONL IR
-format (not SARIF) that any SAST tool can convert to. See
-[mantis-pipeline-adapter/references/mantis-sast-seed.md](mantis-pipeline-adapter/references/mantis-sast-seed.md).
-
 ### Structural Code Index (AST-Level Context)
 
 For large codebases where grep-based call-site discovery is unreliable, the
@@ -545,9 +511,7 @@ supports content-addressed unit reuse, incremental overlays, and a bounded query
 interface. It runs immediately after the snapshot is pinned and before the first
 code-reading analysis stage. See
 [mantis-structural-index/SKILL.md](mantis-structural-index/SKILL.md) for the
-full specification, and
-[mantis-pipeline-adapter/references/mantis-structural-index.md](mantis-pipeline-adapter/references/mantis-structural-index.md)
-for the adapter reference pointer.
+full specification.
 
 > **Note on Standalone vs. Harness Mode:** When using Mantis Skills directly
 > from the CLI in standalone mode, skills like `/mantis-review` or
@@ -566,11 +530,13 @@ Mantis architecture:
 
 1. **Declarative Workflow Graph (`workflow.json` / `core/graph_loader.py`)**:
 
-   - Compiles 16 sequential agent nodes into native ADK `Workflow`, `Agent`, and
+   - Compiles 15 sequential agent nodes into native ADK `Workflow`, `Agent`, and
      `Classifier` constructs.
-   - Attaches Mantis skill directories as native `SkillToolset` instances.
-   - Provides full runtime fallback for system prompts via
-     `prompts/system-*.md`.
+   - Injects high-density, minimal system prompts directly via
+     `reference/core/prompts.py` (`STAGE_PROMPTS`), bypassing Turn-1
+     `load_skill` overhead and preserving model token budgets.
+   - Attaches specialized domain tools directly to agents with stage isolation
+     (`include_contents="none"`), preventing cross-turn context pollution.
 
 2. **Layered Configuration Overlay (`workflow.local.json`)**:
 
@@ -595,20 +561,23 @@ Mantis architecture:
      isolation in a private non-internet VPC with DNS blackholing, IAP
      tunneling, and IAM token suppression.
 
-4. **3-Tier Deduplication & Lineage Ladder (`core/embeddings.py` /
-   `core/database.py`)**:
+4. **Deterministic Lineage Anchors & Agentic Deduplication (`core/database.py` /
+   `mantis-dedupe`)**:
 
-   - **Tier 1 (Exact Heuristic Anchors)**: \<1ms stable signature and AST
-     line-shift matching.
-   - **Tier 2 (RCA Normalization)**: Lightweight LLM extraction of standardized
-     root cause summaries.
-   - **Tier 3 (Semantic Vector Embeddings)**: Nearest-neighbor cosine similarity
-     matching via `vertex_ai/gemini-embedding-001` (or configurable model) with
-     calibrated threshold $\\ge 0.90$ and a structural CWE compatibility guard
-     to prevent cross-vulnerability false merges.
-   - **Observability**: Explicit warnings on live embedding fallback
-     (`⚠️  [EMBEDDING FALLBACK]`) and vector dimension mismatch
-     (`⚠️  [EMBEDDING MISMATCH]`).
+   - **Tier 1 (Exact Content Signature)**: Sub-millisecond deterministic
+     `sha256(canonical_fp | canonical_cwe | target_symbol)` hash matching.
+   - **Tier 2 (Structural Tuple Match)**: Canonical filepath + normalized CWE +
+     target symbol anchor matching.
+   - **Tier 3 (Line Proximity Window)**: Filepath and normalized CWE match
+     within a strict $\\le 3$ line drift window when target symbol is empty.
+   - **Hierarchical Clustering**: Partitions findings by subsystem and filepath
+     into manageable candidate clusters, avoiding cross-module mixing.
+   - **Agentic Deduplication (`mantis-dedupe`)**: Reasoning agent analyzes
+     structural equivalence, dataflow convergence, and root cause equivalence to
+     merge findings into primary records while preserving lineage history.
+   - **Fail-Closed Fallback**: Any finding that does not decisively match
+     preserves or mints a distinct UUIDv4, eliminating false merges without
+     cloud egress or external embedding model dependencies.
 
 5. **Operational CLI Tools & Developer Skills**:
 
@@ -620,8 +589,6 @@ Mantis architecture:
      [`reference/skills/mantis-launch/SKILL.md`](reference/skills/mantis-launch/SKILL.md)).
    - **`scripts/advise.py` (`mantis-advise`)**: Developer security advisor
      querying threat models, historical lineages, and verified patch diffs.
-   - **`scripts/generate_schemas.py`**: Compiles `schema.json` into Pydantic
-     models in `core/schemas.py`.
 
 6. **Open Knowledge Format (OKF v0.2) Semantics (`core/database.py` /
    `scripts/advise.py`)**:
@@ -775,32 +742,29 @@ rescan instead of just an analysis of a given diff or changelist.
 
 ______________________________________________________________________
 
-## Meta-Agent Orchestration Pattern
+## Autonomous Orchestration Pattern
 
 For a truly autonomous and persistent security operation, you can employ the
-**Meta-Agent Orchestration** pattern by invoking the `/mantis-meta-agent` skill.
-In this setup, a high-level "Meta-Agent" (a long-lived Gemini or Antigravity CLI
-session) is responsible for driving the entire reviewing pipeline.
+**Autonomous Orchestration** pattern (via the ADK runner
+`python3 reference/main.py` or an overarching supervisor session). In this
+setup, the orchestrator is responsible for driving the entire reviewing
+pipeline.
 
-### The Meta-Agent's Role:
+### The Orchestrator's Role:
 
-- **Orchestration:** The Meta-Agent manages the execution of each stage natively
-  using CLI subagent delegation.
-- **Persistence:** It operates in a single, long-lived conversation that spans
-  days or weeks, ensuring that the review continues working towards the goal of
-  security flaw discovery, patching, and reporting even while you are in
-  meetings, away for the evening, or over the weekend.
-- **Supervision:** It keeps an eye on the task, handles minor environmental
-  hiccups, reads logs, and ensures the pipeline remains operational.
-- **Interactive Steering:** A major advantage of this pattern is that you can
-  chat with the Meta-Agent while subagents are working. You can ask for status
-  updates, collaboratively debug environment issues, or provide high-level
-  strategic guidance (e.g., "Deep dive on the image parser") to influence the
-  swarm's focus in real-time or in the next loop.
-- **Security Boundaries:** While you can run the Meta-Agent with auto-approve
-  flags (`--dangerously-skip-permissions`), you must strictly confine it within
-  the hardened security boundaries previously described (VPC-SC, no external
-  internet, and restricted IAM roles).
+- **Orchestration:** The Orchestrator manages the execution of each stage
+  natively using workflow nodes or CLI subagent delegation.
+- **Persistence:** It operates across passes and restarts using state
+  checkpoints, ensuring that the review continues working towards the goal of
+  security flaw discovery, patching, and reporting.
+- **Supervision:** It monitors task health, handles environmental degradation
+  gracefully, logs invariants, and ensures the pipeline remains operational.
+- **Interactive Steering:** You can query pipeline status, inspect
+  `knowledge.db`, or provide high-level strategic guidance (e.g., "Deep dive on
+  the image parser") to influence focus in real-time or in the next loop.
+- **Security Boundaries:** Strictly confine execution within the hardened
+  security boundaries previously described (VPC-SC, no external internet, and
+  restricted IAM roles).
 
 This pattern transforms the suite from a set of disjointed tools into a
 continuous, self-driving security research operation.
@@ -1006,12 +970,12 @@ If you want to run the formatter manually:
   > plugins above. If you see `pip show mdformat-frontmatter` return "not
   > found", do NOT run `mdformat`.
 
-> [!CAUTION] **Verbatim blocks (Block A/B/C/D/E/F/G) are wrapped in code fences
-> (```` ``` ````) in all SKILL.md files.** This protects them from `mdformat`
-> rewrapping. The blocks must remain character-identical across all skills.
-> Never insert content *inside* their fences — add notes *after* the closing
-> ```` ``` ````. If you run `mdformat`, **verify with `git diff` that no fenced
-> block content was modified** before committing.
+> [!NOTE] **ADK Invariant Architecture & Deterministic Gates:** Security
+> invariants (INV-1 through INV-6) are enforced deterministically by the Google
+> ADK Python runtime, Pydantic schemas, and tool wrappers rather than legacy
+> prompt fences. Skills focus on vulnerability analysis, attack vectors, and
+> remediation. All invariants are verified by
+> `reference/tests/test_adk_invariants.py`.
 
 ## Advanced / Unattended Cloud Deployment (GCE)
 
@@ -1071,8 +1035,8 @@ to do this, including connecting the pipeline to **Google Cloud Pub/Sub**.
 
 1. **Setup:** Create a Pub/Sub topic (e.g., `mantis-verified-vulns`) and grant
    your GCE VM's Service Account the `roles/pubsub.publisher` role.
-2. **Hooking it up:** The `/mantis-meta-agent` skill can be instructed to
-   trigger notifications natively. You can instruct the meta-agent to run
+2. **Hooking it up:** The orchestrator can be configured or instructed to
+   trigger notifications natively. You can configure it to run
    `gcloud pubsub topics publish mantis-verified-vulns --message="$(cat workspace/findings/<id>.json)"`
    whenever a security flaw is successfully reproduced.
 3. **Routing:** Subscribe a Google Cloud Function or Cloud Run service to that

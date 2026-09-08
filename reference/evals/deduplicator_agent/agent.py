@@ -4,7 +4,9 @@ from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.skills import load_skill_from_dir
 
-from core.config import get_llm_kwargs
+from core.config import get_llm_kwargs, ResilientLiteLlm
+
+LiteLlm = ResilientLiteLlm
 from tools import TOOLS
 
 def build_deduplicator_agent():
