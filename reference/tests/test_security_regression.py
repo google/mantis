@@ -2156,7 +2156,13 @@ class TestThirdRoundAuditRegressions(unittest.TestCase):
             rt_mod._MAX_GIT_DIR_ENTRIES = original
 
         self.assertFalse(ok, "Entry cap did not fail closed.")
-        self.assertIn("entry limit", err)
+        # The refusal must be machine-distinguishable as a capacity limit, and must name
+        # the override, or an operator has no way to tell it apart from a missing repo.
+        self.assertTrue(
+            err.startswith(rt_mod.REPO_TOO_LARGE_PREFIX),
+            f"Capacity refusal is not tagged with the sentinel: {err!r}",
+        )
+        self.assertIn(rt_mod._MAX_GIT_DIR_ENTRIES_ENV, err)
 
         # And the same repo validates fine at the real cap: the cap is the only reason
         # it was refused above.
@@ -2956,6 +2962,464 @@ verified:
         ok, err = _validate_git_jail(outer, jail)
         self.assertFalse(ok, "Validator permitted nested submodule with unvetted diff driver.")
         self.assertIn("Prohibited or unvetted git configuration key 'diff.evil.command' in nested submodule", err)
+
+
+class TestLargeRepositoryScaling(unittest.IsolatedAsyncioTestCase):
+    """Regressions for the large-repository abort measured against chromium.
+
+    Baseline (506,522 tracked files, 69 GB): the run died on node 2 of 18 in 3m06s with
+    zero findings. `list_files` with no arguments serialized 42,128,106 bytes -- roughly
+    10.5M tokens into a 1,048,576-token window -- and the node layer then re-sent that
+    identical request twice more before aborting. Separately, the worktree entry cap
+    silently reported chromium as "not a git repository".
+
+    Covers:
+    1. No list_files return path can emit an unbounded listing, and truncation is declared.
+    2. An impossible request is refused before the provider is contacted.
+    3. Such a refusal is not retried by the ADK node layer.
+    4. A capacity refusal is distinguishable from a missing repository, and overridable.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="mantis_scale_test_"))
+        self.db = str(self.tmp / "k.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # --- 1. Bounded listings ---------------------------------------------------
+
+    async def test_list_files_bounds_a_large_tree_and_declares_truncation(self):
+        """A tree far larger than the cap yields a bounded response naming the true total."""
+        import tools.research_tools as rt_mod
+
+        target = self.tmp / "bigrepo"
+        target.mkdir()
+        total_files = rt_mod.MAX_LIST_ENTRIES * 3
+        for i in range(total_files):
+            (target / f"src_{i:06d}.c").write_text("int main(void){return 0;}\n")
+
+        tok = current_run_context.set(
+            RunContext(jail_dir=target, db_path=self.db, target_file=target, run_id="scale")
+        )
+        try:
+            raw = await rt_mod.list_files("")
+        finally:
+            current_run_context.reset(tok)
+
+        payload = json.loads(raw)
+
+        # POTENCY: the pre-fix implementation returned a bare JSON array of every entry.
+        # If this is still a list, the control is absent regardless of any other assertion.
+        self.assertIsInstance(
+            payload, dict,
+            "list_files returned a bare array: the unbounded listing path is still live.",
+        )
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["shown"], rt_mod.MAX_LIST_ENTRIES)
+        self.assertEqual(len(payload["entries"]), rt_mod.MAX_LIST_ENTRIES)
+        self.assertEqual(
+            payload["total"], total_files,
+            "Truncated listing must still report the true total, or the agent cannot tell "
+            "it is looking at a prefix.",
+        )
+        self.assertIn("narrower", payload["hint"])
+
+        # The serialized response must be small. The chromium failure was a 42 MB payload;
+        # a bound that still emits megabytes has not fixed anything.
+        self.assertLess(len(raw), 1_000_000, "Bounded listing is still multi-megabyte.")
+
+    async def test_list_files_leaves_small_listings_unchanged(self):
+        """Under the cap the response shape is unchanged: no gratuitous break for normal repos."""
+        import tools.research_tools as rt_mod
+
+        target = self.tmp / "smallrepo"
+        target.mkdir()
+        for name in ("a.py", "b.py", "c.py"):
+            (target / name).write_text("pass\n")
+
+        tok = current_run_context.set(
+            RunContext(jail_dir=target, db_path=self.db, target_file=target, run_id="small")
+        )
+        try:
+            payload = json.loads(await rt_mod.list_files(""))
+        finally:
+            current_run_context.reset(tok)
+
+        self.assertEqual(payload, ["a.py", "b.py", "c.py"])
+
+    async def test_list_entry_cap_is_operator_overridable(self):
+        """MANTIS_MAX_LIST_ENTRIES raises the cap without a code change."""
+        import tools.research_tools as rt_mod
+
+        target = self.tmp / "overrideable"
+        target.mkdir()
+        for i in range(12):
+            (target / f"f{i:02d}.py").write_text("pass\n")
+
+        tok = current_run_context.set(
+            RunContext(jail_dir=target, db_path=self.db, target_file=target, run_id="ovr")
+        )
+        try:
+            with patch.dict(os.environ, {rt_mod._MAX_LIST_ENTRIES_ENV: "5"}):
+                lowered = json.loads(await rt_mod.list_files(""))
+            with patch.dict(os.environ, {rt_mod._MAX_LIST_ENTRIES_ENV: "500"}):
+                raised = json.loads(await rt_mod.list_files(""))
+            with patch.dict(os.environ, {rt_mod._MAX_LIST_ENTRIES_ENV: "not-a-number"}):
+                garbage = json.loads(await rt_mod.list_files(""))
+        finally:
+            current_run_context.reset(tok)
+
+        self.assertEqual(lowered["shown"], 5)
+        self.assertEqual(lowered["total"], 12)
+        self.assertEqual(len(raised), 12, "Raising the cap did not take effect.")
+        # An unparseable override must fall back to the default, not to "unlimited".
+        self.assertEqual(len(garbage), 12)
+
+    # --- 2. Pre-dispatch context refusal ---------------------------------------
+
+    def test_impossible_request_is_refused_without_contacting_the_provider(self):
+        """The whole point: the 42 MB payload must never leave the process."""
+        import litellm
+        from core.config import ContextBudgetExceededError, ResilientLiteLLMClient
+
+        calls = []
+
+        async def _never(*args, **kwargs):
+            calls.append(kwargs)
+            raise AssertionError("Provider was contacted with an impossible request.")
+
+        oversized = [
+            {"role": "user", "content": "List the files."},
+            {"role": "tool", "name": "list_files", "content": "a/b/c.cc\n" * 4_700_000},
+        ]
+
+        client = ResilientLiteLLMClient()
+        with patch.object(litellm, "acompletion", _never):
+            with self.assertRaises(ContextBudgetExceededError) as caught:
+                asyncio.run(
+                    client.acompletion(
+                        model="vertex_ai/gemini-3.5-flash-lite",
+                        messages=oversized,
+                        tools=None,
+                    )
+                )
+
+        self.assertEqual(calls, [], "Request was dispatched before being refused.")
+
+        err = caught.exception
+        self.assertEqual(err.limit, 1_048_576)
+        self.assertGreater(err.estimated_tokens, err.limit)
+        # The failure must be actionable: it names the offending message and the tool.
+        message = str(err)
+        self.assertIn("role=tool", message)
+        self.assertIn("list_files", message)
+
+    def test_sync_completion_path_is_guarded_too(self):
+        """A control present on only one dispatch path is a control one caller disables."""
+        import litellm
+        from core.config import ContextBudgetExceededError, ResilientLiteLLMClient
+
+        def _never(*args, **kwargs):
+            raise AssertionError("Provider was contacted with an impossible request.")
+
+        oversized = [{"role": "user", "content": "x" * 40_000_000}]
+
+        with patch.object(litellm, "completion", _never):
+            with self.assertRaises(ContextBudgetExceededError):
+                ResilientLiteLLMClient().completion(
+                    model="vertex_ai/gemini-3.5-flash-lite",
+                    messages=oversized,
+                    tools=None,
+                )
+
+    def test_ordinary_request_still_reaches_the_provider(self):
+        """The guard must not become a general denial of service on normal traffic."""
+        import litellm
+        from core.config import ResilientLiteLLMClient
+
+        seen = {}
+
+        async def _ok(*args, **kwargs):
+            seen.update(kwargs)
+            return "response"
+
+        normal = [
+            {"role": "system", "content": "You are a security analyst."},
+            {"role": "user", "content": "Review this file.\n" + ("x" * 50_000)},
+        ]
+
+        with patch.object(litellm, "acompletion", _ok):
+            result = asyncio.run(
+                ResilientLiteLLMClient().acompletion(
+                    model="vertex_ai/gemini-3.5-flash-lite",
+                    messages=normal,
+                    tools=None,
+                )
+            )
+
+        self.assertEqual(result, "response")
+        self.assertEqual(seen.get("messages"), normal)
+
+    def test_unknown_context_window_fails_open(self):
+        """An unresolvable window must not block a request we cannot prove is doomed."""
+        import litellm
+        from core.config import ResilientLiteLLMClient, resolve_context_limit
+
+        self.assertIsNone(
+            resolve_context_limit("totally-made-up-provider/nonexistent-model-xyz"),
+            "Probe model unexpectedly has a known window; the fail-open path is untested.",
+        )
+
+        async def _ok(*args, **kwargs):
+            return "response"
+
+        with patch.object(litellm, "acompletion", _ok):
+            result = asyncio.run(
+                ResilientLiteLLMClient().acompletion(
+                    model="totally-made-up-provider/nonexistent-model-xyz",
+                    messages=[{"role": "user", "content": "x" * 40_000_000}],
+                    tools=None,
+                )
+            )
+        self.assertEqual(result, "response")
+
+    def test_context_limit_lookup_never_returns_an_output_limit(self):
+        """max_input_tokens, not max_tokens: the latter is the output cap and ~100x smaller."""
+        from core.config import resolve_context_limit
+
+        # A real model whose input window is known to be far larger than its output cap.
+        limit = resolve_context_limit("vertex_ai/gemini-3.5-flash-lite")
+        self.assertIsNotNone(limit, "Baseline model window is unresolvable; test is vacuous.")
+        self.assertGreaterEqual(
+            limit, 100_000,
+            "Resolved limit looks like a max-OUTPUT-token value; ordinary requests would "
+            "be refused against it.",
+        )
+
+    # --- 3. No identical re-send ------------------------------------------------
+
+    def test_deterministic_overflow_is_not_retried_by_the_node_layer(self):
+        """Three identical uploads of a doomed request is the behaviour being removed."""
+        import core.config as config_mod
+        import google.adk.workflow.utils._retry_utils as adk_retry
+
+        should_retry = adk_retry._should_retry_node
+        self.assertIs(
+            should_retry, config_mod._non_retryable_should_retry_node,
+            "The ADK retry override is not installed; this pin cannot observe the control.",
+        )
+
+        retry_config = MagicMock()
+        retry_config.exceptions = None
+        node_state = MagicMock()
+        node_state.attempts = 1
+
+        overflow = config_mod.ContextBudgetExceededError("too big", 10_000_000, 1_048_576)
+        self.assertFalse(
+            should_retry(overflow, retry_config, node_state),
+            "A pre-dispatch overflow refusal is still being retried.",
+        )
+
+        # litellm's own post-dispatch overflow is equally deterministic.
+        class ContextWindowExceededError(Exception):
+            pass
+
+        self.assertFalse(
+            should_retry(ContextWindowExceededError("400 too long"), retry_config, node_state),
+            "A provider-reported context overflow is still being retried.",
+        )
+
+        # POTENCY: the override must not have become a blanket "never retry".
+        class TransientUpstreamError(Exception):
+            pass
+
+        with patch.object(config_mod, "_orig_adk_should_retry_node", return_value=True):
+            self.assertTrue(
+                should_retry(TransientUpstreamError("503"), retry_config, node_state),
+                "The override now suppresses retry for genuinely transient errors.",
+            )
+
+    def test_overflow_wrapped_as_a_cause_is_also_not_retried(self):
+        """Frameworks re-wrap exceptions; the rule must survive one layer of wrapping."""
+        import core.config as config_mod
+
+        retry_config = MagicMock()
+        retry_config.exceptions = None
+        node_state = MagicMock()
+        node_state.attempts = 1
+
+        try:
+            raise config_mod.ContextBudgetExceededError("too big", 10_000_000, 1_048_576)
+        except config_mod.ContextBudgetExceededError as inner:
+            wrapped = RuntimeError("node failed")
+            wrapped.__cause__ = inner
+
+        self.assertFalse(
+            config_mod._non_retryable_should_retry_node(wrapped, retry_config, node_state),
+            "A wrapped overflow refusal is still being retried.",
+        )
+
+    # --- 4. Capacity is not absence --------------------------------------------
+
+    def _repo(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=path, check=True)
+        # Several entries, not one: the cap is a strict greater-than over entries seen in
+        # the worktree walk, so a single-file repo can never cross even a cap of 1 and the
+        # test would pass vacuously against a removed control.
+        (path / "src").mkdir()
+        for i in range(5):
+            (path / "src" / f"f{i}.txt").write_text("content\n")
+        subprocess.run(["git", "add", "."], cwd=path, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True)
+
+    def test_oversized_worktree_is_reported_as_too_large_not_as_missing(self):
+        """chromium is a git repository; saying otherwise hides the downgrade."""
+        import tools.research_tools as rt_mod
+
+        jail = self.tmp / "jail_wt"
+        repo = jail / "repo"
+        self._repo(repo)
+
+        with patch.dict(os.environ, {rt_mod._MAX_WORKTREE_ENTRIES_ENV: "1"}):
+            ok, err = rt_mod._validate_git_jail(repo, jail)
+            self.assertFalse(ok, "Worktree cap did not fail closed.")
+            self.assertTrue(
+                err.startswith(rt_mod.REPO_TOO_LARGE_PREFIX),
+                f"Capacity refusal is not machine-distinguishable: {err!r}",
+            )
+
+            rendered = rt_mod._vcs_unavailable_message(err)
+            # The exact conflation that made chromium look unversioned.
+            self.assertNotIn(
+                "is not a git repository", rendered,
+                "A too-large repository is still being reported as not a git repository.",
+            )
+            self.assertIn("too large", rendered.lower())
+            self.assertIn("DISABLED", rendered)
+            self.assertIn(rt_mod._MAX_WORKTREE_ENTRIES_ENV, err)
+
+        # POTENCY: at the shipped cap the same repository validates, so the cap is the only
+        # reason it was refused above.
+        ok_after, _ = rt_mod._validate_git_jail(repo, jail)
+        self.assertTrue(ok_after, "A benign repository is refused at the shipped cap.")
+
+    def test_genuine_non_repository_still_reports_absence(self):
+        """The new branch must not swallow the real 'no VCS here' case."""
+        import tools.research_tools as rt_mod
+
+        rendered = rt_mod._vcs_unavailable_message("no .git directory found")
+        self.assertIn("is not a git repository", rendered)
+        self.assertNotIn("too large", rendered.lower())
+
+    def test_worktree_cap_override_restores_git_operations(self):
+        """The operator can raise the cap and get git-aware analysis back."""
+        import tools.research_tools as rt_mod
+
+        jail = self.tmp / "jail_ovr"
+        repo = jail / "repo"
+        self._repo(repo)
+
+        with patch.dict(os.environ, {rt_mod._MAX_WORKTREE_ENTRIES_ENV: "1"}):
+            refused, _ = rt_mod._validate_git_jail(repo, jail)
+        with patch.dict(os.environ, {rt_mod._MAX_WORKTREE_ENTRIES_ENV: "10000000"}):
+            allowed, err = rt_mod._validate_git_jail(repo, jail)
+
+        self.assertFalse(refused)
+        self.assertTrue(allowed, f"Raising the cap did not restore validation: {err}")
+
+    def test_shipped_worktree_cap_admits_a_chromium_sized_repository(self):
+        """The default must clear the measured 506,522-file target with headroom."""
+        import tools.research_tools as rt_mod
+
+        self.assertGreaterEqual(
+            rt_mod._resolve_worktree_entry_cap(), 1_000_000,
+            "Default worktree cap is below the measured size of real targets.",
+        )
+
+    def test_detect_vcs_info_does_not_record_a_large_repo_as_unversioned(self):
+        """The provenance artifact must not assert 'none' for a repository we declined to validate."""
+        import tools.research_tools as rt_mod
+
+        jail = self.tmp / "jail_prov"
+        repo = jail / "repo"
+        self._repo(repo)
+
+        tok = current_run_context.set(
+            RunContext(jail_dir=jail, db_path=self.db, target_file=repo, run_id="prov")
+        )
+        try:
+            with patch.dict(os.environ, {rt_mod._MAX_WORKTREE_ENTRIES_ENV: "1"}):
+                info = rt_mod.detect_vcs_info(repo)
+        finally:
+            current_run_context.reset(tok)
+
+        self.assertNotEqual(
+            info["vcs_type"], "none",
+            "A too-large repository is still recorded as unversioned in run provenance. "
+            "'none' is an affirmative claim of no version control.",
+        )
+        self.assertEqual(info["vcs_type"], "unknown")
+        self.assertIn("too large", info["error"].lower())
+
+    def test_every_vcs_type_emitted_is_permitted_by_the_published_schema(self):
+        """detect_vcs_info must not invent enum members the skills cannot render.
+
+        Written after shipping 'unvalidated', which no consumer handled: schema.json
+        constrains this field and mantis-report branches on the same five values. A pin
+        asserting a hand-picked string verifies only that the code does what the code
+        does; this reads the published contract instead.
+        """
+        import re as _re
+
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        schema_path = repo_root / "schema.json"
+        if not schema_path.is_file():
+            # The neuter matrix copies only reference/ into an isolated tree, so the
+            # published contract is genuinely not present there. Skipping keeps this from
+            # reporting a red in every scenario for a reason unrelated to the neutered
+            # control -- a false red is worse than no signal, because it masks real ones.
+            self.skipTest(f"schema.json not present at {schema_path}; contract unavailable.")
+
+        schema = json.loads(schema_path.read_text())
+
+        def _find_enum(node):
+            if isinstance(node, dict):
+                if "vcs_type" in node and isinstance(node["vcs_type"], dict):
+                    values = node["vcs_type"].get("enum")
+                    if values:
+                        return set(values)
+                for value in node.values():
+                    found = _find_enum(value)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for item in node:
+                    found = _find_enum(item)
+                    if found:
+                        return found
+            return None
+
+        permitted = _find_enum(schema)
+        self.assertTrue(permitted, "Could not locate the vcs_type enum; test would be vacuous.")
+
+        source = (repo_root / "reference" / "tools" / "research_tools.py").read_text()
+        body = source[source.index("def detect_vcs_info("):]
+        emitted = set(_re.findall(r'"vcs_type":\s*"([a-z-]+)"', body))
+        emitted |= set(_re.findall(r'kind\s*=\s*"([a-z-]+)"', body))
+        emitted |= set(_re.findall(r'else\s+"([a-z-]+)"', body))
+        self.assertTrue(emitted, "Found no vcs_type literals; test would be vacuous.")
+
+        unpermitted = emitted - permitted
+        self.assertFalse(
+            unpermitted,
+            f"detect_vcs_info emits vcs_type values absent from schema.json: "
+            f"{sorted(unpermitted)}. Permitted: {sorted(permitted)}. Consumers such as "
+            f"mantis-report branch on this enum and will not render a new member.",
+        )
 
 
 

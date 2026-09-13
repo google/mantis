@@ -202,6 +202,46 @@ SCENARIOS = {
          r'for line in f_out.split("\0"):',
          'for line in f_out.splitlines():'),
     ],
+
+    # ---- Large-repository scaling controls ----
+    # Each reverts the exact line the corresponding pin exercises. Reverting a helper the
+    # pin does not reach would produce an inert scenario that reds nothing.
+    "scale_revert_bounded_listing": [
+        ("tools/research_tools.py",
+         "        return _bounded_listing(sorted(files), directory)\n    except Exception as e:\n        return f\"Error listing files: {e}\"",
+         "        return json.dumps(sorted(files), indent=2)  # NEUTERED: unbounded listing\n    except Exception as e:\n        return f\"Error listing files: {e}\""),
+    ],
+    "scale_revert_presend_context_guard": [
+        ("core/config.py",
+         "        # Before the retry loop, not inside it: an oversized request is deterministic, so\n        # every pass through the loop would upload the same doomed payload again.\n        enforce_context_budget(model, messages, tools)",
+         "        pass  # NEUTERED: no pre-dispatch context check"),
+        ("core/config.py",
+         "        # Both dispatch paths are guarded: a control that only covers the async path is a\n        # control that a single synchronous caller silently disables.\n        enforce_context_budget(model, messages, tools)",
+         "        pass  # NEUTERED: no pre-dispatch context check"),
+    ],
+    "scale_revert_overflow_nonretryable": [
+        ("core/config.py",
+         '    "ContextBudgetExceededError",\n    "ContextWindowExceededError",\n)',
+         ")  # NEUTERED: overflow is retried three times identically"),
+    ],
+    "scale_revert_capacity_sentinel": [
+        ("tools/research_tools.py",
+         '                f"{REPO_TOO_LARGE_PREFIX}the worktree holds more than {worktree_cap} entries, "\n                f"so the submodule-escape inspection cannot complete. Set "\n                f"{_MAX_WORKTREE_ENTRIES_ENV} to a higher entry count to raise this limit."',
+         '                f"Repository worktree exceeds entry limit ({worktree_cap}); refusing to validate."  # NEUTERED'),
+    ],
+    "scale_revert_vcs_capacity_branch": [
+        ("tools/research_tools.py",
+         '    if err.startswith(REPO_TOO_LARGE_PREFIX):\n        detail = err.removeprefix(REPO_TOO_LARGE_PREFIX).rstrip()',
+         '    if False:  # NEUTERED: capacity collapses back into absence\n        detail = err.removeprefix(REPO_TOO_LARGE_PREFIX).rstrip()'),
+        ("tools/research_tools.py",
+         '        kind = "unknown" if err.startswith(REPO_TOO_LARGE_PREFIX) else "none"',
+         '        kind = "none"  # NEUTERED'),
+    ],
+    "scale_revert_worktree_cap_raise": [
+        ("tools/research_tools.py",
+         "_MAX_WORKTREE_DIR_ENTRIES = 1000000",
+         "_MAX_WORKTREE_DIR_ENTRIES = 500000  # NEUTERED: below real-world repository sizes"),
+    ],
 }
 
 

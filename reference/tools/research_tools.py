@@ -25,6 +25,44 @@ logger = logging.getLogger(__name__)
 
 MAX_READ_SIZE = 1024 * 1024  # 1 MiB
 
+# Maximum directory entries returned by list_files in a single response.
+#
+# A listing is not a file: truncating a file still leaves useful content, but an
+# unbounded listing is pure context saturation with no analytic value. Measured on
+# chromium, an unbounded listing serialized 42,128,106 bytes (~10.5M tokens) into a
+# 1,048,576-token window -- 10x over -- and killed the run on its second node before
+# any analysis happened.
+#
+# Operator-overridable: a larger window may warrant a larger page.
+_MAX_LIST_ENTRIES_ENV = "MANTIS_MAX_LIST_ENTRIES"
+MAX_LIST_ENTRIES = 1000
+
+# Marks a refusal as "this repository is too large for the guard to validate" rather
+# than "this is not a repository". Callers MUST branch on this instead of collapsing
+# every validation failure into "no VCS available", which is what caused Mantis to
+# treat chromium as an unversioned directory.
+REPO_TOO_LARGE_PREFIX = "REPO_TOO_LARGE: "
+
+
+def _resolve_entry_cap(env_var: str, default: int) -> int:
+    """Resolves an operator-overridable entry cap from the environment at call time.
+
+    Read at call time rather than import time so an operator can raise a cap for a single
+    run without reinstalling or reimporting. Invalid values are logged and ignored rather
+    than silently coerced -- a cap that quietly became something other than what the
+    operator typed is worse than one that visibly refused the input.
+    """
+    raw = os.environ.get(env_var, "")
+    if raw.strip():
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+        logger.warning("Ignoring invalid %s=%r; using default %d.", env_var, raw, default)
+    return default
+
 
 def _resolve_context_db(ctx: Any) -> Optional[str]:
     """Safely resolves and anchors the context db_path before existence checks or opens."""
@@ -428,6 +466,47 @@ async def write_file(filepath: str, content: str) -> str:
     )
 
 
+def _resolve_list_entry_cap() -> int:
+    """Operator-overridable listing cap."""
+    return _resolve_entry_cap(_MAX_LIST_ENTRIES_ENV, MAX_LIST_ENTRIES)
+
+
+def _bounded_listing(entries: list, directory: str = "") -> str:
+    """Serializes a directory listing, bounding it so a large tree cannot saturate the context.
+
+    Every list_files return path goes through here. An unbounded listing is the one tool
+    output with no partial value -- half a file still teaches the model something, half a
+    repository index does not -- and it is also the easiest to blow past a context window
+    by orders of magnitude. When the listing is truncated the response changes shape to an
+    object carrying the true total, so the caller learns the listing was incomplete instead
+    of silently reasoning over a prefix it believes is exhaustive.
+    """
+    cap = _resolve_list_entry_cap()
+    total = len(entries)
+    if total <= cap:
+        return json.dumps(entries, indent=2)
+
+    scope = directory.strip("/") or "the target root"
+    logger.warning(
+        "list_files truncated: returning %d of %d entries under '%s'.", cap, total, scope,
+    )
+    return json.dumps(
+        {
+            "entries": entries[:cap],
+            "shown": cap,
+            "total": total,
+            "truncated": True,
+            "hint": (
+                f"Only the first {cap} of {total} entries under '{scope}' are shown. "
+                "This target is too large to enumerate in one call. Call list_files again "
+                "with a narrower 'directory' to walk a specific subtree, or read_file on "
+                "paths you already know. Do not assume the shown entries are exhaustive."
+            ),
+        },
+        indent=2,
+    )
+
+
 async def list_files(directory: str = "") -> str:
     """Lists files in the target workspace or campaign artifact store."""
     ctx = current_run_context.get()
@@ -463,12 +542,12 @@ async def list_files(directory: str = "") -> str:
             if clean_dir == "workspace" and not items:
                 items.add("workspace/plan.json")
                 items.add("workspace/kb/THREAT_MODEL.md")
-        return json.dumps(sorted(list(items)), indent=2)
+        return _bounded_listing(sorted(items), clean_dir)
 
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:
             files = await ctx.sandbox.list_files(directory)
-            return json.dumps(files, indent=2)
+            return _bounded_listing(sorted(files), directory)
         except PermissionError as pe:
             return f"Error: Permission denied. {pe}"
         except FileNotFoundError as fe:
@@ -484,14 +563,14 @@ async def list_files(directory: str = "") -> str:
         if os.path.isfile(jail):
             if target_dir != jail and target_dir != base_dir:
                 return f"Error: Permission denied. Path outside allowed scope."
-            return json.dumps([os.path.basename(jail)], indent=2)
+            return _bounded_listing([os.path.basename(jail)], directory)
 
         if os.path.commonpath([jail, target_dir]) != jail:
             return f"Error: Permission denied. Directory outside allowed scope."
         if not os.path.exists(target_dir):
             return f"Error: Directory not found at '{directory}'"
         if not os.path.isdir(target_dir):
-            return json.dumps([os.path.basename(target_dir)], indent=2)
+            return _bounded_listing([os.path.basename(target_dir)], directory)
 
         files = []
         for root, dirs, filenames in os.walk(target_dir):
@@ -500,7 +579,7 @@ async def list_files(directory: str = "") -> str:
                 if not fn.startswith("."):
                     rel = os.path.relpath(os.path.join(root, fn), base_dir)
                     files.append(rel)
-        return json.dumps(sorted(files), indent=2)
+        return _bounded_listing(sorted(files), directory)
     except Exception as e:
         return f"Error listing files: {e}"
 
@@ -1019,6 +1098,7 @@ def _validate_git_jail(repo_dir: Path, jail_dir: Path) -> tuple[bool, str]:
     # If a submodule checkout or nested repository exists within repo_dir, ensure its
     # internals contain no jail-escaping symlinks/hardlinks and its config contains no unvetted directives.
     seen_entries = 0
+    worktree_cap = _resolve_worktree_entry_cap()
     for root, dirs, files in os.walk(str(repo_dir), followlinks=False):
         # Do not inspect root repo's own .git in worktree walk (already validated above)
         is_root = (Path(root) == repo_real or Path(root) == repo_dir)
@@ -1027,9 +1107,16 @@ def _validate_git_jail(repo_dir: Path, jail_dir: Path) -> tuple[bool, str]:
             dirs.remove(d)
 
         seen_entries += len(dirs) + len(files)
-        if seen_entries > _MAX_WORKTREE_DIR_ENTRIES:
-            logger.warning("Worktree entry limit (%d) exceeded during submodule inspection.", _MAX_WORKTREE_DIR_ENTRIES)
-            return False, f"Repository worktree exceeds entry limit ({_MAX_WORKTREE_DIR_ENTRIES}); refusing to validate."
+        if seen_entries > worktree_cap:
+            logger.warning(
+                "Worktree entry limit (%d) exceeded during submodule inspection of %s.",
+                worktree_cap, repo_dir,
+            )
+            return False, (
+                f"{REPO_TOO_LARGE_PREFIX}the worktree holds more than {worktree_cap} entries, "
+                f"so the submodule-escape inspection cannot complete. Set "
+                f"{_MAX_WORKTREE_ENTRIES_ENV} to a higher entry count to raise this limit."
+            )
 
         # Check nested .git directories/files (skip root's own .git)
         candidates = []
@@ -1171,11 +1258,49 @@ def _is_git_config_key_allowed(raw_key: str) -> bool:
 
 # A real .git holds far fewer entries than this; the cap exists so a checkout with a
 # pathological fan-out under .git cannot stall validation. Exceeding it fails closed.
+_MAX_GIT_DIR_ENTRIES_ENV = "MANTIS_MAX_GIT_DIR_ENTRIES"
 _MAX_GIT_DIR_ENTRIES = 20000
 
-# Worktree budget for detecting nested submodules. Worktrees for large real-world repositories
-# (with build directories, node_modules, etc.) can hold hundreds of thousands of files.
-_MAX_WORKTREE_DIR_ENTRIES = 500000
+# Worktree budget for detecting nested submodules. Worktrees for large real-world
+# repositories (with build directories, node_modules, etc.) can hold hundreds of
+# thousands of files -- chromium alone is ~506,000 tracked files, which exceeded the
+# previous 500,000 cap by 1.3% and silently disabled every git-aware operation.
+#
+# The cap still exists: it bounds submodule-inspection work so a pathological fan-out
+# cannot stall validation. But exceeding it is a *capacity* refusal, not evidence that
+# the target has no VCS, and callers must be able to tell those apart -- see
+# REPO_TOO_LARGE_PREFIX and _vcs_unavailable_message below.
+_MAX_WORKTREE_ENTRIES_ENV = "MANTIS_MAX_WORKTREE_ENTRIES"
+_MAX_WORKTREE_DIR_ENTRIES = 1000000
+
+
+def _resolve_worktree_entry_cap() -> int:
+    """Operator-overridable worktree entry cap."""
+    return _resolve_entry_cap(_MAX_WORKTREE_ENTRIES_ENV, _MAX_WORKTREE_DIR_ENTRIES)
+
+
+def _resolve_git_dir_entry_cap() -> int:
+    """Operator-overridable .git metadata entry cap."""
+    return _resolve_entry_cap(_MAX_GIT_DIR_ENTRIES_ENV, _MAX_GIT_DIR_ENTRIES)
+
+
+def _vcs_unavailable_message(err: str) -> str:
+    """Renders a git-jail validation failure without conflating capacity with absence.
+
+    Reporting "not a git repository" for a repository that is merely too large to validate
+    is a silent, unfalsifiable downgrade: history, blame and diff analysis all vanish and
+    the run looks like a legitimate scan of an unversioned directory. Capacity refusals are
+    reported as such, and each carries the specific override that would raise the cap that
+    actually fired.
+    """
+    if err.startswith(REPO_TOO_LARGE_PREFIX):
+        detail = err.removeprefix(REPO_TOO_LARGE_PREFIX).rstrip()
+        return (
+            f"INFO: Target IS a git repository, but it is too large for Mantis to validate "
+            f"safely: {detail} Git-aware analysis (history, diff, VCS metadata) is DISABLED "
+            f"for this run. This is a capacity limit, not a missing repository."
+        )
+    return f"INFO: Target repository is not a git repository or VCS metadata is unavailable ({err})."
 
 
 def _assert_no_symlinks_under(base: Path, jail_real: Path) -> tuple[bool, str]:
@@ -1190,17 +1315,19 @@ def _assert_no_symlinks_under(base: Path, jail_real: Path) -> tuple[bool, str]:
         return False, f"Symlinked git metadata '{base.name}' is prohibited for security."
 
     seen = 0
+    git_dir_cap = _resolve_git_dir_entry_cap()
     for root, dirs, files in os.walk(str(base), followlinks=False):
         for name in list(dirs) + list(files):
             seen += 1
-            if seen > _MAX_GIT_DIR_ENTRIES:
+            if seen > git_dir_cap:
                 logger.warning(
                     "Git metadata directory exceeds entry limit (%d); refusing to validate repository at %s.",
-                    _MAX_GIT_DIR_ENTRIES, base,
+                    git_dir_cap, base,
                 )
                 return False, (
-                    "Git metadata directory exceeds the entry limit "
-                    f"({_MAX_GIT_DIR_ENTRIES}); refusing to validate."
+                    f"{REPO_TOO_LARGE_PREFIX}the git metadata directory holds more than "
+                    f"{git_dir_cap} entries, so the symlink-escape inspection cannot complete. "
+                    f"Set {_MAX_GIT_DIR_ENTRIES_ENV} to a higher entry count to raise this limit."
                 )
             entry = Path(root) / name
             if entry.is_symlink():
@@ -1244,7 +1371,7 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
 
     valid, err = _validate_git_jail(repo_dir, jail_dir)
     if not valid:
-        return f"INFO: Target repository is not a git repository or VCS metadata is unavailable ({err})."
+        return _vcs_unavailable_message(err)
 
     limit = min(max(1, int(max_commits)), 100)
 
@@ -1309,7 +1436,7 @@ async def get_git_diff(commit_hash: str = "", path: str = "") -> str:
 
     valid, err = _validate_git_jail(repo_dir, jail_dir)
     if not valid:
-        return f"INFO: Target repository is not a git repository or VCS metadata is unavailable ({err})."
+        return _vcs_unavailable_message(err)
 
     out, ok = _run_safe_git_command(git_args, repo_dir)
     if not ok:
@@ -1347,7 +1474,14 @@ def detect_vcs_info(target_path: Optional[Union[str, Path]] = None) -> dict[str,
 
     valid, err = _validate_git_jail(repo_dir, jail_dir)
     if not valid:
-        return {"vcs_type": "none", "error": err}
+        # A capacity refusal must not be recorded as "none": this artifact is the run's
+        # provenance record, and "none" is an affirmative claim that the target has no
+        # version control, which makes the downgrade invisible in the final report.
+        # "unknown" is the honest value and, unlike a new enum member, is already
+        # permitted by schema.json and already rendered by mantis-report as
+        # "VCS detection failed/error". The legible detail rides in `error`.
+        kind = "unknown" if err.startswith(REPO_TOO_LARGE_PREFIX) else "none"
+        return {"vcs_type": kind, "error": _vcs_unavailable_message(err)}
 
     commit_out, ok = _run_safe_git_command(["rev-parse", "HEAD"], repo_dir)
     if not ok:

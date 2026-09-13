@@ -338,6 +338,179 @@ class MantisStreamingTruncationError(RuntimeError):
     pass
 
 
+class ContextBudgetExceededError(RuntimeError):
+    """Raised before dispatch when a request cannot possibly fit the model's context window.
+
+    Sending it anyway costs a full upload of the payload, a provider-side rejection, and --
+    because the node retry layer cannot tell a deterministic overflow from a transient fault
+    -- two more identical uploads of the same doomed request. The failure is deterministic in
+    the request itself, so the only useful thing to do with it is refuse early and say which
+    message was too big.
+    """
+
+    def __init__(self, message: str, estimated_tokens: int = 0, limit: int = 0):
+        super().__init__(message)
+        self.estimated_tokens = estimated_tokens
+        self.limit = limit
+
+
+# Exceptions whose outcome is fully determined by the request, so re-running the node with
+# the identical request can only reproduce them. ADK's node retry cannot distinguish these
+# from transient faults and will burn the full attempt budget on them.
+#
+# Matched by class name because several of these types live in third-party packages that may
+# not be importable in every deployment, and a missing import must not silently disable the
+# rule. Note this is intentionally NOT the same list as the log-suppression filter below:
+# retrying an error and reporting it are separate decisions, and a context overflow must stay
+# loudly visible precisely because the operator is the one who has to act on it.
+_NON_RETRYABLE_EXC_NAMES = (
+    "BudgetExceededError",
+    "LlmCallsLimitExceededError",
+    "MantisAuthError",
+    "ContextBudgetExceededError",
+    "ContextWindowExceededError",
+)
+
+
+# Characters per token. Deliberately a constant rather than a real tokenizer: tokenizing a
+# multi-megabyte payload to discover that it is multi-megabyte is self-defeating, and the
+# guard only needs to separate "plausibly fits" from "an order of magnitude over". Real code
+# runs denser than 4 chars/token, so this UNDER-estimates and the guard errs toward letting
+# a borderline request through to the provider -- the fail-open direction, which matters
+# because this is a reliability control, not a security boundary.
+_CHARS_PER_TOKEN = 4
+
+# Fraction of the window a request may occupy before it is refused. Below 1.0 because the
+# estimate is approximate and the response needs room too; a request at 95% of the window
+# has no space left to answer in.
+_CONTEXT_BUDGET_RATIO = 0.9
+
+
+def _message_char_len(message: Any) -> int:
+    """Total character length of one chat message, including structured content parts."""
+    if isinstance(message, str):
+        return len(message)
+    if not isinstance(message, Mapping):
+        return len(str(message))
+
+    total = 0
+    for key in ("role", "name", "tool_call_id"):
+        value = message.get(key)
+        if isinstance(value, str):
+            total += len(value)
+
+    content = message.get("content")
+    if isinstance(content, str):
+        total += len(content)
+    elif isinstance(content, (list, tuple)):
+        for part in content:
+            if isinstance(part, Mapping):
+                text = part.get("text")
+                total += len(text) if isinstance(text, str) else len(str(part))
+            else:
+                total += len(str(part))
+    elif content is not None:
+        total += len(str(content))
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, (list, tuple)):
+        for call in tool_calls:
+            total += len(str(call))
+
+    return total
+
+
+def estimate_prompt_tokens(messages: Any, tools: Any = None) -> int:
+    """Cheap upper-bound-ish token estimate for a request, without tokenizing it."""
+    total_chars = 0
+    if isinstance(messages, (list, tuple)):
+        for message in messages:
+            total_chars += _message_char_len(message)
+    elif messages is not None:
+        total_chars += _message_char_len(messages)
+
+    if tools:
+        try:
+            total_chars += len(json.dumps(tools, default=str))
+        except (TypeError, ValueError):
+            total_chars += len(str(tools))
+
+    return total_chars // _CHARS_PER_TOKEN
+
+
+def resolve_context_limit(model: Any) -> Optional[int]:
+    """Returns the model's max input tokens, or None when it cannot be determined.
+
+    Fails open on purpose. An unknown window means we cannot prove the request is doomed,
+    and refusing a request that would have succeeded is a worse failure than the one this
+    guard exists to prevent.
+    """
+    try:
+        import litellm
+    except Exception:
+        return None
+
+    model_name = str(model)
+    # Only ever input limits. litellm's get_max_tokens()/"max_tokens" report the max OUTPUT
+    # tokens -- often a couple of orders of magnitude smaller than the context window -- so
+    # using either as an input budget would refuse ordinary requests.
+    fn = getattr(litellm, "get_max_input_tokens", None)
+    if fn is not None:
+        try:
+            value = fn(model_name)
+        except Exception:
+            value = None
+        if isinstance(value, int) and value > 0:
+            return value
+
+    try:
+        info = litellm.get_model_info(model_name)
+    except Exception:
+        return None
+    if isinstance(info, Mapping):
+        value = info.get("max_input_tokens")
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def _largest_message_summary(messages: Any) -> str:
+    """Names the biggest contributor to an oversized request so the failure is actionable."""
+    if not isinstance(messages, (list, tuple)) or not messages:
+        return ""
+    sizes = [(_message_char_len(m), i, m) for i, m in enumerate(messages)]
+    chars, index, message = max(sizes, key=lambda item: item[0])
+    role = message.get("role", "?") if isinstance(message, Mapping) else "?"
+    return (
+        f" Largest contributor: message {index} (role={role}) at {chars:,} characters "
+        f"(~{chars // _CHARS_PER_TOKEN:,} tokens)."
+    )
+
+
+def enforce_context_budget(model: Any, messages: Any, tools: Any = None) -> None:
+    """Refuses a request that cannot fit the model's context window, before dispatching it."""
+    limit = resolve_context_limit(model)
+    if not limit:
+        return
+
+    estimated = estimate_prompt_tokens(messages, tools)
+    budget = int(limit * _CONTEXT_BUDGET_RATIO)
+    if estimated <= budget:
+        return
+
+    raise ContextBudgetExceededError(
+        f"Request to '{model}' is too large for its context window: estimated "
+        f"~{estimated:,} input tokens against a {limit:,}-token window "
+        f"({estimated / limit:.1f}x the window, budget {budget:,})."
+        f"{_largest_message_summary(messages)}"
+        " Refused before dispatch; retrying the identical request cannot succeed. "
+        "Narrow the tool output feeding this node (for example, pass a 'directory' to "
+        "list_files or a smaller range to read_file).",
+        estimated_tokens=estimated,
+        limit=limit,
+    )
+
+
 def is_auth_error(e: Optional[Exception]) -> bool:
     """Detects whether an exception represents an authentication or token refresh failure."""
     if e is None:
@@ -677,21 +850,13 @@ try:
         if is_auth_error(exception) or isinstance(exception, MantisAuthError):
             return False
         exc_cls_name = getattr(getattr(exception, "__class__", None), "__name__", "")
-        if exc_cls_name in (
-            "BudgetExceededError",
-            "LlmCallsLimitExceededError",
-            "MantisAuthError",
-        ):
+        if exc_cls_name in _NON_RETRYABLE_EXC_NAMES:
             return False
         cause = getattr(exception, "__cause__", None) or getattr(exception, "__context__", None)
         if cause is not None and (
             is_auth_error(cause)
             or isinstance(cause, MantisAuthError)
-            or getattr(getattr(cause, "__class__", None), "__name__", "") in (
-                "BudgetExceededError",
-                "LlmCallsLimitExceededError",
-                "MantisAuthError",
-            )
+            or getattr(getattr(cause, "__class__", None), "__name__", "") in _NON_RETRYABLE_EXC_NAMES
         ):
             return False
         return _orig_adk_should_retry_node(exception, retry_config, node_state)
@@ -712,6 +877,10 @@ class ResilientLiteLLMClient(LiteLLMClient):
         **kwargs: Any,
     ) -> Any:
         import litellm
+
+        # Before the retry loop, not inside it: an oversized request is deterministic, so
+        # every pass through the loop would upload the same doomed payload again.
+        enforce_context_budget(model, messages, tools)
 
         max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
         initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
@@ -782,6 +951,10 @@ class ResilientLiteLLMClient(LiteLLMClient):
         **kwargs: Any,
     ) -> Any:
         import litellm
+
+        # Both dispatch paths are guarded: a control that only covers the async path is a
+        # control that a single synchronous caller silently disables.
+        enforce_context_budget(model, messages, tools)
 
         max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
         initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
