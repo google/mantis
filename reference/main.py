@@ -908,6 +908,7 @@ def resolve_scan_targets(
     token_budget: int = 0,
     db_path: str = "",
     scope_out: Optional[dict] = None,
+    changed_files_override: Optional[list] = None,
 ) -> tuple[list[str], Optional[dict], str]:
     """Chooses what the campaign scans. Returns `(targets, astm, mode)`.
 
@@ -924,6 +925,12 @@ def resolve_scan_targets(
     returned being their directories), `changed_files` and
     `nothing_changed` (True when there was nothing to scan, and `targets` is
     empty). The return shape is unchanged for every caller that does not ask.
+
+    `changed_files_override`, in `changed` mode, is the caller's own list of
+    the files that changed (absolute paths of discovered files, as
+    --changed-files resolves them): it replaces the ledger's answer, and
+    each directory holding them is its own campaign, with no climb. None,
+    the default, asks the ledger as before.
 
     `precomputed_astm` is an already-computed map for this same target. Workflow
     synthesis needs the map too, and it runs before the pipeline; surveying chromium
@@ -1133,6 +1140,42 @@ def resolve_scan_targets(
         # scope_out.
         if target_path.is_file():
             return whole
+        if changed_files_override is not None:
+            # The caller named the files (--changed-files): the ledger is
+            # not asked which ones changed, only which of them it saw in
+            # other content, for the prior-PoC rule. No climb: a driver
+            # running one file at a time must not widen run N's campaign
+            # over the directories of runs 1..N-1 (group_changed_files).
+            focus_override = list(changed_files_override)
+            if not focus_override:
+                if scope_out is not None:
+                    scope_out["focus_files"] = []
+                    scope_out["nothing_changed"] = True
+                return [], None, SCAN_MODE_CHANGED
+            try:
+                from core.config import normalize_model_id
+                from core.cost import changed_files
+
+                run_model = normalize_model_id(str(config.get("default_model") or ""))
+                edited = changed_files(db_path, focus_override, model=run_model) or {"files": []}
+            except Exception as exc:
+                print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
+                edited = {"files": []}
+            groups = (group_changed_files(focus_override, str(target_path), climb=False)
+                      or [{"dir": str(target_path), "files": focus_override}])
+            print(
+                f"Scan mode {SCAN_MODE_CHANGED}: {len(focus_override)} listed file(s) to examine; "
+                f"{len(groups)} campaign(s) over the target, one per directory holding them, "
+                "each scoped to its files.",
+                file=sys.stderr,
+            )
+            if scope_out is not None:
+                scope_out["focus_files"] = focus_override
+                scope_out["focus_groups"] = groups
+                scope_out["changed_files"] = [f for f in focus_override
+                                              if f in set(edited.get("files") or [])]
+                scope_out["nothing_changed"] = False
+            return [g["dir"] for g in groups], None, SCAN_MODE_CHANGED
         focus: Optional[list] = None
         known = 0
         try:
@@ -1595,6 +1638,40 @@ def _render_change_focus(focus_files: list[str], target_root: str) -> str:
     )
 
 
+def _listed_changed_files(target_path: Path, listed: list, discovered_files: list[str]
+                          ) -> tuple[list[str], list[str], list[str]]:
+    """Resolves --changed-files against the target. `(files, outside,
+    not_source)`: `files` are the discovered files the list names, in the
+    discovered spelling and the list's order, without repeats; `outside`
+    the entries that resolve (symlinks followed) outside the target;
+    `not_source` the rest -- inside, but not among the discovered files.
+    A relative entry is relative to the target. Never raises."""
+    root = os.path.realpath(str(target_path))
+    by_real: dict[str, str] = {}
+    for f in discovered_files or []:
+        by_real.setdefault(os.path.realpath(str(f)), str(f))
+    files: list[str] = []
+    outside: list[str] = []
+    not_source: list[str] = []
+    for raw in listed or []:
+        entry = str(raw or "").strip()
+        if not entry:
+            continue
+        try:
+            real = os.path.realpath(os.path.join(root, os.path.expanduser(entry)))
+        except (OSError, ValueError):
+            not_source.append(entry)
+            continue
+        if real != root and not real.startswith(root + os.sep):
+            outside.append(entry)
+        elif real in by_real:
+            if by_real[real] not in files:
+                files.append(by_real[real])
+        else:
+            not_source.append(entry)
+    return files, outside, not_source
+
+
 #: A `changed` campaign is one directory's worth of changed files. A
 #: directory with fewer than CHANGED_CAMPAIGN_MIN_FILES changed files joins
 #: its parent's campaign while the merged campaign stays within
@@ -1604,7 +1681,7 @@ CHANGED_CAMPAIGN_MAX_FILES = 24
 CHANGED_CAMPAIGN_MIN_FILES = 3
 
 
-def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
+def group_changed_files(focus_files: list[str], target_root: str, climb: bool = True) -> list[dict]:
     """The campaigns of a `changed` run: `[{"dir": <abs path>, "files": [...]}]`,
     sorted by path. `dir` is the campaign's identity: a directory holding
     changed files, or -- for a file at the target root when there are other
@@ -1628,6 +1705,12 @@ def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
     otherwise each is its own single-file campaign, scoped to that file,
     since a root campaign would span every other. Never raises; an
     unresolvable file is dropped.
+
+    `climb=False` skips the small-directory climb: each directory keeps
+    its own campaign. For a caller that names the files itself and runs
+    one file at a time (--changed-files, the PR driver), where a climb
+    would widen a later run's scope over the directories of earlier runs.
+    The nesting and root rules still apply.
     """
     root = os.path.realpath(str(target_root))
     by_dir: dict[str, list[str]] = {}
@@ -1652,7 +1735,7 @@ def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
     # 1. Small directories climb toward (never into) the root while they
     #    stay small and the merged campaign stays within the max. Deepest
     #    first, so a directory's children have settled before it decides.
-    changed = True
+    changed = climb
     while changed:
         changed = False
         for d in _deepest_first(by_dir):
@@ -1976,6 +2059,7 @@ async def pipeline(
     db_timeout: Optional[float] = None,
     rescan_changed_harness: bool = False,
     transcript_out: str = "",
+    changed_files_override: Optional[list] = None,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     # SQLite serializes writers, and every parallel campaign writes findings
@@ -2230,6 +2314,35 @@ async def pipeline(
         if recorded_mode:
             config = {**config, "scan_mode": normalize_scan_mode(recorded_mode)}
             print(f"[RESUME] Scan mode {recorded_mode}, as recorded for this run.", file=sys.stderr)
+    # --changed-files: the caller says which files changed instead of the
+    # ledger. Only a `changed` run over a directory has campaigns scoped to
+    # files; anywhere else the list would be silently ignored, so it is an
+    # error. A path outside the target is an error too; a listed file that
+    # is not source here (excluded, binary, untracked-ignored) is said and
+    # left out, and a list with nothing left is an error like an empty
+    # target.
+    if changed_files_override is not None:
+        mode_now = normalize_scan_mode(config.get("scan_mode", SCAN_MODE_AUTO) or SCAN_MODE_AUTO)
+        if target_path.is_file() or mode_now != SCAN_MODE_CHANGED:
+            print(
+                f"Error: --changed-files needs a directory target and --scan-mode {SCAN_MODE_CHANGED} "
+                f"(target is a {'file' if target_path.is_file() else 'directory'}, scan mode {mode_now}).",
+                file=sys.stderr,
+            )
+            return 1
+        listed, outside, not_source = _listed_changed_files(target_path, changed_files_override, discovered_files)
+        if outside:
+            print(f"Error: --changed-files: {len(outside)} path(s) outside the target {target_path}.",
+                  file=sys.stderr)
+            return 1
+        if not_source:
+            print(f"--changed-files: {len(not_source)} listed path(s) are not source files in the target "
+                  "(excluded, binary, ignored or missing); leaving them out.", file=sys.stderr)
+        if not listed:
+            print("Error: --changed-files: none of the listed paths is a source file in the target.",
+                  file=sys.stderr)
+            return 1
+        changed_files_override = listed
     scan_scope: dict = {}
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
         target_path,
@@ -2239,6 +2352,7 @@ async def pipeline(
         token_budget=resolved_budget.max_tokens,
         db_path=db_path,
         scope_out=scan_scope,
+        changed_files_override=changed_files_override,
     )
     # `changed` with nothing changed is a complete answer, not an empty plan:
     # the resolver printed it, and a run that scans nothing must not confirm
@@ -2262,8 +2376,15 @@ async def pipeline(
     # about: the whole set here, for the count and the settlement at the
     # end; each campaign is briefed on, and re-runs the PoCs of, the ones in
     # its own files (_changed_campaign_brief).
+    #
+    # Not when the caller named the files (--changed-files): the caller owns
+    # earlier findings. The PR driver's gate keeps an imported finding open
+    # until the change fixes it or a person dismisses it; a settlement here
+    # would close it on the model's reading of attacker-authored code. So no
+    # brief, no PoC re-runs and no settlement, as for a file target.
+    settle_priors = changed_files_override is None
     prior_in_scope: list[dict] = []
-    if focus_files:
+    if focus_files and settle_priors:
         prior_in_scope, _brief = _regression_brief(
             db_path, run_id, focus_files, str(resolved_path_root or target_path), str(target_path))
         if prior_in_scope:
@@ -2277,6 +2398,8 @@ async def pipeline(
         if not files:
             return "", []
         text = _render_change_focus(files, str(target_path))
+        if not settle_priors:
+            return text, []
         try:
             priors, brief = _regression_brief(
                 db_path, run_id, files, str(resolved_path_root or target_path), str(target_path))

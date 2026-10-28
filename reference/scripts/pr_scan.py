@@ -762,8 +762,17 @@ def archive_rewritten(db_path: str, prior: List[Dict[str, Any]], changed: Dict[s
 def scan_command(state: MantisState, rel_fp: str, max_llm_calls: int,
                  model: str, api_base: str = "", max_tokens: int = 0,
                  spend_report: str = "", knowledge_dir: str = "") -> List[str]:
-    """scan_change's exact invocation plus the CI pins. Pure, for tests."""
-    cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
+    """scan_change's invocation, over the repository, plus the CI pins. Pure, for tests."""
+    # The repository is the target and the file is the run's one changed
+    # file: a campaign over the file's directory, scoped to the file, that
+    # can read the callers and types it needs in other packages. A file
+    # target is a single-file jail, where a changed sink is judged without
+    # the code that reaches it. One file per run still: the budget share,
+    # timeout and status are per file, and the campaign's directory is the
+    # file's own, so run N never reviews runs 1..N-1's findings as its own.
+    cmd = _scan_cmd(state, str(state.repo), max_llm_calls, model)
+    # One token, so a file named like a flag ("-x.py") stays a value.
+    cmd += ["--scan-mode", "changed", f"--changed-files={rel_fp}"]
     # Static analysis only: the runner never executes anything the PR
     # supplied, whatever the action's own workflow.local.json says.
     cmd += ["--sandbox", "static-only"]

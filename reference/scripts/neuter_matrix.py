@@ -322,6 +322,7 @@ SCENARIOS = {
          "        token_budget=resolved_budget.max_tokens,\n"
          "        db_path=db_path,\n"
          "        scope_out=scan_scope,\n"
+         "        changed_files_override=changed_files_override,\n"
          "    )",
          "    targets_to_scan, astm, scan_mode = [str(target_path)], None, \"whole\"  # NEUTERED"),
     ],

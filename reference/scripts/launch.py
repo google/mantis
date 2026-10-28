@@ -217,6 +217,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--changed-files",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help=(
+            "With --scan-mode changed over a directory: the files that changed, "
+            "instead of the coverage ledger's answer; repeatable, one path per flag, "
+            "relative to the target. Each directory holding them is one campaign over "
+            "the whole target, so the agent can read across packages. A path outside "
+            "the target is an error."
+        ),
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
@@ -434,6 +447,7 @@ def run_launch(
     import_knowledge: str = "",
     rescan_changed_harness: bool = False,
     transcript_out: str = "",
+    changed_files: Optional[list] = None,
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -749,6 +763,7 @@ def run_launch(
                 import_knowledge_dir=import_knowledge,
                 rescan_changed_harness=rescan_changed_harness,
                 transcript_out=transcript_out,
+                changed_files_override=changed_files,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -835,6 +850,7 @@ def main() -> int:
             import_knowledge=args.import_knowledge,
             rescan_changed_harness=args.rescan_changed_harness,
             transcript_out=args.transcript_out,
+            changed_files=args.changed_files,
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)

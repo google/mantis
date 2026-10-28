@@ -372,6 +372,84 @@ class TestPreflightAndCommand(unittest.TestCase):
         self.assertIn("--yes", cmd)
 
 
+class TestRepoRootTarget(unittest.IsolatedAsyncioTestCase):
+    """Each changed file is scanned with the repository as the target and the
+    file as the run's one changed file, so the campaign can read the code
+    around it in other packages. The MCP scan_change path keeps its file
+    target."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mantis_pr_root_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = Path(self.tmp, "repo").resolve()
+        (self.repo / "cmd" / "a").mkdir(parents=True)
+        (self.repo / "internal" / "b").mkdir(parents=True)
+        (self.repo / "cmd" / "a" / "main.go").write_text("package main\n", encoding="utf-8")
+        (self.repo / "internal" / "b" / "policy.go").write_text("package b // POLICY-B\n", encoding="utf-8")
+        self.state = pr_scan.MantisState(str(self.repo))
+
+    @staticmethod
+    def _argv(cmd):
+        from scripts.launch import build_parser
+
+        return build_parser().parse_args(cmd[2:])
+
+    def test_scan_command_targets_the_repo_with_the_file_listed(self):
+        cmd = pr_scan.scan_command(self.state, "cmd/a/main.go", 7, "m")
+        args = self._argv(cmd)
+        self.assertEqual(args.target, str(self.repo))
+        self.assertEqual(args.scan_mode, "changed")
+        self.assertEqual(args.changed_files, ["cmd/a/main.go"])
+        self.assertEqual(args.path_root, str(self.repo))
+        self.assertEqual(args.sandbox, "static-only")
+        # A pull-request file named like a flag is still a value.
+        self.assertEqual(self._argv(pr_scan.scan_command(self.state, "-x.py", 7, "m")).changed_files, ["-x.py"])
+
+    def test_the_mcp_scan_command_is_unchanged(self):
+        cmd = pr_scan._scan_cmd(self.state, str(self.repo / "cmd" / "a" / "main.go"), 7, "m")
+        self.assertEqual(cmd[2], str(self.repo / "cmd" / "a" / "main.go"))
+        self.assertNotIn("--scan-mode", cmd)
+        self.assertFalse(any(c.startswith("--changed-files") for c in cmd))
+
+    async def test_a_scan_reads_across_packages(self):
+        """Counterfactual for the file target: pr_scan's own argv, resolved the
+        way the pipeline resolves it (main.py: targets, jail at the target
+        root, target_file the campaign), then read_file on a file in another
+        package. With a file target the jail is the file's directory and the
+        single-file gate refuses the read."""
+        import main
+        from core.context import RunContext, current_run_context
+        from core.sandbox import build_sandbox
+        import tools.research_tools as rt
+
+        args = self._argv(pr_scan.scan_command(self.state, "cmd/a/main.go", 7, "m"))
+        target = Path(args.target)
+        discovered = main.discover_files(target)
+        listed = None
+        if args.changed_files is not None:
+            listed, outside, _not_source = main._listed_changed_files(target, args.changed_files, discovered)
+            self.assertEqual(outside, [])
+        config = {"scan_mode": args.scan_mode or "auto", "surveyor": {"min_source_files": 1000}}
+        targets, _astm, mode = main.resolve_scan_targets(
+            target, config, discovered, db_path="", scope_out={}, changed_files_override=listed)
+        scan_item = targets[0]
+        jail_dir = str(target.parent) if target.is_file() else str(target)
+        sandbox = build_sandbox({"type": "static-only"}, str(target) if target.is_dir() else scan_item)
+        ctx = RunContext(jail_dir=jail_dir, db_path="", target_file=scan_item, run_id="run-pr",
+                         sandbox=sandbox, active_node="researcher")
+        token = current_run_context.set(ctx)
+        try:
+            out = await rt.read_file("internal/b/policy.go")
+            own = await rt.read_file("cmd/a/main.go")
+        finally:
+            current_run_context.reset(token)
+        self.assertNotIn("Permission denied", out)
+        self.assertIn("POLICY-B", out)
+        self.assertIn("package main", own)
+        self.assertEqual(mode, "changed")
+        self.assertEqual(scan_item, str(self.repo / "cmd" / "a"), "the campaign is the file's own directory")
+
+
 class TestSelection(DriverCase):
     def test_cap_is_deterministic_and_names_the_rest(self):
         state = pr_scan.MantisState(str(self.repo))
@@ -1457,13 +1535,15 @@ class TestKnowledgeRefresh(KnowledgeCase):
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-q", "-m", "touch helper")
         probe = Path(self.tmp) / "launched.txt"
+        real_scan_command = pr_scan.scan_command
 
-        def counting(state, target, max_llm_calls, model):
+        def counting(state, rel_fp, *args, **kwargs):
             with open(probe, "a") as fh:
-                fh.write(os.path.relpath(target, self.repo) + "\n")
-            return fake_scan()(state, target, max_llm_calls, model)
+                fh.write(rel_fp + "\n")
+            return real_scan_command(state, rel_fp, *args, **kwargs)
 
-        self.run_main("--radius", "1", scan=counting)
+        with mock.patch.object(pr_scan, "scan_command", counting):
+            self.run_main("--radius", "1", scan=fake_scan())
         launched = probe.read_text().split()
         self.assertEqual(launched[0], "app.py")
         self.assertIn("caller.py", launched, f"index should name caller.py as a caller: {launched}")
@@ -1610,8 +1690,10 @@ class TestArchivingByFinder(KnowledgeCase):
         by_model = {}
         for e in cov["scanned"]:
             by_model.setdefault(e["model"], set()).add(e["path"])
-        self.assertIn("app.py", by_model["vertex_ai/second"])
-        self.assertIn("app.py", by_model["vertex_ai/finder"])
+        # Coverage is the campaign's: app.py sits at the root, so its
+        # campaign is the repository (main.group_changed_files), per model.
+        self.assertIn(".", by_model["vertex_ai/second"])
+        self.assertIn(".", by_model["vertex_ai/finder"])
 
     def test_a_finding_of_unknown_model_is_shelved_by_anyone(self):
         # Version-1 knowledge names no model: the old rule applies.
