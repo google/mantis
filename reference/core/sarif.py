@@ -450,15 +450,20 @@ def write_sarif(
     findings: List[Dict[str, Any]],
     scan_root: str = "",
     tool_version: str = "",
+    include_suppressed: bool = False,
 ) -> Tuple[int, List[str]]:
     """Writes validated SARIF to `path`. Returns `(result_count, skipped_reasons)`.
 
     Validation runs BEFORE the write. A file that fails its own invariants is not
     a partial success -- it is a file whose consumer will either reject it or
     display nothing, and writing it anyway would make the run look successful.
+
+    `include_suppressed` as for build_sarif: for a caller that has already
+    selected the findings to present by its own rule.
     """
     document, skipped = build_sarif(
-        findings, scan_root=scan_root, tool_version=tool_version
+        findings, scan_root=scan_root, tool_version=tool_version,
+        include_suppressed=include_suppressed,
     )
     problems = validate_sarif(document)
     if problems:

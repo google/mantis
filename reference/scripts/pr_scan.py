@@ -1801,6 +1801,48 @@ def _append(path: str, text: str) -> None:
         fh.write(text)
 
 
+def write_report_sarif(state: MantisState, report: Dict[str, Any], path: str) -> Dict[str, Any]:
+    """Writes the report's findings as SARIF, descriptions included, and says
+    what happened: `{"path", "results", "skipped"}` or `{"path", "error"}`.
+
+    The report lists findings in the gate's short view, which leaves out the
+    description; the rows are read back from the run's database by id for
+    the export, keeping the view's path (a rename's new one) and status. The
+    title and description are model-written from the pull request, so they
+    go out through the repository's sanitizer for SARIF
+    (sanitize_markdown_text: terminal control sequences stripped,
+    credentials scrubbed, executable HTML tags entity-encoded) and then
+    core.sarif's own, into SARIF's plain-text message; no markdown field is
+    written. Never raises: the export is a copy of the verdict's inputs, and
+    a failure to write it must not change the verdict or the exit code.
+    """
+    try:
+        from core.database import read_findings
+        from core.llm_gateway import sanitize_markdown_text
+        from core.sarif import write_sarif
+
+        # The findings the gate counted, as it counted them: its open set
+        # includes 'reported', which core.database counts as suppressed, so
+        # build_sarif's own filter is not re-applied; archived notices are
+        # never a verdict input and stay out.
+        views = [f for f in report.get("findings") or []
+                 if isinstance(f, dict) and f.get("relationship") != "archived"]
+        rows = {r.get("id"): r for r in read_findings(state.db_path)} if views else {}
+        findings = []
+        for v in views:
+            row = rows.get(v.get("id"))
+            if row is None:
+                continue
+            findings.append({**row, "filepath": v.get("filepath") or row.get("filepath"),
+                             "status": v.get("status") or row.get("status"),
+                             "title": sanitize_markdown_text(str(row.get("title") or "")),
+                             "description": sanitize_markdown_text(str(row.get("description") or ""))})
+        count, skipped = write_sarif(path, findings, scan_root=str(state.repo), include_suppressed=True)
+        return {"path": path, "results": count, "skipped": skipped}
+    except Exception as exc:
+        return {"path": path, "error": f"{type(exc).__name__}: {exc}"}
+
+
 # --- Entry point ---------------------------------------------------------------------
 
 
@@ -1863,6 +1905,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "so a broken scanner never stops a merge; on, a green check means "
                         "every changed file was audited.")
     p.add_argument("--output-json", default="", help="Write the full report here")
+    p.add_argument("--output-sarif", default="",
+                   help="Also write the gated findings, descriptions included, as SARIF 2.1.0 "
+                        "here (for GitHub code scanning). A failed write is reported and never "
+                        "changes the verdict.")
     p.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY", ""),
                    help="Append the markdown summary here (default: $GITHUB_STEP_SUMMARY)")
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT", ""),
@@ -2114,6 +2160,16 @@ def main(argv: Optional[List[str]] = None,
     report["renamed"] = moves.get("renamed") or {}
     report["deleted"] = moves.get("deleted") or []
     report["state_dir"] = str(state_dir)
+
+    if args.output_sarif:
+        # After the verdict and exit code are final: a SARIF failure is
+        # recorded in the report and said on stdout, and changes neither.
+        report["sarif"] = write_report_sarif(state, report, args.output_sarif)
+        if report["sarif"].get("error"):
+            from core.llm_gateway import sanitize_egress_text
+
+            print(sanitize_egress_text(
+                f"mantis: SARIF not written to {args.output_sarif}: {report['sarif']['error']}"))
 
     if args.output_json:
         from core.llm_gateway import sanitize_egress_data

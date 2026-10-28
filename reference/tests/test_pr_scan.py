@@ -2118,5 +2118,75 @@ class TestOneProcessResults(unittest.TestCase):
         self.assertEqual(res[0]["status"], "credentials_rejected")
 
 
+class TestSarifExport(DriverCase):
+    """--output-sarif: the gated findings with their descriptions, through
+    core.sarif's sanitizer; a failure to write it never touches the verdict."""
+
+    # Model-written from the pull request: a terminal escape, markup and a
+    # credential the model quoted.
+    HOSTILE = ("Taint reaches eval\x1b[31m via helper\x1b[0m. <script>alert(1)</script> "
+               "Key seen: AKIAIOSFODNN7EXAMPLE.")
+
+    def setUp(self):
+        super().setUp()
+        self.sarif = Path(self.tmp) / "out" / "mantis.sarif"
+        self.finding = {"title": "Injection in helper", "description": self.HOSTILE, "severity": "HIGH",
+                        "filepath": "app.py", "line_numbers": [2], "cwe": "CWE-94"}
+
+    def test_the_description_reaches_sarif_scrubbed(self):
+        rc, _ = self.run_main("--output-sarif", str(self.sarif), scan=fake_scan(self.finding))
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+        rep = self.report()
+        self.assertEqual(rep["sarif"], {"path": str(self.sarif), "results": 1, "skipped": []})
+        raw = self.sarif.read_text(encoding="utf-8")
+        doc = json.loads(raw)
+        result = doc["runs"][0]["results"][0]
+        text = result["message"]["text"]
+        self.assertIn("Taint reaches eval via helper.", text, "the description is in the output")
+        self.assertNotIn("\x1b", raw, "no terminal escape survives")
+        self.assertNotIn("\\u001b", raw)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", raw, "the credential is scrubbed")
+        self.assertIn("[REDACTED_AWS_KEY_ID]", text)
+        # Executable markup is entity-encoded, and no markdown field is
+        # written anywhere a viewer would render.
+        self.assertNotIn("<script", raw)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", text)
+        self.assertNotIn("markdown", raw)
+        self.assertEqual(result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"], "app.py")
+        self.assertEqual(result["ruleId"], "CWE-94")
+
+    def test_a_sarif_failure_never_changes_the_verdict(self):
+        rc_plain, _ = self.run_main("--fail-on", "block", scan=fake_scan(self.finding))
+        plain = self.report()
+
+        def boom(*a, **kw):
+            raise OSError("disk full")
+
+        with mock.patch("core.sarif.write_sarif", boom):
+            rc, out = self.run_main("--fail-on", "block", "--output-sarif", str(self.sarif),
+                                    scan=fake_scan(self.finding))
+        rep = self.report()
+        self.assertEqual(rc, rc_plain)
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+        self.assertEqual((rep["verdict"], rep["findings_verdict"], rep["exit_code"]),
+                         (plain["verdict"], plain["findings_verdict"], plain["exit_code"]))
+        self.assertEqual(rep["sarif"], {"path": str(self.sarif), "error": "OSError: disk full"})
+        self.assertIn("SARIF not written", out)
+        self.assertFalse(self.sarif.exists())
+        # A directory where the file should go: the real writer fails, same rule.
+        self.sarif.mkdir(parents=True)
+        rc, _ = self.run_main("--fail-on", "block", "--output-sarif", str(self.sarif),
+                              scan=fake_scan(self.finding))
+        self.assertEqual(rc, rc_plain)
+        self.assertIn("error", self.report()["sarif"])
+
+    def test_no_findings_is_an_empty_sarif(self):
+        rc, _ = self.run_main("--output-sarif", str(self.sarif), scan=fake_scan())
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+        doc = json.loads(self.sarif.read_text(encoding="utf-8"))
+        self.assertEqual(doc["runs"][0]["results"], [])
+        self.assertEqual(self.report()["sarif"]["results"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
