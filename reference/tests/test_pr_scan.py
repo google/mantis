@@ -1768,6 +1768,244 @@ class TestArchivingByFinder(KnowledgeCase):
         self.assertEqual([a["lineage_id"] for a in self.report()["knowledge"]["archived"]], ["lin-app-1"])
 
 
+# The stand-in for a one-process pipeline run: every listed file arrives as a
+# --changed-files flag; it writes the spend report the real pipeline does,
+# with a per-campaign block (files absolute, as main.py lists them) taken
+# from `plan` {rel: {status, tokens, cached, calls, nodes, trigger}}. A file
+# the plan does not name gets no campaign. `then_sleep` rewrites the report
+# after the campaigns and sleeps, as a run killed after them would.
+_FAKE_ONE_PROCESS = """\
+import json, sys, time
+sys.path.insert(0, {ref_root!r})
+from core.cost import record_spend
+from core.database import record_run
+argv = sys.argv[1:]
+listed = [a.split("=", 1)[1] for a in argv if a.startswith("--changed-files=")]
+with open({probe!r}, "a") as fh:
+    fh.write(json.dumps(argv) + "\\n")
+record_run({db!r}, "run-pr", "")
+plan = {plan!r}
+campaigns = []
+for rel in listed:
+    p = plan.get(rel)
+    if p is None:
+        continue
+    record_spend({db!r}, "run-pr", {repo!r} + "/" + rel, "changed", tokens=5)
+    campaigns.append({{"target": {repo!r} + "/" + rel, "files": [{repo!r} + "/" + rel],
+                      "status": p["status"], "pause_trigger": p.get("trigger", ""),
+                      "tokens": p["tokens"], "fresh_tokens": p["tokens"] - p.get("cached", 0),
+                      "cached_tokens": p.get("cached", 0), "llm_calls": p["calls"],
+                      "elapsed_seconds": 1.5, "nodes": p["nodes"]}})
+total = sum(c["fresh_tokens"] + c["cached_tokens"] for c in campaigns) + {extra_tokens!r}
+calls = sum(c["llm_calls"] for c in campaigns)
+path = argv[argv.index("--spend-report") + 1]
+report = {{"run_id": "run-pr", "tokens": total, "fresh_tokens": total, "cached_tokens": 0,
+          "llm_calls": calls, "pause_trigger": {trigger!r}, "nodes": ["history"],
+          "exit_code": None, "campaigns": campaigns}}
+if {old_pipeline!r}:
+    report.pop("campaigns")
+json.dump(report, open(path, "w"))
+if {then_sleep!r}:
+    time.sleep(30)
+sys.exit({code})
+"""
+
+_PLAN_DONE = {"status": "done", "tokens": 300_000, "cached": 200_000, "calls": 30, "nodes": FULL_GRAPH}
+_PLAN_CAPPED = {"status": "paused", "trigger": "campaign_tokens", "tokens": 450_001, "calls": 12,
+                "nodes": ["history", "structural_index", "architect"]}
+
+
+def fake_one_process(probe, plan, code=0, trigger="", old_pipeline=False, then_sleep=False,
+                     extra_tokens=0):
+    def _cmd(state, target, max_llm_calls, model):
+        return [sys.executable, "-c", _FAKE_ONE_PROCESS.format(
+            ref_root=str(pr_scan._REF_ROOT), db=state.db_path, repo=str(state.repo),
+            probe=str(probe), plan=plan, code=code, trigger=trigger,
+            old_pipeline=old_pipeline, then_sleep=then_sleep, extra_tokens=extra_tokens)]
+    return _cmd
+
+
+class TestOneProcess(DriverCase):
+    """--one-process: one pipeline run for the pull request's files, each
+    file's status, tokens and examined flag taken from its own campaign."""
+
+    def setUp(self):
+        super().setUp()
+        # A third changed file in a directory: app.py and new.py at the root
+        # are then their own single-file campaigns (main.group_changed_files).
+        self.commit_pr({"pkg/lib.py": "def lib(v):\n    return v\n"})
+        self.probe = Path(self.tmp) / "argv.jsonl"
+
+    def launches(self):
+        return [json.loads(l) for l in self.probe.read_text().splitlines()]
+
+    def results(self):
+        return {r["file"]: r for r in self.report()["scan"]["results"]}
+
+    def test_each_file_takes_its_own_campaigns_outcome(self):
+        plan = {"app.py": _PLAN_DONE, "new.py": _PLAN_CAPPED, "pkg/lib.py": _PLAN_DONE}
+        rc, _ = self.run_main("--one-process", "--max-tokens", "1500000",
+                              scan=fake_one_process(self.probe, plan, code=1))
+        launches = self.launches()
+        self.assertEqual(len(launches), 1, "one pipeline run for every file")
+        argv = launches[0]
+        self.assertEqual([a for a in argv if a.startswith("--changed-files=")],
+                         ["--changed-files=app.py", "--changed-files=new.py", "--changed-files=pkg/lib.py"])
+        self.assertEqual(argv[argv.index("--max-tokens") + 1], "1500000")
+        self.assertEqual(argv[argv.index("--max-campaign-tokens") + 1], "500000",
+                         "an equal share per campaign, so one file cannot spend the others'")
+        res = self.results()
+        self.assertEqual(res["app.py"]["status"], "done")
+        self.assertEqual(res["pkg/lib.py"]["status"], "done")
+        self.assertEqual(res["new.py"]["status"], "paused_at_budget",
+                         "only the campaign over its share stops; the others finish")
+        self.assertEqual(res["new.py"]["pause_trigger"], "campaign_tokens")
+        self.assertEqual([res[f]["tokens"] for f in ("app.py", "new.py", "pkg/lib.py")],
+                         [300_000, 450_001, 300_000], "cached tokens at full price, per campaign")
+        self.assertEqual([res[f]["llm_calls"] for f in ("app.py", "new.py", "pkg/lib.py")], [30, 12, 30])
+        self.assertEqual([res[f]["examined"] for f in ("app.py", "new.py", "pkg/lib.py")],
+                         [True, False, True], "examined from each campaign's own nodes")
+        self.assertEqual(self.report()["usage"]["tokens"], 1_050_001)
+        rep = self.report()
+        self.assertEqual([u["file"] for u in rep["coverage"]["unaudited"]], ["new.py"])
+        self.assertTrue(any("new.py" in r and "share of the run token budget" in r for r in rep["reasons"]),
+                        rep["reasons"])
+        self.assertEqual(rep["coverage"]["status"], "partial")
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+
+    def test_a_file_the_run_made_no_campaign_of_is_not_audited(self):
+        # The run finished but listed new.py in no campaign (e.g. not source
+        # there): never "done" on the run's exit code alone. The charge the
+        # campaigns do not account for lands on it.
+        plan = {"app.py": _PLAN_DONE, "pkg/lib.py": _PLAN_DONE}
+        self.run_main("--one-process", "--max-tokens", "3M",
+                      scan=fake_one_process(self.probe, plan, extra_tokens=7))
+        res = self.results()
+        self.assertEqual(res["new.py"]["status"], "finished_with_errors")
+        self.assertEqual(res["new.py"]["tokens"], 7)
+        self.assertEqual(self.report()["usage"]["tokens"], 600_007)
+
+    def test_a_killed_run_keeps_the_campaigns_that_finished(self):
+        plan = {"app.py": _PLAN_DONE}
+        self.run_main("--one-process", "--max-tokens", "3M", "--per-file-timeout", "1",
+                      scan=fake_one_process(self.probe, plan, then_sleep=True))
+        res = self.results()
+        self.assertEqual(res["app.py"]["status"], "done", "its account was written before the kill")
+        self.assertEqual(res["new.py"]["status"], "timed_out")
+        self.assertEqual(res["pkg/lib.py"]["status"], "timed_out")
+        self.assertEqual(self.report()["usage"]["tokens"], 3_000_000,
+                         "a killed run is charged its whole grant")
+        self.assertIn("timed out after 3s", self.scan_log(), "the timeout is the files'")
+
+    def test_an_older_pipeline_without_campaigns_gives_every_file_the_runs_outcome(self):
+        plan = {"app.py": _PLAN_DONE, "new.py": _PLAN_DONE, "pkg/lib.py": _PLAN_DONE}
+        self.run_main("--one-process", "--max-tokens", "3M",
+                      scan=fake_one_process(self.probe, plan, old_pipeline=True))
+        res = self.results()
+        self.assertEqual({r["status"] for r in res.values()}, {"done"})
+        self.assertEqual({r["examined"] for r in res.values()}, {False},
+                         "merged run nodes cannot say which file was examined")
+        self.assertEqual(self.report()["usage"]["tokens"], 900_000)
+
+    def test_a_run_paused_before_a_campaign_leaves_that_file_paused(self):
+        plan = {"app.py": _PLAN_DONE}
+        self.run_main("--one-process", "--max-tokens", "3M",
+                      scan=fake_one_process(self.probe, plan, code=2, trigger="token_budget"))
+        res = self.results()
+        self.assertEqual(res["app.py"]["status"], "done")
+        self.assertEqual(res["new.py"]["status"], "paused_at_budget")
+        self.assertEqual(res["new.py"]["pause_trigger"], "token_budget")
+
+    def test_campaigns_below_the_floor_are_not_launched(self):
+        floor = pr_scan.MIN_SCAN_ALLOWANCE
+        plan = {"app.py": _PLAN_DONE, "new.py": _PLAN_DONE, "pkg/lib.py": _PLAN_DONE}
+        self.run_main("--one-process", "--max-tokens", str(2 * floor),
+                      scan=fake_one_process(self.probe, plan))
+        argv = self.launches()[0]
+        self.assertEqual([a for a in argv if a.startswith("--changed-files=")],
+                         ["--changed-files=app.py", "--changed-files=new.py"])
+        self.assertEqual(argv[argv.index("--max-campaign-tokens") + 1], str(floor))
+        self.assertEqual(self.results()["pkg/lib.py"]["status"], "over_budget")
+        self.assertEqual(self.report()["scan"]["over_budget"], ["pkg/lib.py"])
+
+    def test_one_campaign_needs_no_share_and_files_in_one_directory_share_it(self):
+        state = pr_scan.MantisState(str(self.repo))
+        self.commit_pr({"pkg/more.py": "def more():\n    return 2\n"})
+        self.assertEqual(pr_scan.campaign_groups(state, ["app.py", "pkg/lib.py", "new.py", "pkg/more.py"]),
+                         [["app.py"], ["pkg/lib.py", "pkg/more.py"], ["new.py"]])
+        self.assertEqual(pr_scan.campaign_groups(state, ["app.py", "new.py"]), [["app.py", "new.py"]],
+                         "root files alone are the one root campaign")
+        cmd = pr_scan.scan_command(state, ["app.py", "new.py"], 7, "m", max_tokens=10)
+        self.assertNotIn("--max-campaign-tokens", cmd)
+
+    def test_the_mcp_scan_command_is_unchanged_in_one_process_mode(self):
+        state = pr_scan.MantisState(str(self.repo))
+        base = pr_scan._scan_cmd(state, str(self.repo / "app.py"), 7, "m")
+        self.assertEqual(base[2], str(self.repo / "app.py"))
+        self.assertNotIn("--scan-mode", base)
+        self.assertFalse(any(c.startswith("--changed-files") for c in base))
+        cmd = pr_scan.scan_command(state, ["app.py", "-x.py"], 7, "m", max_campaign_tokens=5)
+        head = pr_scan._scan_cmd(state, str(self.repo), 7, "m")
+        self.assertEqual(cmd[:len(head)], head, "the driver only appends to scan_change's command")
+        from scripts.launch import build_parser
+
+        args = build_parser().parse_args(cmd[2:])
+        self.assertEqual(args.changed_files, ["app.py", "-x.py"])
+        self.assertEqual(args.max_campaign_tokens, "5")
+
+    def test_per_file_mode_is_the_default(self):
+        self.assertFalse(pr_scan.parse_args([]).one_process)
+        self.run_main("--max-tokens", "1000000", scan=fake_scan(tokens=10))
+        self.assertEqual(len(self.report()["scan"]["results"]), 3)
+        self.assertEqual(self.report()["usage"]["tokens"], 30)
+
+
+class TestOneProcessResults(unittest.TestCase):
+    """The pure mapping from a run's spend report to per-file results."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.state = pr_scan.MantisState(self.tmp)
+        for rel in ("a/x.py", "a/y.py", "b/z.py"):
+            p = Path(self.tmp, rel)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x = 1\n")
+
+    def test_a_campaigns_spend_is_shared_by_its_files_and_sums_to_the_charge(self):
+        acct = {"tokens": 1_001, "fresh_tokens": 1_001, "cached_tokens": 0, "llm_calls": 7,
+                "pause_trigger": "", "nodes": [],
+                "campaigns": [{"files": [f"{self.state.repo}/a/x.py", f"{self.state.repo}/a/y.py"],
+                               "status": "done", "pause_trigger": "", "tokens": 1_001,
+                               "fresh_tokens": 1_001, "cached_tokens": 0, "llm_calls": 7,
+                               "elapsed_seconds": 2.0, "nodes": FULL_GRAPH}]}
+        res = pr_scan.one_process_results(self.state, ["a/x.py", "a/y.py", "b/z.py"], "m", 1, acct,
+                                          cost=1_500, granted=500, seconds=9.0)
+        by = {r["file"]: r for r in res}
+        self.assertEqual([by[f]["tokens"] for f in ("a/x.py", "a/y.py", "b/z.py")], [501, 500, 499])
+        self.assertEqual(sum(r["tokens"] for r in res), 1_500)
+        self.assertEqual([by[f]["llm_calls"] for f in ("a/x.py", "a/y.py", "b/z.py")], [4, 3, 0])
+        self.assertEqual(by["b/z.py"]["status"], "finished_with_errors")
+        self.assertTrue(by["a/x.py"]["examined"] and by["a/y.py"]["examined"])
+
+    def test_no_account_is_charged_in_full_and_counts_nothing(self):
+        res = pr_scan.one_process_results(self.state, ["a/x.py", "b/z.py"], "m", None, None,
+                                          cost=1_000, granted=500, seconds=3.0)
+        self.assertEqual([r["status"] for r in res], ["timed_out", "timed_out"])
+        self.assertEqual([r["tokens"] for r in res], [500, 500])
+        self.assertEqual([r["llm_calls"] for r in res], [None, None])
+        self.assertEqual(pr_scan.charge_for(None, None, 1_000), 1_000)
+        self.assertEqual(pr_scan.charge_for(None, {"tokens": 10, "fresh_tokens": 10, "cached_tokens": 0}, 1_000),
+                         1_000, "a killed run's partial account does not lower its charge")
+        self.assertEqual(pr_scan.charge_for(-1, None, 1_000), 0)
+
+    def test_rejected_credentials_reach_the_caller(self):
+        acct = {"tokens": 0, "fresh_tokens": 0, "cached_tokens": 0, "llm_calls": 0,
+                "pause_trigger": "", "nodes": [], "campaigns": []}
+        res = pr_scan.one_process_results(self.state, ["a/x.py"], "m", pr_scan.EXIT_AUTH, acct,
+                                          cost=0, granted=0, seconds=1.0)
+        self.assertEqual(res[0]["status"], "credentials_rejected")
+
 
 if __name__ == "__main__":
     unittest.main()

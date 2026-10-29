@@ -141,12 +141,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-campaign-tokens",
+        type=str,
+        default=None,
+        help=(
+            "Token ceiling for each campaign, e.g. 4M or 500k, in the run ceiling's unit "
+            "(see --cache-discount). A campaign that reaches it stops, its findings so far "
+            "stored, and in a run of several campaigns the others go on; so one campaign "
+            "cannot spend the others' share of --max-tokens. Default: none."
+        ),
+    )
+    parser.add_argument(
         "--spend-report",
         type=str,
         default="",
         help=(
             "Write the run's token and call totals as JSON to this path on exit, "
-            "however the run ended (for a driver that allots this process a budget)."
+            "however the run ended (for a driver that allots this process a budget), "
+            "with each campaign's outcome and spend; rewritten as each campaign ends."
         ),
     )
     parser.add_argument(
@@ -448,6 +460,7 @@ def run_launch(
     rescan_changed_harness: bool = False,
     transcript_out: str = "",
     changed_files: Optional[list] = None,
+    max_campaign_tokens: int = 0,
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -764,6 +777,7 @@ def run_launch(
                 rescan_changed_harness=rescan_changed_harness,
                 transcript_out=transcript_out,
                 changed_files_override=changed_files,
+                max_campaign_tokens=max_campaign_tokens,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -799,12 +813,22 @@ def main() -> int:
             parse_duration_seconds(args.max_time)
         except ValueError as exc:
             parser.error(f"--max-time: {exc}")
+    max_campaign_tokens = 0
+    if args.max_campaign_tokens is not None:
+        try:
+            max_campaign_tokens = parse_token_budget(args.max_campaign_tokens)
+        except ValueError as exc:
+            parser.error(f"--max-campaign-tokens: {exc}")
 
     # The spend report is written however the run ended -- a driver that
     # allotted this process a budget needs the number even when the process
     # was interrupted. An exit code of None means "killed before it could say".
-    from main import write_spend_report
+    # The path is also parked for the pipeline, which rewrites the report as
+    # each campaign ends, so a process killed mid-run still names the
+    # campaigns that finished.
+    from main import _SPEND_REPORT, write_spend_report
 
+    _SPEND_REPORT["path"] = args.spend_report or ""
     exit_code: Optional[int] = None
     try:
         exit_code = run_launch(
@@ -851,6 +875,7 @@ def main() -> int:
             rescan_changed_harness=args.rescan_changed_harness,
             transcript_out=args.transcript_out,
             changed_files=args.changed_files,
+            max_campaign_tokens=max_campaign_tokens,
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)

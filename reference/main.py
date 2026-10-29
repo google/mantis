@@ -652,10 +652,12 @@ _SCAN_MODES = (
 # In a multi-campaign run such a trip fails that campaign and the sweep goes
 # on; wall_clock and token_budget are the operator's ceilings and pause the
 # run. See the BudgetExceededError handler in the campaign worker.
+# campaign_tokens is the campaign's own token share (--max-campaign-tokens).
 _CAMPAIGN_GUARDS = frozenset({
     "node_tool_calls_ceiling",
     "node_visits_ceiling",
     "graph_steps",
+    "campaign_tokens",
 })
 
 
@@ -754,6 +756,46 @@ _WORK_PLAN_DISCLOSURE: dict = {"focus": ""}
 _SPEND_REPORT: dict = {"controller": None}
 
 
+def _note_campaign_spend(scan_item: str, files: list, scope: Optional[BudgetController],
+                         status: str, pause_trigger: str = "", elapsed_seconds: float = 0.0) -> None:
+    """Records how one campaign ended, and what it spent, for --spend-report.
+
+    A driver that runs several changed files in one process needs each one's
+    outcome, which the run's totals and exit code cannot give: one campaign
+    can finish while the next is stopped at its own token share. `status` is
+    "done", "failed" or "paused"; `files` the campaign's changed files (its
+    scope when the run named none). The first word on a campaign stands: a
+    later error in the same iteration (a replan's budget stop) does not undo
+    an outcome already reached. The report is rewritten here when the run
+    has one, so a process killed later still says which campaigns finished.
+    Never raises.
+    """
+    try:
+        campaigns = _SPEND_REPORT.setdefault("campaigns", {})
+        if scan_item in campaigns:
+            return
+        snap = scope.spend_snapshot() if scope is not None else {}
+        campaigns[scan_item] = {
+            "target": str(scan_item),
+            "files": [str(f) for f in (files or [])],
+            "status": str(status),
+            "pause_trigger": str(pause_trigger or ""),
+            "tokens": int(snap.get("tokens") or 0),
+            "fresh_tokens": int(snap.get("fresh_tokens") or 0),
+            "cached_tokens": int(snap.get("cached_tokens") or 0),
+            "llm_calls": int(snap.get("llm_calls") or 0),
+            "elapsed_seconds": round(max(0.0, float(elapsed_seconds or 0.0)), 1),
+            # The nodes this campaign entered, in order: its own graph walk,
+            # where the run-level "nodes" is every campaign's merged.
+            "nodes": list(getattr(scope, "node_visit_counts", {}) or {}),
+        }
+    except Exception as exc:
+        print(f"[SPEND REPORT WARNING] campaign {scan_item}: {exc}", file=sys.stderr)
+        return
+    if _SPEND_REPORT.get("path"):
+        write_spend_report(str(_SPEND_REPORT["path"]), None)
+
+
 def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
     """Writes the run's spend as JSON to `path`. Never raises.
 
@@ -774,6 +816,7 @@ def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
                   "pause_trigger": ""}
     report["exit_code"] = exit_code
     report["nodes"] = list(_SPEND_REPORT.get("nodes") or [])
+    report["campaigns"] = list((_SPEND_REPORT.get("campaigns") or {}).values())
     # The session store's size on disk, for the operator's pruning decision;
     # measured at exit so a paused run reports it too.
     try:
@@ -2060,6 +2103,7 @@ async def pipeline(
     rescan_changed_harness: bool = False,
     transcript_out: str = "",
     changed_files_override: Optional[list] = None,
+    max_campaign_tokens: int = 0,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     # SQLite serializes writers, and every parallel campaign writes findings
@@ -3033,7 +3077,10 @@ async def pipeline(
             # This campaign's budget view. Everything below that says
             # budget_ctrl means THIS campaign: deltas, guards, the ledger.
             # Run-level spend flows through to run_budget by mirroring.
-            budget_ctrl = CampaignBudgetScope(run_budget)
+            # --max-campaign-tokens is this campaign's own ceiling.
+            budget_ctrl = CampaignBudgetScope(run_budget, max_tokens=max_campaign_tokens)
+            # The files this campaign is about, for its spend-report entry.
+            campaign_files = list(group.get("focus") or group.get("targets") or [scan_item])
             # The guest holds the whole target when the target is a tree, even
             # for a one-file campaign: a PoC against one Go or Rust file needs
             # the module around it (go.mod, vendor/, package siblings) to
@@ -3227,6 +3274,9 @@ async def pipeline(
                 except Exception as exc:
                     # Bookkeeping must never cost a scan that is finding real bugs.
                     print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
+                _note_campaign_spend(scan_item, campaign_files, budget_ctrl,
+                                     "failed" if task_failed else "done",
+                                     elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
 
                 # Stages that continued in a fresh context (core.graph_loader
                 # node context ceiling), by stage -- what the window cost this
@@ -3414,12 +3464,22 @@ async def pipeline(
                     )
                     _record_guard_failure(db_path, run_id, scan_item, scan_mode, str(be.trigger or ""),
                                           harness_fingerprint=harness_fingerprint)
+                    # Its own token share spent is a pause for that campaign,
+                    # resumable; a runaway guard is a failure.
+                    _note_campaign_spend(
+                        scan_item, campaign_files, budget_ctrl,
+                        "paused" if be.trigger == "campaign_tokens" else "failed",
+                        pause_trigger=str(be.trigger or ""),
+                        elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
                     continue
                 # The first ceiling to trip names the pause; the ADK-raised
                 # call limit never passes through check_budget(), so it is
                 # recorded here rather than there.
                 if not run_budget.pause_trigger:
                     run_budget.pause_trigger = str(be.trigger or "budget_exceeded")
+                _note_campaign_spend(scan_item, campaign_files, budget_ctrl, "paused",
+                                     pause_trigger=str(be.trigger or "budget_exceeded"),
+                                     elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
                 # Report COVERAGE, not just budget. The banner already prints tokens,
                 # steps and elapsed time, but for a file-by-file scan the number that
                 # decides whether the result means anything is how much of the tree was
@@ -3454,6 +3514,8 @@ async def pipeline(
                     return EXIT_AUTH
                 print(f"PIPELINE CRITICAL ABORT IN TASK ({scan_item}): {e}", file=sys.stderr)
                 failures += 1
+                _note_campaign_spend(scan_item, campaign_files, budget_ctrl, "failed",
+                                     elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
             finally:
                 await sandbox.aclose()
         return None

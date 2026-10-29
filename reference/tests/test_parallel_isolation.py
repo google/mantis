@@ -283,7 +283,8 @@ class CampaignGuardTest(unittest.TestCase):
 
         import main
 
-        self.assertEqual(main._CAMPAIGN_GUARDS, {"node_tool_calls_ceiling", "node_visits_ceiling", "graph_steps"})
+        self.assertEqual(main._CAMPAIGN_GUARDS, {"node_tool_calls_ceiling", "node_visits_ceiling", "graph_steps",
+                                                 "campaign_tokens"})
         for run_level in ("wall_clock", "token_budget", "llm_calls_limit"):
             self.assertNotIn(run_level, main._CAMPAIGN_GUARDS)
         src = inspect.getsource(main.pipeline)
@@ -296,6 +297,142 @@ class CampaignGuardTest(unittest.TestCase):
         self.assertIn('"failed": True', inspect.getsource(main._record_guard_failure))
         self.assertIn("tokens=0", inspect.getsource(main._record_guard_failure))
         self.assertIn("len(targets_to_scan) > 1", handler, "a single-campaign run still pauses")
+
+
+class _ChargingEndpoint:
+    """An OpenAI-compatible endpoint that answers every request with a
+    short text and bills `heavy` tokens for a request that mentions
+    `marker`, 1,000 otherwise."""
+
+    def __init__(self, marker: str, heavy: int):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                pass
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode("utf-8", "replace")
+                usage = heavy if marker in body else 1_000
+                data = json.dumps({
+                    "id": "x", "object": "chat.completion", "created": 0, "model": "fake",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "No issues found."}}],
+                    "usage": {"prompt_tokens": usage - 10, "completion_tokens": 10, "total_tokens": usage},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class CampaignTokenShareTest(unittest.TestCase):
+    """--max-campaign-tokens: each campaign's own token ceiling. A campaign
+    that reaches it stops, a failed ledger row (resumable, covering
+    nothing), and the other campaigns go on; the spend report says how each
+    campaign ended, which is what a driver running several changed files in
+    one process reads per file."""
+
+    def test_the_scope_trips_on_its_own_tokens_only(self):
+        from core.budget import BudgetConfig, BudgetController, BudgetExceededError, CampaignBudgetScope
+
+        run = BudgetController(config=BudgetConfig(max_tokens=1_000_000, cache_discount=1.0), run_id="r")
+        first = CampaignBudgetScope(run, max_tokens=100)
+        first.record_tokens(60)
+        with self.assertRaises(BudgetExceededError) as cm:
+            first.record_tokens(60)
+        self.assertEqual(cm.exception.trigger, "campaign_tokens")
+        second = CampaignBudgetScope(run, max_tokens=100)
+        second.record_tokens(90)  # the sibling's 120 are not its own
+        self.assertEqual(run.accumulated_tokens, 210, "the run still sees every campaign's spend")
+        unbounded = CampaignBudgetScope(run)
+        unbounded.record_tokens(10_000)
+        self.assertEqual(unbounded.campaign_max_tokens, 0)
+
+    def test_the_spend_report_carries_each_campaigns_outcome_and_is_rewritten(self):
+        import json
+
+        import main
+        from core.budget import BudgetConfig, BudgetController, CampaignBudgetScope
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "spend.json")
+        saved = dict(main._SPEND_REPORT)
+        self.addCleanup(lambda: (main._SPEND_REPORT.clear(), main._SPEND_REPORT.update(saved)))
+        run = BudgetController(config=BudgetConfig(cache_discount=1.0), run_id="r")
+        main._SPEND_REPORT.clear()
+        main._SPEND_REPORT.update({"controller": run, "path": path})
+        scope = CampaignBudgetScope(run)
+        scope.record_step("history")
+        scope.record_step("researcher")
+        scope.record_step("reporter")
+        scope.record_tokens(500, cached_count=200)
+        main._note_campaign_spend("/r/a", ["/r/a/x.py"], scope, "done", elapsed_seconds=3.04)
+        on_disk = json.loads(Path(path).read_text())
+        self.assertIsNone(on_disk["exit_code"], "rewritten as the campaign ends, before the exit")
+        self.assertEqual(on_disk["campaigns"], [{
+            "target": "/r/a", "files": ["/r/a/x.py"], "status": "done", "pause_trigger": "",
+            "tokens": 500, "fresh_tokens": 300, "cached_tokens": 200, "llm_calls": 1,
+            "elapsed_seconds": 3.0, "nodes": ["history", "researcher", "reporter"]}])
+        # The first word on a campaign stands.
+        main._note_campaign_spend("/r/a", ["/r/a/x.py"], scope, "paused", pause_trigger="token_budget")
+        self.assertEqual(json.loads(Path(path).read_text())["campaigns"][0]["status"], "done")
+        main.write_spend_report(path, 0)
+        self.assertEqual(json.loads(Path(path).read_text())["exit_code"], 0)
+
+    def test_a_campaign_over_its_share_stops_and_the_others_go_on(self):
+        import json
+        import subprocess
+
+        endpoint = _ChargingEndpoint(marker="alpha/a.py", heavy=150_000)
+        self.addCleanup(endpoint.close)
+        tmp = tempfile.mkdtemp(prefix="mantis_share_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = os.path.join(tmp, "repo")
+        for rel in ("alpha/a.py", "beta/b.py"):
+            Path(repo, rel).parent.mkdir(parents=True, exist_ok=True)
+            Path(repo, rel).write_text("def f(x):\n    return x\n")
+        spend, db = os.path.join(tmp, "spend.json"), os.path.join(tmp, "k.db")
+        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+        env.update({"OPENAI_API_KEY": "dummy", "LLM_TIMEOUT": "10", "MANTIS_LLM_MAX_PATIENCE_SECONDS": "5",
+                    "MANTIS_LLM_STREAM": "0"})
+        proc = subprocess.run(
+            [sys.executable, str(_REF_ROOT / "main.py"), repo, "--scan-mode", "changed", "--yes",
+             "--changed-files", "alpha/a.py", "--changed-files", "beta/b.py",
+             "--sandbox", "static-only", "--model", "openai/fake", "--api-base", endpoint.url,
+             "--db", db, "--max-campaign-tokens", "200k", "--max-tokens", "10M", "--cache-discount", "1",
+             "--max-llm-calls", "60", "--spend-report", spend],
+            capture_output=True, text=True, timeout=300, env=env, cwd=str(_REF_ROOT))
+        out = proc.stdout + proc.stderr
+        report = json.loads(Path(spend).read_text())
+        by = {Path(c["target"]).name: c for c in report["campaigns"]}
+        self.assertEqual(set(by), {"alpha", "beta"}, out[-3000:])
+        self.assertEqual(by["alpha"]["status"], "paused")
+        self.assertEqual(by["alpha"]["pause_trigger"], "campaign_tokens")
+        self.assertGreaterEqual(by["alpha"]["tokens"], 200_000)
+        self.assertEqual(by["beta"]["status"], "done", "the other campaign went on and finished")
+        self.assertIn("reporter", by["beta"]["nodes"])
+        self.assertLess(by["beta"]["tokens"], 200_000)
+        self.assertEqual(report["pause_trigger"], "", "the run itself did not pause")
+        self.assertIn("stopped by its own guard (campaign_tokens", out)
+        import sqlite3
+
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute("SELECT target, metadata_json FROM campaign_spend").fetchall()
+        alpha = [json.loads(m or "{}") for t, m in rows if Path(t).name == "alpha"]
+        self.assertEqual(alpha, [{"failed": True, "guard": "campaign_tokens"}], "resumable, covering nothing")
 
 
 class PatientSessionStoreTest(unittest.IsolatedAsyncioTestCase):

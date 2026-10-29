@@ -737,11 +737,19 @@ class CampaignBudgetScope(BudgetController):
     sequential controller -- same ceilings, same triggers, same banner -- and
     resume checkpoints keep reading the parent's run-level totals, which the
     mirroring keeps complete.
+
+    `max_tokens`, when above 0, is this campaign's own token ceiling, checked
+    against this scope's tokens in the run ceiling's unit (cached input
+    weighted by cache_discount). It trips as "campaign_tokens", a campaign
+    guard: in a run of several campaigns that one campaign stops and the
+    others go on, so one campaign cannot spend the others' share. 0, the
+    default, leaves only the run's ceilings.
     """
 
-    def __init__(self, parent: BudgetController):
+    def __init__(self, parent: BudgetController, max_tokens: int = 0):
         super().__init__(config=parent.config, run_id=parent.run_id)
         self._parent = parent
+        self.campaign_max_tokens = max(0, int(max_tokens or 0))
 
     def record_tokens(self, count: int, cached_count: int = 0,
                       cache_discount: Optional[float] = None,
@@ -803,6 +811,16 @@ class CampaignBudgetScope(BudgetController):
         conflicting.
         """
         self._parent.check_budget()
+        if self.campaign_max_tokens > 0 and self.accumulated_tokens >= self.campaign_max_tokens:
+            self.is_paused = True
+            raise BudgetExceededError(
+                trigger="campaign_tokens",
+                current_value=self.accumulated_tokens,
+                limit_value=self.campaign_max_tokens,
+                run_id=self.run_id,
+                details=(f"Campaign tokens {self.accumulated_tokens:,} reached its ceiling of "
+                         f"{self.campaign_max_tokens:,}"),
+            )
         super().check_budget()
 
     def format_pause_banner(self, *args, **kwargs) -> str:
