@@ -318,6 +318,75 @@ class CodebaseSummary(BaseModel):
     key_modules: List[Union[str, Dict[str, Any]]] = Field(default_factory=list, description='Core system components and directories')
     tech_stack: List[str] = Field(default_factory=list, description='Languages, frameworks, and database dependencies')
 
+    @model_validator(mode="before")
+    @classmethod
+    def _map_field_names(cls, data):
+        """The architect's own field names, mapped rather than dropped.
+
+        Models rarely send `overview`: measured on one repository, every
+        record_summary call used names like architecture_overview,
+        system_purpose, attack_surface and trust_boundaries, all of which
+        `extra="ignore"` discarded, so the stored summary was empty. Now
+        the overview is the first prose field present (overview, summary,
+        description, then the architecture_* and system_purpose names),
+        followed by every other field the model sent as a labeled section;
+        modules and the stack also accept their common other names; a bare
+        string where a list belongs becomes a one-item list.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        def text(v) -> str:
+            if isinstance(v, str):
+                return v.strip()
+            if isinstance(v, list):
+                return "\n".join(f"- {text(i)}" for i in v if text(i))
+            if isinstance(v, dict):
+                return "\n".join(f"{k}: {text(i)}" for k, i in v.items() if text(i))
+            return "" if v is None else str(v)
+
+        rest = dict(data)
+        overview = ""
+        for name in _SUMMARY_OVERVIEW_NAMES:
+            if name in rest:
+                value = text(rest.pop(name))
+                if value and not overview:
+                    overview = value
+                elif value:
+                    rest[name] = value
+        modules = next((rest.pop(n) for n in _SUMMARY_MODULE_NAMES if n in rest), [])
+        for n in _SUMMARY_MODULE_NAMES:
+            rest.pop(n, None)
+        stack = next((rest.pop(n) for n in _SUMMARY_STACK_NAMES if n in rest), [])
+        for n in _SUMMARY_STACK_NAMES:
+            rest.pop(n, None)
+        sections = [f"{k.replace('_', ' ').capitalize()}:\n{text(v)}" for k, v in rest.items() if text(v)]
+        if isinstance(modules, str):
+            modules = [modules] if modules.strip() else []
+        elif isinstance(modules, dict):
+            modules = [modules] if modules else []
+        elif isinstance(modules, list):
+            modules = [m if isinstance(m, (str, dict)) else text(m) for m in modules]
+        else:
+            modules = [text(modules)] if text(modules) else []
+        if isinstance(stack, list):
+            stack = [text(s) for s in stack if text(s)]
+        else:
+            stack = [text(stack)] if text(stack) else []
+        return {
+            "overview": "\n\n".join([overview] + sections if overview else sections),
+            "key_modules": modules,
+            "tech_stack": stack,
+        }
+
+
+# The names the architect uses for each CodebaseSummary field, in order of
+# preference (see CodebaseSummary._map_field_names).
+_SUMMARY_OVERVIEW_NAMES = ("overview", "summary", "description", "architecture_overview",
+                           "architecture_description", "architecture_summary", "system_purpose")
+_SUMMARY_MODULE_NAMES = ("key_modules", "critical_components", "components", "modules")
+_SUMMARY_STACK_NAMES = ("tech_stack", "technologies", "technology_stack")
+
 class ExploitChain(BaseModel):
     """Multi-stage exploit chain from /mantis-chain."""
     model_config = ConfigDict(extra="ignore")

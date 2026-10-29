@@ -47,7 +47,7 @@ from core.budget import (
 )
 from core.database import init_db, read_findings, read_risk_scores, update_status
 from core.sandbox import build_sandbox
-from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
+from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT, prefix_reuse_applies
 from core.context import RunContext, current_run_context
 from core.transcript import TranscriptWriter, event_transcript_rows
 from core.paths import resolve_db_path
@@ -1681,6 +1681,40 @@ def _render_change_focus(focus_files: list[str], target_root: str) -> str:
     )
 
 
+def _render_shared_prefix_note(other_files: list[str], target_root: str) -> str:
+    """The first `changed` campaign's note about the run's other changed
+    files, when the campaigns share the repository jail.
+
+    Its architect and threat modeler run once for the whole run: the later
+    campaigns reuse their summary and threat model (core.graph_loader
+    prefix reuse) instead of deriving their own. So those two stages are
+    told every changed file of the run, fenced as data like the campaign's
+    own list; every other stage keeps to this campaign's files.
+    """
+    from core.llm_gateway import wrap_untrusted_content
+
+    if not other_files:
+        return ""
+    root = os.path.realpath(str(target_root))
+    rels = []
+    for f in other_files:
+        try:
+            rel = os.path.relpath(os.path.realpath(str(f)), root)
+        except ValueError:
+            rel = str(f)
+        rels.append(rel.replace(os.sep, "/"))
+    shown = rels[:200]
+    more = f"\n... and {len(rels) - len(shown)} more" if len(rels) > len(shown) else ""
+    listing = wrap_untrusted_content("\n".join(shown) + more, filename="other_changed_files")
+    return (
+        "\n\nSHARED ARCHITECTURE AND THREAT MODEL. The architecture summary and the threat model "
+        "this campaign records are reused by the run's other campaigns, which examine the "
+        "changed files below. The architect and the threat modeler: cover these files too -- "
+        "the components they belong to, their trust boundaries and entry points. Every other "
+        "stage: stay on this campaign's files above.\n" + listing
+    )
+
+
 def _listed_changed_files(target_path: Path, listed: list, discovered_files: list[str]
                           ) -> tuple[list[str], list[str], list[str]]:
     """Resolves --changed-files against the target. `(files, outside,
@@ -3059,6 +3093,9 @@ async def pipeline(
     replan_lock = asyncio.Lock()
     started_targets: set = set()
     pause_banner_shown = False
+    # Set once the campaign whose prefix the others reuse has been told the
+    # run's other changed files (_render_shared_prefix_note).
+    shared_prefix = {"briefed": False}
 
     async def _campaign_worker():
         nonlocal campaign_queue, failures, successes, paused
@@ -3092,6 +3129,15 @@ async def pipeline(
             # A `changed` campaign's directive and the earlier findings it
             # answers for: its own files' (empty in every other mode).
             change_focus, campaign_priors = _changed_campaign_brief(group)
+            # The first campaign whose repo-scope stages the later ones will
+            # reuse (core.graph_loader prefix reuse) has them cover every
+            # changed file of the run, not only its own.
+            if (change_focus and not shared_prefix["briefed"] and len(campaign_groups) > 1
+                    and prefix_reuse_applies(scan_mode, jail_dir, resolved_path_root, scan_item)):
+                shared_prefix["briefed"] = True
+                change_focus += _render_shared_prefix_note(
+                    [f for g in campaign_groups if g is not group for f in (g.get("focus") or [])],
+                    str(target_path))
             branch_ctx = dataclasses.replace(
                 base_ctx,
                 target_file=scan_item,

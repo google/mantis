@@ -629,10 +629,18 @@ _PREFIX_REUSE_ARTIFACTS = {
     "architect": "summary",
     "threat_modeler": "threat_model",
 }
+# Where the recording tools put each of those artifacts (tools/research_tools:
+# record_summary, record_threat_model); a reused one is recorded there again
+# under the reusing campaign.
+_PREFIX_REUSE_PATHS = {
+    "summary": "workspace/.structured/summary.json",
+    "threat_model": "workspace/.structured/threat_model.json",
+}
 
-# main.py owns the scan-mode vocabulary; the literal is mirrored here because
-# importing main from this module would be circular. A test pins the two equal.
+# main.py owns the scan-mode vocabulary; the literals are mirrored here because
+# importing main from this module would be circular. A test pins them equal.
 _SCAN_MODE_CROSS_FUNCTIONAL = "cross-functional"
+_SCAN_MODE_CHANGED = "changed"
 
 # Shared Harness²-inspired tool-loop guard constants and helpers (c8).
 ABORT_GUARD_MIN_TOOL_CALLS = 8
@@ -1000,30 +1008,84 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
     return _after_tool
 
 
+def prefix_reuse_applies(scan_mode: str, jail_dir: str, path_root: str, target: str) -> bool:
+    """Whether a campaign may share the repo-scope prefix stages' work with
+    the other campaigns of its run.
+
+    Cross-functional campaigns share the repository jail by construction. A
+    `changed` campaign shares it when the jail is the repository root (the
+    caller's --path-root, or the target itself when none is given) and the
+    campaign is a directory: a single-file campaign reads its one file
+    only, so it neither produces a repo-wide summary nor consumes one.
+    Every other mode keeps per-campaign prefixes.
+    """
+    if scan_mode == _SCAN_MODE_CROSS_FUNCTIONAL:
+        return True
+    if scan_mode != _SCAN_MODE_CHANGED or not jail_dir or not target:
+        return False
+    jail = os.path.realpath(str(jail_dir))
+    return jail == os.path.realpath(str(path_root or jail_dir)) and os.path.isdir(str(target))
+
+
+def _artifact_says_something(content: Any) -> bool:
+    """A prefix artifact that can stand for a finished stage: not blank, and
+    not a record whose every field is empty (an empty summary is stored as
+    {"overview": "", "key_modules": [], "tech_stack": []})."""
+    text = str(content or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return True
+
+    def empty(v) -> bool:
+        if isinstance(v, str):
+            return not v.strip()
+        if isinstance(v, (list, dict)):
+            return all(empty(i) for i in (v.values() if isinstance(v, dict) else v))
+        return v is None
+
+    return not empty(parsed)
+
+
 def _make_prefix_reuse_callbacks(node_id: str):
     """Before/after callbacks that let a repo-scope prefix stage reuse itself.
 
-    In cross-functional mode every campaign shares the repository jail, and the
-    architect / threat modeler re-derive the same repo-wide summary and threat
-    model on every campaign, overwriting the previous campaign's row each time
-    (campaign_artifacts is UNIQUE(run_id, filepath)). The before-callback
-    returns reuse text -- which the runtime treats as the agent's output,
-    skipping the LLM call -- only when ALL of:
+    Where campaigns share the repository jail (prefix_reuse_applies:
+    cross-functional runs, and changed runs over the repository root), the
+    architect / threat modeler re-derive the same repo-wide summary and
+    threat model on every campaign. The before-callback returns reuse text
+    -- which the runtime treats as the agent's output, skipping the LLM
+    call -- only when ALL of:
 
-      * the run is cross-functional. Per-campaign jails make reuse wrong, so
-        file-by-file and unknown modes always re-run;
-      * this process already ran the stage to completion for this run_id.
-        Process-local on purpose: a resumed run re-derives against the
-        resynced checkout instead of trusting a pre-restart artifact;
-      * the stage's artifact row actually exists in the database.
+      * the campaign shares the jail (prefix_reuse_applies). Per-campaign
+        jails make reuse wrong, so file-by-file, single-file and unknown
+        campaigns always re-run;
+      * this process already ran the stage to completion for this run_id,
+        in a campaign that shares the jail. Process-local on purpose: a
+        resumed run re-derives against the resynced checkout instead of
+        trusting a pre-restart artifact;
+      * that campaign's artifact row exists and says something: an empty
+        summary is not a finished architect.
 
-    Everything else -- missing context, missing artifact, any exception --
-    falls through to running the stage, which is the behavior that shipped
-    (INV-6). What reuse costs is the per-campaign briefing nuance these stages
-    would otherwise see in the seed message; what it buys is their LLM spend
-    on every campaign after the first.
+    The reused artifact is then recorded again under this campaign. Each
+    campaign's tools read their own campaign's rows (get_summary,
+    get_threat_model), so without the copy a reusing campaign saw NO_DATA
+    where the stage it skipped would have left its output.
+
+    Everything else -- missing context, missing or empty artifact, any
+    exception -- falls through to running the stage, which is the behavior
+    that shipped (INV-6). What reuse costs is the per-campaign briefing
+    nuance these stages would otherwise see; what it buys is their LLM
+    spend on every campaign after the first.
     """
-    completed_runs: set[str] = set()
+    # run_id -> the campaign (target) whose completed stage is reused.
+    completed_runs: dict[str, str] = {}
+
+    def _shares_jail(ctx) -> bool:
+        return prefix_reuse_applies(getattr(ctx, "scan_mode", ""), getattr(ctx, "jail_dir", ""),
+                                    getattr(ctx, "path_root", ""), getattr(ctx, "target_file", ""))
 
     def _before(callback_context=None):
         try:
@@ -1032,28 +1094,32 @@ def _make_prefix_reuse_callbacks(node_id: str):
             ctx = current_run_context.get()
             if ctx is None or not ctx.run_id or not ctx.db_path:
                 return None
-            if getattr(ctx, "scan_mode", "") != _SCAN_MODE_CROSS_FUNCTIONAL:
+            if not _shares_jail(ctx):
                 return None
             if ctx.run_id not in completed_runs:
                 return None
-            from core.database import read_artifact
+            from core.database import read_artifact, record_artifact
             from core.paths import resolve_db_path
 
-            artifact = read_artifact(
-                resolve_db_path(ctx.db_path),
-                artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
-                run_id=ctx.run_id,
-            )
-            if not artifact:
+            db = resolve_db_path(ctx.db_path)
+            kind = _PREFIX_REUSE_ARTIFACTS[node_id]
+            producer = completed_runs[ctx.run_id]
+            artifact = read_artifact(db, artifact_type=kind, run_id=ctx.run_id, resource=producer)
+            if not _artifact_says_something(artifact):
                 return None
+            own = str(getattr(ctx, "target_file", "") or "")
+            if own != producer:
+                record_artifact(db, ctx.run_id, kind, _PREFIX_REUSE_PATHS[kind], artifact,
+                                metadata={"resource": own, "snapshot_id": getattr(ctx, "snapshot_id", ""),
+                                          "reused_from": producer})
             return types.Content(
                 role="model",
                 parts=[types.Part(text=(
-                    f"[{node_id}] Reused the {_PREFIX_REUSE_ARTIFACTS[node_id]} "
+                    f"[{node_id}] Reused the {kind} "
                     f"artifact recorded by an earlier campaign of this run: "
-                    f"cross-functional campaigns share the repository jail, so "
+                    f"the campaigns share the repository jail, so "
                     f"this stage's repo-wide input is unchanged. No new "
-                    f"analysis was performed."
+                    f"analysis was performed.{' It is recorded for this campaign too.' if own != producer else ''}"
                 ))],
             )
         except Exception:
@@ -1066,12 +1132,8 @@ def _make_prefix_reuse_callbacks(node_id: str):
             from core.context import current_run_context
 
             ctx = current_run_context.get()
-            if (
-                ctx
-                and ctx.run_id
-                and getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL
-            ):
-                completed_runs.add(ctx.run_id)
+            if ctx and ctx.run_id and _shares_jail(ctx):
+                completed_runs.setdefault(ctx.run_id, str(getattr(ctx, "target_file", "") or ""))
         except Exception:
             pass
         return None

@@ -1365,19 +1365,41 @@ SCENARIOS = {
     ],
     "prefix_reuse_mode_gate_removed": [
         ("core/graph_loader.py",
-         "            if getattr(ctx, \"scan_mode\", \"\") != _SCAN_MODE_CROSS_FUNCTIONAL:\n"
+         "            if not _shares_jail(ctx):\n"
          "                return None\n"
          "            if ctx.run_id not in completed_runs:",
          "            if ctx.run_id not in completed_runs:  # NEUTERED: any mode may reuse"),
         ("core/graph_loader.py",
-         "            if (\n"
-         "                ctx\n"
-         "                and ctx.run_id\n"
-         "                and getattr(ctx, \"scan_mode\", \"\") == _SCAN_MODE_CROSS_FUNCTIONAL\n"
-         "            ):\n"
-         "                completed_runs.add(ctx.run_id)",
+         "            if ctx and ctx.run_id and _shares_jail(ctx):\n"
+         "                completed_runs.setdefault(",
          "            if ctx and ctx.run_id:  # NEUTERED: any mode marks completion\n"
-         "                completed_runs.add(ctx.run_id)"),
+         "                completed_runs.setdefault("),
+    ],
+    # A reusing campaign's tools read its own rows: the reused artifact must be
+    # recorded under it, or get_summary / get_threat_model answer NO_DATA.
+    "prefix_reuse_visibility_copy_removed": [
+        ("core/graph_loader.py",
+         "            if own != producer:\n"
+         "                record_artifact(",
+         "            if False:  # NEUTERED: the reusing campaign's tools see NO_DATA\n"
+         "                record_artifact("),
+    ],
+    "prefix_reuse_producer_pin_removed": [
+        ("core/graph_loader.py",
+         "artifact = read_artifact(db, artifact_type=kind, run_id=ctx.run_id, resource=producer)",
+         "artifact = read_artifact(db, artifact_type=kind, run_id=ctx.run_id)  # NEUTERED: latest row, any campaign"),
+    ],
+    "prefix_reuse_empty_proof_accepted": [
+        ("core/graph_loader.py",
+         "            if not _artifact_says_something(artifact):\n",
+         "            if not artifact:  # NEUTERED: an empty summary proves a finished architect\n"),
+    ],
+    "prefix_reuse_changed_runs_unshared": [
+        ("core/graph_loader.py",
+         "    if scan_mode != _SCAN_MODE_CHANGED or not jail_dir or not target:\n"
+         "        return False\n",
+         "    if True:  # NEUTERED: only cross-functional campaigns share the prefix\n"
+         "        return False\n"),
     ],
 }
 

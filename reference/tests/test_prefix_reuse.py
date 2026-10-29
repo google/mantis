@@ -41,6 +41,7 @@ from core.context import RunContext, current_run_context
 from core.database import init_db, record_artifact
 from core.graph_loader import (
     _PREFIX_REUSE_ARTIFACTS,
+    _SCAN_MODE_CHANGED,
     _SCAN_MODE_CROSS_FUNCTIONAL,
     _make_prefix_reuse_callbacks,
 )
@@ -158,6 +159,229 @@ class VocabularyPinTest(unittest.TestCase):
         self.assertEqual(
             main_module.SCAN_MODE_CROSS_FUNCTIONAL, _SCAN_MODE_CROSS_FUNCTIONAL
         )
+        self.assertEqual(main_module.SCAN_MODE_CHANGED, _SCAN_MODE_CHANGED)
+
+
+class ChangedRunReuseTest(_CallbackTest):
+    """A `changed` run whose jail is the repository root: its directory
+    campaigns share the prefix like cross-functional ones, and a reusing
+    campaign's tools see the reused artifacts as its own."""
+
+    def setUp(self):
+        super().setUp()
+        for d in ("alpha", "beta"):
+            os.makedirs(os.path.join(self.tmp, d))
+            Path(self.tmp, d, "m.py").write_text("x = 1\n")
+        Path(self.tmp, "root.py").write_text("y = 2\n")
+
+    def campaign(self, target, path_root=None, scan_mode=_SCAN_MODE_CHANGED):
+        ctx = RunContext(jail_dir=self.tmp, db_path=self.db, run_id="r1", scan_mode=scan_mode,
+                         target_file=os.path.join(self.tmp, target) if target else self.tmp,
+                         path_root=self.tmp if path_root is None else path_root)
+        token = current_run_context.set(ctx)
+        self.addCleanup(current_run_context.reset, token)
+        return ctx
+
+    def test_a_reusing_campaign_sees_the_reused_artifacts(self):
+        from tools.research_tools import get_summary, get_threat_model, record_summary, record_threat_model
+
+        arch_before, arch_after = _make_prefix_reuse_callbacks("architect")
+        tm_before, tm_after = _make_prefix_reuse_callbacks("threat_modeler")
+        self.campaign("alpha")
+        self.assertIsNone(arch_before())
+        self.assertIn("SUCCESS", record_summary({"overview": "ALPHA-OVERVIEW", "key_modules": ["alpha"]}))
+        arch_after()
+        self.assertIsNone(tm_before())
+        self.assertIn("SUCCESS", record_threat_model({"threats": ["TENANT-ESCAPE"]}))
+        tm_after()
+
+        self.campaign("beta")
+        self.assertIsNotNone(arch_before(), "campaign B reuses the architect")
+        self.assertIsNotNone(tm_before(), "and the threat modeler")
+        self.assertIn("ALPHA-OVERVIEW", get_summary(), "B's tools see the reused summary, not NO_DATA")
+        self.assertIn("TENANT-ESCAPE", get_threat_model())
+
+    def test_an_empty_summary_is_not_a_reuse_proof(self):
+        before, after = _make_prefix_reuse_callbacks("architect")
+        ctx = self.campaign("alpha")
+        record_artifact(self.db, "r1", "summary", "workspace/.structured/summary.json",
+                        json.dumps({"overview": "", "key_modules": [], "tech_stack": []}),
+                        metadata={"resource": ctx.target_file})
+        after()
+        self.campaign("beta")
+        self.assertIsNone(before(), "an empty summary must not skip the architect")
+
+    def test_only_directory_campaigns_over_the_root_jail_share(self):
+        before, after = _make_prefix_reuse_callbacks("architect")
+        ctx = self.campaign("root.py")  # a single-file campaign: never a producer
+        record_artifact(self.db, "r1", "summary", "workspace/.structured/summary.json",
+                        json.dumps({"overview": "ROOT"}), metadata={"resource": ctx.target_file})
+        after()
+        self.campaign("beta")
+        self.assertIsNone(before())
+        ctx = self.campaign("alpha")
+        record_artifact(self.db, "r1", "summary", "workspace/.structured/summary.json",
+                        json.dumps({"overview": "ALPHA"}), metadata={"resource": ctx.target_file})
+        after()
+        self.campaign("root.py")
+        self.assertIsNone(before(), "nor a consumer")
+        self.campaign("beta", path_root=os.path.join(self.tmp, "elsewhere"))
+        self.assertIsNone(before(), "a jail that is not the repository root shares nothing")
+        self.campaign("beta", scan_mode="file-by-file")
+        self.assertIsNone(before())
+        self.campaign("beta")
+        self.assertIsNotNone(before())
+
+    def test_the_producers_artifact_is_reused_not_a_later_one(self):
+        from core.database import read_artifact
+        from tools.research_tools import get_summary
+
+        before, after = _make_prefix_reuse_callbacks("architect")
+        ctx = self.campaign("alpha")
+        record_artifact(self.db, "r1", "summary", "workspace/.structured/summary.json",
+                        json.dumps({"overview": "ALPHA"}), metadata={"resource": ctx.target_file})
+        after()
+        # A single-file campaign ran its own architect in between.
+        record_artifact(self.db, "r1", "summary", "workspace/.structured/summary.json",
+                        json.dumps({"overview": "ROOT-ONLY"}),
+                        metadata={"resource": os.path.join(self.tmp, "root.py")})
+        ctx = self.campaign("beta")
+        self.assertIsNotNone(before())
+        self.assertIn("ALPHA", get_summary())
+        self.assertEqual(json.loads(read_artifact(self.db, artifact_type="summary", run_id="r1",
+                                                  resource=ctx.target_file))["overview"], "ALPHA")
+
+
+class SummaryRecordingTest(_CallbackTest):
+    def test_the_architects_own_field_names_are_kept(self):
+        from core.schemas import CodebaseSummary
+
+        # The shape the architect actually sent (measured): no `overview`.
+        s = CodebaseSummary.model_validate({
+            "system_purpose": "Multi-tenant actor platform.",
+            "architecture_overview": "ateapi control plane, atelet node agent.",
+            "attack_surface": "1. gRPC endpoints",
+            "trust_boundaries": ["Worker <-> atelet", "atelet <-> ateapi"],
+            "critical_components": ["cmd/atelet/workersupport.go"],
+        })
+        self.assertTrue(s.overview.startswith("ateapi control plane, atelet node agent."), s.overview)
+        for kept in ("Multi-tenant actor platform.", "1. gRPC endpoints", "- Worker <-> atelet",
+                     "Trust boundaries:"):
+            self.assertIn(kept, s.overview)
+        self.assertEqual(s.key_modules, ["cmd/atelet/workersupport.go"])
+        # The canonical spelling is unchanged.
+        s = CodebaseSummary.model_validate({"overview": "O", "key_modules": [{"name": "m"}],
+                                            "tech_stack": ["Go"]})
+        self.assertEqual((s.overview, s.key_modules, s.tech_stack), ("O", [{"name": "m"}], ["Go"]))
+        s = CodebaseSummary.model_validate({"summary": "S", "modules": "one", "technologies": "Go"})
+        self.assertEqual((s.overview, s.key_modules, s.tech_stack), ("S", ["one"], ["Go"]))
+
+    def test_record_summary_refuses_an_empty_summary(self):
+        from tools.research_tools import record_summary
+
+        self.install_ctx()
+        for empty in ({}, {"overview": "  ", "key_modules": []}, {"tech_stack": ["Go"]}):
+            out = record_summary(empty)
+            self.assertTrue(out.startswith("ERROR SAVING SUMMARY"), out)
+        from core.database import read_artifact
+
+        self.assertIsNone(read_artifact(self.db, artifact_type="summary", run_id="r1"))
+        self.assertIn("SUCCESS", record_summary({"architecture_overview": "A"}))
+
+
+class _ToolCallingEndpoint:
+    """An OpenAI-compatible endpoint that records each request. A request
+    offering record_summary or record_threat_model, with no tool result in
+    it yet, gets a call to that tool with a non-empty argument; everything
+    else gets a short text answer."""
+
+    def __init__(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.requests: list = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                outer.requests.append(body)
+                tools = {t.get("function", {}).get("name") for t in body.get("tools") or []}
+                answered = any(m.get("role") == "tool" for m in body.get("messages") or [])
+                message = {"role": "assistant", "content": "No issues found."}
+                call = None
+                if not answered and "record_summary" in tools:
+                    call = ("record_summary", {"summary": {"architecture_overview": "SHARED-ARCH"}})
+                elif not answered and "record_threat_model" in tools:
+                    call = ("record_threat_model", {"threat_model": {"threats": ["SHARED-THREAT"]}})
+                if call:
+                    message = {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": f"c{len(outer.requests)}", "type": "function",
+                        "function": {"name": call[0], "arguments": json.dumps(call[1])}}]}
+                data = json.dumps({
+                    "id": "x", "object": "chat.completion", "created": 0, "model": "fake",
+                    "choices": [{"index": 0, "finish_reason": "tool_calls" if call else "stop",
+                                 "message": message}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class ChangedRunEndToEndTest(unittest.TestCase):
+    """A listed changed run over the repository root (the PR driver's
+    one-process shape): the first campaign's architect and threat modeler
+    run, told every changed file; the second campaign reuses them."""
+
+    def test_the_second_campaign_reuses_the_first_campaigns_prefix(self):
+        import subprocess
+
+        endpoint = _ToolCallingEndpoint()
+        self.addCleanup(endpoint.close)
+        tmp = tempfile.mkdtemp(prefix="mantis_shared_prefix_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        repo = os.path.join(tmp, "repo")
+        for rel in ("alpha/a.py", "beta/b.py"):
+            Path(repo, rel).parent.mkdir(parents=True, exist_ok=True)
+            Path(repo, rel).write_text("def f(x):\n    return x\n")
+        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+        env.update({"OPENAI_API_KEY": "dummy", "LLM_TIMEOUT": "10", "MANTIS_LLM_MAX_PATIENCE_SECONDS": "5",
+                    "MANTIS_LLM_STREAM": "0"})
+        proc = subprocess.run(
+            [sys.executable, os.path.join(_REF_ROOT, "main.py"), repo, "--scan-mode", "changed", "--yes",
+             "--changed-files", "alpha/a.py", "--changed-files", "beta/b.py", "--path-root", repo,
+             "--sandbox", "static-only", "--model", "openai/fake", "--api-base", endpoint.url,
+             "--db", os.path.join(tmp, "k.db"), "--max-llm-calls", "60"],
+            capture_output=True, text=True, timeout=300, env=env, cwd=_REF_ROOT)
+        out = proc.stdout + proc.stderr
+
+        def offering(tool):
+            return [r for r in endpoint.requests
+                    if tool in {t.get("function", {}).get("name") for t in r.get("tools") or []}]
+
+        self.assertEqual(out.count("Reused the summary"), 1, out[-3000:])
+        self.assertEqual(out.count("Reused the threat_model"), 1)
+        arch = offering("record_summary")
+        self.assertEqual(len(arch), 2, "one architect (call + answer), not one per campaign")
+        first = json.dumps(arch[0])
+        self.assertIn("SHARED ARCHITECTURE AND THREAT MODEL", first)
+        self.assertTrue("beta/b.py" in first and "alpha/a.py" in first,
+                        "the producing campaign is told every changed file")
+        self.assertEqual(len(offering("record_threat_model")), 2)
 
 
 class WiringPinTest(unittest.TestCase):
