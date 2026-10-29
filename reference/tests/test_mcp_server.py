@@ -540,6 +540,51 @@ class TestScanIndexRestore(unittest.TestCase):
             state.index().enclosing_symbol("app.py", 2).get("found"))
 
 
+class TestReindexPin(unittest.TestCase):
+    """reindex pins a clean git checkout to HEAD, so a repeat is a reuse."""
+
+    def setUp(self):
+        import subprocess
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.repo = make_repo(tmp)
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / "mod.py").write_text("def inner():\n    return 1\n", encoding="utf-8")
+        for args in (["init", "-q"], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "t"], ["add", "-A"], ["commit", "-q", "-m", "c"]):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
+        self.state = mcp_server.MantisState(str(self.repo), home=str(Path(tmp) / "state"))
+
+    def _writes(self):
+        from unittest import mock
+
+        import core.structural_index as sidx
+
+        real = sidx._write_catalog
+        calls = []
+        return calls, mock.patch.object(
+            sidx, "_write_catalog", lambda *a, **k: (calls.append(1), real(*a, **k)))
+
+    def test_repeat_reindex_of_a_clean_checkout_reuses_the_catalog(self):
+        calls, patch = self._writes()
+        with patch:
+            first = mcp_server.reindex(self.state)
+            second = mcp_server.reindex(self.state)
+        self.assertEqual(first["status"], "complete")
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(len(calls), 1, "the second reindex at the same commit rebuilt the catalog")
+
+    def test_catalog_re_rooted_at_the_same_commit_is_still_restored(self):
+        from core.structural_index import build_structural_index
+
+        mcp_server.reindex(self.state)
+        build_structural_index(str(self.repo / "sub"), self.state.state_dir())
+        self.assertFalse(self.state.index().enclosing_symbol("app.py", 2).get("found"))
+        mcp_server.reindex(self.state)
+        self.assertTrue(self.state.index().enclosing_symbol("app.py", 2).get("found"))
+
+
 class TestScanStatusLabels(unittest.TestCase):
     """Pipeline exit 2 is a graceful budget pause, not a failure."""
 

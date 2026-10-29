@@ -889,9 +889,10 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
               meter: Optional[Callable[[Dict[str, str]], int]] = None,
               knowledge_dir: str = "", models: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Runs the pipeline over each file in turn -- under each model in turn
-    when `models` names more than one -- then restores the repo-rooted index
-    (the pipeline re-roots the shared catalog at the one file it scanned,
-    which would blind the gate's blast radius).
+    when `models` names more than one -- then makes sure the gate has a
+    repo-rooted index: the scans index the repository and normally leave
+    one, and when they did not (none launched, or the build failed) it is
+    built here, so the gate's blast radius is never blind.
 
     With several models every file is scanned by every model: the models
     differ in what they find, and knowledge worth keeping is the union. The
@@ -1001,11 +1002,27 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
             })
             if code == EXIT_AUTH:
                 break
-    try:
-        reindex(state)
-    except Exception:
-        pass  # the gate reports a missing index as REVIEW on its own
+    if not index_is_repo_rooted(state):
+        try:
+            reindex(state)
+        except Exception:
+            pass  # the gate reports a missing index as REVIEW on its own
     return results
+
+
+def index_is_repo_rooted(state: MantisState) -> bool:
+    """Whether the published catalog is usable and rooted at the repository.
+
+    The scans index the repository itself, so after them the catalog
+    normally already is the one the gate needs, and rebuilding it -- minutes
+    on a large tree -- buys nothing. The state directory is fresh per run,
+    so a catalog found here was built over this checkout by this run.
+    """
+    try:
+        idx = state.index()
+        return idx.available() and idx.manifest.get("code_root") == str(state.repo)
+    except Exception:
+        return False
 
 
 # --- The verdict ---------------------------------------------------------------------

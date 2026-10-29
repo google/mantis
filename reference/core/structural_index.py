@@ -30,9 +30,10 @@ Design rules, in order:
    membership. "No callers" means "no indexed callers".
 3. Read-only on the target. File enumeration goes through CP-1
    get_vetted_staging_files only; all writes land in the state directory.
-4. Reuse on snapshot match. Rebuilding with the same pinned snapshot_id
-   reuses the published index; "unknown" (unpinned) always rebuilds, with
-   per-file content-addressed unit reuse to keep that cheap.
+4. Reuse on snapshot match. Rebuilding the same root with the same pinned
+   snapshot_id reuses the published index; "unknown" (unpinned) always
+   rebuilds, with per-file content-addressed unit reuse to keep that cheap.
+   git_snapshot_id pins a clean checkout to its HEAD.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import sqlite3
 import time
@@ -579,6 +581,37 @@ def _read_manifest(state_dir: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def git_snapshot_id(code_root: str) -> str:
+    """`git:<HEAD>` when code_root is a clean git checkout, else "unknown".
+
+    The pin is what lets a rebuild reuse the published index, so it must
+    only ever name one tree. The index reads every file under code_root, not
+    only tracked ones, so any untracked or ignored file -- not just a
+    modified one -- counts as dirty. A code_root that is not the top of its
+    repository, or any git failure, is "unknown": a full rebuild is the cost,
+    never a stale catalog.
+    """
+    # Lazy, like the surveyor's: core must not import tools at module scope.
+    try:
+        from tools.research_tools import _run_safe_git_command, _validate_git_jail
+
+        root = Path(code_root)
+        valid, _ = _validate_git_jail(root, root)
+        if not valid:
+            return "unknown"
+        head, ok = _run_safe_git_command(["rev-parse", "HEAD"], root)
+        head = head.strip()
+        if not ok or not re.fullmatch(r"[0-9a-f]{7,64}", head):
+            return "unknown"
+        dirty, ok = _run_safe_git_command(
+            ["status", "--porcelain", "--ignored", "--untracked-files=normal"], root, timeout=60)
+        if not ok or dirty.strip():
+            return "unknown"
+        return f"git:{head}"
+    except Exception:
+        return "unknown"
+
+
 def build_structural_index(
     code_root: str,
     state_dir: str,
@@ -614,12 +647,20 @@ def build_structural_index(
 
 def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str, Any]:
     # Step 1: reuse-on-match. "unknown" is a constant, not a freshness signal,
-    # so an unpinned tree always rebuilds (unit cache keeps that cheap).
+    # so an unpinned tree always rebuilds (unit cache keeps that cheap). The
+    # root must match too: a catalog rooted at a subdirectory has different
+    # relative paths and misses every caller outside it. So must the
+    # extractor, as in the unit cache key: the same commit indexed by an
+    # older build is a different catalog.
+    real_root = os.path.realpath(code_root)
+    extractor = f"{SCHEMA_VERSION}|{EXTRACTOR_NAME}@{_ts_version()}"
     existing = _read_manifest(state)
     if (
         existing is not None
         and snapshot_id != "unknown"
         and existing.get("snapshot_id") == snapshot_id
+        and existing.get("code_root") == real_root
+        and existing.get("extractor") == extractor
         and existing.get("status") in ("complete", "partial")
     ):
         existing["reused"] = True
@@ -727,6 +768,8 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "snapshot_id": snapshot_id,
+        "code_root": real_root,
+        "extractor": extractor,
         "root_fingerprint": fingerprint.hexdigest(),
         "status": status,
         "provider": {
@@ -751,10 +794,52 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
     return manifest
 
 
+class _CandidateLookup:
+    """Per-name lookup tables over same-named candidates, built on first use.
+
+    Qualifier matching used to scan every candidate of a name for every
+    edge; a vendored tree has names (`String`, `Error`) with thousands of
+    definitions and hundreds of thousands of edges calling them, which made
+    each build -- even one with every unit cached -- quadratic. Each table
+    maps a key to the candidate positions that the scan would have matched
+    on it, so a lookup returns exactly the scan's match set:
+
+    - `qualified`: the candidate's qualified_name, for `==` matches.
+    - `dotted`: every suffix of qualified_name after a '.', so that
+      `qualified_name.endswith("." + s)` holds exactly when s is a key.
+    - `stem`: Path(file_path).stem.
+    """
+
+    def __init__(self, syms_by_name: Dict[str, List[Dict[str, Any]]]):
+        self._syms_by_name = syms_by_name
+        self._tables: Dict[str, Tuple[Dict[str, List[int]], ...]] = {}
+
+    def tables(self, name: str) -> Tuple[Dict[str, List[int]], ...]:
+        cached = self._tables.get(name)
+        if cached is not None:
+            return cached
+        qualified: Dict[str, List[int]] = {}
+        dotted: Dict[str, List[int]] = {}
+        stem: Dict[str, List[int]] = {}
+        for i, c in enumerate(self._syms_by_name.get(name, [])):
+            q = c.get("qualified_name")
+            if isinstance(q, str):
+                qualified.setdefault(q, []).append(i)
+            qs = str(q or "")
+            pos = qs.find(".")
+            while pos != -1:
+                dotted.setdefault(qs[pos + 1:], []).append(i)
+                pos = qs.find(".", pos + 1)
+            stem.setdefault(Path(str(c.get("file_path") or "")).stem, []).append(i)
+        self._tables[name] = (qualified, dotted, stem)
+        return self._tables[name]
+
+
 def _resolve_callee_id(
     edge: Dict[str, Any],
     syms_by_name: Dict[str, List[Dict[str, Any]]],
     sym_by_id: Dict[str, Dict[str, Any]],
+    lookup: Optional[_CandidateLookup] = None,
 ) -> Optional[str]:
     """Resolves a call edge to a unique catalog symbol_id, else None (unresolved).
 
@@ -765,6 +850,9 @@ def _resolve_callee_id(
     class or module -- and negatively, refusing to link a PascalCase class/model
     receiver (`UserModel.findAll`) or an ambient runtime object (`console.log`)
     to an unrelated class's method (`RecycleComponent.findAll`).
+
+    `lookup` is the catalog-wide _CandidateLookup a build shares across
+    edges; without one a single-use lookup is built.
     """
     callee_name = edge.get("callee_name") or ""
     candidates = syms_by_name.get(callee_name, [])
@@ -774,29 +862,24 @@ def _resolve_callee_id(
     if not qual:
         return candidates[0]["symbol_id"] if len(candidates) == 1 else None
 
+    qualified, dotted, stem = (lookup or _CandidateLookup(syms_by_name)).tables(callee_name)
     if qual in ("self", "this", "super", "cls"):
         caller_sym = sym_by_id.get(edge.get("caller_id") or "")
         caller_q = (caller_sym or {}).get("qualified_name") or ""
         if "." in caller_q:
             caller_owner = caller_q.rsplit(".", 1)[0]
-            same_owner = [
-                c for c in candidates
-                if c.get("qualified_name") == f"{caller_owner}.{callee_name}"
-            ]
+            same_owner = qualified.get(f"{caller_owner}.{callee_name}", [])
             if len(same_owner) == 1:
-                return same_owner[0]["symbol_id"]
+                return candidates[same_owner[0]]["symbol_id"]
         return candidates[0]["symbol_id"] if len(candidates) == 1 else None
 
     # Explicit receiver (`Session.refresh`, `auth.login`, `UserModel.findAll`).
     suffix = f"{qual}.{callee_name}"
-    matched = [
-        c for c in candidates
-        if c.get("qualified_name") == suffix
-        or str(c.get("qualified_name") or "").endswith("." + suffix)
-        or Path(str(c.get("file_path") or "")).stem == qual
-    ]
+    matched = set(qualified.get(suffix, ()))
+    matched.update(dotted.get(suffix, ()))
+    matched.update(stem.get(qual, ()))
     if len(matched) == 1:
-        return matched[0]["symbol_id"]
+        return candidates[next(iter(matched))]["symbol_id"]
     if len(matched) > 1:
         return None
 
@@ -831,6 +914,7 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
             for sym in unit["symbols"]:
                 syms_by_name.setdefault(sym["name"], []).append(sym)
                 sym_by_id[sym["symbol_id"]] = sym
+        lookup = _CandidateLookup(syms_by_name)
 
         for unit in units:
             for sym in unit["symbols"]:
@@ -849,7 +933,7 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
                          sym["end_line"], sym["signature"], sym["language"]),
                     )
             for edge in unit["edges"]:
-                callee_id = _resolve_callee_id(edge, syms_by_name, sym_by_id)
+                callee_id = _resolve_callee_id(edge, syms_by_name, sym_by_id, lookup)
                 conn.execute(
                     "INSERT INTO call_edges (caller_id, callee_id, callee_name, file_path, line, edge_kind)"
                     " VALUES (?, ?, ?, ?, ?, ?)",

@@ -220,11 +220,12 @@ class MantisState:
 
 def reindex(state: MantisState) -> Dict[str, Any]:
     """Builds or incrementally refreshes the structural index for the repo."""
-    from core.structural_index import build_structural_index
+    from core.structural_index import build_structural_index, git_snapshot_id
 
     state.ensure_home()
     t0 = time.time()
-    manifest = build_structural_index(str(state.repo), state.state_dir()) or {}
+    manifest = build_structural_index(
+        str(state.repo), state.state_dir(), git_snapshot_id(str(state.repo))) or {}
     coverage = manifest.get("coverage") or {}
     return {
         "status": manifest.get("status", "unknown"),

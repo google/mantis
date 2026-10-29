@@ -2004,7 +2004,7 @@ def create_structural_index_node(node_id: str):
         rc = current_run_context.get()
         try:
             from core.paths import resolve_db_path
-            from core.structural_index import build_structural_index, state_dir_for_db
+            from core.structural_index import build_structural_index, git_snapshot_id, state_dir_for_db
 
             # The operator-declared repository root outranks the jail: a
             # single-file scan's jail is the file's parent directory, and
@@ -2019,7 +2019,9 @@ def create_structural_index_node(node_id: str):
                 print(f"[{node_id}] {msg}", flush=True)
                 return adk.Event(output=msg, route=DEFAULT_ROUTE)
             state_dir = state_dir_for_db(resolve_db_path(db_path))
-            snapshot_id = getattr(rc, "snapshot_id", "") or "unknown"
+            # Pinned, a rebuild of the same clean checkout reuses the
+            # published catalog instead of re-resolving every call edge.
+            snapshot_id = getattr(rc, "snapshot_id", "") or git_snapshot_id(jail)
             res = build_structural_index(jail, state_dir, snapshot_id)
             cov = res.get("coverage") or {}
             units = res.get("units") or {}

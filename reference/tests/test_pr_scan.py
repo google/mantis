@@ -1549,6 +1549,62 @@ class TestKnowledgeRefresh(KnowledgeCase):
         self.assertIn("caller.py", launched, f"index should name caller.py as a caller: {launched}")
 
 
+class TestClosingIndex(DriverCase):
+    """The scans already leave a repo-rooted catalog; the driver does not
+    rebuild it after them, and still builds one when there is none."""
+
+    def counted(self):
+        import core.structural_index as sidx
+
+        calls = {"reindex": 0, "write": 0}
+        real_reindex, real_write = pr_scan.reindex, sidx._write_catalog
+
+        def reindex(state):
+            calls["reindex"] += 1
+            return real_reindex(state)
+
+        def write(*a, **k):
+            calls["write"] += 1
+            return real_write(*a, **k)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(pr_scan, "reindex", reindex))
+        stack.enter_context(mock.patch.object(sidx, "_write_catalog", write))
+        return calls, stack
+
+    def test_repo_rooted_catalog_is_not_rebuilt_after_the_scans(self):
+        # Untracked, so the checkout cannot be pinned: without the skip the
+        # closing reindex would re-resolve the whole catalog.
+        (self.repo / "scratch.txt").write_text("x\n", encoding="utf-8")
+        calls, stack = self.counted()
+        with stack:
+            self.run_main("--radius", "1", scan=fake_scan())
+        self.assertEqual(calls, {"reindex": 1, "write": 1})
+        self.assertTrue(self.report()["blast_radius"], "the gate lost the index")
+
+    def test_without_a_catalog_the_driver_still_builds_one_for_the_gate(self):
+        calls, stack = self.counted()
+        with stack:
+            self.run_main(scan=fake_scan())
+        self.assertEqual(calls["reindex"], 1)
+        self.assertTrue(self.report()["blast_radius"], "the gate lost the index")
+
+    def test_a_catalog_rooted_elsewhere_is_not_repo_rooted(self):
+        from core.structural_index import build_structural_index
+        from scripts.mcp_server import MantisState
+
+        state = MantisState(str(self.repo))
+        state.home = self.state_root
+        state.db_path = str(self.state_root / "knowledge.db")
+        self.assertFalse(pr_scan.index_is_repo_rooted(state))
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        build_structural_index(str(self.repo / "sub"), state.state_dir())
+        self.assertFalse(pr_scan.index_is_repo_rooted(state))
+        build_structural_index(str(self.repo), state.state_dir())
+        self.assertTrue(pr_scan.index_is_repo_rooted(state))
+
+
 class TestDailyBudgetInTheRun(DriverCase):
     """The daily budget end to end, with the meter stubbed."""
 
