@@ -789,6 +789,117 @@ class TestEndToEnd(DriverCase):
         self.assertEqual(rc, pr_scan.EXIT_INFRA)
 
 
+class TestTimeoutFollowsProgress(DriverCase):
+    """A scan still writing at its timeout is slow, not hung: it runs on,
+    within bounds. A silent one is killed at its timeout, as before."""
+
+    def test_a_scan_still_writing_at_its_timeout_finishes(self):
+        writer = lambda *a, **k: [sys.executable, "-u", "-c",
+                                  "import time\nfor i in range(26):\n"
+                                  "    print('turn', i, flush=True)\n    time.sleep(0.1)\n"]
+        self.run_main("--per-file-timeout", "2", "--max-files", "1", scan=writer)
+        r = self.report()["scan"]["results"][0]
+        log = self.scan_log()
+        self.assertEqual(r["status"], "done", log[-800:])
+        self.assertIn("still working at 2s", log)
+        self.assertNotIn("timed out", log)
+
+    def test_a_scan_that_never_stops_writing_still_ends(self):
+        forever = lambda *a, **k: [sys.executable, "-u", "-c",
+                                   "import time\nwhile True:\n"
+                                   "    print('x', flush=True)\n    time.sleep(0.05)\n"]
+        self.run_main("--per-file-timeout", "0.5", "--max-files", "1", scan=forever)
+        self.assertEqual(self.report()["scan"]["results"][0]["status"], "timed_out")
+        self.assertIn("(its limit)", self.scan_log())
+
+    def test_a_wait_that_fails_kills_the_scan_and_is_charged_as_a_timeout(self):
+        sleeper = lambda *a, **k: [sys.executable, "-c", "import time; time.sleep(30)"]
+        with mock.patch.object(pr_scan, "wait_for_scan", side_effect=RuntimeError("boom")):
+            self.run_main("--per-file-timeout", "60", "--max-files", "1",
+                          "--max-tokens", "300000", scan=sleeper)
+        r = self.report()["scan"]["results"][0]
+        self.assertEqual((r["status"], r["tokens"]), ("timed_out", 300_000))
+        self.assertLess(r["seconds"], 15, "the scan was left running, not killed")
+        self.assertIn("scan abandoned: RuntimeError('boom')", self.scan_log())
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class _FakeProc:
+    """Ends at `ends_at` on the fake clock (None: never); each wait that
+    does not reach it advances the clock by its timeout."""
+
+    def __init__(self, clock, ends_at=None):
+        self.clock, self.ends_at, self.killed = clock, ends_at, False
+
+    def wait(self, timeout=None):
+        if self.killed:
+            return -9
+        if self.ends_at is not None and (timeout is None or self.clock.t + timeout >= self.ends_at):
+            self.clock.t = max(self.clock.t, self.ends_at)
+            return 0
+        if timeout is None:
+            raise AssertionError("would wait forever")
+        self.clock.t += timeout
+        raise subprocess.TimeoutExpired("scan", timeout)
+
+    def kill(self):
+        self.killed = True
+
+
+class TestWaitForScan(unittest.TestCase):
+    """wait_for_scan on a fake clock: timeout 100, stall window 20, cap 200."""
+
+    def wait(self, ends_at=None, writes_until=0.0, timeout=100.0, stall=20.0):
+        clock = _Clock()
+        proc = _FakeProc(clock, ends_at)
+        code = pr_scan.wait_for_scan(proc, timeout, lambda: int(min(clock.t, writes_until) * 10),
+                                     clock=clock, stall_seconds=stall, extension_factor=2.0)
+        return code, clock.t, proc.killed
+
+    def test_a_scan_that_ends_in_time_is_untouched(self):
+        self.assertEqual(self.wait(ends_at=60), (0, 60, False))
+
+    def test_a_silent_scan_is_killed_at_its_timeout(self):
+        code, t, killed = self.wait(writes_until=0)
+        self.assertEqual((code, killed), (None, True))
+        self.assertGreaterEqual(t, 100)
+        self.assertLess(t, 106)
+
+    def test_a_scan_that_went_silent_well_before_its_timeout_gets_no_extension(self):
+        code, t, _ = self.wait(writes_until=50)
+        self.assertIsNone(code)
+        self.assertLess(t, 106)
+
+    def test_a_scan_writing_past_its_timeout_finishes(self):
+        self.assertEqual(self.wait(ends_at=160, writes_until=150), (0, 160, False))
+
+    def test_a_scan_that_falls_silent_past_its_timeout_is_killed_after_the_stall_window(self):
+        code, t, killed = self.wait(writes_until=130)
+        self.assertEqual((code, killed), (None, True))
+        self.assertGreaterEqual(t, 150)
+        self.assertLess(t, 156)
+
+    def test_a_scan_that_never_falls_silent_is_killed_at_the_cap(self):
+        code, t, killed = self.wait(writes_until=10_000)
+        self.assertEqual((code, killed), (None, True))
+        self.assertAlmostEqual(t, 200, delta=0.1)
+
+    def test_the_stall_window_is_never_longer_than_the_timeout(self):
+        code, t, _ = self.wait(writes_until=0, timeout=5, stall=900)
+        self.assertIsNone(code)
+        self.assertLess(t, 6.5)
+
+    def test_no_timeout_waits_for_the_scan(self):
+        self.assertEqual(self.wait(ends_at=1e9, timeout=0), (0, 1e9, False))
+
+
 class TestKnownFindingsFollowFiles(DriverCase):
     """A finding the database knows at a path is not lost when the path moves."""
 

@@ -163,6 +163,19 @@ DEFAULT_MAX_TOKENS = 10_000_000
 # than running until someone reads the invoice.
 DEFAULT_DAILY_TOKEN_BUDGET = 100_000_000
 
+# A scan still working at its timeout is not killed while its log keeps
+# growing, up to TIMEOUT_EXTENSION_FACTOR times the timeout; one silent for
+# TIMEOUT_STALL_SECONDS (or the timeout itself, when shorter) is. Measured on
+# a shared model quota: of the scans killed at an hour, 27 to 49 minutes went
+# to a handful of model turns of 8 to 20 minutes each, and the same files
+# finished in about half an hour in a later, smaller wave. A file's
+# size did not predict it: a 317-line file timed out twice. The timeout
+# exists to end a hung scan; a slow one that keeps producing is not hung,
+# and killing it throws away a pass that was nearly done. The token budget,
+# not the clock, bounds what it spends.
+TIMEOUT_EXTENSION_FACTOR = 2.0
+TIMEOUT_STALL_SECONDS = 900.0
+
 # Environment the pipeline subprocess never needs and must not inherit:
 # GitHub's own runtime tokens. The pipeline runs model-steered tool calls
 # over attacker-authored code; nothing in that process should be able to
@@ -1041,6 +1054,56 @@ def _open_log(log_path: Path):
     return os.fdopen(os.open(str(log_path), flags, 0o600), "ab")
 
 
+def wait_for_scan(proc: "subprocess.Popen", timeout: float, progress: Callable[[], int],
+                  log: Optional[Any] = None, clock: Callable[[], float] = time.monotonic,
+                  stall_seconds: float = TIMEOUT_STALL_SECONDS,
+                  extension_factor: float = TIMEOUT_EXTENSION_FACTOR) -> Optional[int]:
+    """The scan's exit code, or None once it was killed for its timeout.
+
+    Until `timeout` the scan runs as before. Past it, it keeps running only
+    while it is producing: `progress()` (the size of the log it writes) has
+    grown within the stall window -- stall_seconds, or the timeout itself
+    when that is shorter -- and never beyond extension_factor times the
+    timeout. A timeout of 0 or less waits for the scan to end.
+    """
+    if timeout <= 0:
+        return proc.wait()
+    start = clock()
+    deadline = start + timeout
+    cap = start + timeout * max(1.0, extension_factor)
+    stall = min(stall_seconds, timeout)
+    seen, seen_at = progress(), start
+    poll = max(0.05, min(30.0, stall / 4))
+    extended = False
+    while True:
+        now = clock()
+        wait_for = poll if now >= deadline else min(poll, deadline - now)
+        try:
+            return proc.wait(timeout=max(0.01, min(wait_for, cap - now)))
+        except subprocess.TimeoutExpired:
+            pass
+        now = clock()
+        size = progress()
+        if size != seen:
+            seen, seen_at = size, now
+        if now < deadline:
+            continue
+        if now >= cap or now - seen_at >= stall:
+            break
+        if not extended and log is not None:
+            extended = True
+            log.write(f"[pr_scan] still working at {timeout:.0f}s; running on while it writes "
+                      f"(silent {stall:.0f}s, or {cap - start:.0f}s in all, ends it)\n".encode())
+            log.flush()
+            seen = progress()
+    proc.kill()
+    proc.wait()
+    if log is not None:
+        why = "its limit" if now >= cap else f"{now - seen_at:.0f}s without output"
+        log.write(f"[pr_scan] timed out after {now - start:.0f}s ({why})\n".encode())
+    return None
+
+
 def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: str,
               api_base: str, per_file_timeout: float, log_path: Path,
               env: Optional[Dict[str, str]] = None, max_tokens: int = 0,
@@ -1110,19 +1173,25 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
     with _open_log(log_path) as log:
 
         def launch(cmd: List[str], timeout: float) -> Optional[int]:
-            """The pipeline's exit code; None when killed at `timeout`, -1
-            when it never started."""
+            """The pipeline's exit code; None when killed for its timeout
+            (wait_for_scan: a scan still writing at `timeout` runs on, within
+            bounds), -1 when it never started."""
             try:
-                proc = subprocess.run(
-                    cmd, stdout=log, stderr=log, cwd=str(_REF_ROOT), env=child_env,
-                    timeout=timeout if timeout > 0 else None)
-                return proc.returncode
-            except subprocess.TimeoutExpired:
-                log.write(f"[pr_scan] timed out after {timeout:.0f}s\n".encode())
-                return None
+                proc = subprocess.Popen(
+                    cmd, stdout=log, stderr=log, cwd=str(_REF_ROOT), env=child_env)
             except Exception as exc:  # one bad file must not end the run
                 log.write(f"[pr_scan] scan failed to launch: {exc!r}\n".encode())
+                log.flush()
                 return -1
+            try:
+                return wait_for_scan(proc, timeout, lambda: os.fstat(log.fileno()).st_size, log=log)
+            except BaseException as exc:
+                proc.kill()
+                proc.wait()
+                if not isinstance(exc, Exception):
+                    raise
+                log.write(f"[pr_scan] scan abandoned: {exc!r}\n".encode())
+                return None  # unaudited and charged in full, as a timeout is
             finally:
                 log.flush()
 
@@ -1776,7 +1845,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "pass '' to ignore nothing)")
     p.add_argument("--per-file-timeout", type=float, default=1800.0,
                    help="Seconds before one file's scan is abandoned (0 = none); with "
-                        "--one-process, the run's timeout is this times the files")
+                        "--one-process, the run's timeout is this times the files. A scan "
+                        "still writing output at its timeout runs on, up to "
+                        f"{TIMEOUT_EXTENSION_FACTOR:g} times it, until it falls silent for "
+                        f"{TIMEOUT_STALL_SECONDS:.0f}s (or the timeout, when shorter)")
     p.add_argument("--one-process", action="store_true",
                    help="Scan all the changed files in one pipeline run (per model) rather than "
                         "one run per file, so what a run does once is not paid per file. Each "
