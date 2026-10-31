@@ -1,5 +1,5 @@
 google-adk==2.11.0
-litellm==1.101.0
+litellm==1.101.3
 pydantic>=2.4.0
 microsandbox==0.7.2
 pyyaml==6.0.3
