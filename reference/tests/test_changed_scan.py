@@ -99,10 +99,16 @@ class ContentIdentityTest(_Repo):
         _touch_later(self.files["a"])
         self.assertFalse(content_changed(self.files["a"], ids))
         # Edited: different bytes.
+        original_text = Path(self.files["a"]).read_text()
         self.edit("a")
+        edited_ident = file_identity(self.files["a"])
         self.assertTrue(content_changed(self.files["a"], ids))
-        # Edited back to a version the ledger knows: unchanged against that version.
-        self.assertFalse(content_changed(self.files["a"], ids + [file_identity(self.files["a"])]))
+        # Covered at the edited version: unchanged against the latest record.
+        self.assertFalse(content_changed(self.files["a"], ids + [edited_ident]))
+        # Reverted back to the earlier version: differs from the MOST RECENT
+        # record, so a reverted fix is scanned again rather than skipped.
+        self.edit("a", original_text)
+        self.assertTrue(content_changed(self.files["a"], ids + [edited_ident]))
         self.assertFalse(content_changed(self.files["a"], []), "no record, no change")
 
     def test_size_and_mtime_short_circuit_without_reading(self):
@@ -185,10 +191,16 @@ class LedgerTest(_Repo):
 
     def test_a_second_campaign_records_the_new_content(self):
         files = list(self.files.values())
+        original_a = Path(self.files["a"]).read_text()
         self.cover("a", "b", "pkg/c")
         self.edit("a")
         self.cover("a", run="22222222-2222-3333-4444-555555555555")
         self.assertEqual(uncovered_files(self.db, files), [], "covered as it is now")
+        # Reverting `a` back to its earlier (vulnerable) content must mark it
+        # changed and uncovered again against the most recent record.
+        self.edit("a", original_a)
+        self.assertEqual(changed_files(self.db, files), {"files": [self.files["a"]]})
+        self.assertEqual(uncovered_files(self.db, files), [self.files["a"]])
 
     def test_changed_files_can_be_asked_per_run(self):
         self.cover("a", "b")
@@ -546,6 +558,18 @@ class EndToEndTest(_Repo):
         for out in outs:
             self.assertNotIn("earlier finding(s) sit in the changed files", out)
             self.assertIn("Triggered via: " + os.path.join(self.repo, "pkg") + "\n", out)
+
+    def test_resume_with_scan_mode_changed_on_non_changed_run_exits_64(self):
+        record_spend(self.db, RUN, self.files["a"], "file-by-file", tokens=10, metadata={"failed": False})
+        record_coverage_files(self.db, RUN, self.files["a"], scope_identities([self.files["a"]]))
+        self.edit("a")
+        before = sqlite3.connect(self.db).execute("SELECT COUNT(*) FROM coverage_files").fetchone()[0]
+        code, out = self.run_main("--resume", RUN, "--scan-mode", "changed")
+        self.assertEqual(code, 64, out)
+        self.assertIn("cannot switch --scan-mode from 'file-by-file'", out)
+        self.assertIn("omit --resume to start a new 'changed' run", out)
+        after = sqlite3.connect(self.db).execute("SELECT COUNT(*) FROM coverage_files").fetchone()[0]
+        self.assertEqual(before, after, "rejected invocation must not poison coverage_files")
 
 
 class DirectiveReachesEveryNodeTest(unittest.IsolatedAsyncioTestCase):

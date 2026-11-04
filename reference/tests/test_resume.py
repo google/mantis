@@ -36,7 +36,14 @@ from pathlib import Path
 _REF_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REF_ROOT))
 
-from core.cost import latest_run_id, record_spend, run_ledger, run_scan_mode, uncovered_files  # noqa: E402
+from core.cost import (  # noqa: E402
+    latest_run_id,
+    record_run_scan_mode,
+    record_spend,
+    run_ledger,
+    run_scan_mode,
+    uncovered_files,
+)
 
 
 class LedgerTest(unittest.TestCase):
@@ -85,6 +92,8 @@ class LedgerTest(unittest.TestCase):
         self.assertIsNone(run_ledger(corrupt, "r1"))
 
     def test_run_scan_mode_is_what_the_ledger_recorded(self):
+        from core.database import init_db, record_run
+
         self.assertEqual(run_scan_mode(self.db, "r1"), "", "no database")
         record_spend(self.db, "r1", self.a, "file-by-file", tokens=10)
         record_spend(self.db, "r2", self.root, "whole", tokens=10)
@@ -93,6 +102,12 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(run_scan_mode(self.db, "r3"), "", "no rows")
         self.assertEqual(run_scan_mode("", "r1"), "")
         self.assertEqual(run_scan_mode(self.db, ""), "")
+        # Fallback for a run that paused inside its first campaign before any
+        # campaign_spend row was written.
+        init_db(self.db)
+        record_run(self.db, "r-paused-early", "vertex_ai/gemini-3.8-flash")
+        self.assertTrue(record_run_scan_mode(self.db, "r-paused-early", "file-by-file"))
+        self.assertEqual(run_scan_mode(self.db, "r-paused-early"), "file-by-file")
 
     def test_latest_run_id_is_scoped_to_the_target(self):
         self.assertEqual(latest_run_id(self.db, self.root), "")
@@ -223,10 +238,16 @@ class ResumeRunTest(unittest.TestCase):
         self.assertIn("1 of 4 campaign(s) completed; 3 failed and 0 never started: 3 to scan.", out)
         self.assertIn("file-by-file: 3 campaign(s)", out)
         self.assertNotIn("whole: 1 campaign(s)", out)
-        # An explicit flag still wins.
-        _code, out = self.run_main("--resume", run, scan_mode="whole")
-        self.assertNotIn("as recorded for this run", out)
-        self.assertIn("whole: 1 campaign(s)", out)
+        # Repeating the SAME recorded scan mode is accepted.
+        _code, out = self.run_main("--resume", run, scan_mode="file-by-file")
+        self.assertIn("file-by-file: 3 campaign(s)", out)
+        # Switching to a different scan mode on --resume is rejected as a usage error (64).
+        for other_mode in ("changed", "whole", "cross-functional"):
+            code, out = self.run_main("--resume", run, scan_mode=other_mode)
+            self.assertEqual(code, 64, out)
+            self.assertIn("cannot switch --scan-mode from 'file-by-file'", out)
+            self.assertIn(f"to '{other_mode}'", out)
+            self.assertNotIn("Work plan", out)
 
     def test_resume_without_a_run_to_resume_is_an_error(self):
         code, out = self.run_main("--resume")

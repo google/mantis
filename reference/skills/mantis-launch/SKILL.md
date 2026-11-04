@@ -52,6 +52,13 @@ target repositories.
   - `--timeout`: LLM request timeout in seconds.
   - `--db` / `-d`: Custom path to SQLite knowledge database (default:
     `knowledge.db`).
+  - `--scan-mode`: Scan scope strategy (`auto`, `whole`, `file-by-file`,
+    `cross-functional`, `changed`). Use `changed` (without `--resume`) on the
+    same `knowledge.db` to scan newly added/edited files and verify whether
+    prior findings touching them are `still_present` or `fixed`.
+  - `--resume [RUN_ID]`: Resume an interrupted or partially failed run (latest
+    run for target when `RUN_ID` is omitted), inheriting its recorded scan mode.
+    Cannot be combined with a different `--scan-mode`.
   - `--workflow` / `-w`: Path to custom `workflow.json` layout definition.
   - `--preflight-only` / `--test` / `--preflight`: Run preflight checks and exit
     without starting the campaign.
@@ -111,10 +118,21 @@ Before starting a security campaign, `mantis-launch`:
 python3 "$MANTIS_HOME/reference/scripts/launch.py" . --preflight-only
 ```
 
-### 5. Inspect Results After Launch
+### 5. Incremental Scan & Fix Verification
 
-All findings, exploit reproduction logs, verified patches, and risk calibration
-scores are recorded in `knowledge.db`. Query guidance using `mantis-advise`:
+```bash
+# Resume failed/unstarted campaigns of the baseline run (inherits recorded scan mode)
+"$MANTIS_HOME/reference/run.sh" . --resume
+
+# After fixing code, start a new change-scoped run (do NOT pass --resume)
+"$MANTIS_HOME/reference/run.sh" . --scan-mode changed
+```
+
+### 6. Inspect Results After Launch
+
+All findings, regression verification checks (`regression_checks`), exploit
+reproduction logs, verified patches, and risk calibration scores are recorded in
+`knowledge.db`. Query guidance using `mantis-advise`:
 
 ```bash
 python3 "$MANTIS_HOME/reference/scripts/advise.py" --file src/server/auth.py
@@ -126,8 +144,8 @@ python3 "$MANTIS_HOME/reference/scripts/advise.py" --file src/server/auth.py
   - Target source code files (under target path or repository).
   - `workflow.json` (declarative graph layout and config).
 - **Writes**:
-  - `knowledge.db` (`findings`, `campaign_artifacts`, `risk_scores`, `learnings`
-    tables).
+  - `knowledge.db` (`findings`, `regression_checks`, `campaign_spend`,
+    `coverage_files`, `campaign_artifacts`, `risk_scores`, `learnings` tables).
   - `sessions.db` (ADK session state trajectories), beside `knowledge.db` unless
     `sessions_db_path` / `MANTIS_SESSIONS_DB` says otherwise. It grows with
     every run and is pruned by nobody; each run ends by stating its size. Only a

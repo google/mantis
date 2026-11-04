@@ -65,6 +65,13 @@ python3 scripts/configure.py --test --probe
 python3 scripts/knowledge.py export --db knowledge.db --repo path/to/code   # writes .mantis/knowledge/
 ./run.sh path/to/code --import-knowledge path/to/code/.mantis/knowledge
 
+# 4d. (Optional) Choose a scan mode, then verify fixes incrementally on the same knowledge.db
+./run.sh path/to/code --scan-mode file-by-file   # or whole, cross-functional, auto (see reference/README.md)
+./run.sh path/to/code --scan-mode changed        # new run after editing code (omit --resume)
+
+# 4e. (Optional) Resume an interrupted or partially failed run on the same snapshot
+./run.sh path/to/code --resume                   # inherits the run's recorded scan mode
+
 # 5. (Optional) Set or remove the spend ceiling for a run
 ./run.sh path/to/code --max-tokens 2M --cache-discount 1   # hard cap, every token at full price
 ./run.sh path/to/code --no-budget --parallel 32            # no ceiling, for long unattended runs

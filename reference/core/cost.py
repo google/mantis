@@ -314,12 +314,17 @@ def record_coverage_files(db_path: str, run_id: str, campaign_target: str,
 
 
 def _covered_identities(db_path: str, model: str = "", run_id: str = "") -> dict:
-    """Every path with recorded content, mapped to the identities
-    `(content_hash, size | None, mtime_ns | None)` it was covered as -- by
+    """Every path with recorded content, mapped to the most recent identity
+    `((content_hash, size | None, mtime_ns | None),)` it was covered as -- by
     this model and by unknown models when `model` is given (the rule
     _completed_coverage follows), by one run when `run_id` is given. `{}`
-    when the ledger records no content. Raises when it exists but cannot be
-    read; callers decide what that means."""
+    when the ledger records no content.
+
+    Only the latest recorded row per path counts: if a file was scanned at H1,
+    fixed and scanned at H2, and later reverted back to H1, comparing against
+    all historical hashes would treat the reverted bug as already covered.
+    Raises when the ledger exists but cannot be read; callers decide what that
+    means."""
     if not db_path or not os.path.exists(db_path):
         return {}
     conn = _connect(db_path)
@@ -332,16 +337,18 @@ def _covered_identities(db_path: str, model: str = "", run_id: str = "") -> dict
     out: dict = {}
     for path, content_hash, size, mtime_ns, _run in rows:
         if path and content_hash:
-            out.setdefault(str(path), set()).add((str(content_hash), size, mtime_ns))
+            out[str(path)] = ((str(content_hash), size, mtime_ns),)
     return out
 
 
 def _content_rows(conn: sqlite3.Connection, model: str = "", run_id: str = "") -> list:
-    """`(path, content_hash, size, mtime_ns, run_id)` rows of coverage_files
-    under the same model rule as _completed_coverage."""
+    """`(path, content_hash, size, mtime_ns, run_id)` rows of coverage_files,
+    oldest first (`ORDER BY id ASC`), under the same model rule as
+    _completed_coverage."""
     if run_id:
         return conn.execute(
-            "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files WHERE run_id = ?",
+            "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files "
+            "WHERE run_id = ? ORDER BY id ASC",
             (str(run_id),)).fetchall()
     has_runs = model and conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
@@ -349,9 +356,11 @@ def _content_rows(conn: sqlite3.Connection, model: str = "", run_id: str = "") -
         return conn.execute(
             "SELECT c.path, c.content_hash, c.size, c.mtime_ns, c.run_id FROM coverage_files c "
             "LEFT JOIN runs r ON r.run_id = c.run_id "
-            "WHERE r.model = ? OR r.model IS NULL OR r.model = ''", (str(model),)).fetchall()
+            "WHERE r.model = ? OR r.model IS NULL OR r.model = '' ORDER BY c.id ASC",
+            (str(model),)).fetchall()
     return conn.execute(
-        "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files").fetchall()
+        "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files ORDER BY id ASC"
+    ).fetchall()
 
 
 def _coverage_runs(db_path: str, model: str = "") -> tuple[dict, set]:
@@ -396,27 +405,30 @@ def _coverage_runs(db_path: str, model: str = "") -> tuple[dict, set]:
 
 
 def content_changed(path: str, identities: Iterable[tuple]) -> bool:
-    """Whether `path` differs now from every identity it was covered as.
+    """Whether `path` differs now from the most recent identity (`identities[-1]`)
+    it was covered as.
 
-    Size and mtime decide without reading when they both still match a
+    Size and mtime decide without reading when they both still match the
     recorded pair (the git-index rule); otherwise the file is hashed once.
-    A file that cannot be read now is not reported as changed -- it is not
-    scannable either, and the caller's file list will not contain it.
+    Comparing only against the latest record ensures a revert back to an
+    older, previously scanned commit is seen as a change. A file that cannot
+    be read now is not reported as changed -- it is not scannable either, and
+    the caller's file list will not contain it.
     """
     ids = list(identities)
     if not ids:
         return False
+    h, size, mtime_ns = ids[-1]
     try:
         st = os.stat(path)
     except OSError:
         return False
-    for _h, size, mtime_ns in ids:
-        if size is not None and mtime_ns is not None and int(size) == st.st_size and int(mtime_ns) == st.st_mtime_ns:
-            return False
+    if size is not None and mtime_ns is not None and int(size) == st.st_size and int(mtime_ns) == st.st_mtime_ns:
+        return False
     ident = file_identity(path)
     if ident is None:
         return False
-    return all(ident[0] != str(h) for h, _s, _m in ids)
+    return ident[0] != str(h)
 
 
 def content_recorded_for(db_path: str, files, model: str = "") -> int:
@@ -580,8 +592,8 @@ def uncovered_files(
     fingerprint covers the file for every harness, exactly as a row with no
     model covers it for every model (INV-6).
 
-    A covered file whose CONTENT differs from every version the ledger
-    recorded it as (coverage_files; see changed_files) was never examined
+    A covered file whose CONTENT differs from the most recent version the
+    ledger recorded it as (coverage_files; see changed_files) was not examined
     in its present form, and with `rescan_changed_files` -- the default --
     it is uncovered. So is a file under a covered directory that the
     covering campaign recorded no content for while recording it for its
@@ -728,14 +740,61 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
         return None
 
 
+def record_run_scan_mode(db_path: str, run_id: str, scan_mode: str) -> bool:
+    """Records the resolved scan mode on the `runs` row (`metadata_json`) if not
+    already set, so a run that pauses inside its very first campaign (before any
+    `campaign_spend` row is written) still knows its mode on `--resume`. Never
+    raises (INV-6)."""
+    if not db_path or not run_id or not scan_mode or not os.path.exists(db_path):
+        return False
+    conn = None
+    try:
+        conn = _connect(db_path)
+        with conn:
+            has_runs = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+            ).fetchone()
+            if not has_runs:
+                return False
+            row = conn.execute(
+                "SELECT metadata_json FROM runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                meta = json.loads(row[0] or "{}")
+                if not isinstance(meta, dict):
+                    meta = {}
+            except ValueError:
+                meta = {}
+            if meta.get("scan_mode"):
+                return True
+            meta["scan_mode"] = str(scan_mode)
+            conn.execute(
+                "UPDATE runs SET metadata_json = ? WHERE run_id = ?",
+                (json.dumps(meta), str(run_id)),
+            )
+        return True
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
 def run_scan_mode(db_path: str, run_id: str) -> str:
     """The scan mode a run's campaigns were recorded under, '' if unknown.
 
-    The mode is not stored with the run, but every ledger row carries it,
-    and a resumed run must plan the way the original did: a file-by-file
-    sweep picked up without the flag would otherwise be re-resolved as
-    `auto`, which plans one whole-target campaign for a small directory
-    and so reruns the wrong thing. Latest row wins. Never raises.
+    Checks `campaign_spend` first (latest row wins), falling back to
+    `runs.metadata_json` for a run that paused inside its first campaign before
+    any spend row was written. A resumed run must plan the way the original
+    did: a file-by-file sweep picked up without the flag would otherwise be
+    re-resolved as `auto`, which plans one whole-target campaign for a small
+    directory and so reruns the wrong thing. Never raises.
     """
     if not db_path or not run_id:
         return ""
@@ -744,14 +803,30 @@ def run_scan_mode(db_path: str, run_id: str) -> str:
             return ""
         conn = _connect(db_path)
         try:
-            row = conn.execute(
-                "SELECT scan_mode FROM campaign_spend WHERE run_id = ? "
-                "AND scan_mode IS NOT NULL AND scan_mode != '' ORDER BY id DESC LIMIT 1",
-                (str(run_id),),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT scan_mode FROM campaign_spend WHERE run_id = ? "
+                    "AND scan_mode IS NOT NULL AND scan_mode != '' ORDER BY id DESC LIMIT 1",
+                    (str(run_id),),
+                ).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            except sqlite3.OperationalError:
+                pass
+            try:
+                rrow = conn.execute(
+                    "SELECT metadata_json FROM runs WHERE run_id = ?",
+                    (str(run_id),),
+                ).fetchone()
+                if rrow and rrow[0]:
+                    meta = json.loads(rrow[0])
+                    if isinstance(meta, dict) and meta.get("scan_mode"):
+                        return str(meta["scan_mode"])
+            except (sqlite3.OperationalError, ValueError):
+                pass
         finally:
             conn.close()
-        return str(row[0]) if row else ""
+        return ""
     except Exception:
         return ""
 

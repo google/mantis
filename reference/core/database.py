@@ -1496,9 +1496,10 @@ def read_regression_checks(db_path: str, run_id: Optional[str] = None,
 def prior_findings_touching(db_path: str, current_run_id: str, rel_paths: Sequence[str],
                             scope_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Open findings from runs other than `current_run_id` that sit in one of
-    `rel_paths` (target-relative, as findings store them) or cite one in
-    their code_paths. What a change-scoped run must say something about.
-    Oldest first, one entry per finding. Never raises."""
+    `rel_paths` (target-relative, as findings store them), cite one in their
+    `code_paths`, or share a non-empty `lineage_id` with a finding that does.
+    What a change-scoped run must say something about. Oldest first, one entry
+    per finding. Never raises."""
     wanted = {str(p).replace("\\", "/").lstrip("./") for p in rel_paths if str(p).strip()}
     if not wanted:
         return []
@@ -1506,12 +1507,15 @@ def prior_findings_touching(db_path: str, current_run_id: str, rel_paths: Sequen
         rows = read_findings(db_path, scope_path=scope_path)
     except Exception:
         return []
-    out: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
+    direct_ids: set = set()
+    touched_lineages: set = set()
     for f in rows:
         if str(f.get("run_id") or "") == str(current_run_id):
             continue
         if str(f.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
             continue
+        candidates.append(f)
         fp = str(f.get("filepath") or "").replace("\\", "/")
         cited: set = set()
         raw = f.get("code_paths")
@@ -1527,6 +1531,14 @@ def prior_findings_touching(db_path: str, current_run_id: str, rel_paths: Sequen
                     if entry.get(key):
                         cited.add(str(entry[key]).split(":")[0].replace("\\", "/"))
         if fp in wanted or cited & wanted:
+            direct_ids.add(f.get("id"))
+            lin = str(f.get("lineage_id") or "").strip()
+            if lin:
+                touched_lineages.add(lin)
+    out: List[Dict[str, Any]] = []
+    for f in candidates:
+        lin = str(f.get("lineage_id") or "").strip()
+        if f.get("id") in direct_ids or (lin and lin in touched_lineages):
             out.append(f)
     return out
 

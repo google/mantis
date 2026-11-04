@@ -366,6 +366,46 @@ class SettlementTest(_Base):
         self.assertEqual(main._settle_regression_checks(self.db, NEW, []),
                          {"still_present": [], "fixed": [], "unverified": []})
 
+    async def test_duplicate_open_findings_across_runs_settle_together_by_lineage(self):
+        """When multiple baseline runs (e.g. whole, file-by-file, cross-functional)
+        reported the same defect into one knowledge.db, settling one sibling as
+        fixed closes all open rows of that lineage -- while any still_present
+        verdict on any sibling keeps the whole lineage open (fail-closed)."""
+        import main
+
+        r1 = "11111111-1111-1111-1111-111111111111"
+        r2 = "22222222-1111-1111-1111-111111111111"
+        r3 = "33333333-1111-1111-1111-111111111111"
+        for rid, st in ((r1, "static_confirmed"), (r2, "dynamic_confirmed"), (r3, "static_confirmed")):
+            write_findings(self.db, self.target, [_finding("a.py", "SQLi in a", status=st)], run_id=rid)
+        rows_a = [f for f in read_findings(self.db, scope_path=self.target) if f["filepath"] == "a.py"]
+        self.assertEqual(len(rows_a), 3)
+        self.assertEqual(len({f["lineage_id"] for f in rows_a}), 1, "same defect shares a lineage")
+        ids_a = [f["id"] for f in rows_a]
+
+        # Only one sibling (#ids_a[1]) receives a fixed check; all three close.
+        record_regression_check(self.db, NEW, ids_a[1], "fixed", reason="parameterised", evidence="dynamic")
+        prior_a = prior_findings_touching(self.db, NEW, ["a.py"], scope_path=self.target)
+        settled_a = main._settle_regression_checks(self.db, NEW, prior_a)
+        self.assertEqual(settled_a, {"still_present": [], "fixed": ids_a, "unverified": []})
+        for f in read_findings(self.db, scope_path=self.target):
+            if f["id"] in ids_a:
+                self.assertEqual(f["status"], "mitigated")
+
+        # Disagreement across siblings of one lineage fails closed: none close.
+        for rid in (r1, r2):
+            write_findings(self.db, self.target, [_finding("b.py", "traversal in b")], run_id=rid)
+        rows_b = [f for f in read_findings(self.db, scope_path=self.target) if f["filepath"] == "b.py"]
+        ids_b = [f["id"] for f in rows_b]
+        record_regression_check(self.db, NEW, ids_b[0], "fixed", reason="guard added", evidence="static")
+        record_regression_check(self.db, NEW, ids_b[1], "still_present", reason="PoC bypassed guard", evidence="dynamic")
+        prior_b = prior_findings_touching(self.db, NEW, ["b.py"], scope_path=self.target)
+        settled_b = main._settle_regression_checks(self.db, NEW, prior_b)
+        self.assertEqual(settled_b, {"still_present": ids_b, "fixed": [], "unverified": []})
+        for f in read_findings(self.db, scope_path=self.target):
+            if f["id"] in ids_b:
+                self.assertEqual(f["status"], "dynamic_confirmed")
+
 
 class HarnessRerunTest(_Base):
     """The harness re-runs each earlier PoC itself, before the graph, so the
@@ -518,6 +558,22 @@ class BriefTest(_Base):
         self.assertIn("get_prior_poc", text)
         self.assertEqual(main._regression_brief(self.db, NEW, [os.path.join(self.target, "pkg", "zz.py")], self.target, self.target),
                          ([], ""))
+
+    async def test_the_brief_collapses_duplicate_lineages_and_prefers_poc(self):
+        import main
+
+        r1 = "aaaa1111-1111-1111-1111-111111111111"
+        r2 = "bbbb2222-1111-1111-1111-111111111111"
+        write_findings(self.db, self.target, [_finding("b.py", "traversal in b", status="static_confirmed")], run_id=r1)
+        write_findings(self.db, self.target, [_finding("b.py", "traversal in b", status="dynamic_confirmed")], run_id=r2)
+        rows = read_findings(self.db, scope_path=self.target)
+        f1, f2 = rows[0], rows[1]
+        record_artifact(self.db, r2, "workspace_file", f"workspace/repro_{f2['id']}.py", "poc")
+        prior, text = main._regression_brief(self.db, NEW, [os.path.join(self.target, "b.py")], self.target, self.target)
+        self.assertEqual([f["id"] for f in prior], [f1["id"], f2["id"]], "all open rows stay in prior for settlement")
+        self.assertIn(f"#{f2['id']} [dynamic_confirmed] b.py", text)
+        self.assertIn(f"PoC: yes, also #{f1['id']}", text)
+        self.assertNotIn(f"#{f1['id']} [static_confirmed]", text)
 
     def test_workflow_gives_the_tools_to_the_right_stages(self):
         import json

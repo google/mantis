@@ -39,7 +39,7 @@ if _REF_ROOT not in sys.path:
 from core.budget import BudgetConfig, parse_duration_seconds, parse_token_budget
 from core.config import EXIT_AUTH, MantisAuthError
 from core.synthesizer import ResearchGraphSynthesizer, WorkflowSynthesizer
-from main import _SCAN_MODES, pipeline
+from main import EXIT_USAGE, _SCAN_MODES, pipeline, validate_resume_scan_mode
 from scripts.configure import (
     detect_capabilities,
     ensure_configured,
@@ -223,9 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=list(_SCAN_MODES),
         help=(
-            "Scan mode. file-by-file asks one question of every file; "
-            "cross-functional hunts defects that span files. Defaults to the "
-            "workflow config, or auto."
+            "Scan mode: 'whole' scans the target as one campaign; "
+            "'file-by-file' runs one campaign per source file; "
+            "'cross-functional' hunts composite defects across ranked subsystems; "
+            "'changed' scans only new/edited files since last covered and verifies "
+            "prior findings touching them; 'auto' picks whole if small, else "
+            "file-by-file over uncovered files, else cross-functional. "
+            "Defaults to the workflow config, or auto."
         ),
     )
     parser.add_argument(
@@ -347,10 +351,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         metavar="RUN_ID",
         help=(
-            "Resume a run: scan only the campaigns it has not completed (failed ones "
-            "and ones it never reached), under the same run id, with a fresh budget. "
-            "With no RUN_ID, the most recent run recorded for this target. To rescan "
-            "everything, start a new run instead."
+            "Resume an interrupted or partially failed run: scan only the campaigns "
+            "it has not completed (failed ones and ones it never reached), under the "
+            "same run id and recorded scan mode, with a fresh budget. With no RUN_ID, "
+            "picks the most recent run recorded for this target. Cannot be combined "
+            "with a different --scan-mode; to verify fixes or scan edited code, omit "
+            "--resume and start a new run with --scan-mode changed."
         ),
     )
     parser.add_argument(
@@ -670,6 +676,20 @@ def run_launch(
         overrides["timeout"] = timeout
     if db_path:
         overrides["db_path"] = db_path
+
+    if resume_run_id and scan_mode:
+        from core.paths import resolve_db_path
+
+        resolved_db = resolve_db_path(
+            db_path or cfg.get("db_path", "knowledge.db"),
+            str(Path(wf_file).resolve().parent),
+        )
+        mode_err = validate_resume_scan_mode(
+            resolved_db, str(target_path), resume_run_id, scan_mode
+        )
+        if mode_err:
+            print(f"Error: {mode_err}", file=sys.stderr)
+            return EXIT_USAGE
 
     # Check unconfigured placeholders and auto-configure
     is_unconf, issues = is_default_or_unconfigured(cfg)

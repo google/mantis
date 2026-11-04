@@ -719,6 +719,9 @@ def _record_guard_failure(db_path: str, run_id: str, scan_item: str, scan_mode: 
         print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
 
 
+EXIT_USAGE = 64
+
+
 def normalize_scan_mode(value: Any) -> str:
     """Maps a configured scan mode onto its current spelling.
 
@@ -728,6 +731,50 @@ def normalize_scan_mode(value: Any) -> str:
     """
     text = str(value or "").strip().lower()
     return _SCAN_MODE_ALIASES.get(text, text)
+
+
+def validate_resume_scan_mode(
+    db_path: str,
+    target_path: str,
+    resume_run_id: str,
+    scan_mode_override: Optional[str],
+) -> Optional[str]:
+    """Rejects combining `--resume` with a `--scan-mode` that differs from the
+    resumed run's recorded mode.
+
+    A resumed run continues the scan mode and snapshot it started on (INV-5).
+    Switching modes under an existing `run_id` -- most commonly passing both
+    `--resume` and `--scan-mode changed` after editing code -- either skips
+    `prior_findings_touching()` (which excludes `current_run_id`) while still
+    recording the edited file hash as covered, or exits immediately when the
+    prior run covered the directory. Returns an error message on conflict, else
+    `None`.
+    """
+    if not resume_run_id or not scan_mode_override or not db_path:
+        return None
+    from core.cost import latest_run_id, run_scan_mode
+
+    resolved_run = (
+        latest_run_id(db_path, str(target_path))
+        if resume_run_id == "latest"
+        else str(resume_run_id)
+    )
+    if not resolved_run:
+        return None
+    recorded = run_scan_mode(db_path, resolved_run)
+    if not recorded:
+        return None
+    norm_recorded = normalize_scan_mode(recorded)
+    requested = normalize_scan_mode(scan_mode_override)
+    if requested == norm_recorded:
+        return None
+    return (
+        f"--resume cannot switch --scan-mode from '{norm_recorded}' "
+        f"(recorded for run {resolved_run}) to '{requested}': a resumed run "
+        f"finishes the scan mode and snapshot it started on. Omit --scan-mode "
+        f"to continue run {resolved_run}, or omit --resume to start a new "
+        f"'{requested}' run."
+    )
 
 
 # Campaign count above which an interactive operator is asked to confirm. This IS an
@@ -1551,8 +1598,7 @@ def _regression_brief(db_path: str, run_id: str, focus_files: list[str], root: s
         return [], ""
     if not prior:
         return [], ""
-    lines = []
-    for f in prior[:60]:
+    for f in prior:
         has_poc = False
         try:
             for ext in ("py", "sh", "c", "js", "txt"):
@@ -1562,11 +1608,40 @@ def _regression_brief(db_path: str, run_id: str, focus_files: list[str], root: s
         except Exception:
             has_poc = False
         f["_has_poc"] = has_poc
+
+    # Collapse duplicate open rows that share a non-empty lineage_id across
+    # earlier runs so the 60-item prompt cap covers distinct defects rather
+    # than N copies of the same bug, preferring a dynamic_confirmed row with a
+    # stored PoC as the representative while still returning every open row in
+    # `prior` for settlement.
+    groups: list[list[dict]] = []
+    by_lin: dict[str, list[dict]] = {}
+    for f in prior:
+        lin = str(f.get("lineage_id") or "").strip()
+        if lin:
+            if lin not in by_lin:
+                by_lin[lin] = []
+                groups.append(by_lin[lin])
+            by_lin[lin].append(f)
+        else:
+            groups.append([f])
+
+    def _rep_rank(row: dict) -> tuple:
+        has_poc = bool(row.get("_has_poc"))
+        is_dyn = str(row.get("status") or "").lower() == "dynamic_confirmed"
+        return (has_poc and is_dyn, has_poc, is_dyn, int(row.get("id") or 0))
+
+    lines = []
+    for grp in groups[:60]:
+        f = max(grp, key=_rep_rank)
+        others = [int(g["id"]) for g in grp if int(g["id"]) != int(f["id"])]
+        also = (", also " + ", ".join(f"#{oid}" for oid in others)) if others else ""
         lines.append(
             f"#{f['id']} [{f.get('status')}] {f.get('filepath')}:{f.get('line_numbers') or '?'} "
-            f"{str(f.get('title') or '')[:120]} (run {str(f.get('run_id') or '')[:8]}, PoC: {'yes' if has_poc else 'no'})"
+            f"{str(f.get('title') or '')[:120]} "
+            f"(run {str(f.get('run_id') or '')[:8]}, PoC: {'yes' if f.get('_has_poc') else 'no'}{also})"
         )
-    more = f"\n... and {len(prior) - len(lines)} more" if len(prior) > len(lines) else ""
+    more = f"\n... and {len(groups) - len(lines)} more" if len(groups) > len(lines) else ""
     listing = wrap_untrusted_content("\n".join(lines) + more, filename="prior_findings")
     text = (
         "\n\nPRIOR FINDINGS IN THE CHANGED FILES. Earlier runs of this database reported the findings below in "
@@ -1592,17 +1667,19 @@ def _regression_brief(db_path: str, run_id: str, focus_files: list[str], root: s
 
 
 def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> dict:
-    """After a change-scoped campaign: one decision per prior finding, from
-    the checks the stages recorded and from lineage, and the closures that
-    follow. Precedence: any still_present check (a PoC that reached its
-    sink again, a re-report the tool verified under new_finding_id, or a
-    reading of the code), or a re-report carrying the lineage, means still
-    present whatever else was said -- closing is the one action that must
-    not happen on a disagreement; then a fixed check (dynamic before
-    static); then nothing, which is unverified. A fixed finding is closed
-    as mitigated -- the operator chose this -- with the evidence kind on
-    the record. Returns the summary `{"still_present": [...], "fixed":
-    [...], "unverified": [...]}` of ids.
+    """After a change-scoped campaign: one decision per prior finding (grouped
+    by non-empty `lineage_id` when multiple earlier runs reported the same
+    defect), from the checks the stages recorded and from lineage, and the
+    closures that follow. Precedence across a lineage: any still_present check
+    (a PoC that reached its sink again, a re-report the tool verified under
+    new_finding_id, or a reading of the code), or a re-report carrying the
+    lineage, means still present for every open row of that lineage whatever
+    else was said -- closing is the one action that must not happen on a
+    disagreement; then a fixed check (dynamic before static), propagated across
+    all open sibling rows of that lineage; then nothing, which is unverified.
+    A fixed finding is closed as mitigated -- the operator chose this -- with
+    the evidence kind on the record. Returns the summary `{"still_present":
+    [...], "fixed": [...], "unverified": [...]}` of ids.
     """
     from core.database import mitigate_finding, read_findings, read_regression_checks
     from core.database import record_regression_check as _record
@@ -1618,30 +1695,82 @@ def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> d
     for f in current:
         if f.get("lineage_id"):
             by_lineage.setdefault(str(f["lineage_id"]), []).append(f)
+
+    groups: list[tuple[str, list[dict]]] = []
+    grouped_by_lin: dict[str, list[dict]] = {}
     for p in prior:
-        pid = int(p["id"])
-        checks = read_regression_checks(db_path, run_id=run_id, prior_finding_id=pid)
-        rereported = by_lineage.get(str(p.get("lineage_id") or ""), [])
-        present = [c for c in checks if c["outcome"] == "still_present"]
-        fixed = [c for c in checks if c["outcome"] == "fixed"]
+        lin = str(p.get("lineage_id") or "").strip()
+        if lin:
+            if lin not in grouped_by_lin:
+                grouped_by_lin[lin] = []
+                groups.append((lin, grouped_by_lin[lin]))
+            grouped_by_lin[lin].append(p)
+        else:
+            groups.append(("", [p]))
+
+    for lin, grp in groups:
+        own_checks = {
+            int(p["id"]): read_regression_checks(db_path, run_id=run_id, prior_finding_id=int(p["id"]))
+            for p in grp
+        }
+        all_checks = [c for p in grp for c in own_checks[int(p["id"])]]
+        rereported = by_lineage.get(lin, []) if lin else []
+        present = [c for c in all_checks if c["outcome"] == "still_present"]
+        fixed = [c for c in all_checks if c["outcome"] == "fixed"]
         fixed.sort(key=lambda c: 0 if c["evidence"] == "dynamic" else 1)
+
         if present or rereported:
-            summary["still_present"].append(pid)
-            if not present:
-                _record(db_path, run_id, pid, "still_present",
-                        reason="re-reported by this run under the same lineage", evidence="lineage",
-                        node="harness", new_finding_id=rereported[0]["id"] if rereported else None)
+            for p in grp:
+                pid = int(p["id"])
+                summary["still_present"].append(pid)
+                own_present = [c for c in own_checks[pid] if c["outcome"] == "still_present"]
+                if not own_present:
+                    if rereported:
+                        _record(
+                            db_path, run_id, pid, "still_present",
+                            reason="re-reported by this run under the same lineage",
+                            evidence="lineage", node="harness",
+                            new_finding_id=rereported[0]["id"],
+                        )
+                    else:
+                        src = present[0]
+                        _record(
+                            db_path, run_id, pid, "still_present",
+                            reason=f"same lineage #{src['prior_finding_id']} still present: {src.get('reason') or ''}",
+                            evidence=src["evidence"], node="harness",
+                            new_finding_id=src.get("new_finding_id"),
+                        )
         elif fixed:
             c = fixed[0]
-            if mitigate_finding(db_path, pid, f"{c['evidence']} evidence: {c.get('reason') or ''}", by_run_id=run_id):
-                summary["fixed"].append(pid)
-            else:
-                summary["unverified"].append(pid)
+            src_pid = int(c["prior_finding_id"])
+            for p in grp:
+                pid = int(p["id"])
+                own_fixed = [chk for chk in own_checks[pid] if chk["outcome"] == "fixed"]
+                if not own_fixed:
+                    _record(
+                        db_path, run_id, pid, "fixed",
+                        reason=f"settled via lineage #{src_pid}: {c.get('reason') or ''}",
+                        evidence=c["evidence"], node="harness",
+                    )
+                mit_reason = (
+                    f"{c['evidence']} evidence: {c.get('reason') or ''}"
+                    if src_pid == pid
+                    else f"{c['evidence']} evidence (via #{src_pid}): {c.get('reason') or ''}"
+                )
+                if mitigate_finding(db_path, pid, mit_reason, by_run_id=run_id):
+                    summary["fixed"].append(pid)
+                else:
+                    summary["unverified"].append(pid)
         else:
-            summary["unverified"].append(pid)
-            if not checks:
-                _record(db_path, run_id, pid, "inconclusive", reason="no stage decided about this finding",
-                        evidence="none", node="harness")
+            for p in grp:
+                pid = int(p["id"])
+                summary["unverified"].append(pid)
+                if not own_checks[pid]:
+                    _record(
+                        db_path, run_id, pid, "inconclusive",
+                        reason="no stage decided about this finding",
+                        evidence="none", node="harness",
+                    )
     return summary
 
 
@@ -2285,6 +2414,13 @@ async def pipeline(
             )
             return 1
         print(f"Resuming the most recent run: {resume_run_id}", file=sys.stderr)
+    if resume_run_id and scan_mode_override:
+        mode_err = validate_resume_scan_mode(
+            db_path, str(target_path), resume_run_id, scan_mode_override
+        )
+        if mode_err:
+            print(f"Error: {mode_err}", file=sys.stderr)
+            return EXIT_USAGE
     run_id = resume_run_id if resume_run_id else str(uuid.uuid4())
     # The model this run uses, written down once so every record the run
     # leaves -- findings, learnings, coverage, spend, all keyed by run id --
@@ -2375,23 +2511,22 @@ async def pipeline(
                 file=sys.stderr,
             )
             return 1
-    # An explicit --scan-mode beats workflow config. Copied rather than mutated in place:
-    # `config` is the loaded workflow and is written back out in places, and a CLI flag
-    # for one run must not rewrite the operator's file.
-    if scan_mode_override:
-        config = {**config, "scan_mode": normalize_scan_mode(scan_mode_override)}
-    elif resume_run_id:
-        # A resumed run keeps its scan mode. Without this, a file-by-file
-        # sweep picked up without the flag is re-resolved as `auto`, which
-        # plans one whole-target campaign for a small directory and reruns
-        # the wrong thing. The ledger rows carry the mode; an explicit flag
-        # still wins, and a run with no rows has nothing to inherit.
+    # A resumed run keeps its recorded scan mode (INV-5); any conflicting
+    # --scan-mode was already rejected above with EXIT_USAGE. Copied rather
+    # than mutated in place so a one-run CLI flag never rewrites the
+    # operator's workflow config.
+    if resume_run_id:
         from core.cost import run_scan_mode
 
         recorded_mode = run_scan_mode(db_path, run_id)
         if recorded_mode:
             config = {**config, "scan_mode": normalize_scan_mode(recorded_mode)}
-            print(f"[RESUME] Scan mode {recorded_mode}, as recorded for this run.", file=sys.stderr)
+            if not scan_mode_override:
+                print(f"[RESUME] Scan mode {recorded_mode}, as recorded for this run.", file=sys.stderr)
+        elif scan_mode_override:
+            config = {**config, "scan_mode": normalize_scan_mode(scan_mode_override)}
+    elif scan_mode_override:
+        config = {**config, "scan_mode": normalize_scan_mode(scan_mode_override)}
     # --changed-files: the caller says which files changed instead of the
     # ledger. Only a `changed` run over a directory has campaigns scoped to
     # files; anywhere else the list would be silently ignored, so it is an
@@ -2437,6 +2572,12 @@ async def pipeline(
     # a work plan, open campaigns, or write an empty report.
     if scan_mode == SCAN_MODE_CHANGED and not targets_to_scan:
         return 0
+    try:
+        from core.cost import record_run_scan_mode
+
+        record_run_scan_mode(db_path, run_id, scan_mode)
+    except Exception:
+        pass
     focus_files: list[str] = list(scan_scope.get("focus_files") or [])
     focus_groups: list[dict] = list(scan_scope.get("focus_groups") or [])
     if focus_files and not focus_groups:

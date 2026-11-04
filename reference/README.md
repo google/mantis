@@ -173,10 +173,12 @@ records which campaigns completed and which failed (a model that returned no
 content, a crashed sandbox). `--resume <run_id>` skips the completed ones and
 scans the rest — the failed campaigns and the ones the run never reached — under
 the same run ID, so findings, dedup and coverage carry on. The run keeps the
-scan mode it was recorded under, so `--scan-mode` need not be repeated.
-`--resume` with no ID resumes the most recent run recorded for the target. A run
-that has nothing left exits immediately; to scan everything again, start a new
-run (or delete the database).
+scan mode it was recorded under, so `--scan-mode` need not be repeated — and
+passing a conflicting `--scan-mode` with `--resume` is rejected with exit code
+`64` (`EX_USAGE`). `--resume` with no ID resumes the most recent run recorded
+for the target. A run that has nothing left exits immediately; to verify fixes
+or scan edited files, omit `--resume` and start a new run with
+`--scan-mode changed` (or `--scan-mode whole` to rescan everything).
 
 **A resumed run starts from a fresh budget.** `--resume` does not carry forward
 the tokens, steps or elapsed time already spent: the run keeps its findings,
@@ -241,7 +243,7 @@ estimates are consistently wrong for your workflow.
 
 ## Scan Modes
 
-The two modes answer different questions and are **complementary, not a quality
+The scan modes answer different questions and are **complementary, not a quality
 ladder**. Their names describe *coverage* (how much of the tree is looked at)
 and *reach* (how much context one question spans), which vary independently.
 
@@ -273,13 +275,59 @@ and *reach* (how much context one question spans), which vary independently.
 #   its files.
 ```
 
-The ledger records the content of every file a completed campaign examined, so
-"covered" means covered *as it is now*: a file edited since is uncovered again
-in every mode that consults coverage (`auto` on a large tree re-examines it
-automatically; a small tree is rescanned whole as before, with a note naming
-`--scan-mode changed`). `--resume` is different on purpose: it continues a run
-on the code as it was and says when that code has moved. Files covered before
-content was recorded count as covered until they are scanned once more.
+The ledger records the content of every file a completed campaign examined, and
+compares disk state against the **most recently recorded** version per file (for
+the active model), so "covered" means covered *as it was last scanned*: editing
+a file — or reverting a fixed file back to an older commit — marks it changed
+and uncovered again in every mode that consults coverage (`auto` on a large tree
+re-examines it automatically; a small tree is rescanned whole as before, with a
+note naming `--scan-mode changed`). `--resume` is different on purpose: it
+continues a run on the code as it was and says when that code has moved. Files
+covered before content was recorded count as covered until they are scanned once
+more.
+
+### Verifying fixes and the incremental loop (`--scan-mode changed`)
+
+`knowledge.db` holds persistent state across runs, while each `run_id`
+represents one scan pass over a snapshot (plus any `--resume` retries on that
+same snapshot). The intended scan-fix-verify loop is:
+
+1. **Baseline scan** (`run-id1`): run `auto`, `file-by-file`, `whole`, or
+   `cross-functional` against `knowledge.db`.
+2. **Finish incomplete campaigns (optional)**: if campaigns paused at a budget
+   ceiling or failed, run `./run.sh /path/to/repo --resume` (no `--scan-mode`
+   needed) until `run-id1` finishes.
+3. **Fix & verify** (`run-id2`): after editing code to fix findings, run
+   `./run.sh /path/to/repo --scan-mode changed` **without `--resume`**. This
+   starts a new `run_id` over the same `knowledge.db`. (Combining `--resume`
+   with a mode switch like `--scan-mode changed` is rejected with exit code
+   `64`.)
+4. **Resume `changed` if needed (optional)**: if `run-id2` itself paused or had
+   failed campaigns, `--resume` finishes `run-id2` in `changed` mode.
+5. **Repeat**: make further fixes and run `--scan-mode changed` again
+   (`run-id3`, ...).
+
+What `changed` writes to `knowledge.db`:
+
+- **Campaign targets vs. file hashes**: `changed` groups new and edited files
+  into **one campaign per directory** (merging small sibling directories up to
+  24 files) so agents can read surrounding callers, headers, and routes and run
+  disjoint directories in `--parallel`. Accordingly, `campaign_spend.target` and
+  `coverage_files.campaign_target` record the directory path, while
+  `coverage_files.path` records hashes strictly for the changed files in scope.
+- **Prior findings across multiple runs**: `changed` collects open findings
+  touching the changed files across **all** earlier `run_id`s in `knowledge.db`,
+  re-runs stored `dynamic_confirmed` PoCs before the graph runs, and asks the
+  audit stages to verify the rest. If multiple earlier runs (for example,
+  `whole`, `file-by-file`, and `cross-functional`) reported the same defect
+  under the same `lineage_id`, settlement closes all open sibling rows together
+  when fixed — and fails closed (keeping all of them open) if any check or
+  re-report finds the defect `still_present`.
+- **Inspecting fix verdicts**: each run prints a
+  `🔁 Earlier findings in the changed files` summary, records per-finding
+  evidence in `regression_checks` (`SELECT * FROM regression_checks;`), and
+  transitions fixed rows in `findings` to `status = 'mitigated'` (with
+  `[mitigated by run ...]` in `triage_reasoning`).
 
 A ledger from before content was recorded cannot say what changed, so the first
 `changed` run over it scans the whole target once. To keep those earlier
