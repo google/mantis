@@ -250,9 +250,13 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
         else:
             guest_rel = None  # outside the guest workdir: the sandbox refuses it below
         if guest_rel is not None and guest_rel != target_rel and guest_rel != os.path.basename(real_target):
+            # get_function_boundary is not offered: it applies this same rule
+            # to the body it reads, so naming it sent the agent from one
+            # refusal straight into another.
             return (f"Error: Permission denied. Single-file scans may only read the scanned file "
-                    f"'{target_rel}'. For other files use find_symbol, find_callers, find_callees and "
-                    "get_function_boundary, which answer from the whole tree.")
+                    f"'{target_rel}'. For other files use find_symbol, find_callers and find_callees, "
+                    "which answer from the whole tree's index; no other file's source is readable "
+                    "in this scan.")
 
     sandbox = ctx.sandbox
     if sandbox is None or not hasattr(sandbox, "read_file"):

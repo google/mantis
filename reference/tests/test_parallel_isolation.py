@@ -261,6 +261,9 @@ class SingleFileScopeTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("SECRET-B", out, spelling)
             self.assertNotIn("helper", out, spelling)
             self.assertIn("Single-file scans may only read the scanned file 'cmd/a/main.go'", out, spelling)
+            # get_function_boundary refuses the same bodies; the hint must
+            # not send the agent from one refusal into another.
+            self.assertNotIn("get_function_boundary", out, spelling)
         self.assertEqual({os.path.basename(r) for r in self.reads}, {"main.go"}, "the guest was never asked for another file")
 
     async def test_list_files_shows_the_own_directory_only(self):
