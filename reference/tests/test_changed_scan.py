@@ -359,6 +359,90 @@ class ResolveTest(_Repo):
         self.assertEqual(main._campaign_scope_files({}, self.repo, []), [])
 
 
+class ChangedFilesOverrideTest(_Repo):
+    """--changed-files: the caller names the changed files (the PR driver,
+    one file per run) instead of the ledger."""
+
+    def _resolve(self, listed, **cfg):
+        import main
+
+        scope: dict = {}
+        config = {"scan_mode": "changed", "surveyor": {"min_source_files": 1000}, **cfg}
+        targets, _astm, resolved = main.resolve_scan_targets(
+            Path(self.repo), config, list(self.files.values()), db_path=self.db, scope_out=scope,
+            changed_files_override=listed)
+        return targets, resolved, scope
+
+    def test_listed_paths_resolve_against_the_target(self):
+        import main
+
+        outside_file = os.path.join(self.tmp, "outside.py")
+        Path(outside_file).write_text("x = 1\n")
+        os.symlink(outside_file, os.path.join(self.repo, "link.py"))
+        files, outside, not_source = main._listed_changed_files(
+            Path(self.repo),
+            ["pkg/c.py", self.files["a"], "./pkg/c.py", "../outside.py", "link.py", "missing.py", ""],
+            list(self.files.values()))
+        self.assertEqual(files, [self.files["pkg/c"], self.files["a"]], "discovered spelling, list order, no repeats")
+        self.assertEqual(outside, ["../outside.py", "link.py"], "a symlink is judged by where it lands")
+        self.assertEqual(not_source, ["missing.py"])
+
+    def test_the_list_replaces_the_ledger(self):
+        self.cover("a", "b", "pkg/c")  # the ledger says nothing changed
+        targets, resolved, scope = self._resolve([self.files["pkg/c"]])
+        self.assertEqual((targets, resolved), ([os.path.join(self.repo, "pkg")], "changed"))
+        self.assertEqual(scope["focus_files"], [self.files["pkg/c"]])
+        self.assertEqual(scope["changed_files"], [], "covered as it is: not changed for the prior-PoC rule")
+        self.edit("pkg/c")
+        _targets, _resolved, scope = self._resolve([self.files["pkg/c"]])
+        self.assertEqual(scope["changed_files"], [self.files["pkg/c"]])
+
+    def test_a_listed_file_keeps_its_own_directory(self):
+        import main
+
+        deep = os.path.join(self.repo, "cmd", "x", "y.py")
+        os.makedirs(os.path.dirname(deep))
+        Path(deep).write_text("def y():\n    return 1\n")
+        self.files["cmd/x/y"] = deep
+        self.assertEqual([g["dir"] for g in main.group_changed_files([deep], self.repo)],
+                         [os.path.join(self.repo, "cmd")], "the ledger's grouping climbs a small directory")
+        targets, _resolved, scope = self._resolve([deep])
+        self.assertEqual(targets, [os.path.join(self.repo, "cmd", "x")], "a listed file does not climb")
+        self.assertEqual(scope["focus_groups"], [{"dir": os.path.join(self.repo, "cmd", "x"), "files": [deep]}])
+        # Two listed directories, one inside the other, still never nest.
+        groups = main.group_changed_files([deep, self.files["pkg/c"], os.path.join(self.repo, "cmd", "z.py")],
+                                          self.repo, climb=False)
+        self.assertEqual([g["dir"] for g in groups], [os.path.join(self.repo, "cmd"), os.path.join(self.repo, "pkg")])
+
+    def test_a_root_file_alone_is_the_root_campaign(self):
+        targets, _resolved, _scope = self._resolve([self.files["a"]])
+        self.assertEqual(targets, [self.repo])
+
+    def test_an_empty_list_is_nothing_to_scan(self):
+        targets, resolved, scope = self._resolve([])
+        self.assertEqual((targets, resolved), ([], "changed"))
+        self.assertTrue(scope["nothing_changed"])
+
+    def test_no_prior_poc_is_rerun_in_a_static_sandbox(self):
+        import asyncio
+
+        import main
+        from core.context import RunContext
+        from core.database import read_findings, read_regression_checks, record_artifact, write_findings
+        from core.sandbox import build_sandbox
+
+        write_findings(self.db, self.repo, [{"title": "t", "severity": "HIGH", "status": "dynamic_confirmed",
+                                             "description": "d", "line_numbers": [1], "filepath": "pkg/c.py"}],
+                       run_id=RUN)
+        prior = read_findings(self.db, run_id=RUN)
+        record_artifact(self.db, RUN, "poc", f"workspace/repro_{prior[0]['id']}.py", "print('x')\n")
+        ctx = RunContext(jail_dir=self.repo, db_path=self.db, target_file=self.repo, run_id="r2",
+                         sandbox=build_sandbox({"type": "static-only"}, self.repo))
+        note = asyncio.run(main._rerun_prior_pocs(ctx, self.db, "r2", prior, changed_paths={"pkg/c.py"}))
+        self.assertEqual(note, "")
+        self.assertEqual(read_regression_checks(self.db, run_id="r2"), [])
+
+
 class EndToEndTest(_Repo):
     """The pipeline against a dummy endpoint: the plan it prints is the evidence."""
 
@@ -415,6 +499,53 @@ class EndToEndTest(_Repo):
         self.assertIn("[RESUME] 1 file(s) this run covered changed on disk since", out)
         self.assertIn("--scan-mode changed", out)
         self.assertNotIn("Triggered via: " + self.files["a"], out, "a resumed run does not rescan it")
+
+    def test_listed_changed_files_end_to_end(self):
+        # A fresh database: the ledger would call every file new.
+        _code, out = self.run_main("--scan-mode", "changed", "--changed-files", "pkg/c.py")
+        self.assertIn("Scan mode changed: 1 listed file(s) to examine; 1 campaign(s) over the target", out)
+        self.assertIn("Work plan — changed: 1 campaign(s)", out)
+        self.assertIn("Triggered via: " + os.path.join(self.repo, "pkg") + "\n", out, "the file's directory, over the repo")
+
+    def test_listed_changed_files_misuse_exits_1(self):
+        code, out = self.run_main("--changed-files", "pkg/c.py")
+        self.assertEqual(code, 1, out)
+        self.assertIn("--changed-files needs a directory target and --scan-mode changed", out)
+        code, out = self.run_main("--scan-mode", "changed", "--changed-files", "../outside.py")
+        self.assertEqual(code, 1, out)
+        self.assertIn("1 path(s) outside the target", out)
+        code, out = self.run_main("--scan-mode", "changed", "--changed-files", "missing.py")
+        self.assertEqual(code, 1, out)
+        self.assertIn("none of the listed paths is a source file", out)
+        proc = subprocess.run(
+            [sys.executable, str(_REF_ROOT / "main.py"), self.files["a"], "--yes", "--sandbox", "static-only",
+             "--model", "openai/nonexistent", "--api-base", "http://127.0.0.1:9", "--db", self.db,
+             "--scan-mode", "changed", "--changed-files", "a.py"],
+            capture_output=True, text=True, timeout=300, env=self.env, cwd=str(_REF_ROOT))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("target is a file", proc.stdout + proc.stderr)
+
+    def test_sequential_listed_runs_leave_an_earlier_finding_alone(self):
+        """The PR driver scans one file per run. Two files in one directory,
+        in sequence: the second run neither re-decides nor restamps the
+        first run's finding -- not when it lists the sibling file, and not
+        when it lists the finding's own file."""
+        from core.database import read_findings, read_regression_checks, write_findings
+
+        d = os.path.join(self.repo, "pkg", "d.py")
+        Path(d).write_text("def d():\n    return 4\n")
+        write_findings(self.db, self.repo, [{"title": "ssrf in c", "severity": "HIGH", "status": "static_confirmed",
+                                             "description": "d", "line_numbers": [1], "filepath": "pkg/c.py"}],
+                       run_id=RUN)
+        before = read_findings(self.db, run_id=RUN)
+        self.assertEqual(len(before), 1)
+        outs = [self.run_main("--scan-mode", "changed", "--changed-files", rel)[1] for rel in ("pkg/d.py", "pkg/c.py")]
+        after = read_findings(self.db, run_id=RUN)
+        self.assertEqual([(f["id"], f["status"]) for f in after], [(f["id"], f["status"]) for f in before])
+        self.assertEqual(read_regression_checks(self.db), [], "no later run decided about it")
+        for out in outs:
+            self.assertNotIn("earlier finding(s) sit in the changed files", out)
+            self.assertIn("Triggered via: " + os.path.join(self.repo, "pkg") + "\n", out)
 
 
 class DirectiveReachesEveryNodeTest(unittest.IsolatedAsyncioTestCase):

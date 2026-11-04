@@ -1221,6 +1221,12 @@ def record_summary(summary: dict) -> str:
         return "Error: No active execution context."
     try:
         sum_obj = CodebaseSummary.model_validate(summary) if isinstance(summary, dict) else summary
+        if not (str(sum_obj.overview or "").strip() or sum_obj.key_modules):
+            return (
+                "ERROR SAVING SUMMARY: the submitted summary is empty after validation — "
+                "nothing was recorded. Put the architecture in overview (plain text) and/or "
+                "the main components in key_modules, and call record_summary again."
+            )
         content_json = sum_obj.model_dump_json(indent=2)
         _persist_artifact(ctx, "summary", "workspace/.structured/summary.json", content_json)
         return f"SUCCESS: Recorded codebase summary with {len(sum_obj.key_modules)} module(s)."

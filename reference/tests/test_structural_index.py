@@ -27,11 +27,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import MagicMock
 
 _REF_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -40,12 +42,16 @@ if _REF_ROOT not in sys.path:
 
 from core.context import RunContext, current_run_context
 from core.structural_index import (
+    _AMBIENT_RECEIVERS,
     MAX_FILE_BYTES,
     StructuralIndex,
+    _CandidateLookup,
     _language_for,
     _load_parser,
+    _resolve_callee_id,
     build_structural_index,
     extract_unit,
+    git_snapshot_id,
     state_dir_for_db,
 )
 
@@ -928,6 +934,226 @@ class StateDirKeyingTest(unittest.TestCase):
             self.assertEqual(idx_a.resolve_symbol("beta_fn")["total"], 0)
             self.assertEqual(idx_b.resolve_symbol("beta_fn")["total"], 1)
             self.assertEqual(idx_b.resolve_symbol("alpha_fn")["total"], 0)
+
+
+def _scan_resolve(edge, syms_by_name, sym_by_id):
+    """The resolver as it was before _CandidateLookup: a linear scan of the
+    name's candidates per edge. The reference the lookup must agree with."""
+    callee_name = edge.get("callee_name") or ""
+    candidates = syms_by_name.get(callee_name, [])
+    if not candidates:
+        return None
+    qual = (edge.get("qualifier") or "").strip()
+    if not qual:
+        return candidates[0]["symbol_id"] if len(candidates) == 1 else None
+    if qual in ("self", "this", "super", "cls"):
+        caller_q = (sym_by_id.get(edge.get("caller_id") or "") or {}).get("qualified_name") or ""
+        if "." in caller_q:
+            owner = caller_q.rsplit(".", 1)[0]
+            same = [c for c in candidates if c.get("qualified_name") == f"{owner}.{callee_name}"]
+            if len(same) == 1:
+                return same[0]["symbol_id"]
+        return candidates[0]["symbol_id"] if len(candidates) == 1 else None
+    suffix = f"{qual}.{callee_name}"
+    matched = [
+        c for c in candidates
+        if c.get("qualified_name") == suffix
+        or str(c.get("qualified_name") or "").endswith("." + suffix)
+        or Path(str(c.get("file_path") or "")).stem == qual
+    ]
+    if len(matched) == 1:
+        return matched[0]["symbol_id"]
+    if len(matched) > 1:
+        return None
+    if qual in _AMBIENT_RECEIVERS or qual[0].isupper():
+        return None
+    return candidates[0]["symbol_id"] if len(candidates) == 1 else None
+
+
+class _CountingSym(dict):
+    """A symbol row that counts field reads, to bound per-edge work."""
+
+    reads = 0
+
+    def get(self, *a):
+        _CountingSym.reads += 1
+        return super().get(*a)
+
+
+class CalleeLookupTest(unittest.TestCase):
+    """Qualifier matching goes through per-name tables, not a scan per edge."""
+
+    @staticmethod
+    def _catalog(rng, names, per_name):
+        owners = ["Session", "Token", "pkg.Session", "a.b.Session", "auth", "db", "x"]
+        files = ["app/auth.py", "app/session.go", "lib/db.ts", "vendor/x/token.go",
+                 "session", "a/b.tar.gz", ""]
+        syms_by_name, sym_by_id = {}, {}
+        n = 0
+        for name in names:
+            for _ in range(rng.randint(1, per_name)):
+                n += 1
+                owner = rng.choice(owners + [None])
+                qn = rng.choice([f"{owner}.{name}" if owner else name, name, None, f"{owner}"])
+                sym = {"symbol_id": f"s{n}", "name": name, "qualified_name": qn,
+                       "file_path": rng.choice(files + [None])}
+                syms_by_name.setdefault(name, []).append(sym)
+                sym_by_id[sym["symbol_id"]] = sym
+        return syms_by_name, sym_by_id
+
+    def test_lookup_resolves_exactly_like_the_scan(self):
+        import random
+
+        rng = random.Random(7)
+        names = ["refresh", "login", "String", "Error", "log", "findAll", "a.b"]
+        syms_by_name, sym_by_id = self._catalog(rng, names, 40)
+        # Unique names too, so the single-candidate branches are exercised.
+        for i in range(5):
+            sym = {"symbol_id": f"u{i}", "name": f"uniq{i}", "qualified_name": f"M.uniq{i}",
+                   "file_path": "m.py"}
+            syms_by_name[f"uniq{i}"] = [sym]
+            sym_by_id[sym["symbol_id"]] = sym
+        quals = ["", "  ", "self", "this", "super", "cls", "Session", "pkg.Session",
+                 "b.Session", "a.b.Session", "auth", "session", "token", "db", "console",
+                 "json", "UserModel", "s", "x", "a.b", "b.tar"]
+        callers = list(sym_by_id) + ["", "missing"]
+        lookup = _CandidateLookup(syms_by_name)
+        checked = resolved = 0
+        for name in names + [f"uniq{i}" for i in range(5)] + ["nope", ""]:
+            for qual in quals:
+                for caller in callers[:: max(1, len(callers) // 25)]:
+                    edge = {"callee_name": name, "qualifier": qual, "caller_id": caller}
+                    want = _scan_resolve(edge, syms_by_name, sym_by_id)
+                    self.assertEqual(_resolve_callee_id(edge, syms_by_name, sym_by_id, lookup),
+                                     want, edge)
+                    self.assertEqual(_resolve_callee_id(edge, syms_by_name, sym_by_id), want, edge)
+                    checked += 1
+                    resolved += want is not None
+        # Both outcomes occur, or agreement would prove nothing.
+        self.assertGreater(resolved, 50)
+        self.assertGreater(checked - resolved, 50)
+
+    def test_per_edge_work_does_not_grow_with_candidates(self):
+        # 400 same-named candidates, 300 qualified edges calling the name: a
+        # scan reads every candidate on every edge (~360k reads); the shared
+        # lookup reads each candidate once, to build its tables.
+        cands = [_CountingSym(symbol_id=f"s{i}", name="String", file_path=f"vendor/p{i}/s.go",
+                              qualified_name=f"T{i}.String") for i in range(400)]
+        syms_by_name = {"String": cands}
+        sym_by_id = {c["symbol_id"]: c for c in cands}
+        lookup = _CandidateLookup(syms_by_name)
+        _CountingSym.reads = 0
+        for i in range(300):
+            edge = {"callee_name": "String", "qualifier": f"T{i}", "caller_id": "s0"}
+            self.assertEqual(_resolve_callee_id(edge, syms_by_name, sym_by_id, lookup), f"s{i}")
+            edge = {"callee_name": "String", "qualifier": "self", "caller_id": f"s{i}"}
+            self.assertEqual(_resolve_callee_id(edge, syms_by_name, sym_by_id, lookup), f"s{i}")
+        self.assertLessEqual(_CountingSym.reads, 3 * len(cands) + 2 * 300)
+
+
+def _git_repo(path: Path) -> str:
+    """Commits the fixture at path as a git repository; returns HEAD."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(path), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("add", "-A")
+    git("commit", "-q", "-m", "fixture")
+    return git("rev-parse", "HEAD")
+
+
+class SnapshotPinTest(unittest.TestCase):
+    """A clean checkout pins the index to HEAD, so a rebuild reuses it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="mantis_sidx_pin_")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(os.path.realpath(self._tmp.name))
+        self.code = self.tmp / "code"
+        _write_fixture(self.code)
+        self.head = _git_repo(self.code)
+        self.state = self.tmp / "state"
+
+    def test_clean_checkout_pins_to_head(self):
+        self.assertEqual(git_snapshot_id(str(self.code)), f"git:{self.head}")
+
+    def test_anything_the_index_would_read_differently_is_unknown(self):
+        (self.code / "app" / "db.py").write_text("def helper():\n    return 2\n")
+        self.assertEqual(git_snapshot_id(str(self.code)), "unknown")
+        subprocess.run(["git", "-C", str(self.code), "checkout", "-q", "--", "."], check=True)
+        (self.code / "untracked.py").write_text("x = 1\n")
+        self.assertEqual(git_snapshot_id(str(self.code)), "unknown")
+        (self.code / "untracked.py").unlink()
+        # Ignored files are indexed too, so they unpin as well.
+        (self.code / ".gitignore").write_text("build/\n")
+        subprocess.run(["git", "-C", str(self.code), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.code), "commit", "-q", "-m", "ignore"], check=True)
+        self.assertTrue(git_snapshot_id(str(self.code)).startswith("git:"))
+        (self.code / "build").mkdir()
+        (self.code / "build" / "gen.py").write_text("x = 1\n")
+        self.assertEqual(git_snapshot_id(str(self.code)), "unknown")
+
+    def test_subdirectory_and_non_repository_are_unknown(self):
+        self.assertEqual(git_snapshot_id(str(self.code / "app")), "unknown")
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        self.assertEqual(git_snapshot_id(str(plain)), "unknown")
+        self.assertEqual(git_snapshot_id(str(self.tmp / "missing")), "unknown")
+
+    def test_pinned_rebuild_reuses_and_another_root_does_not(self):
+        snap = git_snapshot_id(str(self.code))
+        first = build_structural_index(str(self.code), str(self.state), snap)
+        self.assertFalse(first.get("reused", False))
+        self.assertEqual(first["code_root"], str(self.code))
+        second = build_structural_index(str(self.code), str(self.state), snap)
+        self.assertTrue(second.get("reused"))
+        # The same pin over a different root is a different catalog.
+        other = build_structural_index(str(self.code / "app"), str(self.state), snap)
+        self.assertFalse(other.get("reused", False))
+
+    def test_pinned_catalog_of_another_extractor_is_rebuilt(self):
+        import core.structural_index as sidx
+
+        snap = git_snapshot_id(str(self.code))
+        build_structural_index(str(self.code), str(self.state), snap)
+        with mock.patch.object(sidx, "_ts_version", return_value="999.0.0"):
+            again = build_structural_index(str(self.code), str(self.state), snap)
+        self.assertFalse(again.get("reused", False),
+                         "a catalog built by another extractor was reused at the same commit")
+
+    async def _run_node(self):
+        from core.graph_loader import create_structural_index_node
+
+        token = current_run_context.set(RunContext(
+            jail_dir=str(self.code), db_path=str(self.tmp / "knowledge.db"),
+            target_file="", run_id="r1"))
+        try:
+            mock_ctx = MagicMock()
+            mock_ctx.state = {}
+            return await create_structural_index_node("structural_index")._func(mock_ctx, None)
+        finally:
+            current_run_context.reset(token)
+
+    def test_pipeline_node_reuses_the_catalog_of_a_clean_checkout(self):
+        import asyncio
+        import core.structural_index as sidx
+
+        (self.tmp / "knowledge.db").touch()
+        real = sidx._write_catalog
+        writes = []
+        with mock.patch.object(sidx, "_write_catalog",
+                               side_effect=lambda *a, **k: (writes.append(1), real(*a, **k))):
+            first = asyncio.run(self._run_node())
+            second = asyncio.run(self._run_node())
+        self.assertIn("Structural index complete", first.output)
+        self.assertIn("Structural index complete", second.output)
+        self.assertEqual(len(writes), 1, "the second run over the same commit rebuilt the catalog")
+        manifest = json.loads(
+            (Path(state_dir_for_db(str(self.tmp / "knowledge.db"))) / "manifest.json").read_text())
+        self.assertEqual(manifest["snapshot_id"], f"git:{self.head}")
 
 
 class WorkflowTopologyTest(unittest.TestCase):

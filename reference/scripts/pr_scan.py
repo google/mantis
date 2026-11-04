@@ -163,6 +163,19 @@ DEFAULT_MAX_TOKENS = 10_000_000
 # than running until someone reads the invoice.
 DEFAULT_DAILY_TOKEN_BUDGET = 100_000_000
 
+# A scan still working at its timeout is not killed while its log keeps
+# growing, up to TIMEOUT_EXTENSION_FACTOR times the timeout; one silent for
+# TIMEOUT_STALL_SECONDS (or the timeout itself, when shorter) is. Measured on
+# a shared model quota: of the scans killed at an hour, 27 to 49 minutes went
+# to a handful of model turns of 8 to 20 minutes each, and the same files
+# finished in about half an hour in a later, smaller wave. A file's
+# size did not predict it: a 317-line file timed out twice. The timeout
+# exists to end a hung scan; a slow one that keeps producing is not hung,
+# and killing it throws away a pass that was nearly done. The token budget,
+# not the clock, bounds what it spends.
+TIMEOUT_EXTENSION_FACTOR = 2.0
+TIMEOUT_STALL_SECONDS = 900.0
+
 # Environment the pipeline subprocess never needs and must not inherit:
 # GitHub's own runtime tokens. The pipeline runs model-steered tool calls
 # over attacker-authored code; nothing in that process should be able to
@@ -759,11 +772,27 @@ def archive_rewritten(db_path: str, prior: List[Dict[str, Any]], changed: Dict[s
     return archived
 
 
-def scan_command(state: MantisState, rel_fp: str, max_llm_calls: int,
+def scan_command(state: MantisState, rel_fp: Any, max_llm_calls: int,
                  model: str, api_base: str = "", max_tokens: int = 0,
-                 spend_report: str = "", knowledge_dir: str = "") -> List[str]:
-    """scan_change's exact invocation plus the CI pins. Pure, for tests."""
-    cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
+                 spend_report: str = "", knowledge_dir: str = "",
+                 max_campaign_tokens: int = 0) -> List[str]:
+    """scan_change's invocation, over the repository, plus the CI pins. Pure, for tests.
+
+    `rel_fp` is one changed file, or a list of them for a one-process run
+    (--one-process): each is listed, and `max_campaign_tokens`, when above
+    0, caps each campaign so one file cannot spend the others' share.
+    """
+    # The repository is the target and the file is the run's one changed
+    # file: a campaign over the file's directory, scoped to the file, that
+    # can read the callers and types it needs in other packages. A file
+    # target is a single-file jail, where a changed sink is judged without
+    # the code that reaches it. One file per run still: the budget share,
+    # timeout and status are per file, and the campaign's directory is the
+    # file's own, so run N never reviews runs 1..N-1's findings as its own.
+    cmd = _scan_cmd(state, str(state.repo), max_llm_calls, model)
+    # One token each, so a file named like a flag ("-x.py") stays a value.
+    rels = [rel_fp] if isinstance(rel_fp, str) else list(rel_fp)
+    cmd += ["--scan-mode", "changed"] + [f"--changed-files={r}" for r in rels]
     # Static analysis only: the runner never executes anything the PR
     # supplied, whatever the action's own workflow.local.json says.
     cmd += ["--sandbox", "static-only"]
@@ -776,6 +805,8 @@ def scan_command(state: MantisState, rel_fp: str, max_llm_calls: int,
     cmd += ["--cache-discount", "1"]
     if max_tokens > 0:
         cmd += ["--max-tokens", str(max_tokens)]  # this file's share of the run budget
+    if max_campaign_tokens > 0:
+        cmd += ["--max-campaign-tokens", str(max_campaign_tokens)]
     if spend_report:
         cmd += ["--spend-report", spend_report]
     if knowledge_dir:
@@ -813,6 +844,28 @@ def read_spend_report(path: Path) -> Optional[Dict[str, Any]]:
     out["pause_trigger"] = str(data.get("pause_trigger") or "")
     nodes = data.get("nodes")
     out["nodes"] = [str(n) for n in nodes if isinstance(n, str)] if isinstance(nodes, list) else []
+    # Each campaign's outcome, for a one-process run. Absent when the
+    # pipeline wrote no such block (an older pipeline), which is not the
+    # same as a run that ended before any campaign did ([]).
+    campaigns = data.get("campaigns")
+    if isinstance(campaigns, list):
+        out["campaigns"] = []
+        for c in campaigns:
+            if not isinstance(c, dict):
+                continue
+            entry: Dict[str, Any] = {}
+            for key in ("tokens", "fresh_tokens", "cached_tokens", "llm_calls"):
+                v = c.get(key)
+                entry[key] = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else 0
+            secs = c.get("elapsed_seconds")
+            entry["elapsed_seconds"] = (float(secs) if isinstance(secs, (int, float))
+                                        and not isinstance(secs, bool) and secs >= 0 else 0.0)
+            entry["status"] = str(c.get("status") or "")
+            entry["pause_trigger"] = str(c.get("pause_trigger") or "")
+            files, cnodes = c.get("files"), c.get("nodes")
+            entry["files"] = [str(f) for f in files if isinstance(f, str)] if isinstance(files, list) else []
+            entry["nodes"] = [str(n) for n in cnodes if isinstance(n, str)] if isinstance(cnodes, list) else []
+            out["campaigns"].append(entry)
     return out
 
 
@@ -864,6 +917,135 @@ def _classify(code: Optional[int], account: Optional[Dict[str, Any]] = None) -> 
     return SCAN_FAILED
 
 
+def charge_for(code: Optional[int], report: Optional[Dict[str, Any]], granted: int) -> int:
+    """What a finished, killed or unlaunched process is charged.
+
+    A process that never started spent nothing. One that was killed (code
+    None) may have left an account, since the pipeline rewrites its report
+    as each campaign ends; but that account stops at the last campaign that
+    ended, not at the kill, so a killed process is charged at least its
+    whole grant. Everything else is charge().
+    """
+    if code == -1:
+        return 0
+    if code is None:
+        return max(granted, charge(report, granted))
+    return charge(report, granted)
+
+
+# --- One process for the pull request (--one-process) --------------------------------
+
+# How a campaign's own outcome, from the pipeline's spend report, reads as a
+# file's scan status.
+_CAMPAIGN_STATUS = {"done": SCAN_DONE, "failed": SCAN_FAILED, "paused": SCAN_PAUSED}
+
+
+def campaign_groups(state: MantisState, rels: List[str]) -> List[List[str]]:
+    """The campaigns a one-process run makes of `rels`, each a list of
+    repo-relative files, in `rels` order.
+
+    The pipeline's own grouping (main.group_changed_files without the climb,
+    as --changed-files runs it): a campaign per directory holding changed
+    files, nested directories joined to their ancestor's. The driver splits
+    the budget into per-campaign shares by it, so it has to be the grouping
+    the run will use. When the pipeline cannot be imported every file is its
+    own group: more groups, smaller shares, the safe direction.
+    """
+    order = {r: i for i, r in enumerate(rels)}
+    groups: List[List[str]] = []
+    try:
+        from main import group_changed_files
+
+        for g in group_changed_files([str(state.repo / r) for r in rels], str(state.repo), climb=False):
+            files = [r for r in (state.rel(str(f)) for f in g.get("files") or []) if r in order]
+            if files:
+                groups.append(files)
+    except Exception:
+        groups = []
+    placed = {f for g in groups for f in g}
+    groups += [[r] for r in rels if r not in placed]
+    groups = [sorted(dict.fromkeys(g), key=order.__getitem__) for g in groups]
+    return sorted(groups, key=lambda g: order[g[0]])
+
+
+def one_process_results(state: MantisState, rels: List[str], model: str, code: Optional[int],
+                        account: Optional[Dict[str, Any]], cost: int, granted: int,
+                        seconds: float) -> List[Dict[str, Any]]:
+    """Per-file results of one pipeline run over several changed files.
+
+    Each file takes its campaign's outcome from the spend report's
+    per-campaign accounts: status, tokens, calls, time, and whether the
+    researcher finished. One campaign can finish while the next stops at its
+    own share, and a process killed after a campaign ended still leaves that
+    campaign's account. A file with no campaign account takes the process's
+    outcome: timed out when it was killed, paused when the run paused
+    before reaching it, rejected credentials when the provider refused
+    them, and failed otherwise (a finished run that left a file out made no
+    campaign of it, e.g. not a source file). A report with no per-campaign
+    block at all (an older pipeline) gives every file the run's outcome.
+
+    Tokens and calls are shared out so the files' sum is the run's charge:
+    a campaign's among its files, and what no campaign accounts for (the
+    killed campaign, or the charge over the account) among the files with
+    no campaign, else to the first file. A count with no account is None.
+    """
+    campaigns = account.get("campaigns") if account else None
+    in_rels = set(rels)
+    placed: Dict[str, Tuple[Dict[str, Any], int, int]] = {}
+    for c in campaigns or []:
+        files = [r for r in dict.fromkeys(state.rel(f) for f in c["files"]) if r in in_rels and r not in placed]
+        for j, f in enumerate(files):
+            placed[f] = (c, len(files), j)
+    if code == -1:
+        unplaced = SCAN_FAILED
+    elif campaigns is None or code == EXIT_AUTH or code is None:
+        unplaced = _classify(code, account)
+    elif code == 2 and account and account.get("pause_trigger"):
+        unplaced = SCAN_PAUSED
+    else:
+        unplaced = SCAN_FAILED
+
+    def split(total: int, k: int, j: int) -> int:
+        return total // k + (total % k if j == 0 else 0)
+
+    results: List[Dict[str, Any]] = []
+    for rel in rels:
+        if rel in placed:
+            c, k, j = placed[rel]
+            status = _CAMPAIGN_STATUS.get(c["status"], SCAN_FAILED)
+            if code == EXIT_AUTH and status != SCAN_DONE:
+                status = SCAN_AUTH_REJECTED
+            results.append({
+                "file": rel, "model": model, "returncode": code, "status": status,
+                "seconds": round(c["elapsed_seconds"], 1),
+                "tokens": split(max(c["fresh_tokens"] + c["cached_tokens"], c["tokens"]), k, j),
+                "llm_calls": split(c["llm_calls"], k, j) if account else None,
+                "granted": granted,
+                "pause_trigger": c["pause_trigger"] if status == SCAN_PAUSED else "",
+                "examined": researcher_finished(c["nodes"]),
+            })
+        else:
+            results.append({
+                "file": rel, "model": model, "returncode": code, "status": unplaced,
+                "seconds": round(seconds, 1) if campaigns is None else 0.0,
+                "tokens": 0, "llm_calls": 0 if account else None, "granted": granted,
+                "pause_trigger": (account or {}).get("pause_trigger", "") if unplaced == SCAN_PAUSED else "",
+                # The run's nodes are every campaign's merged: they say a
+                # file was examined only when the run had that one file.
+                "examined": (len(rels) == 1 and code != -1 and bool(account)
+                             and researcher_finished(account.get("nodes") or [])),
+            })
+    rest = [r for r in results if r["file"] not in placed] or results[:1]
+    for key, total in (("tokens", cost), ("llm_calls", (account or {}).get("llm_calls"))):
+        if total is None or not rest:
+            continue
+        left = int(total) - sum(int(r[key] or 0) for r in results)
+        if left > 0:
+            for j, r in enumerate(rest):
+                r[key] = int(r[key] or 0) + split(left, len(rest), j)
+    return results
+
+
 def _open_log(log_path: Path):
     """Append handle on a log that must be a regular file we created: no
     following symlinks, no reuse of anything that was already there."""
@@ -872,17 +1054,69 @@ def _open_log(log_path: Path):
     return os.fdopen(os.open(str(log_path), flags, 0o600), "ab")
 
 
+def wait_for_scan(proc: "subprocess.Popen", timeout: float, progress: Callable[[], int],
+                  log: Optional[Any] = None, clock: Callable[[], float] = time.monotonic,
+                  stall_seconds: float = TIMEOUT_STALL_SECONDS,
+                  extension_factor: float = TIMEOUT_EXTENSION_FACTOR) -> Optional[int]:
+    """The scan's exit code, or None once it was killed for its timeout.
+
+    Until `timeout` the scan runs as before. Past it, it keeps running only
+    while it is producing: `progress()` (the size of the log it writes) has
+    grown within the stall window -- stall_seconds, or the timeout itself
+    when that is shorter -- and never beyond extension_factor times the
+    timeout. A timeout of 0 or less waits for the scan to end.
+    """
+    if timeout <= 0:
+        return proc.wait()
+    start = clock()
+    deadline = start + timeout
+    cap = start + timeout * max(1.0, extension_factor)
+    stall = min(stall_seconds, timeout)
+    seen, seen_at = progress(), start
+    poll = max(0.05, min(30.0, stall / 4))
+    extended = False
+    while True:
+        now = clock()
+        wait_for = poll if now >= deadline else min(poll, deadline - now)
+        try:
+            return proc.wait(timeout=max(0.01, min(wait_for, cap - now)))
+        except subprocess.TimeoutExpired:
+            pass
+        now = clock()
+        size = progress()
+        if size != seen:
+            seen, seen_at = size, now
+        if now < deadline:
+            continue
+        if now >= cap or now - seen_at >= stall:
+            break
+        if not extended and log is not None:
+            extended = True
+            log.write(f"[pr_scan] still working at {timeout:.0f}s; running on while it writes "
+                      f"(silent {stall:.0f}s, or {cap - start:.0f}s in all, ends it)\n".encode())
+            log.flush()
+            seen = progress()
+    proc.kill()
+    proc.wait()
+    if log is not None:
+        why = "its limit" if now >= cap else f"{now - seen_at:.0f}s without output"
+        log.write(f"[pr_scan] timed out after {now - start:.0f}s ({why})\n".encode())
+    return None
+
+
 def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: str,
               api_base: str, per_file_timeout: float, log_path: Path,
               env: Optional[Dict[str, str]] = None, max_tokens: int = 0,
               max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
               daily: Optional[Dict[str, Any]] = None,
               meter: Optional[Callable[[Dict[str, str]], int]] = None,
-              knowledge_dir: str = "", models: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+              knowledge_dir: str = "", models: Optional[List[str]] = None,
+              one_process: bool = False) -> List[Dict[str, Any]]:
     """Runs the pipeline over each file in turn -- under each model in turn
-    when `models` names more than one -- then restores the repo-rooted index
-    (the pipeline re-roots the shared catalog at the one file it scanned,
-    which would blind the gate's blast radius).
+    when `models` names more than one -- then makes sure the gate has a
+    repo-rooted index: the scans index the repository and normally leave
+    one, and when they did not (none launched, or the build failed) it is
+    built here, so the gate's blast radius is never blind.
 
     With several models every file is scanned by every model: the models
     differ in what they find, and knowledge worth keeping is the union. The
@@ -910,12 +1144,23 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
     each after the lag, instead of a whole run budget each. This run's own
     spend is not yet in the meter, so the floor is what the meter showed at
     the start plus what this run has charged since.
+
+    With `one_process` each model's files are scanned in ONE pipeline run,
+    every file listed, instead of one run per file: the stages a run does
+    once (the index, and whatever a campaign can take from an earlier one)
+    are not paid per file. The run gets the job's share of the budget and
+    each campaign an equal part of it (--max-campaign-tokens), so a file
+    still cannot spend the others' share; the timeout is the per-file one
+    times the files; and each file's status, tokens and examined flag come
+    from its campaign's account in the spend report (one_process_results).
     """
     results: List[Dict[str, Any]] = []
     daily_budget = int(daily["budget"]) if daily else 0
     used_start = int(daily.get("used_before_run") or 0) if daily else 0
     read_meter = meter or tokens_served_today
-    jobs = [(m, rel) for m in (models or [model]) for rel in rels]
+    # One process per model with every file listed, or one per (model, file).
+    jobs: List[Tuple[str, Any]] = ([(m, list(rels)) for m in (models or [model])] if one_process
+                                   else [(m, rel) for m in (models or [model]) for rel in rels])
     log_path.parent.mkdir(parents=True, exist_ok=True)
     child_env = subprocess_env(dict(os.environ if env is None else env))
     if max_input_tokens > 0:
@@ -926,6 +1171,30 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
     spend_dir.mkdir(mode=0o700, exist_ok=True)
     spent = 0
     with _open_log(log_path) as log:
+
+        def launch(cmd: List[str], timeout: float) -> Optional[int]:
+            """The pipeline's exit code; None when killed for its timeout
+            (wait_for_scan: a scan still writing at `timeout` runs on, within
+            bounds), -1 when it never started."""
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=log, stderr=log, cwd=str(_REF_ROOT), env=child_env)
+            except Exception as exc:  # one bad file must not end the run
+                log.write(f"[pr_scan] scan failed to launch: {exc!r}\n".encode())
+                log.flush()
+                return -1
+            try:
+                return wait_for_scan(proc, timeout, lambda: os.fstat(log.fileno()).st_size, log=log)
+            except BaseException as exc:
+                proc.kill()
+                proc.wait()
+                if not isinstance(exc, Exception):
+                    raise
+                log.write(f"[pr_scan] scan abandoned: {exc!r}\n".encode())
+                return None  # unaudited and charged in full, as a timeout is
+            finally:
+                log.flush()
+
         for i, (job_model, rel_fp) in enumerate(jobs):
             budget_now = max_tokens
             if daily_budget > 0 and i > 0:
@@ -941,6 +1210,46 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
                     day_left = max(0, daily_budget - max(used_now, used_start + spent))
                     budget_now = min(max_tokens, spent + day_left) if max_tokens > 0 else spent + day_left
             granted = allowance(budget_now, spent, len(jobs) - i)
+            if one_process:
+                # Every campaign gets an equal share of the grant, so one file
+                # cannot spend the others'; campaigns whose share would fall
+                # below MIN_SCAN_ALLOWANCE are not launched, from the last.
+                groups = campaign_groups(state, rel_fp)
+                while budget_now > 0 and groups and granted // len(groups) < MIN_SCAN_ALLOWANCE:
+                    groups.pop()
+                share = granted // len(groups) if groups and budget_now > 0 else 0
+                listed = [f for f in rel_fp if any(f in g for g in groups)]
+                for f in rel_fp:
+                    if f not in listed:
+                        log.write(f"\n=== mantis scan {f} [{job_model or 'default model'}]: not launched, "
+                                  f"{granted} of {budget_now} run tokens left ===\n".encode())
+                        results.append({"file": f, "model": job_model, "returncode": None,
+                                        "status": SCAN_OVER_BUDGET, "seconds": 0.0,
+                                        "tokens": 0, "llm_calls": 0, "granted": share,
+                                        "pause_trigger": ""})
+                if not listed:
+                    continue
+                spend_path = spend_dir / f"{i}.json"
+                cmd = scan_command(state, listed, max_llm_calls, job_model, api_base,
+                                   max_tokens=granted, spend_report=str(spend_path),
+                                   knowledge_dir=knowledge_dir,
+                                   max_campaign_tokens=share if len(groups) > 1 else 0)
+                log.write(f"\n=== mantis scan {len(listed)} file(s) in {len(groups)} campaign(s) "
+                          f"[{job_model or 'default model'}] ===\n".encode())
+                log.flush()
+                started = time.time()
+                # One process for the files: the timeout is the files'.
+                code = launch(cmd, per_file_timeout * len(listed))
+                account = read_spend_report(spend_path)
+                cost = charge_for(code, account, granted)
+                spent += cost
+                job = one_process_results(state, listed, job_model, code, account, cost,
+                                          share, time.time() - started)
+                order = {f: n for n, f in enumerate(rel_fp)}
+                results.extend(sorted(job, key=lambda r: order[r["file"]]))
+                if code == EXIT_AUTH:
+                    break
+                continue
             if budget_now > 0 and granted < MIN_SCAN_ALLOWANCE:
                 log.write(f"\n=== mantis scan {rel_fp} [{job_model or 'default model'}]: not launched, "
                           f"{granted} of {budget_now} run tokens left ===\n".encode())
@@ -956,23 +1265,11 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
             log.write(f"\n=== mantis scan {rel_fp} [{job_model or 'default model'}] ===\n".encode())
             log.flush()
             started = time.time()
-            code: Optional[int]
-            try:
-                proc = subprocess.run(
-                    cmd, stdout=log, stderr=log, cwd=str(_REF_ROOT), env=child_env,
-                    timeout=per_file_timeout if per_file_timeout > 0 else None)
-                code = proc.returncode
-            except subprocess.TimeoutExpired:
-                log.write(f"[pr_scan] timed out after {per_file_timeout:.0f}s\n".encode())
-                code = None
-            except Exception as exc:  # one bad file must not end the run
-                log.write(f"[pr_scan] scan failed to launch: {exc!r}\n".encode())
-                code = -1
-            log.flush()
+            code = launch(cmd, per_file_timeout)
             account = read_spend_report(spend_path)
             # A process that never started spent nothing; everything else
-            # that left no account is charged in full.
-            cost = 0 if code == -1 else charge(account, granted)
+            # that left no account is charged in full, and so is one killed.
+            cost = charge_for(code, account, granted)
             spent += cost
             results.append({
                 "file": rel_fp,
@@ -992,11 +1289,27 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
             })
             if code == EXIT_AUTH:
                 break
-    try:
-        reindex(state)
-    except Exception:
-        pass  # the gate reports a missing index as REVIEW on its own
+    if not index_is_repo_rooted(state):
+        try:
+            reindex(state)
+        except Exception:
+            pass  # the gate reports a missing index as REVIEW on its own
     return results
+
+
+def index_is_repo_rooted(state: MantisState) -> bool:
+    """Whether the published catalog is usable and rooted at the repository.
+
+    The scans index the repository itself, so after them the catalog
+    normally already is the one the gate needs, and rebuilding it -- minutes
+    on a large tree -- buys nothing. The state directory is fresh per run,
+    so a catalog found here was built over this checkout by this run.
+    """
+    try:
+        idx = state.index()
+        return idx.available() and idx.manifest.get("code_root") == str(state.repo)
+    except Exception:
+        return False
 
 
 # --- The verdict ---------------------------------------------------------------------
@@ -1091,7 +1404,7 @@ def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
             # so far stored, but it records no coverage for a cut-off
             # campaign, so the gate cannot treat the file as audited.
             trigger = r.get("pause_trigger") or ""
-            if trigger == "token_budget":
+            if trigger in ("token_budget", "campaign_tokens"):
                 what, fix = "its share of the run token budget", "Raise max-tokens to let the scan finish."
             elif trigger == "llm_calls_limit":
                 what, fix = "its LLM call ceiling", "Raise max-llm-calls to let the scan finish."
@@ -1531,7 +1844,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "of the scan and the gate (default: common non-code files; "
                         "pass '' to ignore nothing)")
     p.add_argument("--per-file-timeout", type=float, default=1800.0,
-                   help="Seconds before one file's scan is abandoned (0 = none)")
+                   help="Seconds before one file's scan is abandoned (0 = none); with "
+                        "--one-process, the run's timeout is this times the files. A scan "
+                        "still writing output at its timeout runs on, up to "
+                        f"{TIMEOUT_EXTENSION_FACTOR:g} times it, until it falls silent for "
+                        f"{TIMEOUT_STALL_SECONDS:.0f}s (or the timeout, when shorter)")
+    p.add_argument("--one-process", action="store_true",
+                   help="Scan all the changed files in one pipeline run (per model) rather than "
+                        "one run per file, so what a run does once is not paid per file. Each "
+                        "campaign gets an equal share of the budget and each file its "
+                        "campaign's status.")
     p.add_argument("--fail-on", choices=FAIL_ON_CHOICES, default="none",
                    help="What the findings do to the job. none: advisory; block: fail on "
                         "BLOCK; review: fail on REVIEW or BLOCK")
@@ -1703,7 +2025,8 @@ def main(argv: Optional[List[str]] = None,
                             max_input_tokens=args.max_input_tokens,
                             daily=daily,
                             knowledge_dir=knowledge_dir,
-                            models=models) if rels else []
+                            models=models,
+                            one_process=args.one_process) if rels else []
     rejected = next((r for r in results if r["status"] == SCAN_AUTH_REJECTED), None)
     if rejected:
         return _not_run(

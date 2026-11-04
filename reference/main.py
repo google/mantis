@@ -47,7 +47,7 @@ from core.budget import (
 )
 from core.database import init_db, read_findings, read_risk_scores, update_status
 from core.sandbox import build_sandbox
-from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
+from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT, prefix_reuse_applies
 from core.context import RunContext, current_run_context
 from core.transcript import TranscriptWriter, event_transcript_rows
 from core.paths import resolve_db_path
@@ -652,10 +652,12 @@ _SCAN_MODES = (
 # In a multi-campaign run such a trip fails that campaign and the sweep goes
 # on; wall_clock and token_budget are the operator's ceilings and pause the
 # run. See the BudgetExceededError handler in the campaign worker.
+# campaign_tokens is the campaign's own token share (--max-campaign-tokens).
 _CAMPAIGN_GUARDS = frozenset({
     "node_tool_calls_ceiling",
     "node_visits_ceiling",
     "graph_steps",
+    "campaign_tokens",
 })
 
 
@@ -754,6 +756,46 @@ _WORK_PLAN_DISCLOSURE: dict = {"focus": ""}
 _SPEND_REPORT: dict = {"controller": None}
 
 
+def _note_campaign_spend(scan_item: str, files: list, scope: Optional[BudgetController],
+                         status: str, pause_trigger: str = "", elapsed_seconds: float = 0.0) -> None:
+    """Records how one campaign ended, and what it spent, for --spend-report.
+
+    A driver that runs several changed files in one process needs each one's
+    outcome, which the run's totals and exit code cannot give: one campaign
+    can finish while the next is stopped at its own token share. `status` is
+    "done", "failed" or "paused"; `files` the campaign's changed files (its
+    scope when the run named none). The first word on a campaign stands: a
+    later error in the same iteration (a replan's budget stop) does not undo
+    an outcome already reached. The report is rewritten here when the run
+    has one, so a process killed later still says which campaigns finished.
+    Never raises.
+    """
+    try:
+        campaigns = _SPEND_REPORT.setdefault("campaigns", {})
+        if scan_item in campaigns:
+            return
+        snap = scope.spend_snapshot() if scope is not None else {}
+        campaigns[scan_item] = {
+            "target": str(scan_item),
+            "files": [str(f) for f in (files or [])],
+            "status": str(status),
+            "pause_trigger": str(pause_trigger or ""),
+            "tokens": int(snap.get("tokens") or 0),
+            "fresh_tokens": int(snap.get("fresh_tokens") or 0),
+            "cached_tokens": int(snap.get("cached_tokens") or 0),
+            "llm_calls": int(snap.get("llm_calls") or 0),
+            "elapsed_seconds": round(max(0.0, float(elapsed_seconds or 0.0)), 1),
+            # The nodes this campaign entered, in order: its own graph walk,
+            # where the run-level "nodes" is every campaign's merged.
+            "nodes": list(getattr(scope, "node_visit_counts", {}) or {}),
+        }
+    except Exception as exc:
+        print(f"[SPEND REPORT WARNING] campaign {scan_item}: {exc}", file=sys.stderr)
+        return
+    if _SPEND_REPORT.get("path"):
+        write_spend_report(str(_SPEND_REPORT["path"]), None)
+
+
 def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
     """Writes the run's spend as JSON to `path`. Never raises.
 
@@ -774,6 +816,7 @@ def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
                   "pause_trigger": ""}
     report["exit_code"] = exit_code
     report["nodes"] = list(_SPEND_REPORT.get("nodes") or [])
+    report["campaigns"] = list((_SPEND_REPORT.get("campaigns") or {}).values())
     # The session store's size on disk, for the operator's pruning decision;
     # measured at exit so a paused run reports it too.
     try:
@@ -908,6 +951,7 @@ def resolve_scan_targets(
     token_budget: int = 0,
     db_path: str = "",
     scope_out: Optional[dict] = None,
+    changed_files_override: Optional[list] = None,
 ) -> tuple[list[str], Optional[dict], str]:
     """Chooses what the campaign scans. Returns `(targets, astm, mode)`.
 
@@ -924,6 +968,12 @@ def resolve_scan_targets(
     returned being their directories), `changed_files` and
     `nothing_changed` (True when there was nothing to scan, and `targets` is
     empty). The return shape is unchanged for every caller that does not ask.
+
+    `changed_files_override`, in `changed` mode, is the caller's own list of
+    the files that changed (absolute paths of discovered files, as
+    --changed-files resolves them): it replaces the ledger's answer, and
+    each directory holding them is its own campaign, with no climb. None,
+    the default, asks the ledger as before.
 
     `precomputed_astm` is an already-computed map for this same target. Workflow
     synthesis needs the map too, and it runs before the pipeline; surveying chromium
@@ -1133,6 +1183,42 @@ def resolve_scan_targets(
         # scope_out.
         if target_path.is_file():
             return whole
+        if changed_files_override is not None:
+            # The caller named the files (--changed-files): the ledger is
+            # not asked which ones changed, only which of them it saw in
+            # other content, for the prior-PoC rule. No climb: a driver
+            # running one file at a time must not widen run N's campaign
+            # over the directories of runs 1..N-1 (group_changed_files).
+            focus_override = list(changed_files_override)
+            if not focus_override:
+                if scope_out is not None:
+                    scope_out["focus_files"] = []
+                    scope_out["nothing_changed"] = True
+                return [], None, SCAN_MODE_CHANGED
+            try:
+                from core.config import normalize_model_id
+                from core.cost import changed_files
+
+                run_model = normalize_model_id(str(config.get("default_model") or ""))
+                edited = changed_files(db_path, focus_override, model=run_model) or {"files": []}
+            except Exception as exc:
+                print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
+                edited = {"files": []}
+            groups = (group_changed_files(focus_override, str(target_path), climb=False)
+                      or [{"dir": str(target_path), "files": focus_override}])
+            print(
+                f"Scan mode {SCAN_MODE_CHANGED}: {len(focus_override)} listed file(s) to examine; "
+                f"{len(groups)} campaign(s) over the target, one per directory holding them, "
+                "each scoped to its files.",
+                file=sys.stderr,
+            )
+            if scope_out is not None:
+                scope_out["focus_files"] = focus_override
+                scope_out["focus_groups"] = groups
+                scope_out["changed_files"] = [f for f in focus_override
+                                              if f in set(edited.get("files") or [])]
+                scope_out["nothing_changed"] = False
+            return [g["dir"] for g in groups], None, SCAN_MODE_CHANGED
         focus: Optional[list] = None
         known = 0
         try:
@@ -1595,6 +1681,74 @@ def _render_change_focus(focus_files: list[str], target_root: str) -> str:
     )
 
 
+def _render_shared_prefix_note(other_files: list[str], target_root: str) -> str:
+    """The first `changed` campaign's note about the run's other changed
+    files, when the campaigns share the repository jail.
+
+    Its architect and threat modeler run once for the whole run: the later
+    campaigns reuse their summary and threat model (core.graph_loader
+    prefix reuse) instead of deriving their own. So those two stages are
+    told every changed file of the run, fenced as data like the campaign's
+    own list; every other stage keeps to this campaign's files.
+    """
+    from core.llm_gateway import wrap_untrusted_content
+
+    if not other_files:
+        return ""
+    root = os.path.realpath(str(target_root))
+    rels = []
+    for f in other_files:
+        try:
+            rel = os.path.relpath(os.path.realpath(str(f)), root)
+        except ValueError:
+            rel = str(f)
+        rels.append(rel.replace(os.sep, "/"))
+    shown = rels[:200]
+    more = f"\n... and {len(rels) - len(shown)} more" if len(rels) > len(shown) else ""
+    listing = wrap_untrusted_content("\n".join(shown) + more, filename="other_changed_files")
+    return (
+        "\n\nSHARED ARCHITECTURE AND THREAT MODEL. The architecture summary and the threat model "
+        "this campaign records are reused by the run's other campaigns, which examine the "
+        "changed files below. The architect and the threat modeler: cover these files too -- "
+        "the components they belong to, their trust boundaries and entry points. Every other "
+        "stage: stay on this campaign's files above.\n" + listing
+    )
+
+
+def _listed_changed_files(target_path: Path, listed: list, discovered_files: list[str]
+                          ) -> tuple[list[str], list[str], list[str]]:
+    """Resolves --changed-files against the target. `(files, outside,
+    not_source)`: `files` are the discovered files the list names, in the
+    discovered spelling and the list's order, without repeats; `outside`
+    the entries that resolve (symlinks followed) outside the target;
+    `not_source` the rest -- inside, but not among the discovered files.
+    A relative entry is relative to the target. Never raises."""
+    root = os.path.realpath(str(target_path))
+    by_real: dict[str, str] = {}
+    for f in discovered_files or []:
+        by_real.setdefault(os.path.realpath(str(f)), str(f))
+    files: list[str] = []
+    outside: list[str] = []
+    not_source: list[str] = []
+    for raw in listed or []:
+        entry = str(raw or "").strip()
+        if not entry:
+            continue
+        try:
+            real = os.path.realpath(os.path.join(root, os.path.expanduser(entry)))
+        except (OSError, ValueError):
+            not_source.append(entry)
+            continue
+        if real != root and not real.startswith(root + os.sep):
+            outside.append(entry)
+        elif real in by_real:
+            if by_real[real] not in files:
+                files.append(by_real[real])
+        else:
+            not_source.append(entry)
+    return files, outside, not_source
+
+
 #: A `changed` campaign is one directory's worth of changed files. A
 #: directory with fewer than CHANGED_CAMPAIGN_MIN_FILES changed files joins
 #: its parent's campaign while the merged campaign stays within
@@ -1604,7 +1758,7 @@ CHANGED_CAMPAIGN_MAX_FILES = 24
 CHANGED_CAMPAIGN_MIN_FILES = 3
 
 
-def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
+def group_changed_files(focus_files: list[str], target_root: str, climb: bool = True) -> list[dict]:
     """The campaigns of a `changed` run: `[{"dir": <abs path>, "files": [...]}]`,
     sorted by path. `dir` is the campaign's identity: a directory holding
     changed files, or -- for a file at the target root when there are other
@@ -1628,6 +1782,12 @@ def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
     otherwise each is its own single-file campaign, scoped to that file,
     since a root campaign would span every other. Never raises; an
     unresolvable file is dropped.
+
+    `climb=False` skips the small-directory climb: each directory keeps
+    its own campaign. For a caller that names the files itself and runs
+    one file at a time (--changed-files, the PR driver), where a climb
+    would widen a later run's scope over the directories of earlier runs.
+    The nesting and root rules still apply.
     """
     root = os.path.realpath(str(target_root))
     by_dir: dict[str, list[str]] = {}
@@ -1652,7 +1812,7 @@ def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
     # 1. Small directories climb toward (never into) the root while they
     #    stay small and the merged campaign stays within the max. Deepest
     #    first, so a directory's children have settled before it decides.
-    changed = True
+    changed = climb
     while changed:
         changed = False
         for d in _deepest_first(by_dir):
@@ -1976,6 +2136,8 @@ async def pipeline(
     db_timeout: Optional[float] = None,
     rescan_changed_harness: bool = False,
     transcript_out: str = "",
+    changed_files_override: Optional[list] = None,
+    max_campaign_tokens: int = 0,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     # SQLite serializes writers, and every parallel campaign writes findings
@@ -2230,6 +2392,35 @@ async def pipeline(
         if recorded_mode:
             config = {**config, "scan_mode": normalize_scan_mode(recorded_mode)}
             print(f"[RESUME] Scan mode {recorded_mode}, as recorded for this run.", file=sys.stderr)
+    # --changed-files: the caller says which files changed instead of the
+    # ledger. Only a `changed` run over a directory has campaigns scoped to
+    # files; anywhere else the list would be silently ignored, so it is an
+    # error. A path outside the target is an error too; a listed file that
+    # is not source here (excluded, binary, untracked-ignored) is said and
+    # left out, and a list with nothing left is an error like an empty
+    # target.
+    if changed_files_override is not None:
+        mode_now = normalize_scan_mode(config.get("scan_mode", SCAN_MODE_AUTO) or SCAN_MODE_AUTO)
+        if target_path.is_file() or mode_now != SCAN_MODE_CHANGED:
+            print(
+                f"Error: --changed-files needs a directory target and --scan-mode {SCAN_MODE_CHANGED} "
+                f"(target is a {'file' if target_path.is_file() else 'directory'}, scan mode {mode_now}).",
+                file=sys.stderr,
+            )
+            return 1
+        listed, outside, not_source = _listed_changed_files(target_path, changed_files_override, discovered_files)
+        if outside:
+            print(f"Error: --changed-files: {len(outside)} path(s) outside the target {target_path}.",
+                  file=sys.stderr)
+            return 1
+        if not_source:
+            print(f"--changed-files: {len(not_source)} listed path(s) are not source files in the target "
+                  "(excluded, binary, ignored or missing); leaving them out.", file=sys.stderr)
+        if not listed:
+            print("Error: --changed-files: none of the listed paths is a source file in the target.",
+                  file=sys.stderr)
+            return 1
+        changed_files_override = listed
     scan_scope: dict = {}
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
         target_path,
@@ -2239,6 +2430,7 @@ async def pipeline(
         token_budget=resolved_budget.max_tokens,
         db_path=db_path,
         scope_out=scan_scope,
+        changed_files_override=changed_files_override,
     )
     # `changed` with nothing changed is a complete answer, not an empty plan:
     # the resolver printed it, and a run that scans nothing must not confirm
@@ -2262,8 +2454,15 @@ async def pipeline(
     # about: the whole set here, for the count and the settlement at the
     # end; each campaign is briefed on, and re-runs the PoCs of, the ones in
     # its own files (_changed_campaign_brief).
+    #
+    # Not when the caller named the files (--changed-files): the caller owns
+    # earlier findings. The PR driver's gate keeps an imported finding open
+    # until the change fixes it or a person dismisses it; a settlement here
+    # would close it on the model's reading of attacker-authored code. So no
+    # brief, no PoC re-runs and no settlement, as for a file target.
+    settle_priors = changed_files_override is None
     prior_in_scope: list[dict] = []
-    if focus_files:
+    if focus_files and settle_priors:
         prior_in_scope, _brief = _regression_brief(
             db_path, run_id, focus_files, str(resolved_path_root or target_path), str(target_path))
         if prior_in_scope:
@@ -2277,6 +2476,8 @@ async def pipeline(
         if not files:
             return "", []
         text = _render_change_focus(files, str(target_path))
+        if not settle_priors:
+            return text, []
         try:
             priors, brief = _regression_brief(
                 db_path, run_id, files, str(resolved_path_root or target_path), str(target_path))
@@ -2892,6 +3093,9 @@ async def pipeline(
     replan_lock = asyncio.Lock()
     started_targets: set = set()
     pause_banner_shown = False
+    # Set once the campaign whose prefix the others reuse has been told the
+    # run's other changed files (_render_shared_prefix_note).
+    shared_prefix = {"briefed": False}
 
     async def _campaign_worker():
         nonlocal campaign_queue, failures, successes, paused
@@ -2910,7 +3114,10 @@ async def pipeline(
             # This campaign's budget view. Everything below that says
             # budget_ctrl means THIS campaign: deltas, guards, the ledger.
             # Run-level spend flows through to run_budget by mirroring.
-            budget_ctrl = CampaignBudgetScope(run_budget)
+            # --max-campaign-tokens is this campaign's own ceiling.
+            budget_ctrl = CampaignBudgetScope(run_budget, max_tokens=max_campaign_tokens)
+            # The files this campaign is about, for its spend-report entry.
+            campaign_files = list(group.get("focus") or group.get("targets") or [scan_item])
             # The guest holds the whole target when the target is a tree, even
             # for a one-file campaign: a PoC against one Go or Rust file needs
             # the module around it (go.mod, vendor/, package siblings) to
@@ -2922,6 +3129,15 @@ async def pipeline(
             # A `changed` campaign's directive and the earlier findings it
             # answers for: its own files' (empty in every other mode).
             change_focus, campaign_priors = _changed_campaign_brief(group)
+            # The first campaign whose repo-scope stages the later ones will
+            # reuse (core.graph_loader prefix reuse) has them cover every
+            # changed file of the run, not only its own.
+            if (change_focus and not shared_prefix["briefed"] and len(campaign_groups) > 1
+                    and prefix_reuse_applies(scan_mode, jail_dir, resolved_path_root, scan_item)):
+                shared_prefix["briefed"] = True
+                change_focus += _render_shared_prefix_note(
+                    [f for g in campaign_groups if g is not group for f in (g.get("focus") or [])],
+                    str(target_path))
             branch_ctx = dataclasses.replace(
                 base_ctx,
                 target_file=scan_item,
@@ -3104,6 +3320,9 @@ async def pipeline(
                 except Exception as exc:
                     # Bookkeeping must never cost a scan that is finding real bugs.
                     print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
+                _note_campaign_spend(scan_item, campaign_files, budget_ctrl,
+                                     "failed" if task_failed else "done",
+                                     elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
 
                 # Stages that continued in a fresh context (core.graph_loader
                 # node context ceiling), by stage -- what the window cost this
@@ -3291,12 +3510,22 @@ async def pipeline(
                     )
                     _record_guard_failure(db_path, run_id, scan_item, scan_mode, str(be.trigger or ""),
                                           harness_fingerprint=harness_fingerprint)
+                    # Its own token share spent is a pause for that campaign,
+                    # resumable; a runaway guard is a failure.
+                    _note_campaign_spend(
+                        scan_item, campaign_files, budget_ctrl,
+                        "paused" if be.trigger == "campaign_tokens" else "failed",
+                        pause_trigger=str(be.trigger or ""),
+                        elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
                     continue
                 # The first ceiling to trip names the pause; the ADK-raised
                 # call limit never passes through check_budget(), so it is
                 # recorded here rather than there.
                 if not run_budget.pause_trigger:
                     run_budget.pause_trigger = str(be.trigger or "budget_exceeded")
+                _note_campaign_spend(scan_item, campaign_files, budget_ctrl, "paused",
+                                     pause_trigger=str(be.trigger or "budget_exceeded"),
+                                     elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
                 # Report COVERAGE, not just budget. The banner already prints tokens,
                 # steps and elapsed time, but for a file-by-file scan the number that
                 # decides whether the result means anything is how much of the tree was
@@ -3331,6 +3560,8 @@ async def pipeline(
                     return EXIT_AUTH
                 print(f"PIPELINE CRITICAL ABORT IN TASK ({scan_item}): {e}", file=sys.stderr)
                 failures += 1
+                _note_campaign_spend(scan_item, campaign_files, budget_ctrl, "failed",
+                                     elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
             finally:
                 await sandbox.aclose()
         return None
