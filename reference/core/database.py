@@ -203,9 +203,10 @@ def canonical_filepath(fp: str, target_file: str = "") -> str:
     while tf_clean.startswith("./"):
         tf_clean = tf_clean[2:]
 
-    # Retrieve active context jail_dir / path_root if available
+    # Retrieve active context jail_dir / path_root / sandbox workdir if available
     jail_dir = ""
     path_root = ""
+    workdir = "/workspace"
     try:
         from core.context import current_run_context
         ctx = current_run_context.get()
@@ -213,6 +214,10 @@ def canonical_filepath(fp: str, target_file: str = "") -> str:
             jail_dir = str(ctx.jail_dir).replace("\\", "/").rstrip("/")
         if ctx and getattr(ctx, "path_root", ""):
             path_root = str(ctx.path_root).replace("\\", "/").rstrip("/")
+        sb = getattr(ctx, "sandbox", None) if ctx else None
+        sb_wd = str(getattr(sb, "working_dir", "") or "").replace("\\", "/").rstrip("/")
+        if sb_wd:
+            workdir = sb_wd
     except Exception:
         pass
 
@@ -242,18 +247,70 @@ def canonical_filepath(fp: str, target_file: str = "") -> str:
                     pass
         return path
 
+    def _real_workspace_path_exists(rel_under_ws: str) -> bool:
+        if not rel_under_ws or rel_under_ws == "." or rel_under_ws.startswith(".."):
+            return False
+        roots = [path_root, jail_dir]
+        if target_dir and os.path.isabs(target_dir):
+            roots.append(target_dir if os.path.isdir(target_dir) else os.path.dirname(target_dir))
+        for b in roots:
+            if b and os.path.isdir(b):
+                cand = os.path.normpath(os.path.join(b, "workspace", rel_under_ws))
+                b_norm = os.path.normpath(b)
+                if cand.startswith(b_norm + os.sep) and os.path.exists(cand):
+                    return True
+        return False
+
+    tf_is_dir = bool(target_dir and os.path.isdir(target_dir))
     tf_rel = _relativize(tf_clean) if os.path.isabs(tf_clean) else tf_clean
 
     if os.path.isabs(raw):
         raw_rel = _relativize(raw)
-        return posixpath.normpath(raw_rel) if raw_rel else ""
+        if raw_rel != raw:
+            raw = raw_rel
+            if not raw:
+                return ""
+        elif workdir and (raw == workdir or raw.startswith(workdir + "/")):
+            # Guest sandbox workdir prefix (e.g. '/workspace/...'): strip and
+            # continue through relative normalization and target_file anchoring.
+            raw = raw[len(workdir):].lstrip("/")
+            while raw.startswith("./"):
+                raw = raw[2:]
+            if not raw:
+                return posixpath.normpath(tf_rel) if (tf_rel and not tf_is_dir) else ""
+        else:
+            return posixpath.normpath(raw_rel) if raw_rel else ""
 
-    # If raw is a bare basename (no slashes) and tf_rel has path components ending with raw
-    if "/" not in raw and tf_rel and "/" in tf_rel:
-        if tf_rel.endswith("/" + raw) or os.path.basename(tf_rel) == raw:
-            return posixpath.normpath(tf_rel)
+    # Strip synthetic 'workspace/' prefix (virtual artifact store / relative guest
+    # workdir) unless the target checkout actually contains 'workspace/<rest>'.
+    while raw == "workspace" or raw.startswith("workspace/"):
+        if raw == "workspace":
+            raw = ""
+            break
+        after_ws = posixpath.normpath(raw[len("workspace/"):])
+        if after_ws in ("", ".") or after_ws.startswith(".."):
+            break
+        if _real_workspace_path_exists(after_ws):
+            break
+        raw = after_ws
 
-    return posixpath.normpath(raw)
+    if not raw:
+        return posixpath.normpath(tf_rel) if (tf_rel and not tf_is_dir) else ""
+
+    raw = posixpath.normpath(raw)
+    if raw == ".":
+        return ""
+
+    # If target_file names a concrete file with directory components and raw is its
+    # bare basename or a '/'-aligned trailing suffix, promote to tf_rel unless raw
+    # already exists as a distinct file at the repository/jail root.
+    if tf_rel and not tf_is_dir and "/" in tf_rel and raw != tf_rel:
+        if ("/" not in raw and os.path.basename(tf_rel) == raw) or tf_rel.endswith("/" + raw):
+            root_base = path_root or jail_dir
+            if "/" not in raw or not root_base or not os.path.isfile(os.path.join(root_base, raw)):
+                return posixpath.normpath(tf_rel)
+
+    return raw
 
 def _drop_artifact_uniqueness(cursor) -> None:
     """Rebuilds campaign_artifacts without UNIQUE(run_id, filepath) on a
@@ -943,6 +1000,10 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 for cp in code_paths:
                     parts = str(cp).strip().rsplit(":", 1)
                     cand_p = parts[0].strip()
+                    if ":" in cand_p:
+                        maybe_p, maybe_line = cand_p.rsplit(":", 1)
+                        if maybe_line.strip().isdigit():
+                            cand_p = maybe_p.strip()
                     if cand_p and not cand_p.endswith(("/", "\\")):
                         raw_fp = cand_p
                         break
@@ -950,7 +1011,41 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             if not raw_fp and filepath and not os.path.isdir(filepath):
                 raw_fp = filepath
 
+            raw_id = finding.get("id")
+            explicit_id: Optional[int] = None
+            if isinstance(raw_id, int) and not isinstance(raw_id, bool) and raw_id > 0:
+                explicit_id = raw_id
+            elif isinstance(raw_id, str) and raw_id.strip().isdigit() and int(raw_id.strip()) > 0:
+                explicit_id = int(raw_id.strip())
+
+            matched_id_row = None
+            if explicit_id is not None:
+                # Scoped to this run: an id is a small integer a model can
+                # guess, and rows of other runs -- imported knowledge above
+                # all -- are not this run's to rewrite.
+                cursor.execute(
+                    "SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
+                    (explicit_id, run_id),
+                )
+                matched_id_row = cursor.fetchone()
+
             finding_filepath = canonical_filepath(raw_fp, target_file=filepath if (filepath and not os.path.isdir(filepath)) else "")
+            if matched_id_row:
+                prev_fp = str(matched_id_row[1] or "").strip()
+                if prev_fp and not prev_fp.startswith(("workspace/", "/workspace/")):
+                    if (
+                        not finding_filepath
+                        or finding_filepath in (".", "/")
+                        or finding_filepath.startswith(("workspace/", "/workspace/"))
+                        or (
+                            "/" in prev_fp
+                            and (
+                                finding_filepath == os.path.basename(prev_fp)
+                                or prev_fp.endswith("/" + finding_filepath)
+                            )
+                        )
+                    ):
+                        finding_filepath = prev_fp
             raw_sev = finding.get("severity") or "MEDIUM"
             normalized_severity = str(raw_sev).upper()
 
@@ -1055,7 +1150,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             # the rest. The id is the model's (scoped to this run below) or
             # the row this report is updating.
             if patch_status == "VERIFIED_SECURE" and finding_evidence:
-                own_id = finding.get("id") if isinstance(finding.get("id"), int) else None
+                own_id = explicit_id
                 if own_id is None and existing_row:
                     own_id = existing_row[0]
                 own = finding_evidence.get(str(own_id)) if own_id is not None else None
@@ -1064,16 +1159,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     patch_status = "VERIFICATION_INCOMPLETE"
 
             # Check if updating an existing record by explicit ID or exact composite key
-            target_id = None
-            if finding.get("id") and isinstance(finding.get("id"), int):
-                # Scoped to this run: an id is a small integer a model can
-                # guess, and rows of other runs -- imported knowledge above
-                # all -- are not this run's to rewrite.
-                cursor.execute("SELECT id FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
-                               (finding["id"], run_id))
-                id_row = cursor.fetchone()
-                if id_row:
-                    target_id = id_row[0]
+            target_id = matched_id_row[0] if matched_id_row else None
 
             if not target_id:
                 cursor.execute(

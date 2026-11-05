@@ -18,6 +18,7 @@ import logging
 import os
 import posixpath
 import re
+import stat
 import subprocess
 from typing import Any, Optional, Union
 from pydantic import ValidationError
@@ -356,30 +357,304 @@ def _protected_citation(rel_path: str) -> bool:
     return any(p in dirs for p in parts) or parts[-1] in files
 
 
-def _resolve_citation(jail_root: str, rel_path: str, base_rel: str = "") -> "tuple[Optional[str], str]":
-    """(host path, jail-relative path) for a citation.
+_VIRTUAL_WORKSPACE_EXACT = frozenset({
+    "mantis-summary.md",
+    "workspace",
+    "workspace/plan.json",
+    "workspace/learnings.jsonl",
+    "workspace/historical_learnings.jsonl",
+    "workspace/findings_update.json",
+    "workspace/review_packet.md",
+    "workspace/THREAT_MODEL.md",
+})
 
-    Tolerates the two citation bases seen in real runs. A path cited from a
-    DEEPER base (the jail's own directory name prefixed, a vendored subtree)
-    resolves by stripping leading components; a path cited relative to the
-    campaign's target subdirectory (base_rel, e.g. an eval target 'app/')
-    resolves by prefixing it. The returned jail-relative path is the one the
-    rest of the pipeline -- read_file under the same jail -- can open, so
-    the caller can repair the stored citation to it.
+_VIRTUAL_WORKSPACE_PREFIXES = (
+    "workspace/.structured/",
+    "workspace/findings/",
+    "workspace/kb/",
+    "workspace/chains/",
+    "workspace/report/",
+    "workspace/archive/",
+)
+
+_VIRTUAL_REPRO_RE = re.compile(r"^workspace/repro_(?:prior_)?\d+(?:[./]|$)")
+
+
+def _is_mantis_virtual_artifact_path(raw_path: str, jail_root: str = "") -> bool:
+    """True when `raw_path` names a Mantis virtual workspace artifact rather
+    than a repository file (unless that path actually exists under `jail_root`)."""
+    clean = str(raw_path or "").strip().replace("\\", "/")
+    if clean.startswith("file://"):
+        clean = clean[7:]
+    while clean.startswith("./"):
+        clean = clean[2:]
+    clean = clean.lstrip("/").rstrip("/")
+    if not clean:
+        return False
+    if jail_root and _jail_file(jail_root, clean) is not None:
+        return False
+    if clean in _VIRTUAL_WORKSPACE_EXACT:
+        return True
+    if any(clean.startswith(p) or clean == p.rstrip("/") for p in _VIRTUAL_WORKSPACE_PREFIXES):
+        return True
+    if _VIRTUAL_REPRO_RE.match(clean):
+        return True
+    return False
+
+
+def _strip_synthetic_workspace(
+    rel_path: str,
+    jail_root: str = "",
+    workdir: str = "/workspace",
+) -> "tuple[str, bool]":
+    """Strips synthetic guest workdir ('/workspace/...') and virtual 'workspace/'
+    prefixes unless the target checkout actually contains that path on disk.
+    Returns `(cleaned_path, stripped_synthetic_prefix)`."""
+    raw = str(rel_path or "").strip().replace("\\", "/")
+    if raw.startswith("file://"):
+        raw = raw[7:]
+    while raw.startswith("./"):
+        raw = raw[2:]
+    if not raw:
+        return "", False
+
+    if jail_root and os.path.isabs(raw):
+        try:
+            real_raw = os.path.realpath(raw)
+            if real_raw == jail_root or real_raw.startswith(jail_root + os.sep):
+                rel = os.path.relpath(real_raw, jail_root).replace("\\", "/")
+                return ("" if rel == "." else rel), False
+        except OSError:
+            pass
+
+    wd = (workdir or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+    stripped = False
+    clean = raw
+    if os.path.isabs(clean):
+        if clean == wd or clean.startswith(wd + "/"):
+            clean = clean[len(wd):].lstrip("/")
+            stripped = True
+        else:
+            clean = clean.lstrip("/")
+    while clean.startswith("./"):
+        clean = clean[2:]
+
+    if jail_root and clean and not stripped and _jail_file(jail_root, clean) is not None:
+        return clean, False
+
+    while clean == "workspace" or clean.startswith("workspace/"):
+        if jail_root and _jail_file(jail_root, clean) is not None:
+            break
+        if clean == "workspace":
+            clean = ""
+            stripped = True
+            break
+        after = posixpath.normpath(clean[len("workspace/"):])
+        if after in ("", ".") or after.startswith(".."):
+            break
+        clean = after
+        stripped = True
+
+    if clean:
+        norm = posixpath.normpath(clean)
+        clean = "" if norm == "." else norm
+    return clean, stripped
+
+
+def _find_matching_jail_files(jail_root: str, suffix: str, max_entries: int = 100_000) -> "list[str]":
+    """Finds all readable, non-protected regular files in `jail_root` whose
+    jail-relative path equals `suffix` or ends with `'/' + suffix`."""
+    norm_suffix = str(suffix or "").replace("\\", "/").strip("/")
+    if not norm_suffix or "://" in norm_suffix or _protected_citation(norm_suffix):
+        return []
+    parts_check = norm_suffix.split("/")
+    if ".." in parts_check:
+        return []
+    want_name = parts_check[-1]
+    protected_dirs = {d.lower() for d in PROTECTED_VCS_DIRS}
+    protected_files = {f.lower() for f in PROTECTED_METADATA_FILES}
+    if want_name.lower() in protected_files or want_name.lower() in protected_dirs:
+        return []
+
+    matches: "list[str]" = []
+    seen = 0
+    try:
+        for root, dirs, files in os.walk(jail_root, followlinks=False):
+            dirs[:] = [
+                d for d in dirs
+                if d.lower() not in protected_dirs and not os.path.islink(os.path.join(root, d))
+            ]
+            seen += len(dirs) + len(files)
+            if seen > max_entries:
+                return []
+            for fname in files:
+                if fname != want_name:
+                    continue
+                full = os.path.join(root, fname)
+                if os.path.islink(full):
+                    continue
+                try:
+                    st = os.lstat(full)
+                    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                        continue
+                    real_full = os.path.realpath(full)
+                    if real_full != jail_root and not real_full.startswith(jail_root + os.sep):
+                        continue
+                    rel = os.path.relpath(real_full, jail_root).replace("\\", "/")
+                except OSError:
+                    continue
+                if rel == norm_suffix or rel.endswith("/" + norm_suffix):
+                    matches.append(rel)
+    except OSError:
+        return []
+    matches.sort()
+    return matches
+
+
+def _resolve_citation_checked(
+    jail_root: str,
+    rel_path: str,
+    base_rel: str = "",
+    single_target: str = "",
+    workdir: str = "/workspace",
+) -> "tuple[Optional[str], str, list[str]]":
+    """Resolves a cited path to `(host_path, repaired_jail_rel_path, ambiguous_matches)`.
+
+    - In a single-file campaign (`single_target` set), resolution is strictly
+      lexical against `single_target` (zero sibling filesystem probing).
+    - In a directory campaign, exact paths (under `base_rel` or `jail_root`) win
+      first; synthetic `/workspace/` or `workspace/` prefixes and omitted parent
+      directories repair to the unique matching file in `jail_root`, or report
+      `ambiguous_matches` when multiple files share that suffix/basename.
     """
-    probe = str(rel_path or "").replace("\\", "/").removeprefix("./").strip().lstrip("/")
-    while True:
-        host = _jail_file(jail_root, probe)
-        if host is not None:
-            return host, probe
-        if base_rel:
-            based = f"{base_rel}/{probe}"
+    if single_target:
+        if _names_single_target(rel_path, jail_root, single_target, workdir=workdir) and os.path.isfile(single_target):
+            try:
+                target_rel = os.path.relpath(single_target, jail_root).replace("\\", "/")
+                return single_target, target_rel, []
+            except ValueError:
+                return single_target, os.path.basename(single_target), []
+        return None, str(rel_path or ""), []
+
+    if _is_mantis_virtual_artifact_path(rel_path, jail_root):
+        return None, str(rel_path or ""), []
+
+    raw = str(rel_path or "").strip().replace("\\", "/")
+    if raw.startswith("file://"):
+        raw = raw[7:]
+    while raw.startswith("./"):
+        raw = raw[2:]
+    if jail_root and os.path.isabs(raw):
+        try:
+            real_raw = os.path.realpath(raw)
+            if real_raw != jail_root and real_raw.startswith(jail_root + os.sep) and os.path.isfile(real_raw):
+                return real_raw, os.path.relpath(real_raw, jail_root).replace("\\", "/"), []
+        except OSError:
+            pass
+
+    exact_probe = raw.lstrip("/")
+    while exact_probe.startswith("./"):
+        exact_probe = exact_probe[2:]
+
+    # 1. Exact resolution before stripping any prefix: prefer campaign target
+    #    subdirectory (`base_rel`) first when not already prefixed by it, then `jail_root`.
+    if exact_probe and not os.path.isabs(raw):
+        if base_rel and not exact_probe.startswith(base_rel + "/"):
+            based = f"{base_rel}/{exact_probe}"
             host = _jail_file(jail_root, based)
             if host is not None:
-                return host, based
-        if "/" not in probe:
-            return None, probe
+                return host, posixpath.normpath(based), []
+        host = _jail_file(jail_root, exact_probe)
+        if host is not None:
+            return host, posixpath.normpath(exact_probe), []
+    elif exact_probe and os.path.isabs(raw):
+        # Leading '/' that was neither jail_root nor /workspace (e.g. '/routes/login.py'):
+        # check exact repo-relative match if unambiguous.
+        wd = (workdir or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+        if not (raw == wd or raw.startswith(wd + "/")):
+            if base_rel and not exact_probe.startswith(base_rel + "/"):
+                based = f"{base_rel}/{exact_probe}"
+                host = _jail_file(jail_root, based)
+                if host is not None:
+                    return host, posixpath.normpath(based), []
+            host = _jail_file(jail_root, exact_probe)
+            if host is not None:
+                return host, posixpath.normpath(exact_probe), []
+
+    # 2. Synthetic '/workspace/' or 'workspace/' prefix stripped.
+    ws_clean, stripped_ws = _strip_synthetic_workspace(rel_path, jail_root, workdir=workdir)
+    if stripped_ws:
+        if not ws_clean:
+            return None, "", []
+        if "/" in ws_clean:
+            if base_rel and not ws_clean.startswith(base_rel + "/"):
+                based = f"{base_rel}/{ws_clean}"
+                host = _jail_file(jail_root, based)
+                if host is not None:
+                    return host, posixpath.normpath(based), []
+            host = _jail_file(jail_root, ws_clean)
+            if host is not None:
+                return host, posixpath.normpath(ws_clean), []
+        matches = _find_matching_jail_files(jail_root, ws_clean)
+        if len(matches) > 1 and base_rel:
+            scoped = [m for m in matches if m == base_rel or m.startswith(base_rel + "/")]
+            if scoped:
+                matches = scoped
+        if len(matches) == 1:
+            host = _jail_file(jail_root, matches[0])
+            if host is not None:
+                return host, matches[0], []
+        if len(matches) > 1:
+            return None, ws_clean, matches
+        return None, ws_clean, []
+
+    if not exact_probe:
+        return None, "", []
+
+    # 3. Bare basename or trailing directory suffix with omitted leading dirs
+    #    (e.g. 'db_container_pipe_processor.sh' or 'files/db_container_pipe_processor.sh').
+    matches = _find_matching_jail_files(jail_root, exact_probe)
+    if len(matches) > 1 and base_rel:
+        scoped = [m for m in matches if m == base_rel or m.startswith(base_rel + "/")]
+        if scoped:
+            matches = scoped
+    if len(matches) == 1:
+        host = _jail_file(jail_root, matches[0])
+        if host is not None:
+            return host, matches[0], []
+    if len(matches) > 1:
+        return None, exact_probe, matches
+
+    # 4. Deeper-base prefix (e.g. 'vendor/pkg/app.py' when scanning 'vendor/pkg/'
+    #    as the target root): strip leading components against `base_rel` / `jail_root`,
+    #    refusing if multiple files in `jail_root` share the stripped suffix.
+    probe = exact_probe
+    while "/" in probe:
         probe = probe.split("/", 1)[1]
+        cand_rel = ""
+        cand_host = None
+        if base_rel and not probe.startswith(base_rel + "/"):
+            based = f"{base_rel}/{probe}"
+            cand_host = _jail_file(jail_root, based)
+            if cand_host is not None:
+                cand_rel = posixpath.normpath(based)
+        if cand_host is None:
+            cand_host = _jail_file(jail_root, probe)
+            if cand_host is not None:
+                cand_rel = posixpath.normpath(probe)
+        if cand_host is not None:
+            all_m = _find_matching_jail_files(jail_root, probe)
+            if len(all_m) > 1:
+                return None, probe, all_m
+            return cand_host, cand_rel, []
+    return None, probe, []
+
+
+def _resolve_citation(jail_root: str, rel_path: str, base_rel: str = "") -> "tuple[Optional[str], str]":
+    """(host path, jail-relative path) for a citation (2-tuple wrapper around
+    `_resolve_citation_checked`)."""
+    host, repaired, _amb = _resolve_citation_checked(jail_root, rel_path, base_rel=base_rel)
+    return host, repaired
 
 
 def _isdir_in_jail(ctx, raw_fp: str) -> bool:
@@ -399,15 +674,42 @@ def _isdir_in_jail(ctx, raw_fp: str) -> bool:
         return False
 
 
-def _names_single_target(cited: str, jail_root: str, single_target: str) -> bool:
+def _names_single_target(cited: str, jail_root: str, single_target: str, workdir: str = "/workspace") -> bool:
     """Lexically, does a citation name the scanned file? No filesystem probing,
     so a wrong guess learns nothing."""
-    clean = str(cited or "").replace("\\", "/").removeprefix("./").strip().lstrip("/")
     try:
         target_rel = os.path.relpath(single_target, jail_root).replace("\\", "/")
     except ValueError:
         return False
-    return clean == target_rel or clean.endswith("/" + target_rel) or clean == os.path.basename(target_rel)
+    if not target_rel.startswith("workspace/") and _is_mantis_virtual_artifact_path(cited):
+        return False
+    raw = str(cited or "").strip().replace("\\", "/")
+    if raw.startswith("file://"):
+        raw = raw[7:]
+    while raw.startswith("./"):
+        raw = raw[2:]
+    wd = (workdir or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+    single_norm = single_target.replace("\\", "/")
+    if raw.startswith(wd + "/") and not single_norm.startswith(wd + "/"):
+        clean = raw[len(wd):].lstrip("/")
+    else:
+        clean = raw.lstrip("/")
+    while clean.startswith("./"):
+        clean = clean[2:]
+    if not target_rel.startswith("workspace/"):
+        while clean.startswith("workspace/"):
+            clean = clean[len("workspace/"):]
+    if not clean:
+        return False
+    norm = posixpath.normpath(clean)
+    if norm in ("", ".") or ".." in norm.split("/"):
+        return False
+    return (
+        norm == target_rel
+        or norm == os.path.basename(target_rel)
+        or target_rel.endswith("/" + norm)
+        or norm.endswith("/" + target_rel)
+    )
 
 
 def _citation_readable(jail_root: str, host_path: str, single_target: str = "") -> bool:
@@ -458,16 +760,34 @@ def _citation_text(host_path: str) -> Optional[str]:
         return None
 
 
-def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, problems: "list[str]",
-                             single_target: str = "") -> None:
+def _check_finding_citations(
+    f: Any,
+    idx: int,
+    jail_root: str,
+    base_rel: str,
+    problems: "list[str]",
+    single_target: str = "",
+    workdir: str = "/workspace",
+) -> None:
     """Appends one message per provably false citation in a single finding."""
     f_dict = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
     title = f_dict.get("title") or f"Finding #{idx + 1}"
     fp = str(f_dict.get("filepath") or "").strip()
     if fp and not _protected_citation(fp):
-        host, repaired = _resolve_citation(jail_root, fp, base_rel)
+        host, repaired, ambiguous = _resolve_citation_checked(
+            jail_root, fp, base_rel=base_rel, single_target=single_target, workdir=workdir
+        )
         if host is None:
-            if single_target and not _names_single_target(fp, jail_root, single_target):
+            if ambiguous:
+                shown = ", ".join(f"'{m}'" for m in ambiguous[:4])
+                if len(ambiguous) > 4:
+                    shown += f", +{len(ambiguous) - 4} more"
+                problems.append(
+                    f"Finding '{title}': filepath '{fp}' is ambiguous "
+                    f"(matches {len(ambiguous)} files in target: {shown}); "
+                    f"specify the full target-relative path"
+                )
+            elif single_target and not _names_single_target(fp, jail_root, single_target, workdir=workdir):
                 pass  # not the scanned file: say nothing about whether it exists
             else:
                 problems.append(
@@ -476,10 +796,9 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
         elif not _citation_readable(jail_root, host, single_target):
             pass  # read_file would refuse it; the verifier stays equally silent
         else:
-            clean_fp = fp.replace("\\", "/").removeprefix("./").lstrip("/")
-            if repaired != clean_fp:
-                # Resolvable only at a different base: store the path the
-                # rest of the pipeline can actually open.
+            if repaired and repaired != fp:
+                # Store the canonical target-relative path the rest of the
+                # pipeline and knowledge.db can open unambiguously.
                 if hasattr(f, "filepath"):
                     f.filepath = repaired
                 elif isinstance(f, dict):
@@ -495,7 +814,11 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
                     problems.append(
                         f"Finding '{title}': line_numbers {bad} out of range for '{fp}' ({total} lines)"
                     )
-    for cp in f_dict.get("code_paths") or []:
+
+    raw_cps = list(f_dict.get("code_paths") or [])
+    repaired_cps = list(raw_cps)
+    cps_changed = False
+    for cp_idx, cp in enumerate(raw_cps):
         entry = str(cp).strip()
         if ":" not in entry or "://" in entry or " " in entry:
             continue  # prose or a URL, not a checkable path:line / path:symbol
@@ -513,9 +836,20 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
             continue
         if _protected_citation(path_part):
             continue
-        host, _ = _resolve_citation(jail_root, path_part, base_rel)
+        host, cp_repaired, cp_ambiguous = _resolve_citation_checked(
+            jail_root, path_part, base_rel=base_rel, single_target=single_target, workdir=workdir
+        )
         if host is None:
-            if single_target and not _names_single_target(path_part, jail_root, single_target):
+            if cp_ambiguous:
+                shown = ", ".join(f"'{m}'" for m in cp_ambiguous[:4])
+                if len(cp_ambiguous) > 4:
+                    shown += f", +{len(cp_ambiguous) - 4} more"
+                problems.append(
+                    f"Finding '{title}': code_paths entry '{entry}' cites ambiguous path '{path_part}' "
+                    f"(matches {len(cp_ambiguous)} files in target: {shown})"
+                )
+                continue
+            if single_target and not _names_single_target(path_part, jail_root, single_target, workdir=workdir):
                 continue  # not the scanned file: no existence oracle
             problems.append(
                 f"Finding '{title}': code_paths entry '{entry}' cites a file that does not exist in the target"
@@ -523,6 +857,11 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
             continue
         if not _citation_readable(jail_root, host, single_target):
             continue
+        if cp_repaired and cp_repaired != path_part:
+            repaired_cps[cp_idx] = (
+                f"{cp_repaired}:{line_token}:{token}" if line_token else f"{cp_repaired}:{token}"
+            )
+            cps_changed = True
         text = _citation_text(host)
         if text is None:
             continue
@@ -541,10 +880,20 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
                 problems.append(
                     f"Finding '{title}': symbol '{token}' does not appear in '{path_part}'"
                 )
+    if cps_changed:
+        if hasattr(f, "code_paths"):
+            f.code_paths = repaired_cps
+        elif isinstance(f, dict):
+            f["code_paths"] = repaired_cps
 
 
-def _citation_problems(findings: Any, jail_dir: str, target_file: str = "",
-                       path_root: str = "") -> "list[str]":
+def _citation_problems(
+    findings: Any,
+    jail_dir: str,
+    target_file: str = "",
+    path_root: str = "",
+    workdir: str = "/workspace",
+) -> "list[str]":
     """Collects provably false citations across findings. Never raises."""
     problems: "list[str]" = []
     jail_root = os.path.realpath(jail_dir) if jail_dir and os.path.isdir(jail_dir) else ""
@@ -587,8 +936,15 @@ def _citation_problems(findings: Any, jail_dir: str, target_file: str = "",
         single_target = ""
     for i, f in enumerate(findings):
         try:
-            _check_finding_citations(f, i, jail_root, base_rel, problems,
-                                     single_target=single_target)
+            _check_finding_citations(
+                f,
+                i,
+                jail_root,
+                base_rel,
+                problems,
+                single_target=single_target,
+                workdir=workdir,
+            )
         except Exception as exc:  # unverifiable is not wrong
             logger.warning("Citation check skipped for finding %d: %r", i, exc)
     return problems
@@ -608,6 +964,18 @@ def report_findings(report: VulnerabilityReport) -> str:
         elif isinstance(report, list):
             report_obj = VulnerabilityReport(findings=report)
             findings = report_obj.findings
+
+        sb = getattr(ctx, "sandbox", None)
+        workdir = (
+            str(getattr(sb, "working_dir", "") or "").replace("\\", "/").rstrip("/")
+            or "/workspace"
+        )
+        jail_real_dir = (
+            os.path.realpath(ctx.jail_dir)
+            if ctx.jail_dir and os.path.isdir(ctx.jail_dir)
+            else ""
+        )
+
         # Validate and repair finding filepaths and line numbers
         for idx, f in enumerate(findings):
             f_dict = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
@@ -621,6 +989,10 @@ def report_findings(report: VulnerabilityReport) -> str:
                     is_dir_or_root = True
                 elif ctx.target_file and clean_fp == ctx.target_file.rstrip("/") and os.path.isdir(ctx.target_file):
                     is_dir_or_root = True
+                elif clean_fp in (workdir, "/workspace", "workspace") and (
+                    not jail_real_dir or _jail_file(jail_real_dir, clean_fp.lstrip("/")) is None
+                ):
+                    is_dir_or_root = True
                 elif _isdir_in_jail(ctx, raw_fp):
                     is_dir_or_root = True
 
@@ -629,16 +1001,22 @@ def report_findings(report: VulnerabilityReport) -> str:
                 extracted_lines = []
                 for cp in code_paths:
                     cp_clean = str(cp).strip()
-                    if ":" in cp_clean:
+                    if ":" in cp_clean and "://" not in cp_clean:
                         parts = cp_clean.rsplit(":", 1)
                         cand_path = parts[0].strip()
                         cand_line = parts[1].strip()
+                        if ":" in cand_path:
+                            maybe_p, maybe_line = cand_path.rsplit(":", 1)
+                            if maybe_line.strip().isdigit():
+                                cand_path = maybe_p.strip()
+                                if not cand_line.isdigit():
+                                    cand_line = maybe_line.strip()
                         if cand_path and not cand_path.endswith(("/", "\\")):
                             if not extracted_fp:
                                 extracted_fp = cand_path
                             if cand_line.isdigit():
                                 extracted_lines.append(int(cand_line))
-                    elif cp_clean and not cp_clean.endswith(("/", "\\")):
+                    elif cp_clean and "://" not in cp_clean and not cp_clean.endswith(("/", "\\")):
                         if not extracted_fp:
                             extracted_fp = cp_clean
 
@@ -667,12 +1045,57 @@ def report_findings(report: VulnerabilityReport) -> str:
                         f"Please specify the file path and resubmit via report_findings."
                     )
 
+        # Lexical single-file target check (zero sibling probing / no existence oracle):
+        # a single-file campaign may only record findings against its scanned file.
+        single_problems: "list[str]" = []
+        single_target_rel = ""
+        if (
+            jail_real_dir
+            and ctx.target_file
+            and os.path.isfile(ctx.target_file)
+            and getattr(ctx, "active_node", "") not in _RUN_WIDE_FINDINGS_NODES
+        ):
+            effective_root = jail_real_dir
+            raw_path_root = getattr(ctx, "path_root", "") or ""
+            if raw_path_root:
+                try:
+                    p_real = os.path.realpath(raw_path_root)
+                    if (
+                        os.path.isdir(p_real)
+                        and p_real != effective_root
+                        and effective_root.startswith(p_real + os.sep)
+                    ):
+                        effective_root = p_real
+                except OSError:
+                    pass
+            try:
+                single_real = os.path.realpath(ctx.target_file)
+                if single_real.startswith(effective_root + os.sep):
+                    single_target_rel = os.path.relpath(single_real, effective_root).replace("\\", "/")
+                    for idx, f in enumerate(findings):
+                        f_cur = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
+                        fp_cur = str(f_cur.get("filepath") or "").strip()
+                        title_cur = f_cur.get("title") or f"Finding #{idx + 1}"
+                        if not _names_single_target(fp_cur, effective_root, single_real, workdir=workdir):
+                            single_problems.append(
+                                f"Finding '{title_cur}': single-file scans may only report findings "
+                                f"on '{single_target_rel}' (got '{fp_cur}')"
+                            )
+            except (OSError, ValueError):
+                single_target_rel = ""
+
         # Deterministic citation gate, AFTER the repair pass so repaired
         # paths are what gets verified. Fail-closed on provable falsehoods,
         # fail-open on anything unverifiable -- see _citation_problems.
         problems = list(dict.fromkeys(
-            _citation_problems(findings, ctx.jail_dir or "", ctx.target_file or "",
-                               getattr(ctx, "path_root", "") or "")
+            single_problems
+            + _citation_problems(
+                findings,
+                ctx.jail_dir or "",
+                ctx.target_file or "",
+                getattr(ctx, "path_root", "") or "",
+                workdir=workdir,
+            )
         ))
         if problems:
             shown = "; ".join(problems[:MAX_CITATION_PROBLEMS])
@@ -684,6 +1107,13 @@ def report_findings(report: VulnerabilityReport) -> str:
                 "get_function_boundary, correct every citation, and resubmit the full "
                 "report via report_findings."
             )
+
+        if single_target_rel:
+            for f in findings:
+                if hasattr(f, "filepath"):
+                    f.filepath = single_target_rel
+                elif isinstance(f, dict):
+                    f["filepath"] = single_target_rel
 
         write_findings(ctx.db_path, ctx.target_file, findings, run_id=ctx.run_id,
                        verified_evidence=bool(getattr(ctx, "sandbox_executed", False)),

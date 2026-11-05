@@ -151,6 +151,13 @@ class FindingSchema(BaseModel):
     line_numbers: Optional[List[int]] = Field(default=None, description="Line numbers where flaw occurs")
     score: Optional[int] = Field(default=None, description="Calibrated risk score (0-100)")
 
+    @field_validator('id', mode='before')
+    @classmethod
+    def coerce_id_to_str(cls, v: Any) -> Any:
+        if isinstance(v, int) and not isinstance(v, bool):
+            return str(v)
+        return v
+
     @field_validator('severity', mode='before')
     @classmethod
     def normalize_severity(cls, v: Any) -> str:
