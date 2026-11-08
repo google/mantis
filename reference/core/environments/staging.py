@@ -33,6 +33,54 @@ from typing import List, Tuple, Union
 
 from .static_env import PROTECTED_METADATA_FILES, PROTECTED_VCS_DIRS
 
+MAX_STAGING_FILES = 50_000
+MAX_STAGING_BYTES = 512 * 1024 * 1024
+
+
+def _resolve_staging_limits() -> Tuple[int, int]:
+    """Returns `(max_files, max_bytes)` honoring `MANTIS_MAX_STAGING_*` env overrides."""
+    max_files = MAX_STAGING_FILES
+    raw_files = os.environ.get("MANTIS_MAX_STAGING_FILES", "").strip()
+    if raw_files:
+        try:
+            parsed_f = int(raw_files)
+            if parsed_f > 0:
+                max_files = parsed_f
+        except ValueError:
+            pass
+    max_bytes = MAX_STAGING_BYTES
+    raw_bytes = os.environ.get("MANTIS_MAX_STAGING_BYTES", "").strip()
+    if raw_bytes:
+        try:
+            parsed_b = int(raw_bytes)
+            if parsed_b > 0:
+                max_bytes = parsed_b
+        except ValueError:
+            pass
+    return max_files, max_bytes
+
+
+def enforce_staging_budget(vetted: List[Tuple[Path, str]]) -> None:
+    """Verifies that staging `vetted` files will not exceed host/guest file or byte caps."""
+    max_files, max_bytes = _resolve_staging_limits()
+    if len(vetted) > max_files:
+        raise RuntimeError(
+            f"Refusing to stage checkout: {len(vetted)} files exceeds maximum staging limit "
+            f"of {max_files} files (set MANTIS_MAX_STAGING_FILES to raise)."
+        )
+    total_bytes = 0
+    for src_file, _ in vetted:
+        try:
+            st = os.lstat(src_file)
+        except OSError:
+            continue
+        total_bytes += st.st_size
+        if total_bytes > max_bytes:
+            raise RuntimeError(
+                f"Refusing to stage checkout: cumulative size exceeds maximum staging limit "
+                f"of {max_bytes} bytes (set MANTIS_MAX_STAGING_BYTES to raise)."
+            )
+
 
 def get_vetted_staging_files(target_path: Union[str, Path]) -> List[Tuple[Path, str]]:
     """Inspects target_path and returns a list of (source_abs_path, relative_guest_path) tuples.
@@ -124,6 +172,7 @@ def stage_to_directory(target_path: Union[str, Path], dest_dir: Union[str, Path]
     """Copies all vetted staging files from target_path into dest_dir, creating parents."""
     dest_path = Path(dest_dir)
     vetted = get_vetted_staging_files(target_path)
+    enforce_staging_budget(vetted)
     count = 0
 
     for src_file, rel_file in vetted:
@@ -139,6 +188,7 @@ def stage_to_directory(target_path: Union[str, Path], dest_dir: Union[str, Path]
 def create_vetted_tar_archive(target_path: Union[str, Path], tar_output_path: Union[str, Path]) -> int:
     """Creates a compressed tar.gz archive of vetted files with relative paths, without symlinks."""
     vetted = get_vetted_staging_files(target_path)
+    enforce_staging_budget(vetted)
     tar_path = Path(tar_output_path)
     tar_path.parent.mkdir(parents=True, exist_ok=True)
 

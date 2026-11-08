@@ -103,9 +103,10 @@ class MicrosandboxEnvironment(BaseEnvironment):
             await sb.fs.mkdir(str(self._workdir))
 
             if self.target_path and os.path.exists(self.target_path):
-                from .staging import get_vetted_staging_files
+                from .staging import enforce_staging_budget, get_vetted_staging_files
                 try:
                     vetted_files = get_vetted_staging_files(self.target_path)
+                    enforce_staging_budget(vetted_files)
                     for src_file, rel_file in vetted_files:
                         dest_file = f"{self._workdir}/{rel_file}"
                         dest_dir = os.path.dirname(dest_file)

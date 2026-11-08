@@ -227,5 +227,64 @@ class BoundedGuestStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("exceeds maximum static read size", str(ctx.exception))
 
 
+class StagingBudgetTest(unittest.IsolatedAsyncioTestCase):
+    """Staging enforces file-count and cumulative-byte ceilings before copying."""
+
+    async def test_staging_caps_enforce_file_count_and_cumulative_bytes(self):
+        import tempfile
+        from core.environments import microsandbox_env as M
+        from core.environments import staging
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            root.mkdir()
+            for idx in range(4):
+                (root / f"f{idx}.py").write_bytes(b"x" * 600)
+
+            # Read-only enumeration remains available even when staging caps are lowered.
+            with (
+                mock.patch.object(staging, "MAX_STAGING_FILES", 2),
+                mock.patch.object(staging, "MAX_STAGING_BYTES", 1000),
+            ):
+                self.assertEqual(len(staging.get_vetted_staging_files(root)), 4)
+
+            dest = Path(td) / "staged"
+            with mock.patch.object(staging, "MAX_STAGING_FILES", 3):
+                with self.assertRaises(RuntimeError) as ctx_files:
+                    staging.stage_to_directory(root, dest)
+            self.assertIn("MANTIS_MAX_STAGING_FILES", str(ctx_files.exception))
+            self.assertFalse(dest.exists())
+
+            tar_out = Path(td) / "staged.tar.gz"
+            with mock.patch.object(staging, "MAX_STAGING_BYTES", 1500):
+                with self.assertRaises(RuntimeError) as ctx_bytes:
+                    staging.create_vetted_tar_archive(root, tar_out)
+            self.assertIn("MANTIS_MAX_STAGING_BYTES", str(ctx_bytes.exception))
+            self.assertFalse(tar_out.exists())
+
+            env = M.MicrosandboxEnvironment.__new__(M.MicrosandboxEnvironment)
+            env.target_path = str(root)
+            env.image = "mantis-sandbox:latest"
+            env.timeout = 30.0
+            env.memory = None
+            env.cpus = None
+            env._workdir = Path("/workspace")
+            env._sb = None
+            env._name = None
+            env._stage_error = None
+            env.is_initialized = False
+
+            async def fake_create(name, **kwargs):
+                return _FakeSandbox()
+
+            with (
+                mock.patch.object(M.MsbSandbox, "create", side_effect=fake_create),
+                mock.patch.object(staging, "MAX_STAGING_BYTES", 1500),
+            ):
+                with self.assertRaises(RuntimeError) as ctx_msb:
+                    await env.initialize()
+            self.assertIn("MANTIS_MAX_STAGING_BYTES", str(ctx_msb.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
