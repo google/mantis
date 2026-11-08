@@ -18,7 +18,7 @@ Harness2 edits a harness as files under ``context/harness/``. For Mantis the
 harness is the ADK reference pipeline's configuration, so the tree is:
 
     workflow.json          nodes, edges, per-node tools (closed allowlist),
-                           per-node model/effort, budget, sandbox tier
+                           per-node model/effort (config, budget, sandbox locked)
     prompts/<node_id>.md   the system instruction of each agent node
     tool_guidance.md       text appended to every agent node's instruction
 
@@ -273,13 +273,44 @@ def validate_tree(tree: Dict[str, str], base: Dict[str, str]) -> Dict[str, Any]:
                 f"over the {MAX_NODE_PROMPT_CHARS} cap; every token is paid on every call of that node -- cut, do not add"
             )
 
-    base_sb = ((base_workflow.get("config") or {}).get("sandbox") or {}).get("type")
-    new_sb = ((workflow.get("config") or {}).get("sandbox") or {}).get("type")
+    base_cfg = base_workflow.get("config") if isinstance(base_workflow.get("config"), dict) else {}
+    new_cfg = workflow.get("config") if isinstance(workflow.get("config"), dict) else {}
+    base_sb_dict = base_cfg.get("sandbox") if isinstance(base_cfg.get("sandbox"), dict) else {}
+    new_sb_dict = new_cfg.get("sandbox") if isinstance(new_cfg.get("sandbox"), dict) else {}
+    base_sb = base_sb_dict.get("type")
+    new_sb = new_sb_dict.get("type")
     if base_sb is not None and new_sb != base_sb:
         errs.append(
             f"config.sandbox.type changed from {base_sb!r} to {new_sb!r}; a proposal may not change the "
             "sandbox tier -- what the pipeline may execute is the operator's decision, not the harness's"
         )
+    if base_workflow:
+        changed_cfg = sorted(
+            k for k in (set(base_cfg) | set(new_cfg)) if base_cfg.get(k) != new_cfg.get(k)
+        )
+        other_sb_changed = {k: v for k, v in base_sb_dict.items() if k != "type"} != {
+            k: v for k, v in new_sb_dict.items() if k != "type"
+        }
+        non_sb_type_cfg = [k for k in changed_cfg if k != "sandbox" or other_sb_changed or new_sb == base_sb]
+        if non_sb_type_cfg:
+            errs.append(
+                f"config keys {non_sb_type_cfg} changed from the base workflow; global config "
+                "(sandbox options, api_base, evidence_sources, sarif_output, etc.) is operator-owned and locked"
+            )
+        if workflow.get("budget") != base_workflow.get("budget"):
+            errs.append(
+                "budget changed from the base workflow; spend ceilings are the operator's decision, not the harness's"
+            )
+
+    base_node_api_bases = {str(n.get("id")): n.get("api_base") for n in _agent_nodes(base_workflow)}
+    for node in _agent_nodes(workflow):
+        node_id = str(node.get("id") or "")
+        expected_api_base = base_node_api_bases.get(node_id, None)
+        if node.get("api_base") != expected_api_base:
+            errs.append(
+                f"node '{node_id}': api_base changed from {expected_api_base!r} to {node.get('api_base')!r}; "
+                "a proposal may not redirect LLM traffic to another endpoint"
+            )
 
     try:
         from tools import TOOLS

@@ -145,6 +145,43 @@ class SurfaceTest(unittest.TestCase):
         for needle in ("not_a_tool", "sandbox.type", "ghost.md", "critic", "cap"):
             self.assertIn(needle, msg)
 
+    def test_validation_and_execute_reject_config_budget_and_api_base_tampering(self):
+        tree = S.base_tree(WORKFLOW)
+
+        def mutate_wf(fn):
+            cand = dict(tree)
+            wf = json.loads(cand["workflow.json"])
+            fn(wf)
+            cand["workflow.json"] = json.dumps(wf)
+            return cand
+
+        cases = [
+            ("evidence_sources", lambda wf: wf["config"].update({"evidence_sources": [{"type": "os:system"}]})),
+            ("sandbox", lambda wf: wf["config"]["sandbox"].update({"runtime": "runc", "options": {"gcloud_bin": "/tmp/evil"}})),
+            ("api_base", lambda wf: wf["config"].update({"api_base": "http://127.0.0.1:9999"})),
+            ("sarif_output", lambda wf: wf["config"].update({"sarif_output": "/tmp/out.sarif"})),
+            ("budget", lambda wf: wf.update({"budget": {"max_cost_usd": 999999.0}})),
+            ("api_base", lambda wf: next(n for n in wf["nodes"] if n["id"] == "researcher").update({"api_base": "http://evil.invalid"})),
+        ]
+        for expected_substr, mutator in cases:
+            with self.subTest(expected=expected_substr):
+                bad = mutate_wf(mutator)
+                with self.assertRaises(ValueError) as cm:
+                    S.validate_tree(bad, tree)
+                self.assertIn(expected_substr, str(cm.exception))
+
+        # Direct adapter.execute() also enforces validate_tree before compiling/running.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            target = tmp_p / "repo"; target.mkdir(); (target / "app.py").write_text("print(1)\n")
+            adapter = _adapter(tmp_p, target)
+            evil_harness = tmp_p / "evil_harness"; evil_harness.mkdir()
+            bad_wf = json.loads(tree["workflow.json"])
+            bad_wf["config"]["evidence_sources"] = [{"type": "os:system"}]
+            (evil_harness / "workflow.json").write_text(json.dumps(bad_wf), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                adapter.execute("demo", evil_harness, "demo--evil1")
+
     def test_surface_admits_only_the_three_file_kinds(self):
         wf = json.loads(WORKFLOW.read_text())
         self.assertTrue(S.on_surface("workflow.json", wf))

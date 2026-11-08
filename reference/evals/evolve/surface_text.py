@@ -35,7 +35,7 @@ three kinds of file, each with a different cost and reach:
 
 | path | what it is | when it is in context |
 |---|---|---|
-| `{WORKFLOW_FILE}` | the stages (nodes), their wiring (edges and routes), the TOOLS each stage may call, each stage's model and effort, the run budget | shapes every run; costs nothing per call |
+| `{WORKFLOW_FILE}` | the stages (nodes), their wiring (edges and routes), the TOOLS each stage may call, each stage's model and effort | shapes every run; costs nothing per call |
 | `{PROMPTS_DIR}/<node_id>.md` | the system instruction of ONE stage | ALWAYS ON for that stage -- every token competes with that stage's own output on every one of its calls |
 | `{GUIDANCE_FILE}` | text appended to EVERY stage's instruction | ALWAYS ON for every stage -- the most expensive place to put anything |
 
@@ -67,8 +67,10 @@ THREE RULES THAT DISCARD THE WHOLE PROPOSAL. Validation runs before any rollout,
 harness that fails it is thrown away entire:
 
 1. THE TOOL SET IS CLOSED. Every tool on every stage must be in the registry; the error
-   names the registry. The sandbox tier (`config.sandbox.type`) may not change -- what the
-   pipeline is allowed to execute is the operator's decision, not the harness's.
+   names the registry. Global `config` (including `config.sandbox`, `evidence_sources`,
+   `api_base`, and `sarif_output`), per-node `api_base`, and `budget` are locked to the base
+   workflow -- what the pipeline may execute, spend, and contact is the operator's decision,
+   not the harness's.
 2. `{WORKFLOW_FILE}` MUST STAY VALID. It is parsed by a strict schema: unknown keys, a
    route that names no edge, a classifier without its verdict schema, a node with no path
    from START -- each is rejected with the exact message the loader produces.

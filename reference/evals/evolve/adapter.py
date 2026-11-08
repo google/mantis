@@ -573,6 +573,7 @@ class MantisAdapterBase:
         # Omitted-is-inherited: a proposal only carries what it changed.
         merged = dict(self._base_tree)
         merged.update(tree)
+        hsurface.validate_tree(merged, self._base_tree)
         workflow_path = hsurface.compile_to_file(merged, run_dir / "workflow.json")
 
         settings = self.settings
