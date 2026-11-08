@@ -265,8 +265,9 @@ def _record_finding_evidence(
         entry = entries.setdefault(key, {"reproduced": False, "reattacked": False,
                                          "reattack_present": False, "sink_symbol": "", "reason": ""})
         if getattr(ctx, "active_node", "") == "patcher":
-            entry["reattacked"] = True
-            entry["reattack_present"] = bool(evidence_present)
+            if evidence_present or ran is not False:
+                entry["reattacked"] = True
+                entry["reattack_present"] = bool(evidence_present)
         elif evidence_present:
             entry["reproduced"] = True
         if sink_symbol:
@@ -318,11 +319,18 @@ def poc_ran(output: str, exit_code: int, timed_out: bool = False) -> bool:
     return not any(m in text for m in POC_SETUP_FAILURE_MARKERS)
 
 
+def _has_dynamic_sandbox(ctx: Any) -> bool:
+    """True only when an active dynamic guest sandbox (not static-only) is configured."""
+    if ctx is None or getattr(ctx, "sandbox", None) is None:
+        return False
+    return type(ctx.sandbox).__name__ not in ("StaticOnlyEnvironment", "StaticOnlySandbox")
+
+
 async def run_sandbox(command: str) -> str:
     """Executes a command securely inside the configured sandbox. Use this to compile or run the reproduction script."""
     ctx = current_run_context.get()
     if ctx is None or ctx.sandbox is None:
-        return "ERROR: No active sandbox environment (sandbox unavailable)."
+        return "exit=127\nSANDBOX-UNAVAILABLE: ERROR: No active sandbox environment (sandbox unavailable)."
 
     try:
         sandbox_type = type(ctx.sandbox).__name__
@@ -333,7 +341,8 @@ async def run_sandbox(command: str) -> str:
             if ctx.static_sandbox_attempts >= 3:
                 if not _is_non_repro_node(ctx):
                     return (
-                        f"ERROR: Sandbox execution permanently blocked in static-only mode (attempt {ctx.static_sandbox_attempts}). "
+                        f"exit=127\n"
+                        f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked in static-only mode (attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again. "
                         f"STOP calling tools immediately and submit your stage verdict using the 'set_model_response' tool "
                         f"(e.g. set_model_response(route='failed_repro', reason='Dynamic execution disabled in static-only mode')) "
@@ -341,7 +350,8 @@ async def run_sandbox(command: str) -> str:
                         f"in your model response to conclude this stage."
                     )
                 return (
-                    f"ERROR: Sandbox execution permanently blocked in static-only mode (attempt {ctx.static_sandbox_attempts}). "
+                    f"exit=127\n"
+                    f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked in static-only mode (attempt {ctx.static_sandbox_attempts}). "
                     f"Dynamic execution is disabled. Do NOT call run_sandbox again."
                 )
             if not _is_non_repro_node(ctx):
@@ -369,14 +379,16 @@ async def run_sandbox(command: str) -> str:
                 if ctx.static_sandbox_attempts >= 3:
                     if not _is_non_repro_node(ctx):
                         return (
-                            f"ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
+                            f"exit=127\n"
+                            f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                             f"Dynamic execution is disabled. Do NOT call run_sandbox again. "
                             f"STOP calling tools immediately and submit your stage verdict using the 'set_model_response' tool "
                             f"or as structured JSON text (e.g. {{\"route\": \"failed_repro\", \"reason\": \"Sandbox unavailable\"}}) "
                             f"in your model response to conclude this stage."
                         )
                     return (
-                        f"ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
+                        f"exit=127\n"
+                        f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
                     )
             else:
@@ -403,14 +415,16 @@ async def run_sandbox(command: str) -> str:
                 if ctx.static_sandbox_attempts >= 3:
                     if not _is_non_repro_node(ctx):
                         return (
-                            f"ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
+                            f"exit=127\n"
+                            f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                             f"Dynamic execution is disabled. Do NOT call run_sandbox again. "
                             f"STOP calling tools immediately and submit your stage verdict using the 'set_model_response' tool "
                             f"or as structured JSON text (e.g. {{\"route\": \"failed_repro\", \"reason\": \"Sandbox unavailable\"}}) "
                             f"in your model response to conclude this stage."
                         )
                     return (
-                        f"ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
+                        f"exit=127\n"
+                        f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
                     )
             elif res.startswith("exit="):
@@ -461,7 +475,7 @@ async def run_sandbox_with_evidence(
         # carries the sentinel token -- i.e. is a stale sentinel. Anything
         # else is left alone; a file without the token cannot be evidence.
         ctx_pre = current_run_context.get()
-        if ctx_pre and ctx_pre.sandbox:
+        if _has_dynamic_sandbox(ctx_pre):
             try:
                 existing = await ctx_pre.sandbox.read_file(Path(sentinel_path))
                 if MANTIS_SENTINEL_TOKEN in existing.decode("utf-8", errors="replace"):
@@ -470,7 +484,7 @@ async def run_sandbox_with_evidence(
                 pass  # no file: nothing stale to clear
 
     raw_res = await run_sandbox(command)
-    exit_code = 0
+    exit_code = 127
     output = raw_res
 
     if raw_res.startswith("exit="):
@@ -479,16 +493,16 @@ async def run_sandbox_with_evidence(
             exit_code = int(parts[0].split("=")[1])
             output = parts[1] if len(parts) > 1 else ""
         except (ValueError, IndexError):
-            pass
+            exit_code = 127
 
     sentinel_content = ""
     if sentinel_path:
         ctx = current_run_context.get()
-        # SECURITY (INV-1/INV-4): the sentinel is read ONLY from inside the sandbox.
-        # sentinel_path is model-controlled, so a host-filesystem fallback would be both
-        # an arbitrary host read and a way to satisfy reached-sink evidence with a file
-        # that no exploit ever produced. With no sandbox there is no admissible evidence.
-        if ctx and ctx.sandbox:
+        # SECURITY (INV-1/INV-4): the sentinel is read ONLY from inside a dynamic
+        # guest sandbox. StaticOnlyEnvironment reads from the host target checkout,
+        # which would allow a target file containing the sentinel token to satisfy
+        # reached-sink evidence without any dynamic execution.
+        if _has_dynamic_sandbox(ctx):
             try:
                 content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))
                 sentinel_content = content_bytes.decode("utf-8", errors="replace")

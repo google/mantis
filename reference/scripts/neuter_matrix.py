@@ -61,8 +61,8 @@ SCENARIOS = {
     ],
     "revert_sentinel_host_read": [
         ("tools/sandbox_tools.py",
-         "        if ctx and ctx.sandbox:\n            try:\n                content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass",
-         "        if ctx and ctx.sandbox:\n            try:\n                content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass\n        if not sentinel_content and Path(sentinel_path).exists():\n            sentinel_content = Path(sentinel_path).read_text(errors=\"replace\")"),
+         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass",
+         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass\n        if not sentinel_content and Path(sentinel_path).exists():\n            sentinel_content = Path(sentinel_path).read_text(errors=\"replace\")"),
     ],
     "revert_staging_vcs_and_hardlink": [
         ("core/environments/staging.py",

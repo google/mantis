@@ -321,5 +321,51 @@ class ToolSurfaceTest(unittest.TestCase):
         self.assertIn("finding_evidence={}", inspect.getsource(main))
 
 
+class StaticOnlySentinelIsolationTest(_Base):
+    """Static-only sandboxes must never satisfy reached-sink evidence or
+    count blocked calls as executed re-attacks, even when a host target file
+    contains MANTIS_REACHED_ENTRYPOINT and >= 3 sandbox calls are made."""
+
+    async def test_host_file_with_token_cannot_forged_evidence_in_static_only(self):
+        from core.environments.static_env import StaticOnlyEnvironment
+
+        decoy = os.path.join(self.target, "pkg", "decoy.txt")
+        with open(decoy, "w", encoding="utf-8") as f:
+            f.write(f"seeded token: {TOKEN}\n")
+
+        env = StaticOnlyEnvironment(target_path=self.target)
+        ctx = self._ctx(sandbox=env, node="reproducer")
+
+        for attempt in range(1, 5):
+            res = await run_sandbox_with_evidence(
+                "python3 poc.py",
+                sentinel_path="pkg/decoy.txt",
+                finding_id=1,
+            )
+            self.assertEqual(res["exit_code"], 127, f"attempt {attempt}")
+            self.assertFalse(res["evidence_present"], f"attempt {attempt}")
+            self.assertFalse(ctx.sandbox_executed, f"attempt {attempt}")
+            self.assertFalse(ctx.finding_evidence["1"]["reproduced"], f"attempt {attempt}")
+
+        # Host decoy file must also remain untouched (never truncated by pre-run clear).
+        with open(decoy, "r", encoding="utf-8") as f:
+            self.assertIn(TOKEN, f.read())
+
+    async def test_blocked_static_call_in_patcher_does_not_count_as_reattack(self):
+        from core.environments.static_env import StaticOnlyEnvironment
+
+        env = StaticOnlyEnvironment(target_path=self.target)
+        ctx = self._ctx(sandbox=env, node="patcher")
+        ctx.finding_evidence = {"1": {"reproduced": True}}
+
+        for attempt in range(1, 5):
+            res = await run_sandbox_with_evidence("python3 poc.py", finding_id=1)
+            self.assertEqual(res["exit_code"], 127, f"attempt {attempt}")
+            self.assertFalse(
+                ctx.finding_evidence["1"].get("reattacked", False),
+                f"blocked attempt {attempt} must not count as a re-attack",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
