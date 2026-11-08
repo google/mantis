@@ -365,5 +365,118 @@ class GvisorHardeningTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(gvisor_env.MAX_CONTAINER_LIFETIME_SECONDS), create_argv)
 
 
+class MicrosandboxHardeningTest(unittest.IsolatedAsyncioTestCase):
+    """Microsandbox bounds guest file I/O, hardens shell fallbacks, and verifies Network.none() before auto-promotion."""
+
+    def _make_env(self, sb):
+        from core.environments import microsandbox_env as M
+
+        env = M.MicrosandboxEnvironment.__new__(M.MicrosandboxEnvironment)
+        env.target_path = ""
+        env.image = "mantis-sandbox:latest"
+        env.timeout = 10.0
+        env.memory = None
+        env.cpus = None
+        env._workdir = Path("/workspace")
+        env._sb = sb
+        env._name = "mantis-msb-test"
+        env._stage_error = None
+        env.is_initialized = True
+        return env
+
+    async def test_microsandbox_read_and_write_enforce_byte_caps_and_fail_closed_fallbacks(self):
+        from core.environments import microsandbox_env as M
+
+        class _StubFs:
+            async def mkdir(self, _path):
+                return None
+
+            async def read(self, _path):
+                return b"R" * 2048
+
+            async def write(self, _path, _data):
+                raise RuntimeError("fs.write unavailable")
+
+        class _StubOut:
+            def __init__(self, exit_code: int, stdout_text: str = "", stderr_text: str = ""):
+                self.exit_code = exit_code
+                self.stdout_text = stdout_text
+                self.stderr_text = stderr_text
+
+        class _StubSb:
+            def __init__(self):
+                self.fs = _StubFs()
+                self.next_out = _StubOut(0, "")
+
+            async def shell(self, _cmd, **_kwargs):
+                return self.next_out
+
+        sb = _StubSb()
+        env = self._make_env(sb)
+
+        # 1. Direct fs.read enforces MAX_GUEST_FILE_BYTES without falling back to shell cat
+        with mock.patch.object(M, "MAX_GUEST_FILE_BYTES", 1024):
+            with self.assertRaises(ValueError) as ctx_read:
+                await env.read_file("huge.bin")
+            self.assertIn("exceeds maximum sandbox read size", str(ctx_read.exception))
+
+            # 2. write_file enforces MAX_GUEST_FILE_BYTES upfront
+            with self.assertRaises(ValueError) as ctx_write:
+                await env.write_file("huge.bin", b"W" * 2048)
+            self.assertIn("exceeds maximum sandbox write size", str(ctx_write.exception))
+
+        # 3. Shell fallback for read_file refuses symlinks and oversized files
+        async def _fail_read(_path):
+            raise RuntimeError("fs.read unavailable")
+
+        sb.fs.read = _fail_read
+        sb.next_out = _StubOut(2, "MSB_ERR:SYMLINK\n")
+        with self.assertRaises(PermissionError):
+            await env.read_file("escape_link")
+
+        sb.next_out = _StubOut(4, "MSB_ERR:TOO_LARGE:99999\n")
+        with mock.patch.object(M, "MAX_GUEST_FILE_BYTES", 1024):
+            with self.assertRaises(ValueError):
+                await env.read_file("too_big.bin")
+
+        # 4. Shell fallback for write_file refuses symlinks and surfaces non-zero exit codes
+        sb.next_out = _StubOut(2, "", "MSB_ERR:SYMLINK\n")
+        with self.assertRaises(PermissionError):
+            await env.write_file("link_out", b"payload")
+
+        sb.next_out = _StubOut(1, "", "disk full")
+        with self.assertRaises(RuntimeError) as ctx_fb_write:
+            await env.write_file("out.txt", b"payload")
+        self.assertIn("disk full", str(ctx_fb_write.exception))
+
+    def test_configure_refuses_microsandbox_auto_promotion_when_network_none_is_permissive(self):
+        from microsandbox.types import Action, Network
+        from scripts import configure
+
+        ok, _ = configure.verify_microsandbox_isolation_primitives()
+        self.assertTrue(ok)
+
+        bad_net = mock.MagicMock()
+        bad_net.policy = mock.MagicMock(
+            default_egress=Action.ALLOW,
+            default_ingress=Action.DENY,
+            rules=(),
+        )
+        bad_net.ports = {}
+
+        with (
+            mock.patch.object(Network, "none", return_value=bad_net),
+            mock.patch.object(configure, "check_microsandbox_virtualization", return_value=(True, "KVM ok")),
+            mock.patch.object(configure, "find_cached_microsandbox_image", return_value="mantis-sandbox:latest"),
+            mock.patch("shutil.which", return_value=None),
+        ):
+            ok_bad, reason_bad = configure.verify_microsandbox_isolation_primitives()
+            self.assertFalse(ok_bad)
+            self.assertIn("Action.DENY", reason_bad)
+            caps = configure.detect_capabilities()
+            self.assertNotIn("microsandbox", caps["available_sandboxes"])
+            self.assertEqual(caps["recommended_sandbox"], "static-only")
+
+
 if __name__ == "__main__":
     unittest.main()

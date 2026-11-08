@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import os
 import shlex
 import sys
@@ -22,7 +23,7 @@ from google.adk.environment import ExecutionResult
 from microsandbox import Sandbox as MsbSandbox, PullPolicy
 from microsandbox.types import Network
 
-from .base import BaseEnvironment
+from .base import BaseEnvironment, MAX_GUEST_FILE_BYTES
 from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 from core.truncation import truncate_with_marker
 
@@ -34,6 +35,26 @@ MAX_OUTPUT = 16000
 #: Hard lifetime of one guest, enforced by the runtime: six hours is longer
 #: than any campaign and bounds what a missed close() can cost.
 MAX_GUEST_LIFETIME_SECONDS = 6 * 3600
+_MAX_FALLBACK_WRITE_BYTES = 65536
+
+
+def verify_network_none_policy(net: Optional[Network] = None) -> None:
+    """Fails closed if the microsandbox SDK's Network.none() ever permits traffic or ports."""
+    from microsandbox.types import Action
+
+    candidate = Network.none() if net is None else net
+    policy = getattr(candidate, "policy", None)
+    if (
+        policy is None
+        or getattr(policy, "default_egress", None) != Action.DENY
+        or getattr(policy, "default_ingress", None) != Action.DENY
+        or tuple(getattr(policy, "rules", ())) != ()
+        or dict(getattr(candidate, "ports", {})) != {}
+    ):
+        raise RuntimeError(
+            "Microsandbox Network.none() isolation invariant failed: "
+            "default egress and ingress must both be Action.DENY with empty rules and ports."
+        )
 
 
 class MicrosandboxEnvironment(BaseEnvironment):
@@ -82,6 +103,7 @@ class MicrosandboxEnvironment(BaseEnvironment):
         if self._stage_error is not None:
             raise self._stage_error
         if self._sb is None:
+            verify_network_none_policy()
             name = f"mantis-msb-{uuid.uuid4().hex[:12]}"
             sizing = {}
             if self.memory:
@@ -204,34 +226,78 @@ class MicrosandboxEnvironment(BaseEnvironment):
     async def read_file(self, path: Union[Path, str]) -> bytes:
         sb = await self._ensure()
         resolved_path = self._resolve_guest_path(path)
+        fs_err: Optional[Exception] = None
         try:
-            return await sb.fs.read(str(resolved_path))
+            raw = await sb.fs.read(str(resolved_path))
+            data = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
         except Exception as e:
-            # Fallback to shell read if fs.read encounters an issue
-            exec_res = await self.execute(f"cat {shlex.quote(str(resolved_path))}")
-            if exec_res.exit_code == 0:
-                return exec_res.stdout.encode("utf-8")
-            raise FileNotFoundError(f"File not found in sandbox: {path} ({e})")
+            fs_err = e
+            q = shlex.quote(str(resolved_path))
+            cap = int(MAX_GUEST_FILE_BYTES)
+            cmd = (
+                f"if [ -L {q} ]; then echo MSB_ERR:SYMLINK; exit 2; fi; "
+                f"if [ ! -f {q} ]; then echo MSB_ERR:MISSING; exit 3; fi; "
+                f"sz=$(wc -c < {q}); "
+                f"if [ \"$sz\" -gt {cap} ]; then echo \"MSB_ERR:TOO_LARGE:$sz\"; exit 4; fi; "
+                f"base64 < {q}"
+            )
+            out = await sb.shell(cmd, cwd=str(self._workdir), timeout=self.timeout)
+            stdout_text = (out.stdout_text or "").strip()
+            if out.exit_code == 2 or stdout_text.startswith("MSB_ERR:SYMLINK"):
+                raise PermissionError(f"Permission denied: refusing to read symlink in sandbox: {path}")
+            if out.exit_code == 4 or stdout_text.startswith("MSB_ERR:TOO_LARGE"):
+                raise ValueError(
+                    f"File '{path}' exceeds maximum sandbox read size ({cap} bytes)."
+                )
+            if out.exit_code != 0:
+                raise FileNotFoundError(f"File not found in sandbox: {path} ({fs_err})")
+            data = base64.b64decode(stdout_text.encode("ascii"))
+        if len(data) > MAX_GUEST_FILE_BYTES:
+            raise ValueError(
+                f"File '{path}' ({len(data)} bytes) exceeds maximum sandbox read size "
+                f"({MAX_GUEST_FILE_BYTES} bytes)."
+            )
+        return data
 
     async def write_file(self, path: Union[Path, str], content: Union[str, bytes]) -> None:
         sb = await self._ensure()
         resolved_path = self._resolve_guest_path(path)
+        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        if len(data) > MAX_GUEST_FILE_BYTES:
+            raise ValueError(
+                f"Payload for '{path}' ({len(data)} bytes) exceeds maximum sandbox write size "
+                f"({MAX_GUEST_FILE_BYTES} bytes)."
+            )
         parent_dir = str(resolved_path.parent)
         if parent_dir and parent_dir != str(self._workdir):
             try:
                 await sb.fs.mkdir(parent_dir)
             except Exception:
                 pass
-        data = content.encode("utf-8") if isinstance(content, str) else content
         try:
             await sb.fs.write(str(resolved_path), data)
-        except Exception:
-            # Fallback to shell write
-            import base64
+        except Exception as e:
+            if len(data) > _MAX_FALLBACK_WRITE_BYTES:
+                raise RuntimeError(
+                    f"Failed to write '{path}' via MicroSandbox fs API ({e}), and payload "
+                    f"({len(data)} bytes) exceeds safe shell fallback limit ({_MAX_FALLBACK_WRITE_BYTES} bytes)."
+                ) from e
             b64_data = base64.b64encode(data).decode("ascii")
-            await self.execute(
-                f"mkdir -p {shlex.quote(parent_dir)} && echo '{b64_data}' | base64 -d > {shlex.quote(str(resolved_path))}"
+            q_parent = shlex.quote(parent_dir)
+            q_dest = shlex.quote(str(resolved_path))
+            cmd = (
+                f"mkdir -p {q_parent} && "
+                f"if [ -L {q_dest} ]; then echo MSB_ERR:SYMLINK >&2; exit 2; fi && "
+                f"printf '%s' '{b64_data}' | base64 -d > {q_dest}"
             )
+            out = await sb.shell(cmd, cwd=str(self._workdir), timeout=self.timeout)
+            if out.exit_code == 2:
+                raise PermissionError(f"Permission denied: refusing to write through symlink '{path}'.")
+            if out.exit_code != 0:
+                stderr_text = getattr(out, "stderr_text", "") or out.stdout_text or ""
+                raise RuntimeError(
+                    f"Failed to write file '{path}' in MicroSandbox (exit={out.exit_code}): {stderr_text.strip()}"
+                ) from e
 
     async def list_files(self, directory: str = "") -> List[str]:
         await self._ensure()
@@ -282,6 +348,7 @@ class MicrosandboxEnvironment(BaseEnvironment):
 
     async def preflight(self) -> None:
         from microsandbox import Image, ImageNotFoundError
+        verify_network_none_policy()
         try:
             await Image.get(self.image)
         except ImageNotFoundError as e:

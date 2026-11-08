@@ -236,6 +236,36 @@ def check_microsandbox_virtualization() -> Tuple[bool, str]:
     return False, f"microsandbox is not supported on platform '{sys.platform}'."
 
 
+def verify_microsandbox_isolation_primitives() -> Tuple[bool, str]:
+    """Verifies the installed microsandbox SDK enforces Network.none() and PullPolicy.NEVER."""
+    try:
+        from microsandbox import PullPolicy
+        from microsandbox.types import Action, Network
+    except Exception as e:
+        return False, f"microsandbox SDK not importable: {e}"
+
+    try:
+        net = Network.none()
+        policy = getattr(net, "policy", None)
+        if (
+            policy is None
+            or getattr(policy, "default_egress", None) != Action.DENY
+            or getattr(policy, "default_ingress", None) != Action.DENY
+            or tuple(getattr(policy, "rules", ())) != ()
+            or dict(getattr(net, "ports", {})) != {}
+        ):
+            return (
+                False,
+                "microsandbox Network.none() does not enforce Action.DENY on default egress/ingress with empty rules and ports.",
+            )
+        if getattr(PullPolicy, "NEVER", None) is None:
+            return False, "microsandbox PullPolicy.NEVER is unavailable."
+    except Exception as e:
+        return False, f"microsandbox isolation check failed: {e}"
+
+    return True, "Microsandbox Network.none() egress/ingress DENY policy verified."
+
+
 def find_cached_microsandbox_image(preferred: str = "") -> Optional[str]:
     """Returns the first locally cached guest image usable by the microsandbox tier.
 
@@ -304,13 +334,15 @@ def detect_capabilities() -> dict:
         "available_sandboxes": ["static-only"],
     }
 
-    # 1. Check virtualization for microsandbox (Linux KVM or macOS
-    # Hypervisor.framework -- see check_microsandbox_virtualization).
+    # 1. Check virtualization and SDK isolation primitives for microsandbox
+    # (Linux KVM or macOS Hypervisor.framework -- see check_microsandbox_virtualization).
     virt_ok, _ = check_microsandbox_virtualization()
     if virt_ok:
         caps["kvm"] = os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
-        caps["available_sandboxes"].append("microsandbox")
-        caps["microsandbox_image"] = find_cached_microsandbox_image()
+        iso_ok, _ = verify_microsandbox_isolation_primitives()
+        if iso_ok:
+            caps["available_sandboxes"].append("microsandbox")
+            caps["microsandbox_image"] = find_cached_microsandbox_image()
 
     # 2. Check container engines and gVisor
     for tool in ("docker", "podman"):
@@ -418,6 +450,10 @@ def is_default_or_unconfigured(config: dict) -> Tuple[bool, List[str]]:
         virt_ok, virt_msg = check_microsandbox_virtualization()
         if not virt_ok:
             issues.append(f"Microsandbox virtualization unavailable: {virt_msg}")
+        else:
+            iso_ok, iso_msg = verify_microsandbox_isolation_primitives()
+            if not iso_ok:
+                issues.append(f"Microsandbox isolation policy unverified: {iso_msg}")
 
     # Model checks
     model = config.get("default_model", DEFAULT_MODEL)
@@ -500,6 +536,9 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
         virt_ok, virt_msg = check_microsandbox_virtualization()
         if not virt_ok:
             return False, virt_msg
+        iso_ok, iso_msg = verify_microsandbox_isolation_primitives()
+        if not iso_ok:
+            return False, iso_msg
         configured_image = str(sandbox_cfg.get("options", {}).get("image", "") or "")
         cached = find_cached_microsandbox_image(preferred=configured_image)
         if configured_image and cached != configured_image:
