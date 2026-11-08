@@ -1886,7 +1886,7 @@ def get_security_guidance(filepath: str = "") -> str:
 
 def record_regression_check(prior_finding_id: int, outcome: str, reason: str, new_finding_id: int = 0) -> str:
     """Records what this run decided about a finding an EARLIER run reported in a file this run examines: 'still_present', 'fixed', or 'inconclusive'. A finding re-run through its PoC is judged by that run's evidence."""
-    from core.database import OPEN_FINDING_STATUSES, REGRESSION_OUTCOMES, read_findings
+    from core.database import OPEN_FINDING_STATUSES, REGRESSION_OUTCOMES, read_findings, run_belongs_to_active_target
     from core.database import record_regression_check as _record
 
     ctx = current_run_context.get()
@@ -1905,6 +1905,8 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
     prior = next((f for f in read_findings(resolved_db) if f.get("id") == pid), None)
     if prior is None:
         return f"Error: no finding with id {pid}."
+    if not run_belongs_to_active_target(resolved_db, prior.get("run_id")):
+        return f"Error: finding {pid} belongs to a different target repository."
     if str(prior.get("run_id") or "") == str(ctx.run_id or ""):
         return (f"Error: finding {pid} belongs to THIS run. A regression check is about a finding an earlier "
                 "run reported; this run's own findings are judged by review and reproduction.")
@@ -1950,7 +1952,7 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
 
 async def get_prior_poc(prior_finding_id: int) -> str:
     """Fetches the proof-of-concept an EARLIER run wrote for one of its findings (workspace/repro_<id>.py) into this run's workspace as workspace/repro_prior_<id>.py, with the companion files it needs (its workspace/repro_<id>/ harness, the files it left in the target tree), so it can be re-run UNCHANGED against the current code."""
-    from core.database import read_artifact, read_findings
+    from core.database import read_artifact, read_findings, run_belongs_to_active_target
     from core.poc_scaffold import restore_poc_companions
 
     ctx = current_run_context.get()
@@ -1965,6 +1967,8 @@ async def get_prior_poc(prior_finding_id: int) -> str:
     if prior is None:
         return f"Error: no finding with id {pid}."
     prior_run = str(prior.get("run_id") or "")
+    if not run_belongs_to_active_target(resolved_db, prior_run):
+        return f"Error: finding {pid} belongs to a different target repository."
     if prior_run == str(ctx.run_id or ""):
         return f"Error: finding {pid} is this run's own; its PoC is in workspace/ already."
     content = None

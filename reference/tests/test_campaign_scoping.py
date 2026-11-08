@@ -659,5 +659,148 @@ class CrossCampaignMutationIsolationTest(_DbTest):
         self.assertEqual(by_id[self.ids["camp-b-primary"]]["mantis_risk_score"], 8.5)
 
 
+class CrossTargetSharedDbIsolationTest(_DbTest):
+    """A shared knowledge.db must isolate PoCs, regression checks, lineage history,
+    and security guidance across distinct target repositories."""
+
+    def setUp(self):
+        super().setUp()
+        import asyncio
+        from core.database import record_artifact, record_learning
+
+        self._asyncio = asyncio
+        self.repo_a = os.path.join(self.tmp, "repo_a")
+        self.repo_b = os.path.join(self.tmp, "repo_b")
+        os.makedirs(os.path.join(self.repo_a, "app"), exist_ok=True)
+        os.makedirs(os.path.join(self.repo_b, "app"), exist_ok=True)
+        for repo in (self.repo_a, self.repo_b):
+            with open(os.path.join(repo, "app", "auth.py"), "w", encoding="utf-8") as fh:
+                fh.write("def login(u): return u\n")
+
+        # Populate Repo A findings, PoC, threat model, FP, recurrent lineage, and learning.
+        self._install_repo_ctx(self.repo_a, "run-a-1")
+        write_findings(
+            self.db,
+            "app/auth.py",
+            [
+                _finding("RepoA-SQLi", "app/auth.py", description="repo A secret sqli"),
+                {
+                    **_finding("RepoA-FP", "app/auth.py", description="repo A benign pattern"),
+                    "status": "false_positive",
+                },
+            ],
+            run_id="run-a-1",
+        )
+        a_rows = read_findings(self.db, run_id="run-a-1")
+        self.repo_a_sqli_id = next(f["id"] for f in a_rows if f["title"] == "RepoA-SQLi")
+        self.repo_a_lineage = next(f["lineage_id"] for f in a_rows if f["title"] == "RepoA-SQLi")
+        record_artifact(
+            self.db,
+            "run-a-1",
+            "poc",
+            f"workspace/repro_{self.repo_a_sqli_id}.py",
+            "print('REPO_A_SECRET_POC_TOKEN')\n",
+        )
+        record_artifact(
+            self.db,
+            "run-a-1",
+            "threat_model",
+            "workspace/kb/THREAT_MODEL.md",
+            "# Threat Model\n\nRepoA Confidential Payments Core.\n",
+            metadata={"resource": self.repo_a, "agent_authored": True},
+        )
+        record_learning(self.db, "run-a-1", "auth", "RepoA-only trajectory rule")
+
+        # Second Repo A run so RepoA-SQLi becomes a recurrent lineage inside Repo A.
+        self._install_repo_ctx(self.repo_a, "run-a-2")
+        write_findings(
+            self.db,
+            "app/auth.py",
+            [{
+                **_finding("RepoA-SQLi", "app/auth.py", description="repo A secret sqli again"),
+                "lineage_id": self.repo_a_lineage,
+            }],
+            run_id="run-a-2",
+        )
+
+        # Populate Repo B finding on the exact same relative path `app/auth.py`.
+        self._install_repo_ctx(self.repo_b, "run-b-1")
+        write_findings(
+            self.db,
+            "app/auth.py",
+            [_finding("RepoB-XSS", "app/auth.py", description="repo B reflected xss")],
+            run_id="run-b-1",
+        )
+        b_rows = read_findings(self.db, run_id="run-b-1")
+        self.repo_b_xss_id = b_rows[0]["id"]
+        record_artifact(
+            self.db,
+            "run-b-1",
+            "poc",
+            f"workspace/repro_{self.repo_b_xss_id}.py",
+            "print('REPO_B_OWN_POC')\n",
+        )
+
+    def _install_repo_ctx(self, repo_root: str, run_id: str, target_file: str = "app/auth.py"):
+        token = current_run_context.set(RunContext(
+            jail_dir=repo_root,
+            path_root=repo_root,
+            db_path=self.db,
+            target_file=target_file,
+            run_id=run_id,
+        ))
+        self.addCleanup(current_run_context.reset, token)
+
+    def test_get_prior_poc_and_regression_check_refuse_cross_target_findings(self):
+        from core.database import prior_findings_touching
+        from tools.research_tools import get_prior_poc, record_regression_check
+
+        # Active in Repo B (`run-b-2`): Repo A's PoC and regression check must be refused.
+        self._install_repo_ctx(self.repo_b, "run-b-2")
+        poc_err = self._asyncio.run(get_prior_poc(self.repo_a_sqli_id))
+        self.assertIn("different target repository", poc_err)
+        self.assertNotIn("REPO_A_SECRET_POC_TOKEN", poc_err)
+
+        reg_err = record_regression_check(self.repo_a_sqli_id, "fixed", "not in repo B")
+        self.assertIn("different target repository", reg_err)
+
+        # Same-target prior PoC in Repo B still succeeds.
+        poc_ok = self._asyncio.run(get_prior_poc(self.repo_b_xss_id))
+        self.assertTrue(poc_ok.startswith("SUCCESS:"), poc_ok)
+        self.assertIn("REPO_B_OWN_POC", poc_ok)
+
+        # prior_findings_touching in Repo B sees only Repo B's open prior finding.
+        touching_b = prior_findings_touching(self.db, "run-b-2", ["app/auth.py"])
+        self.assertEqual([f["title"] for f in touching_b], ["RepoB-XSS"])
+
+    def test_query_lineage_and_security_guidance_do_not_leak_across_targets(self):
+        from tools.research_tools import get_security_guidance, query_lineage
+
+        # Active in Repo B (`run-b-2`): querying `app/auth.py` or Repo A's lineage_id must not leak Repo A.
+        self._install_repo_ctx(self.repo_b, "run-b-2")
+        lin_fp_b = query_lineage(filepath="app/auth.py")
+        self.assertIn("RepoB-XSS", lin_fp_b)
+        self.assertNotIn("RepoA-SQLi", lin_fp_b)
+
+        lin_id_a_from_b = query_lineage(lineage_id=self.repo_a_lineage)
+        self.assertTrue(lin_id_a_from_b.startswith("NO_DATA:"), lin_id_a_from_b)
+
+        guidance_b = get_security_guidance("app/auth.py")
+        self.assertIn("RepoB-XSS", guidance_b)
+        self.assertNotIn("RepoA-SQLi", guidance_b)
+        self.assertNotIn("RepoA-FP", guidance_b)
+        self.assertNotIn("RepoA Confidential Payments Core", guidance_b)
+        self.assertNotIn("RepoA-only trajectory rule", guidance_b)
+        self.assertNotIn(self.repo_a_lineage, guidance_b)
+
+        # Switching back to Repo A (`run-a-3`) restores visibility of Repo A's history and hides Repo B.
+        self._install_repo_ctx(self.repo_a, "run-a-3")
+        guidance_a = get_security_guidance("app/auth.py")
+        self.assertIn("RepoA-SQLi", guidance_a)
+        self.assertIn("RepoA-FP", guidance_a)
+        self.assertIn("RepoA-only trajectory rule", guidance_a)
+        self.assertNotIn("RepoB-XSS", guidance_a)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -935,6 +935,141 @@ def _ownership_clause(scope_path: Optional[str], campaign: Optional[str]) -> "tu
     return "(" + " OR ".join(parts) + ")", params
 
 
+def active_target_root(explicit_target: str = "") -> str:
+    """Derives the canonical realpath of the active scan target root from `RunContext`
+    or an explicit filesystem path, returning `""` when unanchored."""
+    from core.context import current_run_context
+
+    ctx = current_run_context.get()
+    if ctx is not None:
+        pr = str(getattr(ctx, "path_root", "") or "").strip()
+        if pr:
+            return os.path.realpath(pr).rstrip("/")
+        jd = str(getattr(ctx, "jail_dir", "") or "").strip()
+        if jd:
+            real_jd = os.path.realpath(jd)
+            if os.path.isfile(real_jd):
+                return os.path.dirname(real_jd).rstrip("/")
+            return real_jd.rstrip("/")
+    cand = str(explicit_target or "").strip()
+    if cand and os.path.isabs(cand) and os.path.exists(cand):
+        real_c = os.path.realpath(cand)
+        if os.path.isfile(real_c):
+            return os.path.dirname(real_c).rstrip("/")
+        return real_c.rstrip("/")
+    return ""
+
+
+def _ensure_run_target_root(conn: sqlite3.Connection, run_id: Any, target_root: str) -> None:
+    """Persists `target_root` in `runs.metadata_json` for `run_id` without overwriting an
+    existing recorded root."""
+    rid = str(run_id or "").strip()
+    root = str(target_root or "").strip()
+    if not rid or not root:
+        return
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                model TEXT,
+                started DATETIME DEFAULT CURRENT_TIMESTAMP,
+                metadata_json TEXT DEFAULT '{}'
+            )
+        """)
+        row = cursor.execute("SELECT metadata_json FROM runs WHERE run_id = ?", (rid,)).fetchone()
+        if row is None:
+            cursor.execute(
+                "INSERT OR IGNORE INTO runs (run_id, model, metadata_json) VALUES (?, '', ?)",
+                (rid, json.dumps({"target_root": root})),
+            )
+            return
+        try:
+            meta = json.loads(row[0] or "{}")
+            if not isinstance(meta, dict):
+                meta = {}
+        except Exception:
+            meta = {}
+        if not meta.get("target_root"):
+            meta["target_root"] = root
+            cursor.execute(
+                "UPDATE runs SET metadata_json = ? WHERE run_id = ?",
+                (json.dumps(meta), rid),
+            )
+    except sqlite3.Error:
+        pass
+
+
+def run_target_roots(db_path: str) -> Dict[str, str]:
+    """Returns `{run_id: target_root}` for all runs in `db_path` that recorded a target root."""
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    try:
+        with _db(db_path) as conn:
+            rows = conn.execute("SELECT run_id, metadata_json FROM runs").fetchall()
+        out: Dict[str, str] = {}
+        for r in rows:
+            rid = str(r[0] or "")
+            if not rid:
+                continue
+            try:
+                meta = json.loads(r[1] or "{}")
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict) and meta.get("target_root"):
+                out[rid] = str(meta["target_root"])
+        return out
+    except (sqlite3.Error, OSError):
+        return {}
+
+
+def run_targets_compatible(active_root: str, recorded_root: str) -> bool:
+    """True when `recorded_root` belongs to the same target repository as `active_root`
+    (or when either root is unrecorded for INV-6 backward compatibility)."""
+    if not active_root or not recorded_root:
+        return True
+    a = os.path.realpath(active_root).rstrip("/")
+    b = os.path.realpath(recorded_root).rstrip("/")
+    if a == b:
+        return True
+    try:
+        common = os.path.commonpath([a, b]).rstrip("/")
+    except ValueError:
+        return False
+    if common not in (a, b):
+        return False
+    # One path is inside the other (e.g. single-file or slice scan vs repo root):
+    # compatible unless an independent nested repository boundary (.git) sits between them.
+    anc = common
+    desc = b if common == a else a
+    rel = os.path.relpath(desc, anc)
+    curr = anc
+    for part in Path(rel).parts:
+        curr = os.path.join(curr, part)
+        if os.path.exists(os.path.join(curr, ".git")):
+            return False
+    return True
+
+
+def run_belongs_to_active_target(
+    db_path: str,
+    row_run_id: Any,
+    *,
+    active_root: Optional[str] = None,
+    roots_map: Optional[Dict[str, str]] = None,
+) -> bool:
+    """True if `row_run_id` was recorded against a target compatible with `active_root`."""
+    eff_active = active_target_root() if active_root is None else active_root
+    if not eff_active:
+        return True
+    rid = str(row_run_id or "").strip()
+    if not rid:
+        return True
+    mapping = run_target_roots(db_path) if roots_map is None else roots_map
+    recorded = mapping.get(rid, "")
+    return run_targets_compatible(eff_active, recorded)
+
+
 def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = "",
                    verified_evidence: Optional[bool] = None,
                    finding_evidence: Optional[Dict[str, dict]] = None):
@@ -955,6 +1090,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
     """
     with _db(db_path) as conn:
         cursor = conn.cursor()
+        _ensure_run_target_root(conn, run_id, active_target_root(filepath))
         # Which campaign is reporting: `filepath` is the campaign's target
         # (the tools pass RunContext.target_file). Recorded on every row the
         # campaign writes and kept on a re-report by another campaign; see
@@ -1751,11 +1887,17 @@ def prior_findings_touching(db_path: str, current_run_id: str, rel_paths: Sequen
         rows = read_findings(db_path, scope_path=scope_path)
     except Exception:
         return []
+    roots_map = run_target_roots(db_path)
+    eff_root = active_target_root(scope_path or "")
     candidates: List[Dict[str, Any]] = []
     direct_ids: set = set()
     touched_lineages: set = set()
     for f in rows:
         if str(f.get("run_id") or "") == str(current_run_id):
+            continue
+        if not run_belongs_to_active_target(
+            db_path, f.get("run_id"), active_root=eff_root, roots_map=roots_map
+        ):
             continue
         if str(f.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
             continue
@@ -2072,6 +2214,7 @@ def record_okf_concept(db_path: str, run_id: str, concept: Dict[str, Any]):
             "DELETE FROM okf_concepts WHERE run_id = ? AND concept_id = ? AND resource = ?",
             (run_id, concept_id, res),
         )
+        _ensure_run_target_root(conn, run_id, active_target_root())
         cursor.execute("""
             INSERT OR REPLACE INTO okf_concepts (
                 run_id, concept_id, type, title, resource, tags, status,
@@ -2358,6 +2501,7 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
     resource = str((metadata or {}).get("resource") or "")
     with _db(db_path) as conn:
         cursor = conn.cursor()
+        _ensure_run_target_root(conn, run_id, active_target_root(resource))
         meta_str = json.dumps(metadata or {})
         rows = cursor.execute("SELECT id, metadata_json FROM campaign_artifacts WHERE run_id = ? AND filepath = ?",
                               (run_id, filepath)).fetchall()
@@ -2562,6 +2706,8 @@ def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] =
             cursor.execute(
                 "INSERT OR IGNORE INTO runs (run_id, model, metadata_json) VALUES (?, ?, ?)",
                 (str(run_id), str(model or ""), json.dumps(metadata or {})))
+            if metadata and metadata.get("target_root"):
+                _ensure_run_target_root(conn, run_id, str(metadata["target_root"]))
         return True
     except (sqlite3.Error, OSError, TypeError, ValueError):
         return False
@@ -2584,6 +2730,7 @@ def record_learning(db_path: str, run_id: str, category: str, learning: str, tag
     """Record a learning entry for cross-pass feedback, deduplicating within a run."""
     with _db(db_path) as conn:
         cursor = conn.cursor()
+        _ensure_run_target_root(conn, run_id, active_target_root())
         tags_str = json.dumps(tags or [])
         cursor.execute(
             "SELECT id FROM learnings WHERE run_id = ? AND category = ? AND learning = ? LIMIT 1",
@@ -2725,8 +2872,11 @@ def query_historical_lineage(
     signature: str = "",
     lineage_id: str = "",
     filepath: str = "",
+    target_root: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieves all historical occurrences and lifecycle states of a finding lineage across runs."""
+    eff_root = active_target_root(filepath) if target_root is None else target_root
+    roots_map = run_target_roots(db_path) if eff_root else {}
     with _db(db_path) as conn:
         cursor = conn.cursor()
         query = "SELECT * FROM findings WHERE 1=1"
@@ -2748,6 +2898,10 @@ def query_historical_lineage(
         rows = []
         for r in cursor.fetchall():
             row_dict = dict(r)
+            if eff_root and not run_belongs_to_active_target(
+                db_path, row_dict.get("run_id"), active_root=eff_root, roots_map=roots_map
+            ):
+                continue
             if row_dict.get("line_numbers"):
                 try:
                     parsed = json.loads(row_dict["line_numbers"])
@@ -2861,11 +3015,27 @@ def _compact_vulnerability_pattern(body: str, desc: str = "") -> str:
     return res.strip()
 
 
-def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] = None, full: bool = False) -> Dict[str, Any]:
+def query_security_guidance(
+    db_path: str,
+    filepath: str,
+    run_id: Optional[str] = None,
+    full: bool = False,
+    target_root: Optional[str] = None,
+) -> Dict[str, Any]:
     """Aggregates active threat models, OKF concepts, historical vulnerabilities, triaged false positives,
     recurrent lineages, and verified remediation patterns into actionable security guidance for a target file.
     """
     from core.llm_gateway import SecretScrubber, safe_markdown_fence, safe_markdown_inline, safe_markdown_span
+
+    eff_root = active_target_root(filepath) if target_root is None else target_root
+    roots_map = run_target_roots(db_path) if eff_root else {}
+
+    def _same_target(row_run_id: Any) -> bool:
+        if not eff_root:
+            return True
+        return run_belongs_to_active_target(
+            db_path, row_run_id, active_root=eff_root, roots_map=roots_map
+        )
 
     with _db(db_path) as conn:
         cursor = conn.cursor()
@@ -2873,6 +3043,7 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
 
         # 1. OKF Concepts (Scoped to Target File)
         scoped_okf = read_okf_concepts(db_path, resource=norm_fp, run_id=run_id, include_repo_wide=True) if norm_fp else read_okf_concepts(db_path, run_id=run_id)
+        scoped_okf = [c for c in scoped_okf if _same_target(c.get("run_id"))]
         
         # Extract scoped threat boundaries, component entities, architecture summaries, security invariants, and vulnerability patterns
         threat_concepts = [c for c in scoped_okf if c.get("type") in ("Threat Boundary", "Threat Model")]
@@ -2913,13 +3084,15 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
                 ("artifact_type = ?", ["threat_model"]),
                 ("filepath = ?", ["workspace/kb/THREAT_MODEL.md"]),
             ):
-                tm_query = f"SELECT content, metadata_json FROM campaign_artifacts WHERE {where}"
+                tm_query = f"SELECT run_id, content, metadata_json FROM campaign_artifacts WHERE {where}"
                 tm_params = list(base_params)
                 if run_id:
                     tm_query += " AND run_id = ?"
                     tm_params.append(run_id)
                 tm_query += " ORDER BY id DESC"
                 for art_row in cursor.execute(tm_query, tm_params).fetchall():
+                    if not _same_target(art_row["run_id"]):
+                        continue
                     content = art_row["content"] or ""
                     if not content:
                         continue
@@ -2955,7 +3128,7 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
                 ORDER BY timestamp DESC, id DESC
             """
             cursor.execute(query_confirmed)
-        confirmed_rows = [dict(r) for r in cursor.fetchall()]
+        confirmed_rows = [dict(r) for r in cursor.fetchall() if _same_target(r["run_id"])]
         for c in confirmed_rows:
             if "embedding" in c:
                 c["embedding"] = None
@@ -2976,41 +3149,76 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
                 ORDER BY timestamp DESC, id DESC
             """
             cursor.execute(query_fp)
-        fp_rows = [dict(r) for r in cursor.fetchall()]
+        fp_rows = [dict(r) for r in cursor.fetchall() if _same_target(r["run_id"])]
         for fp_item in fp_rows:
             if "embedding" in fp_item:
                 fp_item["embedding"] = None
 
         # 4. Recurrent Lineages (lineage_ids appearing >= 2 times)
-        if norm_fp:
-            query_recurrent = """
-                SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
-                       MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
-                       GROUP_CONCAT(DISTINCT status) as observed_statuses
-                FROM findings
-                WHERE filepath = ?
-                  AND lineage_id IS NOT NULL AND lineage_id != ''
-                GROUP BY lineage_id
-                HAVING COUNT(*) >= 2
-                ORDER BY occurrence_count DESC
-            """
-            cursor.execute(query_recurrent, (norm_fp,))
+        if eff_root:
+            if norm_fp:
+                cursor.execute(
+                    "SELECT lineage_id, run_id, signature, title, timestamp, status FROM findings "
+                    "WHERE filepath = ? AND lineage_id IS NOT NULL AND lineage_id != ''",
+                    (norm_fp,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT lineage_id, run_id, signature, title, timestamp, status FROM findings "
+                    "WHERE lineage_id IS NOT NULL AND lineage_id != ''"
+                )
+            grouped: Dict[str, List[sqlite3.Row]] = {}
+            for r in cursor.fetchall():
+                if _same_target(r["run_id"]):
+                    grouped.setdefault(str(r["lineage_id"]), []).append(r)
+            recurrent_lineages = []
+            for lid, items in grouped.items():
+                if len(items) < 2:
+                    continue
+                sigs = [str(it["signature"]) for it in items if it["signature"] is not None]
+                titles = [str(it["title"]) for it in items if it["title"] is not None]
+                stamps = [str(it["timestamp"]) for it in items if it["timestamp"] is not None]
+                obs = sorted({str(it["status"]) for it in items if it["status"] is not None})
+                recurrent_lineages.append({
+                    "lineage_id": lid,
+                    "signature": min(sigs) if sigs else None,
+                    "title": min(titles) if titles else None,
+                    "occurrence_count": len(items),
+                    "first_seen": min(stamps) if stamps else None,
+                    "last_seen": max(stamps) if stamps else None,
+                    "observed_statuses": ",".join(obs),
+                })
+            recurrent_lineages.sort(key=lambda d: d["occurrence_count"], reverse=True)
         else:
-            query_recurrent = """
-                SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
-                       MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
-                       GROUP_CONCAT(DISTINCT status) as observed_statuses
-                FROM findings
-                WHERE lineage_id IS NOT NULL AND lineage_id != ''
-                GROUP BY lineage_id
-                HAVING COUNT(*) >= 2
-                ORDER BY occurrence_count DESC
-            """
-            cursor.execute(query_recurrent)
-        recurrent_lineages = [dict(r) for r in cursor.fetchall()]
+            if norm_fp:
+                query_recurrent = """
+                    SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
+                           MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
+                           GROUP_CONCAT(DISTINCT status) as observed_statuses
+                    FROM findings
+                    WHERE filepath = ?
+                      AND lineage_id IS NOT NULL AND lineage_id != ''
+                    GROUP BY lineage_id
+                    HAVING COUNT(*) >= 2
+                    ORDER BY occurrence_count DESC
+                """
+                cursor.execute(query_recurrent, (norm_fp,))
+            else:
+                query_recurrent = """
+                    SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
+                           MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
+                           GROUP_CONCAT(DISTINCT status) as observed_statuses
+                    FROM findings
+                    WHERE lineage_id IS NOT NULL AND lineage_id != ''
+                    GROUP BY lineage_id
+                    HAVING COUNT(*) >= 2
+                    ORDER BY occurrence_count DESC
+                """
+                cursor.execute(query_recurrent)
+            recurrent_lineages = [dict(r) for r in cursor.fetchall()]
 
         # 5. Learned Invariants & Trajectory Rules
-        learnings = read_learnings(db_path)
+        learnings = [l for l in read_learnings(db_path) if _same_target(l.get("run_id"))]
 
         def _is_agent_claimed_human(c_item: Dict[str, Any]) -> bool:
             if c_item.get("agent_claimed_human"):

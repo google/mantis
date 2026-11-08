@@ -2468,7 +2468,12 @@ async def pipeline(
         from core.database import record_run
 
         run_model = normalize_model_id(str(config.get("default_model") or ""))
-        record_run(db_path, run_id, run_model)
+        _run_target_anchor = (
+            os.path.realpath(os.path.expanduser(path_root)).rstrip("/")
+            if path_root and os.path.isdir(os.path.expanduser(path_root))
+            else os.path.realpath(str(target_path.parent if target_path.is_file() else target_path)).rstrip("/")
+        )
+        record_run(db_path, run_id, run_model, metadata={"target_root": _run_target_anchor})
     except Exception as exc:
         print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
     # Memory from the repository: a checked-in knowledge export, read into
