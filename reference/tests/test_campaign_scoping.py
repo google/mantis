@@ -561,5 +561,103 @@ class SecurityGuidanceScopingTest(_DbTest):
         self.assertIn("Product Search", self._guidance_tm("routes/search.ts"))
 
 
+class CrossCampaignMutationIsolationTest(_DbTest):
+    """Per-id dismissals, dedupe merges, explicit-id rewrites, and calibration
+    updates must stay within the active campaign's scope."""
+
+    def setUp(self):
+        super().setUp()
+        write_findings(
+            self.db, "app/a.py",
+            [
+                _finding("camp-a-primary", "app/a.py", description="desc a1"),
+                _finding("camp-a-dup", "app/a.py", description="desc a2"),
+                _finding("camp-a-cross", "shared/sink.py", description="desc cross"),
+            ],
+            run_id="r1",
+        )
+        write_findings(
+            self.db, "other/b.py",
+            [
+                _finding("camp-b-primary", "other/b.py", description="desc b1"),
+                _finding("camp-b-dup", "other/b.py", description="desc b2"),
+            ],
+            run_id="r1",
+        )
+        self.ids = {f["title"]: f["id"] for f in read_findings(self.db, run_id="r1")}
+
+    def test_classifier_dismissal_cannot_dismiss_other_campaigns_finding(self):
+        from core.graph_loader import _persist_finding_dismissals
+
+        self.install_ctx(target_file="other/b.py", active_node="reviewer_classifier")
+        _persist_finding_dismissals("reviewer_classifier", [
+            {"finding_id": self.ids["camp-a-primary"], "route": "false_positive", "reason": "cross-campaign"},
+            {"finding_id": self.ids["camp-b-dup"], "route": "false_positive", "reason": "in-campaign"},
+        ])
+        statuses = _statuses_by_title(self.db)
+        self.assertEqual(statuses["camp-a-primary"], "reported")
+        self.assertEqual(statuses["camp-b-dup"], "false_positive")
+
+        # Campaign A can still dismiss its own cross-directory finding via ownership.
+        self.install_ctx(target_file="app/a.py", active_node="reviewer_classifier")
+        _persist_finding_dismissals("reviewer_classifier", [
+            {"finding_id": self.ids["camp-a-cross"], "route": "non_viable", "reason": "owned"},
+        ])
+        self.assertEqual(_statuses_by_title(self.db)["camp-a-cross"], "non_viable")
+
+    def test_dedupe_findings_cannot_merge_other_campaigns_findings(self):
+        from tools.research_tools import dedupe_findings
+
+        self.install_ctx(target_file="other/b.py", active_node="deduplicator")
+        dedupe_findings(
+            primary_title="camp-b-primary",
+            duplicate_titles=["camp-a-dup", "camp-b-dup"],
+            duplicate_ids=[self.ids["camp-a-primary"]],
+            reason="same bug",
+        )
+        statuses = _statuses_by_title(self.db)
+        self.assertEqual(statuses["camp-a-primary"], "reported")
+        self.assertEqual(statuses["camp-a-dup"], "reported")
+        self.assertEqual(statuses["camp-b-dup"], "duplicate_merged")
+        self.assertEqual(statuses["camp-b-primary"], "reported")
+
+    def test_report_findings_explicit_id_cannot_overwrite_other_campaign(self):
+        from tools.research_tools import report_findings
+
+        self.install_ctx(target_file="other/b.py", active_node="researcher")
+        report_findings([{
+            "id": self.ids["camp-a-primary"],
+            "title": "hijacked-title",
+            "filepath": "other/b.py",
+            "severity": "LOW",
+            "description": "hijacked description",
+        }])
+        by_id = {f["id"]: f for f in read_findings(self.db, run_id="r1")}
+        self.assertEqual(by_id[self.ids["camp-a-primary"]]["title"], "camp-a-primary")
+        self.assertEqual(by_id[self.ids["camp-a-primary"]]["filepath"], "app/a.py")
+
+    def test_calibrate_finding_cannot_recalibrate_other_campaign(self):
+        from tools.research_tools import calibrate_finding
+
+        self.install_ctx(target_file="other/b.py", active_node="calibrator")
+        calibrate_finding(
+            finding_id=self.ids["camp-a-primary"],
+            mantis_risk_score=1.5,
+            impact_score=1,
+            likelihood_score=1,
+            priority="LOW",
+        )
+        calibrate_finding(
+            finding_id=self.ids["camp-b-primary"],
+            mantis_risk_score=8.5,
+            impact_score=5,
+            likelihood_score=4,
+            priority="CRITICAL",
+        )
+        by_id = {f["id"]: f for f in read_findings(self.db, run_id="r1")}
+        self.assertIsNone(by_id[self.ids["camp-a-primary"]]["mantis_risk_score"])
+        self.assertEqual(by_id[self.ids["camp-b-primary"]]["mantis_risk_score"], 8.5)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1019,14 +1019,21 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 explicit_id = int(raw_id.strip())
 
             matched_id_row = None
+            id_own_clause, id_own_params = _ownership_clause(filepath, filepath)
             if explicit_id is not None:
-                # Scoped to this run: an id is a small integer a model can
-                # guess, and rows of other runs -- imported knowledge above
-                # all -- are not this run's to rewrite.
-                cursor.execute(
-                    "SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
-                    (explicit_id, run_id),
-                )
+                # Scoped to this run and campaign: an id is a small integer a
+                # model can guess, and rows of other runs or sibling campaigns
+                # are not this campaign's to rewrite.
+                if id_own_clause:
+                    cursor.execute(
+                        f"SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? AND {id_own_clause} LIMIT 1",
+                        (explicit_id, run_id, *id_own_params),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
+                        (explicit_id, run_id),
+                    )
                 matched_id_row = cursor.fetchone()
 
             finding_filepath = canonical_filepath(raw_fp, target_file=filepath if (filepath and not os.path.isdir(filepath)) else "")
@@ -1150,7 +1157,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             # the rest. The id is the model's (scoped to this run below) or
             # the row this report is updating.
             if patch_status == "VERIFIED_SECURE" and finding_evidence:
-                own_id = explicit_id
+                own_id = matched_id_row[0] if matched_id_row else (explicit_id if not id_own_clause else None)
                 if own_id is None and existing_row:
                     own_id = existing_row[0]
                 own = finding_evidence.get(str(own_id)) if own_id is not None else None
@@ -1270,18 +1277,22 @@ def update_finding_calibration(
     likelihood_score: Optional[int] = None,
     priority: Optional[str] = None,
     run_id: str = "",
+    scope_path: Optional[str] = None,
+    campaign: Optional[str] = None,
 ):
     """Updates per-finding calibration metrics on the canonical 0.1 - 10.0 scale."""
+    own_clause, own_params = _ownership_clause(scope_path, campaign)
+    own_sql = f" AND {own_clause}" if own_clause else ""
     with _db(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
+        cursor.execute(f"""
             UPDATE findings
             SET mantis_risk_score = ?,
                 impact_score = ?,
                 likelihood_score = ?,
                 priority = ?
-            WHERE id = ? AND (run_id = ? OR run_id = '')
-        """, (mantis_risk_score, impact_score, likelihood_score, priority, finding_id, run_id))
+            WHERE id = ? AND (run_id = ? OR run_id = ''){own_sql}
+        """, (mantis_risk_score, impact_score, likelihood_score, priority, finding_id, run_id, *own_params))
 
 def _terminal_clause_for(status: str) -> str:
     """SQL guard keeping status transitions monotonic.
@@ -1472,7 +1483,14 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str,
                 """, (new_tier, json.dumps(ver_list), c_id))
 
 
-def update_finding_status_by_id(db_path: str, finding_id: int, run_id: str, status: str):
+def update_finding_status_by_id(
+    db_path: str,
+    finding_id: int,
+    run_id: str,
+    status: str,
+    scope_path: Optional[str] = None,
+    campaign: Optional[str] = None,
+):
     """Update one finding's status by primary key, with the same monotonic
     guard as update_status.
 
@@ -1486,15 +1504,17 @@ def update_finding_status_by_id(db_path: str, finding_id: int, run_id: str, stat
         fid = int(finding_id)
     except (TypeError, ValueError):
         return
+    own_clause, own_params = _ownership_clause(scope_path, campaign)
+    own_sql = f" AND {own_clause}" if own_clause else ""
     with _db(db_path) as conn:
         cursor = conn.cursor()
         terminal_clause = _terminal_clause_for(status)
         cursor.execute(f"""
             UPDATE findings
             SET status = ?
-            WHERE id = ? AND run_id = ?
+            WHERE id = ? AND run_id = ?{own_sql}
               {terminal_clause}
-        """, (status, fid, run_id))
+        """, (status, fid, run_id, *own_params))
 
 
 # --- Regression checks: what a later run decided about an earlier finding ---------
@@ -2476,16 +2496,18 @@ def merge_findings(
     run_id: str = "",
     primary_id: Optional[int] = None,
     duplicate_ids: Optional[List[int]] = None,
+    scope_path: Optional[str] = None,
+    campaign: Optional[str] = None,
 ) -> int:
     """Marks duplicate findings as suppressed/merged in the database, safely protecting the primary finding.
 
-    Every statement is scoped to `run_id` and guarded by the monotonic
-    clause. The ids come from the deduplicator model, which also reads
-    finding text the target wrote, so they are guessable integers an
-    injected model can aim: unscoped, one call from run A merged a
-    patch_verified finding in run B, and the primary restore revived a row
-    the operator had merged on purpose. A primary_id outside the run is
-    ignored rather than trusted.
+    Every statement is scoped to `run_id` (and the active campaign when
+    `scope_path`/`campaign` is given) and guarded by the monotonic clause. The
+    ids come from the deduplicator model, which also reads finding text the
+    target wrote, so they are guessable integers an injected model can aim:
+    unscoped, one call from run A merged a patch_verified finding in run B, and
+    within a multi-campaign run one campaign could merge another campaign's
+    findings. A primary_id outside scope is ignored rather than trusted.
     """
     dup_titles = duplicate_titles or []
     dup_ids = duplicate_ids or []
@@ -2494,6 +2516,9 @@ def merge_findings(
 
     run_clause = "run_id = ?" if run_id else "(run_id IS NULL OR run_id = '')"
     run_params: List[Any] = [run_id] if run_id else []
+    own_clause, own_params = _ownership_clause(scope_path, campaign)
+    scope_clause = f"{run_clause} AND {own_clause}" if own_clause else run_clause
+    scope_params: List[Any] = [*run_params, *own_params]
     terminal = _terminal_clause_for("duplicate_merged")
 
     with _db(db_path) as conn:
@@ -2502,14 +2527,14 @@ def merge_findings(
 
         # 1. Resolve primary_id if not provided; a supplied one must be in scope.
         if primary_id is not None:
-            cursor.execute(f"SELECT 1 FROM findings WHERE id = ? AND {run_clause}",
-                           (primary_id, *run_params))
+            cursor.execute(f"SELECT 1 FROM findings WHERE id = ? AND {scope_clause}",
+                           (primary_id, *scope_params))
             if cursor.fetchone() is None:
                 primary_id = None
         if primary_id is None and primary_title:
             cursor.execute(
-                f"SELECT id FROM findings WHERE title = ? AND {run_clause} ORDER BY id ASC LIMIT 1",
-                (primary_title, *run_params),
+                f"SELECT id FROM findings WHERE title = ? AND {scope_clause} ORDER BY id ASC LIMIT 1",
+                (primary_title, *scope_params),
             )
             row = cursor.fetchone()
             if row:
@@ -2523,15 +2548,15 @@ def merge_findings(
                 UPDATE findings
                 SET status = 'duplicate_merged',
                     description = description || '\n[MERGED: Duplicate of ' || ? || ' - Reason: ' || ? || ']'
-                WHERE id = ? AND id != ? AND {run_clause} {terminal}
+                WHERE id = ? AND id != ? AND {scope_clause} {terminal}
             """, (primary_title, reason, d_id, primary_id if primary_id is not None else -1,
-                  *run_params))
+                  *scope_params))
             merged_count += cursor.rowcount
 
         # 3. Merge by duplicate_titles (strictly excluding primary_id)
         for dup in dup_titles:
-            where_clauses = ["title = ?", run_clause]
-            params: List[Any] = [primary_title, reason, dup, *run_params]
+            where_clauses = ["title = ?", scope_clause]
+            params: List[Any] = [primary_title, reason, dup, *scope_params]
             if primary_id is not None:
                 where_clauses.append("id != ?")
                 params.append(primary_id)
@@ -2546,12 +2571,12 @@ def merge_findings(
             merged_count += cursor.rowcount
 
         # 4. Invariant assertion: primary finding must NEVER remain in duplicate_merged status
-        #    -- for the primary this call just established, in this run.
+        #    -- for the primary this call just established, in this campaign's scope.
         if primary_id is not None:
             cursor.execute(
                 f"UPDATE findings SET status = 'static_confirmed' "
-                f"WHERE id = ? AND status = 'duplicate_merged' AND {run_clause}",
-                (primary_id, *run_params),
+                f"WHERE id = ? AND status = 'duplicate_merged' AND {scope_clause}",
+                (primary_id, *scope_params),
             )
 
         return merged_count

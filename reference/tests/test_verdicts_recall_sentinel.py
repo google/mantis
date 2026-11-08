@@ -379,7 +379,7 @@ class TestClassifierPerFindingVerdicts(unittest.TestCase):
         self.db = os.path.join(self.tmp, "p6.db")
         init_db(self.db)
 
-    def _run_classifier(self, node_input, target_file="app.py", run_id="r_p6",
+    def _run_classifier(self, node_input, target_file="", run_id="r_p6",
                         db_path=None, routes=("confirmed",)):
         node = gl.create_classifier("reviewer_classifier", list(routes))
         fn = node.__pydantic_private__["_func"]

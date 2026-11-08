@@ -350,12 +350,14 @@ def _persist_finding_dismissals(node_id: str, entries: list[dict]) -> None:
             return
         from core.database import update_finding_status_by_id
 
+        scope = getattr(rc, "target_file", None) or None
         for e in dismissals:
             if e["finding_id"] is None:
                 continue
             try:
                 update_finding_status_by_id(
-                    rc.db_path, e["finding_id"], rc.run_id, e["route"]
+                    rc.db_path, e["finding_id"], rc.run_id, e["route"],
+                    scope_path=scope, campaign=scope,
                 )
             except Exception as exc:
                 print(
@@ -2419,6 +2421,8 @@ def create_calibrator_node(
                     likelihood_score=calib.likelihood_score,
                     priority=calib.priority,
                     run_id=run_id,
+                    scope_path=target_file or None,
+                    campaign=target_file or None,
                 )
 
                 record_calibration(

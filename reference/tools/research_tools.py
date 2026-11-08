@@ -1268,6 +1268,7 @@ def calibrate_finding(
         pri = str(priority).upper()
         if pri not in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
             return f"Error: priority must be CRITICAL, HIGH, MEDIUM, or LOW, got {priority!r}."
+        scope = getattr(ctx, "target_file", None) or None
         update_finding_calibration(
             ctx.db_path,
             int(finding_id),
@@ -1276,6 +1277,8 @@ def calibrate_finding(
             int(likelihood_score),
             pri,
             run_id=ctx.run_id or "",
+            scope_path=scope,
+            campaign=scope,
         )
         return f"SUCCESS: Calibrated finding {finding_id} -> Risk Score: {val:.1f}/10.0, Priority: {pri}, Impact: {impact_score}/5, Likelihood: {likelihood_score}/5."
     except Exception as e:
@@ -1370,6 +1373,7 @@ async def write_file(filepath: str, content: str) -> str:
                                 val = float(item["mantis_risk_score"])
                                 if val > 10.0 and val <= 100.0:
                                     val = val / 10.0
+                                scope = getattr(ctx, "target_file", None) or None
                                 update_finding_calibration(
                                     ctx.db_path,
                                     int(f_id),
@@ -1378,6 +1382,8 @@ async def write_file(filepath: str, content: str) -> str:
                                     likelihood_score=int(item["likelihood_score"]) if "likelihood_score" in item else None,
                                     priority=str(item.get("priority")),
                                     run_id=ctx.run_id or "",
+                                    scope_path=scope,
+                                    campaign=scope,
                                 )
                             except (ValueError, TypeError):
                                 pass
@@ -1745,6 +1751,7 @@ def dedupe_findings(
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
     try:
+        scope = getattr(ctx, "target_file", None) or None
         count = db_merge_findings(
             ctx.db_path,
             primary_title=primary_title,
@@ -1753,6 +1760,8 @@ def dedupe_findings(
             run_id=ctx.run_id,
             primary_id=primary_id,
             duplicate_ids=duplicate_ids,
+            scope_path=scope,
+            campaign=scope,
         )
         return f"SUCCESS: Deduplicated {count} finding(s) under primary title '{primary_title}'."
     except Exception as e:
