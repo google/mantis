@@ -231,5 +231,141 @@ class OneParserTest(unittest.TestCase):
         self.assertEqual(res.returncode, 64, res.stderr[-500:])
 
 
+class SandboxDowngradeAndExitCodeTest(unittest.TestCase):
+    """MANTIS_ALLOW_SANDBOX_DOWNGRADE=1 propagates static-only into pipeline,
+    and exit code 2 is reserved strictly for budget pauses."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="mantis_downgrade_")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(os.path.realpath(self._tmp.name))
+        self.wf = self.tmp / "workflow.json"
+        shutil.copyfile(Path(_REF_ROOT) / "workflow.json", self.wf)
+        self.local = self.tmp / "workflow.local.json"
+        self.local.write_text(
+            json.dumps(
+                {
+                    "config": {
+                        "default_model": "openai/nonexistent",
+                        "api_base": "http://127.0.0.1:9",
+                        "sandbox": {"type": "gvisor", "options": {}},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.target = self.tmp / "app.py"
+        self.target.write_text("def f():\n    return 1\n", encoding="utf-8")
+
+    def test_run_launch_invalid_budget_returns_exit_usage_not_2(self):
+        from scripts.launch import run_launch
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = run_launch(target=str(self.target), max_time="not-a-duration")
+        self.assertEqual(rc, 64)
+
+    def test_refuse_silent_downgrade_exits_1_not_2(self):
+        from scripts.configure import _refuse_silent_downgrade
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MANTIS_ALLOW_SANDBOX_DOWNGRADE", None)
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    _refuse_silent_downgrade("sandbox unavailable")
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_allow_sandbox_downgrade_propagates_static_only_to_pipeline_without_persisting(self):
+        from scripts.launch import run_launch
+
+        captured: dict = {}
+
+        async def _fake_pipeline(**kwargs):
+            captured.update(kwargs)
+            return 0
+
+        caps = {
+            "available_sandboxes": ["static-only"],
+            "recommended_sandbox": "static-only",
+            "microsandbox_image": None,
+        }
+        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+        env["OPENAI_API_KEY"] = "dummy"
+        env["MANTIS_ALLOW_SANDBOX_DOWNGRADE"] = "1"
+        with patch.dict(os.environ, env, clear=True), \
+             patch("scripts.configure.detect_capabilities", return_value=caps), \
+             patch("scripts.launch.pipeline", side_effect=_fake_pipeline), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            rc = run_launch(
+                target=str(self.target),
+                workflow_path=str(self.wf),
+                model="openai/override-model",
+                assume_yes=True,
+            )
+
+        self.assertEqual(rc, 0)
+        sb_override = captured.get("sandbox_override")
+        self.assertEqual(sb_override, {"type": "static-only", "options": {}})
+        # Overlay on disk must still hold 'gvisor' (session-only downgrade).
+        disk_overlay = json.loads(self.local.read_text(encoding="utf-8"))
+        self.assertEqual(disk_overlay["config"]["sandbox"]["type"], "gvisor")
+
+    def test_pipeline_direct_call_propagates_downgrade_and_runtime_sandbox_error_exits_1(self):
+        import main as mantis_main
+
+        caps = {
+            "available_sandboxes": ["static-only"],
+            "recommended_sandbox": "static-only",
+            "microsandbox_image": None,
+        }
+        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+        env["OPENAI_API_KEY"] = "dummy"
+
+        # 1. With MANTIS_ALLOW_SANDBOX_DOWNGRADE=1, pipeline loads static-only
+        # instead of reloading gvisor from workflow.local.json (aborted at work
+        # plan confirmation so no LLM call is needed).
+        env_ok = {**env, "MANTIS_ALLOW_SANDBOX_DOWNGRADE": "1"}
+        seen_Configs: list = []
+        orig_load = mantis_main.load_workflow_from_json
+
+        def _spy_load(*a, **kw):
+            wf, cfg = orig_load(*a, **kw)
+            seen_Configs.append(cfg)
+            return wf, cfg
+
+        with patch.dict(os.environ, env_ok, clear=True), \
+             patch("scripts.configure.detect_capabilities", return_value=caps), \
+             patch.object(mantis_main, "load_workflow_from_json", side_effect=_spy_load), \
+             patch.object(mantis_main, "_confirm_work_plan", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            rc = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=str(self.target),
+                    workflow_path=str(self.wf),
+                    db_override=str(self.tmp / "k.db"),
+                )
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen_Configs[-1]["sandbox"]["type"], "static-only")
+
+        # 2. If build_sandbox raises RuntimeError at preflight (e.g. auto_configure=False),
+        # pipeline returns 1 (fatal error), never 2 (reserved for budget pause).
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(mantis_main, "_confirm_work_plan", return_value=True), \
+             patch.object(mantis_main, "build_sandbox", side_effect=RuntimeError("boom")), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            rc_err = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=str(self.target),
+                    workflow_path=str(self.wf),
+                    db_override=str(self.tmp / "k2.db"),
+                    auto_configure=False,
+                )
+            )
+        self.assertEqual(rc_err, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

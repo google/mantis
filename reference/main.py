@@ -2332,6 +2332,7 @@ async def pipeline(
     if reasoning_effort_override:
         banner_resume_flags["--reasoning-effort"] = reasoning_effort_override
 
+    effective_sandbox_override = sandbox_override
     # Auto-resolve unconfigured placeholders if enabled
     if auto_configure:
         try:
@@ -2349,12 +2350,19 @@ async def pipeline(
                 overrides["timeout"] = timeout_override
             if reasoning_effort_override:
                 overrides["reasoning_effort"] = reasoning_effort_override
-            await ensure_configured_async(
+            configured_cfg = await ensure_configured_async(
                 workflow_path,
                 auto=True,
                 overrides=overrides if overrides else None,
                 persist_overrides=save_config,
             )
+            if (
+                not effective_sandbox_override
+                and os.environ.get("MANTIS_ALLOW_SANDBOX_DOWNGRADE") == "1"
+                and isinstance(configured_cfg, dict)
+                and (configured_cfg.get("sandbox") or {}).get("type") in ("static-only", "static")
+            ):
+                effective_sandbox_override = {"type": "static-only", "options": {}}
         except Exception as ce:
             print(f"[CONFIG WARNING] Auto-configuration check: {ce}", file=sys.stderr)
 
@@ -2364,7 +2372,7 @@ async def pipeline(
             workflow_path,
             model_override=model_override,
             api_base_override=api_base_override,
-            sandbox_override=sandbox_override,
+            sandbox_override=effective_sandbox_override,
             db_override=db_override,
             timeout_override=timeout_override,
             reasoning_effort_override=reasoning_effort_override,
@@ -3148,7 +3156,7 @@ async def pipeline(
         await test_sandbox.aclose()
     except (ValueError, TypeError, RuntimeError) as e:
         print(f"Sandbox Configuration Error: {e}", file=sys.stderr)
-        return 2
+        return 1
 
     compaction_config = None
     use_compaction = config.get("enable_compaction", False) if enable_compaction is None else enable_compaction

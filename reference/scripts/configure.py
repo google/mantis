@@ -884,7 +884,7 @@ def _refuse_silent_downgrade(reason: str) -> None:
         "MANTIS_ALLOW_SANDBOX_DOWNGRADE=1. Downgrades are never persisted.",
         file=sys.stderr,
     )
-    raise SystemExit(2)
+    raise SystemExit(1)
 
 
 def _sandbox_choice_is_explicit(workflow_path: str) -> bool:
@@ -994,19 +994,38 @@ async def ensure_configured_async(
         and not _sandbox_choice_is_explicit(target_wf)
     )
 
+    preflight_ran = False
+    preflight_msgs: List[str] = []
     if not is_unconf and not overrides and sb_available and not promote_to_microsandbox:
-        ok, _ = await run_preflight_checks_async(cfg, probe_llm=probe_llm)
+        preflight_ran = True
+        ok, preflight_msgs = await run_preflight_checks_async(cfg, probe_llm=probe_llm)
         if ok:
             if sb_type in ("static-only", "static"):
                 _print_static_floor_hint(caps)
             return cfg
 
     updates: dict[str, Any] = {}
+    downgraded_sandbox: Optional[dict[str, Any]] = None
 
     if interactive:
         return run_interactive_wizard(target_wf)
 
     if auto:
+        sb_preflight_failed = preflight_ran and any(
+            m.startswith("[SANDBOX PREFLIGHT] ❌") for m in preflight_msgs
+        )
+        if (
+            not preflight_ran
+            and sb_available
+            and sb_type not in ("static-only", "static")
+            and os.environ.get("MANTIS_ALLOW_SANDBOX_DOWNGRADE") == "1"
+        ):
+            _, pf_msgs = await run_preflight_checks_async(
+                cfg, test_llm=False, test_sandbox=True, probe_llm=False
+            )
+            sb_preflight_failed = any(
+                m.startswith("[SANDBOX PREFLIGHT] ❌") for m in pf_msgs
+            )
         if promote_to_microsandbox:
             msb_image = caps["microsandbox_image"]
             updates["sandbox"] = {
@@ -1029,7 +1048,7 @@ async def ensure_configured_async(
             cur_proj = sb_opts.get("project", "")
             if is_placeholder(cur_proj):
                 resolved_proj = caps.get("gcp_project") or caps.get("vertex_project")
-                if resolved_proj and "gce" in caps.get("available_sandboxes", []):
+                if resolved_proj and "gce" in caps.get("available_sandboxes", []) and not sb_preflight_failed:
                     sb_opts["project"] = resolved_proj
                     updates["sandbox"] = {"type": "gce", "options": sb_opts}
                     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", resolved_proj)
@@ -1042,23 +1061,28 @@ async def ensure_configured_async(
                         "⚠️  [REPRO DISABLED] Operator-approved downgrade 'gce' -> 'static-only' for THIS SESSION ONLY."
                     )
                     # Session-only: not added to updates, so never persisted to workflow.local.json
-                    cfg = {**cfg, "sandbox": {"type": "static-only", "options": {}}}
-            elif "gce" not in caps.get("available_sandboxes", []):
+                    downgraded_sandbox = {"type": "static-only", "options": {}}
+                    cfg = {**cfg, "sandbox": dict(downgraded_sandbox)}
+            elif "gce" not in caps.get("available_sandboxes", []) or sb_preflight_failed:
                 _refuse_silent_downgrade(
                     "Host lacks requirements for 'gce' sandbox (gcloud/auth missing)."
                 )
                 print(
                     "⚠️  [REPRO DISABLED] Operator-approved downgrade 'gce' -> 'static-only' for THIS SESSION ONLY."
                 )
-                cfg = {**cfg, "sandbox": {"type": "static-only", "options": {}}}
-        elif sb_type not in caps.get("available_sandboxes", []):
+                downgraded_sandbox = {"type": "static-only", "options": {}}
+                cfg = {**cfg, "sandbox": dict(downgraded_sandbox)}
+        elif sb_type not in caps.get("available_sandboxes", []) or (
+            sb_type not in ("static-only", "static") and sb_preflight_failed
+        ):
             _refuse_silent_downgrade(
                 f"Host lacks requirements for '{sb_type}' sandbox."
             )
             print(
                 f"⚠️  [REPRO DISABLED] Operator-approved downgrade '{sb_type}' -> 'static-only' for THIS SESSION ONLY."
             )
-            cfg = {**cfg, "sandbox": {"type": "static-only", "options": {}}}
+            downgraded_sandbox = {"type": "static-only", "options": {}}
+            cfg = {**cfg, "sandbox": dict(downgraded_sandbox)}
 
         # Auto-resolve Model
         model = cfg.get("default_model", DEFAULT_MODEL)
@@ -1101,7 +1125,10 @@ async def ensure_configured_async(
                     wf_data = update_workflow_config(
                         target_wf, {**all_updates, **overrides}, save=False, save_tracked=save_tracked
                     )
-                return wf_data.get("config", {})
+                ret_cfg = dict(wf_data.get("config", {}))
+                if downgraded_sandbox is not None and "sandbox" not in overrides:
+                    ret_cfg["sandbox"] = dict(downgraded_sandbox)
+                return ret_cfg
 
     return cfg
 

@@ -47,6 +47,7 @@ from scripts.configure import (
     is_default_or_unconfigured,
     load_workflow_dict,
     run_preflight_checks,
+    update_workflow_config,
 )
 
 
@@ -490,7 +491,7 @@ def run_launch(
             cli_budget_overrides["max_tokens"] = parse_token_budget(token_budget)
     except ValueError as ve:
         print(f"❌ Error: {ve}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
     # --no-budget disables both RUN-level spend ceilings (0 = unbounded). Expressed
     # as CLI overrides so the normal effective-budget merge and the dry-run
     # display both see it; deliberately leaves the runaway-loop guards alone.
@@ -532,6 +533,8 @@ def run_launch(
                 probe_llm=probe_llm,
                 persist_overrides=save_config,
             )
+        elif overrides:
+            cfg = update_workflow_config(wf_file, overrides, save=False).get("config", cfg)
         ok, messages = run_preflight_checks(cfg, target_path=str(target_path), probe_llm=probe_llm)
         if not ok:
             print("\n❌ Preflight Verification Failed:", file=sys.stderr)
@@ -648,6 +651,7 @@ def run_launch(
     wf_file = find_workflow_json(workflow_path)
     wf_data = load_workflow_dict(wf_file, load_local=False if objective else True)
     cfg = wf_data.get("config", {})
+    initial_sb_type = (cfg.get("sandbox") or {}).get("type")
 
     # Resolve effective budget: CLI overrides > workflow budget > default BudgetConfig
     wf_budget_raw = wf_data.get("budget") or cfg.get("budget") or {}
@@ -706,6 +710,8 @@ def run_launch(
                 probe_llm=probe_llm,
                 persist_overrides=save_config,
             )
+    elif overrides:
+        cfg = update_workflow_config(wf_file, overrides, save=False).get("config", cfg)
 
     # Preflight Check
     ok, messages = run_preflight_checks(cfg, target_path=str(target_path), probe_llm=probe_llm)
@@ -761,6 +767,17 @@ def run_launch(
             print(f"  • Resume Run ID: {'most recent run' if resume_run_id == 'latest' else resume_run_id}")
         return 0
 
+    effective_sandbox_override: Optional[dict | str] = sandbox
+    if (
+        not effective_sandbox_override
+        and os.environ.get("MANTIS_ALLOW_SANDBOX_DOWNGRADE") == "1"
+        and initial_sb_type not in (None, "", "static-only", "static")
+        and (cfg.get("sandbox") or {}).get("type") in ("static-only", "static")
+    ):
+        # Propagate the session-only downgrade into pipeline() in memory (as a
+        # dict so banner_resume_flags does not turn it into sticky --sandbox).
+        effective_sandbox_override = {"type": "static-only", "options": {}}
+
     # Launch Pipeline
     try:
         return asyncio.run(
@@ -769,7 +786,7 @@ def run_launch(
                 workflow_path=wf_file,
                 model_override=model,
                 api_base_override=api_base,
-                sandbox_override=sandbox,
+                sandbox_override=effective_sandbox_override,
                 db_override=db_path,
                 timeout_override=timeout,
                 reasoning_effort_override=reasoning_effort,
