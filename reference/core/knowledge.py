@@ -42,6 +42,8 @@ import json
 import os
 import re
 import sqlite3
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -439,6 +441,140 @@ def read_head(in_dir: str) -> str:
     return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{7,64}", head) else ""
 
 
+def _raw_starts_within_repo(raw_dir: str, repo_root: Optional[str]) -> bool:
+    """True when `raw_dir` is relative or lexically begins under `repo_root`."""
+    if not repo_root:
+        return False
+    raw_s = str(raw_dir)
+    if not os.path.isabs(raw_s):
+        return True
+    for base in (str(repo_root), os.path.abspath(repo_root), os.path.realpath(repo_root)):
+        prefix = base.rstrip(os.sep) + os.sep
+        if raw_s == base.rstrip(os.sep) or raw_s.startswith(prefix):
+            return True
+    return False
+
+
+def _validate_knowledge_dir(target_dir: str, repo_root: Optional[str], *, create: bool,
+                            err_cls: type[Exception]) -> Path:
+    """Validates `target_dir` against symlink traversal and repo escape.
+
+    Refuses symlinks on `target_dir`, on any intermediate directory under
+    `repo_root` (when `target_dir` targets the repository), and on any entry
+    already present inside `target_dir`. Also refuses paths inside `.git`.
+    """
+    raw_s = str(target_dir or "").strip()
+    if not raw_s:
+        raise err_cls("knowledge directory path is empty")
+
+    in_repo = _raw_starts_within_repo(raw_s, repo_root)
+    if in_repo and repo_root:
+        repo_real = Path(os.path.realpath(repo_root))
+        if os.path.isabs(raw_s):
+            # Preserve lexical `..` segments relative to whichever repo spelling matched.
+            matched_base = next(
+                b.rstrip(os.sep)
+                for b in (str(repo_root), os.path.abspath(repo_root), str(repo_real))
+                if raw_s == b.rstrip(os.sep) or raw_s.startswith(b.rstrip(os.sep) + os.sep)
+            )
+            rel_raw = raw_s[len(matched_base):].lstrip(os.sep)
+        else:
+            rel_raw = raw_s
+        parts = [p for p in rel_raw.replace("\\", "/").split("/") if p and p != "."]
+        if any(p == ".." for p in parts):
+            raise err_cls(f"refusing parent traversal in knowledge directory '{target_dir}'")
+        if ".git" in parts:
+            raise err_cls(f"refusing knowledge directory inside .git: '{target_dir}'")
+        cur = repo_real
+        for part in parts:
+            cur = cur / part
+            if os.path.lexists(cur):
+                st = os.lstat(cur)
+                if stat.S_ISLNK(st.st_mode):
+                    raise err_cls(f"refusing symlink component '{cur}' along knowledge directory")
+                if not stat.S_ISDIR(st.st_mode):
+                    raise err_cls(f"knowledge directory component '{cur}' is not a directory")
+            elif create:
+                cur.mkdir(mode=0o755, exist_ok=False)
+            else:
+                raise err_cls(f"{target_dir} is not a directory")
+        resolved = Path(os.path.realpath(cur))
+        try:
+            rel_resolved = resolved.relative_to(repo_real)
+        except ValueError as exc:
+            raise err_cls(f"knowledge directory '{target_dir}' resolves outside repository '{repo_real}'") from exc
+        if ".git" in rel_resolved.parts:
+            raise err_cls(f"refusing knowledge directory inside .git: '{target_dir}'")
+        out = cur
+    else:
+        raw_path = Path(raw_s)
+        if os.path.islink(raw_path):
+            raise err_cls(f"refusing symlinked knowledge directory '{target_dir}'")
+        abs_path = Path(os.path.abspath(raw_s))
+        if ".git" in abs_path.parts:
+            raise err_cls(f"refusing knowledge directory inside .git: '{target_dir}'")
+        # Walk from the deepest existing ancestor so newly created segments and
+        # the leaf directory are verified with lstat (without tripping on OS root
+        # aliases such as /var -> /private/var).
+        missing: List[str] = []
+        probe = abs_path
+        while not os.path.lexists(probe):
+            missing.append(probe.name)
+            if probe.parent == probe:
+                break
+            probe = probe.parent
+        if os.path.lexists(probe):
+            st = os.lstat(probe)
+            if stat.S_ISLNK(st.st_mode):
+                raise err_cls(f"refusing symlink component '{probe}' along knowledge directory")
+            if not stat.S_ISDIR(st.st_mode):
+                raise err_cls(f"{target_dir} is not a directory")
+        if missing and not create:
+            raise err_cls(f"{target_dir} is not a directory")
+        cur = Path(os.path.realpath(probe))
+        for part in reversed(missing):
+            cur = cur / part
+            cur.mkdir(mode=0o755, exist_ok=False)
+        out = cur
+
+    with os.scandir(out) as it:
+        for entry in it:
+            if entry.is_symlink():
+                raise err_cls(f"refusing symlink '{entry.name}' inside knowledge directory '{target_dir}'")
+    return out
+
+
+def _atomic_write_text(out: Path, name: str, text: str) -> None:
+    """Writes `out / name` via a sibling temp file + os.replace without following symlinks."""
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise PermissionError(f"invalid knowledge filename '{name}'")
+    if os.path.islink(out):
+        raise PermissionError(f"refusing symlinked knowledge directory '{out}'")
+    dst = out / name
+    if os.path.lexists(dst):
+        st = os.lstat(dst)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"refusing to overwrite non-regular file or symlink '{dst}'")
+        if st.st_nlink > 1:
+            raise PermissionError(f"refusing to overwrite hard-linked file '{dst}'")
+    fd, tmp_path = tempfile.mkstemp(dir=str(out), prefix=f".{name}.", suffix=".tmp")
+    try:
+        data = text.encode("utf-8")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        if os.path.lexists(dst):
+            st = os.lstat(dst)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise PermissionError(f"refusing to overwrite non-regular file or symlink '{dst}'")
+        os.replace(tmp_path, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None,
                      head: Optional[str] = None) -> Dict[str, Any]:
     """Writes the knowledge base under `out_dir` as text. Returns counts.
@@ -451,8 +587,7 @@ def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None
     produce the same bytes, so a re-export after a run diffs to exactly what
     changed.
     """
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out = _validate_knowledge_dir(out_dir, repo_root, create=True, err_cls=PermissionError)
     conn = _connect(db_path)
     try:
         findings = _export_findings(conn, repo_root)
@@ -467,7 +602,7 @@ def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None
         conn.close()
 
     def write(name: str, text: str) -> None:
-        (out / name).write_text(text, encoding="utf-8")
+        _atomic_write_text(out, name, text)
 
     def pretty_json(raw: Optional[str]) -> Optional[str]:
         if raw is None:
@@ -491,15 +626,19 @@ def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None
                        (SUMMARY_JSON, pretty_json(_scrub(summary_json, 10**7) if summary_json else None))):
         if text:
             write(name, text if text.endswith("\n") else text + "\n")
-        elif (out / name).exists():
+        elif os.path.lexists(out / name):
+            if os.path.islink(out / name):
+                raise PermissionError(f"refusing to unlink symlink '{out / name}'")
             (out / name).unlink()
     write(COVERAGE, json.dumps(coverage, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
     write(README, README_TEXT)
     digest = hashlib.sha256()
     for name in (FINDINGS, LEARNINGS, THREAT_MODEL_JSON, THREAT_MODEL_MD, ARCHITECTURE_MD, SUMMARY_JSON, COVERAGE, RUNS):
         p = out / name
-        if p.exists():
-            digest.update(name.encode()); digest.update(p.read_bytes())
+        raw_bytes = _read_bounded(p, MAX_FILE_BYTES)
+        if raw_bytes is not None:
+            digest.update(name.encode())
+            digest.update(raw_bytes)
     manifest = {"schema_version": SCHEMA_VERSION, "generator": "mantis", "counts": counts,
                 "models": models, "content_sha256": digest.hexdigest()}
     head = head if head is not None else _git_head(repo_root)
@@ -820,9 +959,7 @@ def import_knowledge(db_path: str, in_dir: str, run_id: str, repo_root: str,
     the directory is not an export this version reads; everything else
     degrades to "that part was not imported".
     """
-    src = Path(in_dir)
-    if not src.is_dir():
-        raise KnowledgeImportError(f"{in_dir} is not a directory")
+    src = _validate_knowledge_dir(in_dir, repo_root, create=False, err_cls=KnowledgeImportError)
     raw = _read_bounded(src / MANIFEST, 1 << 20)
     if raw is None:
         raise KnowledgeImportError(f"{in_dir} has no readable {MANIFEST}")

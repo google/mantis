@@ -109,7 +109,11 @@ def main(argv=None) -> int:
         if not os.path.exists(args.db):
             print(f"error: no database at {args.db}", file=sys.stderr)
             return 2
-        counts = export_knowledge(args.db, out, repo_root=repo)
+        try:
+            counts = export_knowledge(args.db, out, repo_root=repo)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print(f"Exported to {out}: {describe(counts)}.")
         return 0
     src = args.src or os.path.join(repo, KNOWLEDGE_DIR)

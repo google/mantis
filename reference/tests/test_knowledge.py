@@ -142,6 +142,36 @@ class TestExport(unittest.TestCase):
         self.assertTrue(Path(self.repo, K.KNOWLEDGE_DIR, K.FINDINGS).exists())
         self.assertIn("3 finding(s)", proc.stdout)
 
+    def test_export_refuses_symlinks_and_parent_traversal(self):
+        git_dir = Path(self.repo, ".git")
+        git_dir.mkdir()
+        git_cfg = git_dir / "config"
+        git_cfg.write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+
+        # 1. Symlinked target file inside .mantis/knowledge -> ../../.git/config
+        os.makedirs(self.out, exist_ok=True)
+        os.symlink("../../.git/config", os.path.join(self.out, K.THREAT_MODEL_MD))
+        with self.assertRaises(PermissionError):
+            K.export_knowledge(self.db, self.out, repo_root=self.repo)
+        self.assertEqual(git_cfg.read_text(encoding="utf-8"), "[core]\n\trepositoryformatversion = 0\n")
+        shutil.rmtree(self.out)
+
+        # 2. Symlinked .mantis/knowledge directory pointing outside the repository
+        outside = Path(self.tmp, "outside_victim")
+        outside.mkdir()
+        os.makedirs(os.path.dirname(self.out), exist_ok=True)
+        os.symlink(str(outside), self.out)
+        with self.assertRaises(PermissionError):
+            K.export_knowledge(self.db, self.out, repo_root=self.repo)
+        self.assertEqual(os.listdir(outside), [])
+        os.unlink(self.out)
+
+        # 3. Lexical parent traversal out of repo_root or into .git
+        with self.assertRaises(PermissionError):
+            K.export_knowledge(self.db, os.path.join(self.repo, ".mantis", "..", "..", "outside_victim"), repo_root=self.repo)
+        with self.assertRaises(PermissionError):
+            K.export_knowledge(self.db, os.path.join(self.repo, ".git", "knowledge"), repo_root=self.repo)
+
 
 class TestImport(unittest.TestCase):
     def setUp(self):
@@ -308,7 +338,6 @@ class TestImport(unittest.TestCase):
             "{" + "x" * (K.MAX_LINE_BYTES + 10) + "}",
         ]
         Path(hostile, K.FINDINGS).write_text("\n".join(lines) + "\n")
-        os.symlink("/etc/hostname", os.path.join(hostile, K.LEARNINGS))
         Path(hostile, K.THREAT_MODEL_JSON).write_text("{not json")
         Path(hostile, K.COVERAGE).write_text(json.dumps({"runs": [{"run_id": "r", "examined": ["../x", "src/ok.py"]}],
                                                          "scanned": [{"path": "../../x"}, {"path": "src/ok.py"}]}))
@@ -327,6 +356,15 @@ class TestImport(unittest.TestCase):
         self.assertLessEqual(len(rows[0]["description"]), K.MAX_TEXT_CHARS)
         from core.memory import load_coverage
         self.assertEqual(load_coverage(self.db, self.repo)["examined_ever"], [os.path.join(self.repo, "src/ok.py")])
+
+        # Symlinked export directory or symlinked file inside export directory is refused.
+        symlink_dir = os.path.join(self.tmp, "symlink_export")
+        os.symlink(self.export, symlink_dir)
+        with self.assertRaises(K.KnowledgeImportError):
+            K.import_knowledge(self.db, symlink_dir, run_id="r", repo_root=self.repo)
+        os.symlink("/etc/hostname", os.path.join(hostile, K.LEARNINGS))
+        with self.assertRaises(K.KnowledgeImportError):
+            K.import_knowledge(self.db, hostile, run_id="r", repo_root=self.repo)
 
     def test_main_flag_imports_before_the_run_and_skips_the_knowledge_dir(self):
         # No model: a dummy endpoint makes the run fail after planning, which is
@@ -349,8 +387,8 @@ class TestImport(unittest.TestCase):
         self.assertIn("2 campaigns", out, "the knowledge directory itself is not a scan target")
         self.assertEqual(len(read_findings(self.db)), 3)
         proc = subprocess.run(
-            [sys.executable, str(_REF_ROOT / "main.py"), self.repo, "--yes", "--db", self.db,
-             "--import-knowledge", os.path.join(self.tmp, "missing")],
+            [sys.executable, str(_REF_ROOT / "main.py"), self.repo, "--yes", "--sandbox", "static-only",
+             "--db", self.db, "--import-knowledge", os.path.join(self.tmp, "missing")],
             capture_output=True, text=True, timeout=240, env=env, cwd=str(_REF_ROOT))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("--import-knowledge", proc.stdout + proc.stderr)
