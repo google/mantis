@@ -65,23 +65,34 @@ ensure the following prerequisites are installed and configured:
      available in `PATH` (`/usr/bin/python3`). Without `python3`, instance
      startup fails fail-closed during guest isolation verification.
 
-3. **Pre-Warmed Build Tools & Dependencies**:
+3. **Pre-Warmed Build Tools & Trusted Dependency Caches**:
 
    - Because the isolated VPC has zero external internet routing and no Cloud
      NAT, all compilers, build runtimes, package manager caches, test
-     frameworks, and dependencies needed to compile the target repository and
-     reproduce vulnerabilities must be pre-installed and pre-built on the VM
-     before capturing the disk image.
+     frameworks, and third-party libraries needed to compile the target and
+     reproduce vulnerabilities must be pre-installed on the builder VM from
+     trusted distributions or pinned registries before capturing the disk image.
+   - Do **not** clone or build an untrusted target repository on the builder VM;
+     `GceEnvironment` stages the vetted checkout into each ephemeral isolated VM
+     at runtime.
 
 ### Image Capture Workflow
 
-1. Provision a development VM with all necessary build runtimes, compilers,
-   package managers, and test suites.
+1. Provision a clean builder VM and install all necessary build runtimes,
+   compilers, package managers, and test frameworks from trusted OS/language
+   repositories.
 2. Confirm that passwordless `sudo` and `python3` are configured as described
    above.
-3. Build your target repository on the VM to warm all local build caches,
-   dependencies, and artifacts.
+3. Warm language/package caches from trusted, operator-vetted dependency lists
+   only (never by running an untrusted target repository's build scripts).
 4. Capture a custom disk image from the source build VM:
+
+> [!WARNING] **Never Build Untrusted Targets on the Image Builder VM**: Running
+> `make`, `pip install`, `npm install`, `cargo build`, or other build commands
+> inside an untrusted checkout executes repository-controlled hooks (`setup.py`,
+> `build.rs`, `postinstall`, compiler plugins) on a networked VM and persists
+> any modifications into every subsequent sandbox instance booted from the
+> image.
 
 ```bash
 gcloud compute images create "${IMAGE_NAME}" \

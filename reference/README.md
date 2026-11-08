@@ -951,7 +951,8 @@ gcloud dns response-policies rules create block-all-domains \
     --dns-name="*." \
     --local-data=name="*.",type="A",ttl=300,rrdatas="0.0.0.0"
 
-# 4. Create Assessment Disk Image from your pre-warmed build/dev VM
+# 4. Create Assessment Disk Image from a trusted toolchain VM
+#    (install toolchains/caches from trusted sources only; never build an untrusted target on the builder VM)
 gcloud compute images create "${IMAGE_NAME}" \
     --project="${PROJECT_ID}" \
     --source-disk="${DEV_BUILD_VM}" \
