@@ -2770,13 +2770,6 @@ def load_workflow_from_json(
                 if schema_cls is None:
                     errors.append(f"Node {node_id}: unknown output_schema '{node_cfg.output_schema}'")
                     node_has_error = True
-            if node_cfg.fork_from is not None:
-                if node_cfg.fork_from == node_id:
-                    errors.append(f"Node {node_id}: fork_from names itself.")
-                    node_has_error = True
-                elif node_cfg.fork_from not in agent_node_ids:
-                    errors.append(f"Node {node_id}: fork_from '{node_cfg.fork_from}' is not an agent node of this graph.")
-                    node_has_error = True
                 elif node_cfg.output_schema == "ReviewVerdict" and ExtendedReviewVerdict is not None:
                     # P6: bind the extended schema so the reviewer CAN return
                     # per-finding verdicts. This must happen at bind time, not
@@ -2792,6 +2785,13 @@ def load_workflow_from_json(
                     # extended model, the canonical schema stays bound and
                     # behavior is exactly pre-P6.
                     schema_cls = ExtendedReviewVerdict
+            if node_cfg.fork_from is not None:
+                if node_cfg.fork_from == node_id:
+                    errors.append(f"Node {node_id}: fork_from names itself.")
+                    node_has_error = True
+                elif node_cfg.fork_from not in agent_node_ids:
+                    errors.append(f"Node {node_id}: fork_from '{node_cfg.fork_from}' is not an agent node of this graph.")
+                    node_has_error = True
 
             if node_has_error:
                 continue

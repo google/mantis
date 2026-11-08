@@ -180,6 +180,24 @@ class TestExtendedVerdictWireCompat(unittest.TestCase):
         )
         self.assertEqual(fv.finding_id, 1)
 
+    def test_shipped_reviewer_node_binds_extended_verdict_without_fork_from(self):
+        """Regression test: shipped workflow.json has no fork_from on reviewer,
+        yet reviewer MUST bind ExtendedReviewVerdict and receive the
+        PER-FINDING VERDICTS instruction contract."""
+        wf_path = Path(_REF_ROOT) / "workflow.json"
+        wf, _cfg = gl.load_workflow_from_json(str(wf_path), load_local=False)
+        reviewer_agent = None
+        for edge in wf.edges:
+            for n in (edge.from_node, edge.to_node):
+                agent = getattr(n, "agent", n)
+                if getattr(agent, "name", None) == "reviewer":
+                    reviewer_agent = agent
+                    break
+        self.assertIsNotNone(reviewer_agent)
+        self.assertIs(reviewer_agent.output_schema, ExtendedReviewVerdict)
+        inst = reviewer_agent.instruction(None)
+        self.assertIn("PER-FINDING VERDICTS:", inst)
+
 
 # ===========================================================================
 # P6-2: _coerce_finding_verdicts normalization
