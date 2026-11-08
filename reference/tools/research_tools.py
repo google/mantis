@@ -2149,6 +2149,7 @@ def _run_safe_git_command(
 
     base_cmd = [
         "git",
+        "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -2195,6 +2196,7 @@ def _run_safe_git_command(
         str(ceiling_dir) if ceiling_dir is not None else str(repo_dir.resolve().parent)
     )
     git_env["GIT_NO_LAZY_FETCH"] = "1"
+    git_env["GIT_OPTIONAL_LOCKS"] = "0"
     git_env["GIT_TERMINAL_PROMPT"] = "0"
     git_env["GIT_ASKPASS"] = "/usr/bin/false"
     git_env["GIT_SSH_COMMAND"] = "/usr/bin/false"
@@ -2320,6 +2322,12 @@ def _validate_git_jail(repo_dir: Path, jail_dir: Path) -> tuple[bool, str]:
         if not ok:
             return False, err
 
+    validated_gitdirs: set[Path] = set()
+    for base in {git_dir_real, common_dir_real}:
+        ok, err = _validate_gitdir_tree(base, repo_dir, jail_real, validated_gitdirs, is_nested=False)
+        if not ok:
+            return False, err
+
     # SECURITY (INV-4): Inspect the worktree for nested .git directories or gitlinks.
     # If a submodule checkout or nested repository exists within repo_dir, ensure its
     # internals contain no jail-escaping symlinks/hardlinks and its config contains no unvetted directives.
@@ -2356,29 +2364,120 @@ def _validate_git_jail(repo_dir: Path, jail_dir: Path) -> tuple[bool, str]:
                 return False, f"Nested git metadata '{nested.name}' is a prohibited symlink."
             if nested.is_file():
                 try:
-                    first_line = nested.read_text(encoding="utf-8", errors="replace").splitlines()[0]
-                    if first_line.startswith("gitdir:"):
-                        gd_path = first_line.removeprefix("gitdir:").strip()
-                        resolved_gd = (nested.parent / gd_path).resolve()
-                        resolved_gd.relative_to(jail_real)
+                    lines = nested.read_text(encoding="utf-8", errors="replace").splitlines()
+                    first_line = lines[0] if lines else ""
+                    if not first_line.startswith("gitdir:"):
+                        return False, f"Invalid nested git pointer file '{nested}'."
+                    gd_path = first_line.removeprefix("gitdir:").strip()
+                    if not gd_path:
+                        return False, f"Empty nested git pointer file '{nested}'."
+                    raw_gd = Path(gd_path) if os.path.isabs(gd_path) else (nested.parent / gd_path)
+                    if raw_gd.is_symlink():
+                        return False, f"Nested git pointer target '{raw_gd}' is a prohibited symlink."
+                    resolved_gd = raw_gd.resolve()
+                    resolved_gd.relative_to(jail_real)
                 except (ValueError, IndexError, OSError):
                     return False, f"Nested git pointer file '{nested}' resolves outside jail boundary."
+                if not resolved_gd.is_dir():
+                    return False, f"Nested git pointer target '{resolved_gd}' is not a directory."
+                if resolved_gd not in validated_gitdirs:
+                    ok, err = _assert_no_symlinks_under(resolved_gd, jail_real)
+                    if not ok:
+                        return False, err
+                    ok, err = _validate_gitdir_tree(resolved_gd, repo_dir, jail_real, validated_gitdirs)
+                    if not ok:
+                        return False, err
             elif nested.is_dir():
                 ok, err = _assert_no_symlinks_under(nested, jail_real)
                 if not ok:
                     return False, err
-                nested_cfg = nested / "config"
-                if nested_cfg.is_file() and not nested_cfg.is_symlink():
-                    n_out, n_ok = _run_safe_git_command(
-                        ["config", "--file", str(nested_cfg), "--no-includes", "--name-only", "-z", "-l"],
-                        repo_dir,
-                    )
-                    if n_ok:
-                        for line in n_out.split("\0"):
-                            key = line.strip()
-                            if key and not _is_git_config_key_allowed(key):
-                                return False, f"Prohibited or unvetted git configuration key '{key}' in nested submodule."
+                ok, err = _validate_gitdir_tree(nested, repo_dir, jail_real, validated_gitdirs)
+                if not ok:
+                    return False, err
 
+    return True, ""
+
+
+def _validate_gitdir_tree(
+    git_dir_base: Path,
+    repo_dir: Path,
+    jail_real: Path,
+    validated: set[Path],
+    *,
+    is_nested: bool = True,
+) -> tuple[bool, str]:
+    """Audits every config, commondir, and alternates file anywhere under a gitdir.
+
+    Submodules store their metadata under `.git/modules/<name>/config` (or at an
+    arbitrary in-jail target named by a `gitdir:` pointer), and linked worktrees
+    store overrides under `.git/worktrees/<name>/config.worktree`. Walking the
+    entire gitdir ensures no child git invocation can load an unvetted config.
+    """
+    base_real = git_dir_base.resolve()
+    if base_real in validated:
+        return True, ""
+    validated.add(base_real)
+
+    for walk_root, _dirs, walk_files in os.walk(str(base_real), followlinks=False):
+        root_p = Path(walk_root)
+        in_sub_tree = is_nested or (root_p != base_real)
+        label = "nested submodule" if in_sub_tree else "repository"
+        for fname in walk_files:
+            low = fname.lower()
+            entry = root_p / fname
+            if low == "alternates" and root_p.name.lower() == "info" and root_p.parent.name.lower() == "objects":
+                return False, "External git object stores (objects/info/alternates) are prohibited."
+            if low == "commondir":
+                try:
+                    rel_common = entry.read_text(encoding="utf-8", errors="replace").strip()
+                    if not rel_common:
+                        return False, f"Empty commondir file in '{root_p}'."
+                    target_common = (Path(rel_common) if os.path.isabs(rel_common) else (root_p / rel_common)).resolve()
+                    target_common.relative_to(jail_real)
+                except (ValueError, OSError):
+                    return False, f"Nested git commondir in '{root_p}' points outside jail boundary."
+                if target_common.is_dir() and target_common not in validated:
+                    ok, err = _assert_no_symlinks_under(target_common, jail_real)
+                    if not ok:
+                        return False, err
+                    ok, err = _validate_gitdir_tree(target_common, repo_dir, jail_real, validated, is_nested=True)
+                    if not ok:
+                        return False, err
+            if low == "config" or low.startswith("config."):
+                if low.endswith(".lock"):
+                    continue
+                c_out, c_ok = _run_safe_git_command(
+                    ["config", "--file", str(entry), "--no-includes", "--name-only", "-z", "-l"],
+                    repo_dir,
+                )
+                if not c_ok:
+                    return False, f"Failed to inspect git configuration '{entry.name}': {c_out}"
+                for line in c_out.split("\0"):
+                    key = line.strip()
+                    if not key:
+                        continue
+                    if key.lower() == "core.worktree" and in_sub_tree:
+                        wt_out, wt_ok = _run_safe_git_command(
+                            ["config", "--file", str(entry), "--no-includes", "-z", "--get-all", "core.worktree"],
+                            repo_dir,
+                        )
+                        wt_vals = [v for v in wt_out.split("\0") if v] if wt_ok else []
+                        wt_safe = bool(wt_vals)
+                        for wt_val in wt_vals:
+                            try:
+                                raw_wt = Path(wt_val) if os.path.isabs(wt_val) else (root_p / wt_val)
+                                if raw_wt.is_symlink():
+                                    wt_safe = False
+                                    break
+                                wt_real = raw_wt.resolve()
+                                wt_real.relative_to(jail_real)
+                            except (ValueError, OSError):
+                                wt_safe = False
+                                break
+                        if wt_safe:
+                            continue
+                    if not _is_git_config_key_allowed(key):
+                        return False, f"Prohibited or unvetted git configuration key '{key}' in {label}."
     return True, ""
 
 

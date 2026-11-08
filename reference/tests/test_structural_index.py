@@ -1155,6 +1155,73 @@ class SnapshotPinTest(unittest.TestCase):
             (Path(state_dir_for_db(str(self.tmp / "knowledge.db"))) / "manifest.json").read_text())
         self.assertEqual(manifest["snapshot_id"], f"git:{self.head}")
 
+    def test_snapshot_probe_does_not_rewrite_git_index(self):
+        # Touching a tracked file's mtime without changing its bytes normally
+        # causes `git status` to refresh `.git/index` unless optional locks are off.
+        target_py = self.code / "app" / "auth.py"
+        st = os.stat(target_py)
+        os.utime(target_py, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        git_index = self.code / ".git" / "index"
+        before_bytes = git_index.read_bytes()
+        before_mtime = os.stat(git_index).st_mtime_ns
+        self.assertEqual(git_snapshot_id(str(self.code)), f"git:{self.head}")
+        self.assertEqual(git_index.read_bytes(), before_bytes)
+        self.assertEqual(os.stat(git_index).st_mtime_ns, before_mtime)
+
+    def test_submodule_and_pointer_gitdir_configs_are_vetted_and_never_executed(self):
+        from tools.research_tools import _validate_git_jail
+
+        marker = self.tmp / "submodule_filter_ran"
+        # 1. Populated submodule with a hostile clean filter in .git/modules/sub/config
+        sub_src = self.tmp / "sub_src"
+        sub_src.mkdir()
+        (sub_src / "lib.py").write_text("x = 1\n")
+        _git_repo(sub_src)
+        subprocess.run(
+            ["git", "-C", str(self.code), "-c", "protocol.file.allow=always",
+             "submodule", "add", "-q", f"file://{sub_src}", "sub"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(self.code), "commit", "-q", "-m", "add sub"], check=True)
+        # Benign initialized submodule (with in-jail core.worktree) remains valid.
+        ok_clean, err_clean = _validate_git_jail(self.code, self.code)
+        self.assertTrue(ok_clean, f"benign submodule should pass git jail validation: {err_clean}")
+
+        (self.code / "sub" / ".gitattributes").write_text("* filter=evil\n")
+        (self.code / "sub" / "lib.py").write_text("x = 2\n")
+        mod_cfg = self.code / ".git" / "modules" / "sub" / "config"
+        base_mod_cfg = mod_cfg.read_text(encoding="utf-8")
+        with open(mod_cfg, "a", encoding="utf-8") as fh:
+            fh.write(f'\n[filter "evil"]\n\tclean = touch {marker}\n')
+
+        valid, err = _validate_git_jail(self.code, self.code)
+        self.assertFalse(valid, "unvetted filter in .git/modules/sub/config must fail git jail validation")
+        self.assertIn("filter.evil.clean", err)
+        self.assertEqual(git_snapshot_id(str(self.code)), "unknown")
+        self.assertFalse(marker.exists(), "git_snapshot_id must never execute submodule filter")
+
+        # Escaping core.worktree inside .git/modules/sub/config is also rejected.
+        mod_cfg.write_text("[core]\n\trepositoryformatversion = 0\n\tworktree = /tmp\n", encoding="utf-8")
+        valid_wt, err_wt = _validate_git_jail(self.code, self.code)
+        self.assertFalse(valid_wt)
+        self.assertIn("core.worktree", err_wt)
+
+        # 2. Clean out .git/modules/sub/config, then point nested/.git at an in-jail gitdir carrying filter.evil.clean
+        mod_cfg.write_text(base_mod_cfg, encoding="utf-8")
+        alt_gd = self.code / ".hidden_gitdir"
+        alt_gd.mkdir()
+        (alt_gd / "config").write_text(f'[core]\n\trepositoryformatversion = 0\n[filter "evil"]\n\tclean = touch {marker}\n')
+        nested_wt = self.code / "nested_wt"
+        nested_wt.mkdir()
+        (nested_wt / ".git").write_text("gitdir: ../.hidden_gitdir\n")
+
+        valid2, err2 = _validate_git_jail(self.code, self.code)
+        self.assertFalse(valid2, "unvetted config behind nested .git pointer must fail git jail validation")
+        self.assertIn("filter.evil.clean", err2)
+        self.assertEqual(git_snapshot_id(str(self.code)), "unknown")
+        self.assertFalse(marker.exists())
+
 
 class WorkflowTopologyTest(unittest.TestCase):
     """The shipped workflow keeps the structural_index node and topology."""

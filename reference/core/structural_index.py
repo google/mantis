@@ -604,7 +604,10 @@ def git_snapshot_id(code_root: str) -> str:
         if not ok or not re.fullmatch(r"[0-9a-f]{7,64}", head):
             return "unknown"
         dirty, ok = _run_safe_git_command(
-            ["status", "--porcelain", "--ignored", "--untracked-files=normal"], root, timeout=60)
+            ["status", "--porcelain", "--ignored", "--untracked-files=normal", "--ignore-submodules=all"],
+            root,
+            timeout=60,
+        )
         if not ok or dirty.strip():
             return "unknown"
         return f"git:{head}"
