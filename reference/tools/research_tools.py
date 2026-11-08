@@ -2219,6 +2219,85 @@ def _run_safe_git_command(
         return f"Error executing git: {e}", False
 
 
+def _run_safe_git_bytes(
+    cmd_args: list[str],
+    repo_dir: Path,
+    *,
+    input_bytes: Optional[bytes] = None,
+    ceiling_dir: Optional[Union[str, Path]] = None,
+    timeout: Optional[float] = None,
+) -> tuple[bytes, bool]:
+    """Binary-stdout counterpart to `_run_safe_git_command` with identical git hardening."""
+    from core.llm_gateway import get_sanitized_env
+
+    base_cmd = [
+        "git",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.quotePath=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "diff.tool=",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "log.showSignature=false",
+        "-c",
+        "gpg.program=/usr/bin/false",
+        "-c",
+        "gpg.ssh.program=/usr/bin/false",
+        "-c",
+        "gpg.x509.program=/usr/bin/false",
+        "-c",
+        "gpg.ssh.allowedSignersFile=/dev/null",
+        "-c",
+        "gpg.ssh.defaultKeyCommand=",
+        "-c",
+        "core.sshCommand=/usr/bin/false",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "diff.submodule=short",
+        "-c",
+        "submodule.recurse=false",
+        "-c",
+        f"core.worktree={repo_dir}",
+        "-C",
+        str(repo_dir),
+    ]
+    git_env = get_sanitized_env()
+    git_env["GIT_CONFIG_NOSYSTEM"] = "1"
+    git_env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    git_env["GIT_CEILING_DIRECTORIES"] = (
+        str(ceiling_dir) if ceiling_dir is not None else str(repo_dir.resolve().parent)
+    )
+    git_env["GIT_NO_LAZY_FETCH"] = "1"
+    git_env["GIT_OPTIONAL_LOCKS"] = "0"
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+    git_env["GIT_ASKPASS"] = "/usr/bin/false"
+    git_env["GIT_SSH_COMMAND"] = "/usr/bin/false"
+    effective_timeout = _resolve_git_timeout(timeout)
+    try:
+        res = subprocess.run(
+            base_cmd + cmd_args,
+            input=input_bytes,
+            capture_output=True,
+            text=False,
+            timeout=effective_timeout,
+            env=git_env,
+        )
+        if res.returncode != 0:
+            return res.stderr, False
+        return res.stdout, True
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return b"", False
+
+
 def _validate_git_jail(repo_dir: Path, jail_dir: Path) -> tuple[bool, str]:
     """Validates that repo_dir is a git repository strictly contained within jail_dir.
 

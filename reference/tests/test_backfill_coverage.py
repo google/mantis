@@ -86,6 +86,18 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(git_blob_identities(self.repo, "0" * 40, ["a.py"]), {}, "unknown commit: nothing")
         self.assertEqual(git_blob_identities(self.tmp, self.commit, ["a.py"]), {}, "not a repo: nothing")
 
+    def test_git_blob_identities_refuses_unvetted_repo_config_and_flag_commits(self):
+        marker = os.path.join(self.tmp, "fsmonitor_ran")
+        self.assertEqual(git_blob_identities(self.repo, "--all", ["a.py"]), {})
+        with open(os.path.join(self.repo, ".git", "config"), "a", encoding="utf-8") as fh:
+            fh.write(
+                f'\n[core]\n\tfsmonitor = touch {marker}\n'
+                '[extensions]\n\tpartialClone = origin\n'
+                '[remote "origin"]\n\tpromisor = true\n'
+            )
+        self.assertEqual(git_blob_identities(self.repo, self.commit, ["a.py"]), {})
+        self.assertFalse(os.path.exists(marker))
+
     def test_the_runs_recorded_commit_is_found_on_its_artifacts(self):
         self.assertEqual(run_snapshot_ids(self.db), {})
         record_artifact(self.db, RUN, "summary", "workspace/kb/summary.md", "x",

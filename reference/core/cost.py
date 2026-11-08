@@ -1387,26 +1387,50 @@ def git_blob_identities(repo_root: str, commit: str, rel_paths: Iterable[str]) -
     content ledger's own rule), with no mtime: a later check hashes rather
     than trusting a timestamp. Files absent at the commit are left out.
     {} when git is unavailable or the commit unknown. Never raises."""
-    import subprocess
-
-    rels = [str(p).replace(os.sep, "/") for p in rel_paths if str(p).strip()]
+    commit_clean = str(commit or "").strip()
+    if (
+        not commit_clean
+        or commit_clean.startswith("-")
+        or len(commit_clean) > 128
+        or not re.fullmatch(r"[a-zA-Z0-9~^._/-]+", commit_clean)
+    ):
+        return {}
+    rels = [
+        str(p).replace(os.sep, "/")
+        for p in rel_paths
+        if str(p).strip() and "\n" not in str(p) and "\r" not in str(p) and "\x00" not in str(p)
+    ]
     if not rels:
         return {}
     try:
-        subprocess.run(["git", "-C", repo_root, "cat-file", "-e", f"{commit}^{{commit}}"],
-                       check=True, capture_output=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
+        from tools.research_tools import (
+            _run_safe_git_bytes,
+            _run_safe_git_command,
+            _validate_git_jail,
+        )
+
+        root_path = Path(repo_root)
+        valid, _ = _validate_git_jail(root_path, root_path)
+        if not valid:
+            return {}
+        _, exists_ok = _run_safe_git_command(
+            ["cat-file", "-e", f"{commit_clean}^{{commit}}"],
+            root_path,
+            timeout=30,
+        )
+        if not exists_ok:
+            return {}
+        data, batch_ok = _run_safe_git_bytes(
+            ["cat-file", "--batch"],
+            root_path,
+            input_bytes="".join(f"{commit_clean}:{rel}\n" for rel in rels).encode("utf-8"),
+            timeout=600,
+        )
+        if not batch_ok:
+            return {}
+    except Exception:
         return {}
     out: dict = {}
-    try:
-        proc = subprocess.run(
-            ["git", "-C", repo_root, "cat-file", "--batch"],
-            input="".join(f"{commit}:{rel}\n" for rel in rels).encode("utf-8"),
-            capture_output=True, timeout=600,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    data = proc.stdout
     pos = 0
     for rel in rels:
         nl = data.find(b"\n", pos)
