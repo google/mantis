@@ -61,6 +61,31 @@ STATE_DIRNAME = "structural_index"
 # so truncation always drops the same tail.
 MAX_UNITS = 10000
 MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_TOTAL_SOURCE_BYTES = 200 * 1024 * 1024
+MAX_TOTAL_SYMBOLS = 250000
+
+
+def _resolve_index_limits() -> Tuple[int, int]:
+    """Returns `(max_total_source_bytes, max_total_symbols)` honoring env overrides."""
+    max_bytes = MAX_TOTAL_SOURCE_BYTES
+    raw_bytes = os.environ.get("MANTIS_MAX_INDEX_BYTES", "").strip()
+    if raw_bytes:
+        try:
+            parsed_b = int(raw_bytes)
+            if parsed_b > 0:
+                max_bytes = parsed_b
+        except ValueError:
+            pass
+    max_syms = MAX_TOTAL_SYMBOLS
+    raw_syms = os.environ.get("MANTIS_MAX_INDEX_SYMBOLS", "").strip()
+    if raw_syms:
+        try:
+            parsed_s = int(raw_syms)
+            if parsed_s > 0:
+                max_syms = parsed_s
+        except ValueError:
+            pass
+    return max_bytes, max_syms
 
 _EXT_LANGUAGES = {
     ".py": "python",
@@ -683,8 +708,17 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
     fingerprint = hashlib.sha256()
     reused = rebuilt = failed = 0
     languages_used: Dict[str, bool] = {}
+    max_total_bytes, max_total_symbols = _resolve_index_limits()
+    total_bytes_read = 0
+    total_symbols = 0
+    budget_exhausted = False
 
     for abs_path, rel_path in sources:
+        if budget_exhausted or total_bytes_read >= max_total_bytes or total_symbols >= max_total_symbols:
+            truncated = True
+            budget_exhausted = True
+            coverage_rows.append((rel_path, 0, "", "skipped_budget"))
+            continue
         language = _language_for(rel_path)
         # Size and type are checked on the inode BEFORE reading: read_bytes()
         # on a multi-gigabyte sparse file pulled the whole thing into memory
@@ -702,6 +736,11 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
         if st.st_size > MAX_FILE_BYTES:
             coverage_rows.append((rel_path, 0, "", "skipped_too_large"))
             continue
+        if total_bytes_read + st.st_size > max_total_bytes:
+            truncated = True
+            budget_exhausted = True
+            coverage_rows.append((rel_path, 0, "", "skipped_budget"))
+            continue
         try:
             raw = Path(abs_path).read_bytes()
         except Exception:
@@ -710,6 +749,11 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
             continue
         if len(raw) > MAX_FILE_BYTES:
             coverage_rows.append((rel_path, 0, "", "skipped_too_large"))
+            continue
+        if total_bytes_read + len(raw) > max_total_bytes:
+            truncated = True
+            budget_exhausted = True
+            coverage_rows.append((rel_path, 0, "", "skipped_budget"))
             continue
         content_sha = hashlib.sha256(raw).hexdigest()
         fingerprint.update(f"{rel_path}:{content_sha}\n".encode())
@@ -726,6 +770,14 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
             # The cache key is content-addressed, but a renamed file would
             # replay the old relative path; trust the cache only in place.
             if cached.get("file") == rel_path:
+                cached_syms = len(cached.get("symbols") or ())
+                if total_symbols + cached_syms > max_total_symbols:
+                    truncated = True
+                    budget_exhausted = True
+                    coverage_rows.append((rel_path, 0, cache_key, "skipped_budget"))
+                    continue
+                total_bytes_read += len(raw)
+                total_symbols += cached_syms
                 units.append(cached)
                 coverage_rows.append((rel_path, 1, cache_key, "indexed"))
                 languages_used[language] = True
@@ -744,6 +796,14 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
             failed += 1
             coverage_rows.append((rel_path, 0, cache_key, "failed"))
             continue
+        unit_syms = len(unit.get("symbols") or ())
+        if total_symbols + unit_syms > max_total_symbols:
+            truncated = True
+            budget_exhausted = True
+            coverage_rows.append((rel_path, 0, cache_key, "skipped_budget"))
+            continue
+        total_bytes_read += len(raw)
+        total_symbols += unit_syms
         units.append(unit)
         coverage_rows.append((rel_path, 1, cache_key, "indexed"))
         languages_used[language] = True

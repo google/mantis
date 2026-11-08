@@ -1155,6 +1155,66 @@ class SnapshotPinTest(unittest.TestCase):
             (Path(state_dir_for_db(str(self.tmp / "knowledge.db"))) / "manifest.json").read_text())
         self.assertEqual(manifest["snapshot_id"], f"git:{self.head}")
 
+    def test_pipeline_node_offloads_build_from_event_loop_thread(self):
+        import asyncio
+        import threading
+        import core.structural_index as sidx
+
+        (self.tmp / "knowledge.db").touch()
+        real_build = sidx.build_structural_index
+        build_threads = []
+
+        def _spy_build(*a, **k):
+            build_threads.append(threading.get_ident())
+            return real_build(*a, **k)
+
+        loop_threads = []
+
+        async def _exercise():
+            loop_threads.append(threading.get_ident())
+            return await self._run_node()
+
+        with mock.patch.object(sidx, "build_structural_index", side_effect=_spy_build):
+            ev = asyncio.run(_exercise())
+        self.assertIn("Structural index complete", ev.output)
+        self.assertEqual(len(build_threads), 1)
+        self.assertNotEqual(build_threads[0], loop_threads[0])
+
+    def test_global_byte_and_symbol_caps_degrade_to_partial_index(self):
+        import core.structural_index as sidx
+
+        big_repo = self.tmp / "capped_repo"
+        big_repo.mkdir()
+        for idx in range(4):
+            (big_repo / f"m{idx}.py").write_text(
+                "\n".join(f"def fn_{idx}_{j}():\n    return {j}\n" for j in range(5)),
+                encoding="utf-8",
+            )
+        sample_size = (big_repo / "m0.py").stat().st_size
+
+        # 1. Cumulative byte cap stops after first 2 files and marks tail skipped_budget -> partial.
+        state_bytes = self.tmp / "state_bytes"
+        with mock.patch.object(sidx, "MAX_TOTAL_SOURCE_BYTES", sample_size * 2 + 4):
+            res_b = build_structural_index(str(big_repo), str(state_bytes), "unknown")
+        self.assertEqual(res_b["status"], "partial")
+        self.assertTrue(res_b["truncated"])
+        self.assertEqual(res_b["coverage"]["total_files"], 4)
+        self.assertEqual(res_b["coverage"]["indexed_files"], 2)
+        with sqlite3.connect(str(state_bytes / "catalog.sqlite")) as conn:
+            statuses = dict(conn.execute("SELECT file_path, status FROM coverage").fetchall())
+        self.assertEqual(statuses["m0.py"], "indexed")
+        self.assertEqual(statuses["m1.py"], "indexed")
+        self.assertEqual(statuses["m2.py"], "skipped_budget")
+        self.assertEqual(statuses["m3.py"], "skipped_budget")
+
+        # 2. Cumulative symbol cap (<module> + 5 functions = 6 symbols per file) caps at 1 file.
+        state_syms = self.tmp / "state_syms"
+        with mock.patch.object(sidx, "MAX_TOTAL_SYMBOLS", 8):
+            res_s = build_structural_index(str(big_repo), str(state_syms), "unknown")
+        self.assertEqual(res_s["status"], "partial")
+        self.assertTrue(res_s["truncated"])
+        self.assertEqual(res_s["coverage"]["indexed_files"], 1)
+
     def test_snapshot_probe_does_not_rewrite_git_index(self):
         # Touching a tracked file's mtime without changing its bytes normally
         # causes `git status` to refresh `.git/index` unless optional locks are off.

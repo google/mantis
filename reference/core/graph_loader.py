@@ -2067,6 +2067,7 @@ def create_structural_index_node(node_id: str):
 
         rc = current_run_context.get()
         try:
+            import asyncio
             from core.paths import resolve_db_path
             from core.structural_index import build_structural_index, git_snapshot_id, state_dir_for_db
 
@@ -2085,8 +2086,13 @@ def create_structural_index_node(node_id: str):
             state_dir = state_dir_for_db(resolve_db_path(db_path))
             # Pinned, a rebuild of the same clean checkout reuses the
             # published catalog instead of re-resolving every call edge.
-            snapshot_id = getattr(rc, "snapshot_id", "") or git_snapshot_id(jail)
-            res = build_structural_index(jail, state_dir, snapshot_id)
+            # Offloaded to a worker thread so tree-sitter parsing and SQLite
+            # catalog writes do not block the asyncio event loop.
+            def _build_sync() -> dict[str, Any]:
+                snap = getattr(rc, "snapshot_id", "") or git_snapshot_id(jail)
+                return build_structural_index(jail, state_dir, snap)
+
+            res = await asyncio.to_thread(_build_sync)
             cov = res.get("coverage") or {}
             units = res.get("units") or {}
             summary = (
