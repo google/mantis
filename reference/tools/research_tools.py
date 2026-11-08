@@ -1768,6 +1768,55 @@ def dedupe_findings(
         return f"ERROR DEDUPLICATING FINDINGS: {e}"
 
 
+def record_patch(
+    finding_id: int,
+    patch_diff: str,
+    reattack_status: str = "failed_to_bypass",
+    remediation: str = "",
+) -> str:
+    """Records a remediation patch diff for a finding and updates patch verification status from dynamic re-attack evidence."""
+    from core.database import record_finding_patch
+
+    ctx = current_run_context.get()
+    if ctx is None or not ctx.db_path:
+        return "Error: No active execution context or database path."
+    if not str(patch_diff or "").strip():
+        return "Error: patch_diff must be a non-empty unified diff."
+    norm_reattack = str(reattack_status or "failed_to_bypass").strip().lower()
+    if norm_reattack not in ("failed_to_bypass", "bypassed", "not_attempted"):
+        return (
+            f"Error: reattack_status must be 'failed_to_bypass', 'bypassed', or "
+            f"'not_attempted', got {reattack_status!r}."
+        )
+    has_dynamic_sb = (
+        getattr(ctx, "sandbox", None) is not None
+        and type(ctx.sandbox).__name__ not in ("StaticOnlyEnvironment", "StaticOnlySandbox")
+    )
+    verified_ev = bool(has_dynamic_sb and getattr(ctx, "sandbox_executed", False))
+    scope = getattr(ctx, "target_file", None) or None
+    try:
+        res = record_finding_patch(
+            ctx.db_path,
+            int(finding_id),
+            run_id=ctx.run_id or "",
+            patch_diff=patch_diff,
+            reattack_status=norm_reattack,
+            remediation=remediation,
+            verified_evidence=verified_ev,
+            finding_evidence=getattr(ctx, "finding_evidence", None),
+            scope_path=scope,
+            campaign=scope,
+        )
+        if res is None:
+            return f"Error: Finding {finding_id} not found in active campaign scope."
+        return (
+            f"SUCCESS: Recorded patch for finding {res['finding_id']} "
+            f"(patch_status={res['patch_status']}, status={res['status']})."
+        )
+    except Exception as e:
+        return f"ERROR RECORDING PATCH: {e}"
+
+
 def generate_report(report: dict) -> str:
     """Validates and records the executive vulnerability review packet solely into the SQLite database."""
     from core.schemas import ExecutiveReport

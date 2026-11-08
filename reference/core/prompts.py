@@ -190,6 +190,7 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "sentinel_<finding_id> path. A finding is VERIFIED_SECURE only when its own re-attack returns "
         "evidence_present=False after its own reproduction returned True; re-attacking one finding says nothing "
         "about another, and a PoC that no longer runs (setup failure) is inconclusive, not blocked.\n"
+        "- Persist each patched finding's unified diff and re-attack outcome with record_patch(finding_id=..., patch_diff=..., reattack_status=..., remediation=...).\n"
         + TRUNCATION_RULE +
         "- Query patch lineage with query_lineage to ensure changes follow regression-free semantics."
     ),

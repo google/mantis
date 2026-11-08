@@ -686,6 +686,7 @@ class TestUntrustedContentFramingAndScrubbing(unittest.IsolatedAsyncioTestCase):
             "record_exploit_chain",
             "record_learning",
             "dedupe_findings",
+            "record_patch",
             "generate_report",
             "apply_patch",
             "run_sandbox_with_evidence",

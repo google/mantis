@@ -121,7 +121,7 @@
       "id": "patcher",
       "type": "agent",
       "reasoning_effort": "high",
-      "tools": ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage", "find_symbol", "find_callers", "find_callees", "get_function_boundary"],
+      "tools": ["apply_patch", "record_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage", "find_symbol", "find_callers", "find_callees", "get_function_boundary"],
       "on_enter_status": "dynamic_confirmed"
     },
     {

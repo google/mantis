@@ -367,5 +367,120 @@ class StaticOnlySentinelIsolationTest(_Base):
             )
 
 
+class RecordPatchToolTest(_Base):
+    """record_patch makes VERIFIED_SECURE / patch_verified reachable on the
+    shipped patcher node, strictly gated on dynamic per-finding evidence."""
+
+    def test_shipped_patcher_node_declares_record_patch(self):
+        import json
+
+        wf = json.loads((_REF_ROOT / "workflow.json").read_text(encoding="utf-8"))
+        patcher = next(n for n in wf["nodes"] if n["id"] == "patcher")
+        self.assertIn("record_patch", patcher["tools"])
+
+    async def test_verified_reattack_promotes_only_that_finding_to_patch_verified(self):
+        from tools.research_tools import record_patch
+
+        ids = self._seed(2)
+        sb = _ScriptedSandbox(stdout=TOKEN + "\n")
+        ctx = self._ctx(sandbox=sb, node="reproducer")
+        await run_sandbox_with_evidence("python3 poc.py", finding_id=ids[0])
+
+        ctx.active_node = "patcher"
+        sb.stdout = "Attack blocked cleanly\n"
+        await run_sandbox_with_evidence("python3 poc.py", finding_id=ids[0])
+
+        res0 = record_patch(
+            finding_id=ids[0],
+            patch_diff="--- a/pkg/mod1.py\n+++ b/pkg/mod1.py\n@@ -1 +1 @@\n-bad()\n+good()\n",
+            reattack_status="failed_to_bypass",
+            remediation="Use parameterized query",
+        )
+        self.assertIn("VERIFIED_SECURE", res0)
+        self.assertIn("patch_verified", res0)
+
+        # Sibling finding without its own reproduction + re-attack stays VERIFICATION_INCOMPLETE.
+        res1 = record_patch(
+            finding_id=ids[1],
+            patch_diff="--- a/pkg/mod2.py\n+++ b/pkg/mod2.py\n@@ -1 +1 @@\n-x\n+y\n",
+            reattack_status="failed_to_bypass",
+        )
+        self.assertIn("VERIFICATION_INCOMPLETE", res1)
+
+        by_id = {r["id"]: r for r in read_findings(self.db, run_id="run-1")}
+        self.assertEqual(by_id[ids[0]]["patch_status"], "VERIFIED_SECURE")
+        self.assertEqual(by_id[ids[0]]["status"], "patch_verified")
+        self.assertEqual(by_id[ids[0]]["remediation"], "Use parameterized query")
+        self.assertEqual(by_id[ids[1]]["patch_status"], "VERIFICATION_INCOMPLETE")
+        self.assertEqual(by_id[ids[1]]["status"], "static_confirmed")
+
+    async def test_bypassed_reattack_marks_verification_failed(self):
+        from tools.research_tools import record_patch
+
+        ids = self._seed(1)
+        sb = _ScriptedSandbox(stdout=TOKEN + "\n")
+        ctx = self._ctx(sandbox=sb, node="reproducer")
+        await run_sandbox_with_evidence("python3 poc.py", finding_id=ids[0])
+
+        ctx.active_node = "patcher"
+        await run_sandbox_with_evidence("python3 poc.py", finding_id=ids[0])  # still reaches sink
+
+        res = record_patch(
+            finding_id=ids[0],
+            patch_diff="--- a/pkg/mod1.py\n+++ b/pkg/mod1.py\n@@ -1 +1 @@\n-bad()\n+still_bad()\n",
+            reattack_status="failed_to_bypass",
+        )
+        self.assertIn("VERIFICATION_FAILED", res)
+        row = read_findings(self.db, run_id="run-1")[0]
+        self.assertEqual(row["patch_status"], "VERIFICATION_FAILED")
+        self.assertEqual(row["status"], "static_confirmed")
+
+    async def test_static_only_sandbox_cannot_record_verified_secure(self):
+        from core.environments.static_env import StaticOnlyEnvironment
+        from tools.research_tools import record_patch
+
+        ids = self._seed(1)
+        ctx = self._ctx(sandbox=StaticOnlyEnvironment(target_path=self.target), node="patcher")
+        ctx.sandbox_executed = True
+        ctx.finding_evidence = {
+            str(ids[0]): {"reproduced": True, "reattacked": True, "reattack_present": False}
+        }
+        res = record_patch(
+            finding_id=ids[0],
+            patch_diff="--- a/pkg/mod1.py\n+++ b/pkg/mod1.py\n@@ -1 +1 @@\n-a\n+b\n",
+            reattack_status="failed_to_bypass",
+        )
+        self.assertIn("VERIFICATION_INCOMPLETE", res)
+        row = read_findings(self.db, run_id="run-1")[0]
+        self.assertEqual(row["patch_status"], "VERIFICATION_INCOMPLETE")
+        self.assertEqual(row["status"], "static_confirmed")
+
+    async def test_out_of_campaign_finding_id_is_rejected(self):
+        from tools.research_tools import record_patch
+
+        write_findings(
+            self.db, "other/b.py",
+            [{"title": "other bug", "severity": "HIGH", "status": "dynamic_confirmed",
+              "description": "d", "line_numbers": [1], "filepath": "other/b.py", "cwe": "CWE-89"}],
+            run_id="run-1",
+        )
+        other_id = read_findings(self.db, run_id="run-1")[0]["id"]
+        ctx = RunContext(
+            jail_dir=self.target, db_path=self.db, target_file="pkg/mod1.py",
+            sandbox=_ScriptedSandbox(stdout="ok"), run_id="run-1", active_node="patcher",
+        )
+        tok = current_run_context.set(ctx)
+        try:
+            res = record_patch(
+                finding_id=other_id,
+                patch_diff="--- a/other/b.py\n+++ b/other/b.py\n@@ -1 +1 @@\n-x\n+y\n",
+            )
+        finally:
+            current_run_context.reset(tok)
+        self.assertIn("not found in active campaign scope", res)
+        row = read_findings(self.db, run_id="run-1")[0]
+        self.assertEqual(row["patch_status"] or "", "")
+
+
 if __name__ == "__main__":
     unittest.main()

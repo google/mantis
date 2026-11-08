@@ -1517,6 +1517,144 @@ def update_finding_status_by_id(
         """, (status, fid, run_id, *own_params))
 
 
+def record_finding_patch(
+    db_path: str,
+    finding_id: int,
+    run_id: str,
+    patch_diff: str,
+    reattack_status: str = "failed_to_bypass",
+    remediation: str = "",
+    verified_evidence: bool = False,
+    finding_evidence: Optional[Dict[str, dict]] = None,
+    scope_path: Optional[str] = None,
+    campaign: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Persists a finding's patch diff and deterministically gates VERIFIED_SECURE / patch_verified.
+
+    Requires dynamic sandbox execution (`verified_evidence`) AND per-finding
+    attributed evidence (`reproduced=True`, `reattacked=True`,
+    `reattack_present=False`) before setting `patch_status='VERIFIED_SECURE'`
+    and advancing `status` to `'patch_verified'`. Returns None when the
+    finding is outside `run_id` or the active campaign scope.
+    """
+    try:
+        fid = int(finding_id)
+    except (TypeError, ValueError):
+        return None
+
+    own_clause, own_params = _ownership_clause(scope_path, campaign)
+    own_sql = f" AND {own_clause}" if own_clause else ""
+    norm_reattack = str(reattack_status or "").strip().lower()
+    clean_diff = str(patch_diff or "")
+
+    with _db(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT id, filepath, status, patch_status, patch_diff, remediation "
+            f"FROM findings WHERE id = ? AND run_id = ?{own_sql} LIMIT 1",
+            (fid, run_id, *own_params),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+
+        finding_fp = str(row[1] or "")
+        prev_patch_status = str(row[3] or "")
+        prev_patch_diff = str(row[4] or "")
+        effective_remediation = str(remediation).strip() if str(remediation or "").strip() else row[5]
+
+        own_ev = (finding_evidence or {}).get(str(fid)) if isinstance(finding_evidence, dict) else None
+        ev_verified = bool(
+            isinstance(own_ev, dict)
+            and own_ev.get("reproduced")
+            and own_ev.get("reattacked")
+            and not own_ev.get("reattack_present")
+        )
+        is_verified = bool(
+            clean_diff.strip()
+            and norm_reattack == "failed_to_bypass"
+            and verified_evidence
+            and ev_verified
+        )
+
+        if is_verified:
+            computed_patch_status = "VERIFIED_SECURE"
+        elif prev_patch_status.upper() == "VERIFIED_SECURE":
+            computed_patch_status = "VERIFIED_SECURE"
+            if not clean_diff.strip():
+                clean_diff = prev_patch_diff
+        elif norm_reattack == "bypassed" or (
+            isinstance(own_ev, dict) and own_ev.get("reattacked") and own_ev.get("reattack_present")
+        ):
+            computed_patch_status = "VERIFICATION_FAILED"
+        else:
+            computed_patch_status = "VERIFICATION_INCOMPLETE"
+
+        cursor.execute(
+            f"""
+            UPDATE findings
+            SET patch_diff = ?,
+                patch_status = ?,
+                remediation = ?
+            WHERE id = ? AND run_id = ?{own_sql}
+            """,
+            (clean_diff, computed_patch_status, effective_remediation, fid, run_id, *own_params),
+        )
+
+        if is_verified:
+            terminal_clause = _terminal_clause_for("patch_verified")
+            cursor.execute(
+                f"""
+                UPDATE findings
+                SET status = 'patch_verified'
+                WHERE id = ? AND run_id = ?{own_sql}
+                  {terminal_clause}
+                """,
+                (fid, run_id, *own_params),
+            )
+            if finding_fp and not os.path.isdir(finding_fp):
+                from datetime import datetime, timezone
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                cursor.execute(
+                    "SELECT id, trust_tier, verified_by FROM okf_concepts WHERE run_id = ? AND resource = ?",
+                    (run_id, finding_fp),
+                )
+                for c_row in [dict(r) for r in cursor.fetchall()]:
+                    c_id = c_row["id"]
+                    current_tier = c_row.get("trust_tier") or "unverified"
+                    try:
+                        ver_list = json.loads(c_row.get("verified_by") or "[]")
+                    except Exception:
+                        ver_list = []
+                    by_key = "process:sandbox_patch_verified"
+                    existing_entry = next(
+                        (e for e in ver_list if isinstance(e, dict) and e.get("by") == by_key),
+                        None,
+                    )
+                    if existing_entry is not None:
+                        existing_entry["status"] = "patch_verified"
+                        existing_entry["at"] = now_iso
+                    else:
+                        ver_list.append({"by": by_key, "status": "patch_verified", "at": now_iso})
+                    new_tier = "human_reviewed" if current_tier == "human_reviewed" else "machine_confirmed"
+                    cursor.execute(
+                        "UPDATE okf_concepts SET trust_tier = ?, verified_by = ? WHERE id = ?",
+                        (new_tier, json.dumps(ver_list), c_id),
+                    )
+
+        cursor.execute(
+            "SELECT status, patch_status FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
+            (fid, run_id),
+        )
+        updated = cursor.fetchone()
+        return {
+            "finding_id": fid,
+            "status": str(updated[0] or "") if updated else "",
+            "patch_status": str(updated[1] or "") if updated else computed_patch_status,
+        }
+
+
 # --- Regression checks: what a later run decided about an earlier finding ---------
 
 REGRESSION_OUTCOMES = ("still_present", "fixed", "inconclusive")
