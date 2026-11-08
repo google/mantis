@@ -251,6 +251,17 @@ class StaticOnlyEnvironment(BaseEnvironment):
         base_dir = os.path.dirname(real_target) if os.path.isfile(real_target) else real_target
 
         path_str = str(directory) if directory else ""
+        if path_str:
+            raw_search = path_str if os.path.isabs(path_str) else os.path.join(base_dir, path_str)
+            if os.path.islink(raw_search):
+                raise PermissionError(f"Permission denied: refusing to list symlink '{directory}'")
+            raw_parts = [p.lower() for p in Path(path_str.replace("\\", "/")).parts if p not in ("", ".")]
+            if any(p in PROTECTED_VCS_DIRS for p in raw_parts) or (
+                raw_parts and raw_parts[-1] in PROTECTED_METADATA_FILES
+            ):
+                raise PermissionError(
+                    f"Permission denied: refusing to list version-control metadata or credential files ('{directory}')"
+                )
         if path_str and os.path.isabs(path_str):
             search_dir = os.path.realpath(path_str)
         elif path_str:
@@ -269,16 +280,38 @@ class StaticOnlyEnvironment(BaseEnvironment):
         except ValueError:
             raise PermissionError(f"Permission denied: path '{directory}' is outside target scope")
 
+        rel_search = os.path.relpath(search_dir, base_dir)
+        rel_parts = [p.lower() for p in Path(rel_search).parts if p not in ("", ".")]
+        if any(p in PROTECTED_VCS_DIRS for p in rel_parts) or (
+            rel_parts and rel_parts[-1] in PROTECTED_METADATA_FILES
+        ):
+            raise PermissionError(
+                f"Permission denied: refusing to list version-control metadata or credential files ('{directory}')"
+            )
+
         if not os.path.exists(search_dir):
             raise FileNotFoundError(f"Directory not found: '{directory}' (resolved: '{search_dir}')")
         if not os.path.isdir(search_dir):
-            return [os.path.relpath(search_dir, base_dir)]
+            return [rel_search]
 
         results = []
-        for root, dirs, files in os.walk(search_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for root, dirs, files in os.walk(search_dir, followlinks=False):
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d.lower() not in PROTECTED_VCS_DIRS
+                and not os.path.islink(os.path.join(root, d))
+            ]
             for fn in files:
-                if not fn.startswith(".") and not fn.endswith(".db"):
+                fn_lower = fn.lower()
+                if (
+                    not fn.startswith(".")
+                    and not fn.endswith(".db")
+                    and fn_lower not in PROTECTED_METADATA_FILES
+                    and fn_lower not in PROTECTED_VCS_DIRS
+                    and not os.path.islink(os.path.join(root, fn))
+                ):
                     rel = os.path.relpath(os.path.join(root, fn), base_dir)
                     results.append(rel)
         return sorted(results)

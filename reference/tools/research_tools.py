@@ -1458,11 +1458,27 @@ def _bounded_listing(entries: list, directory: str = "") -> str:
     )
 
 
+def _is_protected_rel_path(rel_path: str) -> bool:
+    """Returns True when rel_path names or traverses VCS metadata or credential files."""
+    if not rel_path:
+        return False
+    norm = str(rel_path).replace("\\", "/")
+    parts = [p.lower() for p in Path(norm).parts if p not in ("", ".")]
+    if not parts:
+        return False
+    if any(p in PROTECTED_VCS_DIRS for p in parts):
+        return True
+    return parts[-1] in PROTECTED_METADATA_FILES
+
+
 async def list_files(directory: str = "") -> str:
     """Lists files in the target workspace or campaign artifact store."""
     ctx = current_run_context.get()
     if ctx is None:
         return "Error: No active execution context."
+
+    if directory and _is_protected_rel_path(directory):
+        return "Error: Permission denied. Refusing to list version-control metadata or credential files."
 
     clean_dir = directory.replace("\\", "/").strip("./").strip("/")
     if clean_dir.startswith("workspace") or clean_dir == "findings":
@@ -1516,7 +1532,7 @@ async def list_files(directory: str = "") -> str:
             names = [os.path.basename(ctx.target_file)]
         rel_dir = os.path.relpath(own_dir, jail_real).replace(os.sep, "/")
         rels = [n if rel_dir == "." else f"{rel_dir}/{n}" for n in names]
-        rels = _without_excluded(ctx, rels)
+        rels = [p for p in _without_excluded(ctx, rels) if not _is_protected_rel_path(p)]
         return (_bounded_listing(sorted(rels), rel_dir if rel_dir != "." else "")
                 + "\nNOTE: single-file campaign: this is the scanned file's own directory. The rest of the "
                 "tree is reachable through find_symbol, find_callers, find_callees and get_function_boundary.")
@@ -1524,7 +1540,7 @@ async def list_files(directory: str = "") -> str:
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:
             files = await ctx.sandbox.list_files(directory)
-            files = _without_excluded(ctx, files)
+            files = [p for p in _without_excluded(ctx, files) if not _is_protected_rel_path(p)]
             return _bounded_listing(sorted(files), directory)
         except PermissionError as pe:
             return f"Error: Permission denied. {pe}"
@@ -1535,6 +1551,10 @@ async def list_files(directory: str = "") -> str:
 
     jail = os.path.realpath(ctx.jail_dir)
     base_dir = os.path.dirname(jail) if os.path.isfile(jail) else jail
+    if directory:
+        raw_target = directory if os.path.isabs(directory) else os.path.join(base_dir, directory)
+        if os.path.islink(raw_target):
+            return "Error: Permission denied. Refusing to list symlink."
     target_dir = os.path.realpath(os.path.join(base_dir, directory)) if directory else base_dir
 
     try:
@@ -1545,19 +1565,33 @@ async def list_files(directory: str = "") -> str:
 
         if os.path.commonpath([jail, target_dir]) != jail:
             return f"Error: Permission denied. Directory outside allowed scope."
+        rel_target_dir = os.path.relpath(target_dir, base_dir)
+        if _is_protected_rel_path(rel_target_dir):
+            return "Error: Permission denied. Refusing to list version-control metadata or credential files."
         if not os.path.exists(target_dir):
             return f"Error: Directory not found at '{directory}'"
         if not os.path.isdir(target_dir):
             return _bounded_listing([os.path.basename(target_dir)], directory)
 
         files = []
-        for root, dirs, filenames in os.walk(target_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for root, dirs, filenames in os.walk(target_dir, followlinks=False):
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d.lower() not in PROTECTED_VCS_DIRS
+                and not os.path.islink(os.path.join(root, d))
+            ]
             for fn in sorted(filenames):
-                if not fn.startswith("."):
+                if (
+                    not fn.startswith(".")
+                    and fn.lower() not in PROTECTED_METADATA_FILES
+                    and fn.lower() not in PROTECTED_VCS_DIRS
+                    and not os.path.islink(os.path.join(root, fn))
+                ):
                     rel = os.path.relpath(os.path.join(root, fn), base_dir)
                     files.append(rel)
-        files = _without_excluded(ctx, files)
+        files = [p for p in _without_excluded(ctx, files) if not _is_protected_rel_path(p)]
         return _bounded_listing(sorted(files), directory)
     except Exception as e:
         return f"Error listing files: {e}"
@@ -2097,6 +2131,11 @@ def _validate_safe_repo_path(path: str, jail_dir: Path) -> tuple[Optional[Path],
     if not path:
         return None, None
     clean_fp = path.replace("\\", "/").removeprefix("./")
+    if _is_protected_rel_path(clean_fp):
+        return (
+            None,
+            f"Error: Permission denied. Refusing to access version-control metadata or credential file '{path}'.",
+        )
     target_path_raw = jail_dir / clean_fp
     if target_path_raw.is_symlink():
         return None, f"Error: Permission denied. Refusing to access symlink '{path}'."
@@ -2104,9 +2143,14 @@ def _validate_safe_repo_path(path: str, jail_dir: Path) -> tuple[Optional[Path],
     if target_path_real.is_symlink():
         return None, f"Error: Permission denied. Refusing to access symlink '{path}'."
     try:
-        target_path_real.relative_to(jail_dir)
+        rel_to_jail = target_path_real.relative_to(jail_dir)
     except ValueError:
         return None, f"Error: Permission denied. Path '{path}' is outside the repository bounds."
+    if _is_protected_rel_path(str(rel_to_jail)):
+        return (
+            None,
+            f"Error: Permission denied. Refusing to access version-control metadata or credential file '{path}'.",
+        )
     return target_path_real, None
 
 
@@ -2811,6 +2855,15 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
 _COMMIT_HASH_RE = re.compile(r"^[a-zA-Z0-9~^._-]+$")
 
 
+def _git_metadata_exclude_pathspecs() -> list[str]:
+    """Returns git pathspecs that exclude credential/metadata files at any depth."""
+    specs = ["."]
+    for name in sorted(PROTECTED_METADATA_FILES):
+        specs.append(f":(exclude,icase){name}")
+        specs.append(f":(exclude,icase,glob)**/{name}")
+    return specs
+
+
 async def get_git_diff(commit_hash: str = "", path: str = "") -> str:
     """Shows the diff and commit details for a specific commit, or the latest commit diff (HEAD~1..HEAD)."""
     jail_dir, target_path = _resolve_jail_and_target()
@@ -2840,6 +2893,8 @@ async def get_git_diff(commit_hash: str = "", path: str = "") -> str:
         if target_p:
             rel_path = os.path.relpath(target_p, repo_dir)
             git_args += ["--", rel_path]
+    else:
+        git_args += ["--", *_git_metadata_exclude_pathspecs()]
 
     valid, err = _validate_git_jail(repo_dir, jail_dir)
     if not valid:

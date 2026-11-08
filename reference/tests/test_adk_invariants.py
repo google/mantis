@@ -721,6 +721,77 @@ class TestADKInvariants(unittest.IsolatedAsyncioTestCase):
         finally:
             current_run_context.reset(tok)
 
+    async def test_list_files_refuses_vcs_dirs_and_git_diff_excludes_committed_env(self):
+        """INV-4: list_files refuses .git listing and git history tools redact committed .env files."""
+        import subprocess
+        from core.environments.static_env import StaticOnlyEnvironment
+        from tools.research_tools import list_files
+
+        repo = Path(self.test_dir) / "vcs_and_env_repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "Auditor"], cwd=str(repo), check=True)
+        subprocess.run(["git", "config", "user.email", "auditor@example.com"], cwd=str(repo), check=True)
+
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (repo / ".env").write_text("DB_PASSWORD=top_secret_root_env\n", encoding="utf-8")
+        (repo / "config").mkdir()
+        (repo / "config" / ".env").write_text("NESTED_KEY=top_secret_nested_env\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit with secrets"], cwd=str(repo), check=True)
+
+        (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+        (repo / ".env").write_text("DB_PASSWORD=rotated_secret_root_env\n", encoding="utf-8")
+        (repo / "config" / ".env").write_text("NESTED_KEY=rotated_secret_nested_env\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+        subprocess.run(["git", "commit", "-m", "Update app and env"], cwd=str(repo), check=True)
+
+        static_sb = StaticOnlyEnvironment(target_path=str(repo))
+        with self.assertRaises(PermissionError):
+            await static_sb.list_files(".git")
+        with self.assertRaises(PermissionError):
+            await static_sb.list_files(".git/objects")
+        with self.assertRaises(PermissionError):
+            await static_sb.list_files(".env")
+
+        for sb in (static_sb, None):
+            ctx = RunContext(jail_dir=str(repo), db_path=self.db_path, run_id="git-env-test", sandbox=sb)
+            tok = current_run_context.set(ctx)
+            try:
+                for forbidden in (".git", "./.git", ".git/objects", ".env", "config/.env"):
+                    res_list = await list_files(forbidden)
+                    self.assertIn("Permission denied", res_list, (sb, forbidden, res_list))
+                    self.assertNotIn("HEAD", res_list)
+                    self.assertNotIn("config", res_list.splitlines()[0] if "HEAD" in res_list else "")
+
+                root_listing = await list_files("")
+                self.assertIn("app.py", root_listing)
+                self.assertNotIn(".git", root_listing)
+                self.assertNotIn(".env", root_listing)
+
+                # Repo-wide diff and commit show return app.py changes while excluding .env secrets
+                diff_latest = await get_git_diff()
+                self.assertIn("+x = 2", diff_latest)
+                self.assertNotIn("secret_root_env", diff_latest)
+                self.assertNotIn("secret_nested_env", diff_latest)
+
+                diff_head = await get_git_diff(commit_hash="HEAD")
+                self.assertIn("+x = 2", diff_head)
+                self.assertNotIn("secret_root_env", diff_head)
+                self.assertNotIn("secret_nested_env", diff_head)
+
+                diff_init = await get_git_diff(commit_hash="HEAD~1")
+                self.assertIn("+x = 1", diff_init)
+                self.assertNotIn("secret_root_env", diff_init)
+                self.assertNotIn("secret_nested_env", diff_init)
+
+                # Explicit path queries to .env or .git are refused outright
+                for bad_path in (".env", "config/.env", ".git/config"):
+                    self.assertIn("Permission denied", await get_git_diff(path=bad_path))
+                    self.assertIn("Permission denied", await get_git_log(path=bad_path))
+            finally:
+                current_run_context.reset(tok)
+
     def test_find_workflow_json_does_not_probe_untrusted_cwd(self):
         """Disallow loading workflow.json from an arbitrary untrusted CWD without explicit flag."""
         from scripts.configure import find_workflow_json
