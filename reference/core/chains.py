@@ -373,10 +373,23 @@ def update_chain_from_campaign(
         if not cid:
             return None
         summary = findings_summary if isinstance(findings_summary, dict) else {}
-        try:
-            findings_n = max(0, int(summary.get("findings") or 0))
-        except (TypeError, ValueError):
+        raw_findings = summary.get("findings")
+        if isinstance(raw_findings, dict):
+            from core.database import is_suppressed
+
             findings_n = 0
+            for st, cnt in raw_findings.items():
+                if is_suppressed(st):
+                    continue
+                try:
+                    findings_n += max(0, int(cnt or 0))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            try:
+                findings_n = max(0, int(raw_findings or 0))
+            except (TypeError, ValueError):
+                findings_n = 0
         route = _clean(campaign_route, 64).lower()
         paths = [_clean(summary.get("target"))]
         members = summary.get("members")

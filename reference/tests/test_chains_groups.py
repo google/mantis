@@ -864,5 +864,136 @@ class TestMemberCoverageStamping(unittest.TestCase):
         self.assertEqual((cost, n), (400_000, 1))
 
 
+class TestChainWiringFixes(unittest.TestCase):
+    """Regression coverage for chain ID assignment, dict chain rendering, and
+    per-status finding settlement."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mantis_test_chain_wiring_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.db = _mk_db(self.tmp)
+
+    def test_open_chains_for_groups_assigns_uuid_chain_ids_not_dict_keys(self):
+        from core.chains import load_open_chains
+        from main import _open_chains_for_groups
+
+        groups = [
+            {"targets": ["app/plain.py"], "chain": None},
+            {
+                "targets": ["app/invalid.py"],
+                "chain": {"description": "no links", "links": []},
+            },
+            {
+                "targets": ["app/upload.py", "app/auth.py"],
+                "chain": {
+                    "description": "upload feeds auth",
+                    "links": [
+                        {
+                            "source_component": "upload.py",
+                            "sink_component": "auth.py",
+                            "claim": "unvalidated filename",
+                        }
+                    ],
+                },
+            },
+        ]
+        _open_chains_for_groups(self.db, "r-chain", groups)
+        self.assertNotIn("chain_id", groups[0])
+        self.assertNotIn("chain_id", groups[1])
+        self.assertIsInstance(groups[2].get("chain_id"), str)
+        self.assertGreater(len(groups[2]["chain_id"]), 8)
+        loaded = load_open_chains(self.db)
+        self.assertEqual([c["chain_id"] for c in loaded], [groups[2]["chain_id"]])
+
+    def test_render_group_campaign_context_formats_dict_chain_cleanly(self):
+        from main import _render_group_campaign_context
+
+        out = _render_group_campaign_context(
+            {
+                "targets": ["app/upload.py", "app/auth.py"],
+                "chain": {
+                    "description": "upload feeds auth",
+                    "links": [
+                        {
+                            "source_component": "app/upload.py",
+                            "sink_component": "app/auth.py",
+                            "claim": "untrusted path reaches open()",
+                        }
+                    ],
+                },
+            },
+            {},
+        )
+        self.assertIn(UNTRUSTED_DATA_START, out)
+        self.assertIn("Proposed cross-target chain: upload feeds auth", out)
+        self.assertIn("app/upload.py -> app/auth.py: untrusted path reaches open()", out)
+        self.assertNotIn("{'description'", out)
+
+    def test_update_chain_accepts_per_status_finding_dict_and_settles_chains(self):
+        from core.chains import open_chains, update_chain_from_campaign
+
+        cids = open_chains(
+            self.db,
+            "r-settle",
+            [
+                {
+                    "targets": ["app/auth.py"],
+                    "chain": {
+                        "description": "auth chain",
+                        "links": [
+                            {
+                                "source_component": "auth.py",
+                                "sink_component": "db.py",
+                                "claim": "sqli",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "targets": ["app/upload.py"],
+                    "chain": {
+                        "description": "upload chain",
+                        "links": [
+                            {
+                                "source_component": "upload.py",
+                                "sink_component": "exec.py",
+                                "claim": "cmdi",
+                            }
+                        ],
+                    },
+                },
+            ],
+        )
+        update_chain_from_campaign(
+            self.db,
+            cids[0],
+            campaign_route="confirmed",
+            findings_summary={
+                "target": "app/auth.py",
+                "findings": {"static_confirmed": 1, "false_positive": 2},
+            },
+        )
+        update_chain_from_campaign(
+            self.db,
+            cids[1],
+            campaign_route="dismissal",
+            findings_summary={
+                "target": "app/upload.py",
+                "findings": {"false_positive": 2, "non_viable": 1},
+            },
+        )
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = dict(
+                conn.execute(
+                    "SELECT chain_id, status FROM hypothesis_chains"
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+        self.assertEqual(rows[cids[0]], "confirmed")
+        self.assertEqual(rows[cids[1]], "refuted")
+
+
 if __name__ == "__main__":
     unittest.main()

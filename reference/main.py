@@ -2138,7 +2138,29 @@ def _render_group_campaign_context(group: dict, plan: dict) -> str:
     """
     try:
         members = [str(m) for m in (group.get("targets") or []) if str(m).strip()]
-        chain_text = str(group.get("chain") or "").strip()
+        raw_chain = group.get("chain")
+        chain_desc = ""
+        chain_link_lines: list[str] = []
+        if isinstance(raw_chain, dict):
+            chain_desc = str(raw_chain.get("description") or "").strip()
+            raw_links = raw_chain.get("links")
+            if isinstance(raw_links, list):
+                for lk in raw_links:
+                    if not isinstance(lk, dict):
+                        continue
+                    src = str(lk.get("source_component") or "").strip()
+                    sink = str(lk.get("sink_component") or "").strip()
+                    claim = str(lk.get("claim") or "").strip()
+                    if not (src or sink or claim):
+                        continue
+                    endpoints = f"{src} -> {sink}" if (src and sink) else (src or sink)
+                    if endpoints and claim:
+                        chain_link_lines.append(f"  * {endpoints}: {claim}")
+                    else:
+                        chain_link_lines.append(f"  * {endpoints or claim}")
+        else:
+            chain_desc = str(raw_chain or "").strip()
+        has_chain = bool(chain_desc or chain_link_lines)
         # The group's own hypothesis is delivered here only when the plan's
         # per-target hypotheses map will not already deliver it for the primary
         # -- the same words twice crowd the prompt without informing it.
@@ -2148,7 +2170,7 @@ def _render_group_campaign_context(group: dict, plan: dict) -> str:
             (plan.get("hypotheses") or {}).get(primary), dict
         )
         has_group_hypothesis = bool(hypothesis) and not primary_covered
-        if len(members) < 2 and not chain_text and not has_group_hypothesis:
+        if len(members) < 2 and not has_chain and not has_group_hypothesis:
             return ""
         body = []
         if len(members) >= 2:
@@ -2159,8 +2181,12 @@ def _render_group_campaign_context(group: dict, plan: dict) -> str:
             body.extend(f"  - {m}" for m in members)
         if has_group_hypothesis:
             body.append("Group hypothesis: " + hypothesis)
-        if chain_text:
-            body.append("Proposed cross-target chain: " + chain_text)
+        if chain_desc:
+            body.append("Proposed cross-target chain: " + chain_desc)
+        elif chain_link_lines:
+            body.append("Proposed cross-target chain:")
+        if chain_link_lines:
+            body.extend(chain_link_lines)
 
         from core.llm_gateway import wrap_untrusted_content
 
@@ -2199,8 +2225,9 @@ def _open_chains_for_groups(db_path: str, run_id: str, groups: list) -> None:
         if not pending:
             return
         chain_ids = chains.open_chains(db_path, run_id, pending)
-        for group, chain_id in zip(pending, chain_ids or []):
-            group["chain_id"] = chain_id
+        for idx, chain_id in (chain_ids or {}).items():
+            if isinstance(idx, int) and 0 <= idx < len(pending) and chain_id:
+                pending[idx]["chain_id"] = chain_id
     except Exception:
         pass
 
@@ -3520,21 +3547,46 @@ async def pipeline(
                         )
 
                 # The dossier entry for this campaign: what ran, what it
-                # grouped, and what it found as per-status counts -- stated,
-                # never judged. Route is omitted deliberately: nothing on this
-                # path knows one cheaply, and inventing a summary here would
-                # put loop-authored prose where the replanner expects facts.
+                # grouped, and what it found as per-status counts. Route is
+                # derived strictly from recorded finding statuses (kept open
+                # findings -> "confirmed"; all recorded findings dismissed ->
+                # "dismissal"; zero findings or failed campaign -> ""), never
+                # invented when no finding verdict exists.
+                finding_counts = _campaign_finding_counts(db_path, run_id, scan_item)
+                from core.database import is_suppressed as _is_suppressed_status
+
+                open_findings_n = sum(
+                    int(n or 0)
+                    for st, n in finding_counts.items()
+                    if not _is_suppressed_status(st)
+                )
+                dismissed_findings_n = sum(
+                    int(n or 0)
+                    for st, n in finding_counts.items()
+                    if str(st).strip().lower() in ("false_positive", "non_viable", "sample_or_test")
+                )
+                derived_route = ""
+                if not task_failed:
+                    if open_findings_n > 0:
+                        derived_route = "confirmed"
+                    elif dismissed_findings_n > 0:
+                        derived_route = "dismissal"
                 completed_entry = {
                     "target": scan_item,
                     "members": list(group.get("targets") or [scan_item]),
-                    "findings": _campaign_finding_counts(db_path, run_id, scan_item),
+                    "findings": finding_counts,
+                    "findings_by_status": finding_counts,
+                    "route": "failed" if task_failed else derived_route,
                 }
                 completed_campaigns.append(completed_entry)
                 # File the outcome against the group's chain record, when the
                 # plan linked one. Silent on every failure by design: the
                 # chain ledger is lineage, never a gate on the scan.
                 _update_chain_for_group(
-                    db_path, group, campaign_route="", findings_summary=completed_entry
+                    db_path,
+                    group,
+                    campaign_route=derived_route,
+                    findings_summary=completed_entry,
                 )
 
                 # Dynamic replanning: the model that produced the plan is shown
