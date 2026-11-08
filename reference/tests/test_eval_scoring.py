@@ -210,5 +210,41 @@ class TestEvalScoring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["f1"], 1.0)
 
 
+class TestStageAgentAlignment(unittest.TestCase):
+
+    def test_reviewer_stage_agent_uses_production_prompt_guard_and_extended_schema(self):
+        from core.config import ExtendedReviewVerdict
+        from core.llm_gateway import UNTRUSTED_CODE_AUDIT_GUARD
+        from core.prompts import get_stage_prompt
+        from evals.stage_agents import build_stage_agent
+
+        agent = build_stage_agent("reviewer", model_id="test-model", reasoning_effort="low")
+        self.assertIs(agent.output_schema, ExtendedReviewVerdict)
+        rendered = agent.instruction(None)
+        self.assertIn(get_stage_prompt("reviewer", "mantis-review"), rendered)
+        self.assertIn(UNTRUSTED_CODE_AUDIT_GUARD.strip(), rendered)
+        self.assertIn("CRITICAL TERMINATION CONTRACT:", rendered)
+        self.assertIn("PER-FINDING VERDICTS:", rendered)
+
+    def test_patcher_stage_agent_uses_production_prompt_and_record_patch_tools(self):
+        from core.prompts import get_stage_prompt
+        from evals.stage_agents import build_stage_agent
+
+        agent = build_stage_agent("patcher", model_id="test-model", reasoning_effort="low")
+        tool_names = {getattr(t, "__name__", str(t)) for t in agent.tools}
+        self.assertIn("record_patch", tool_names)
+        self.assertIn("run_sandbox_with_evidence", tool_names)
+        rendered = agent.instruction(None)
+        self.assertIn(get_stage_prompt("patcher", "mantis-coder"), rendered)
+
+    def test_stage_configs_toolsets_match_shipped_workflow(self):
+        from evals.stage_agents import STAGE_CONFIGS
+
+        wf = json.loads((Path(_REF_ROOT) / "workflow.json").read_text(encoding="utf-8"))
+        wf_tools = {n["id"]: n["tools"] for n in wf["nodes"] if n.get("type") == "agent"}
+        for stage, cfg in STAGE_CONFIGS.items():
+            self.assertEqual(cfg["tools"], wf_tools[stage], f"tool drift on stage '{stage}'")
+
+
 if __name__ == "__main__":
     unittest.main()

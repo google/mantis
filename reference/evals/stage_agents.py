@@ -13,21 +13,21 @@
 # limitations under the License.
 
 from contextlib import contextmanager
-from pathlib import Path
 import os
 import shutil
 import tempfile
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
-from google.adk.skills import load_skill_from_dir
-from core.config import get_llm_kwargs, ResilientLiteLlm
+from core.config import ExtendedReviewVerdict, get_llm_kwargs, ResilientLiteLlm
+from core.llm_gateway import UNTRUSTED_CODE_AUDIT_GUARD
+from core.prompts import get_stage_prompt
 
 LiteLlm = ResilientLiteLlm
 from core.schemas import ReviewVerdict, CriticVerdict, ReproVerdict, ExecutiveReport
 from tools import TOOLS
 
 STAGE_OUTPUT_SCHEMAS = {
-    'reviewer': ReviewVerdict,
+    'reviewer': ExtendedReviewVerdict or ReviewVerdict,
     'critic': CriticVerdict,
     'reproducer': ReproVerdict,
     'reporter': ExecutiveReport,
@@ -52,48 +52,66 @@ STAGE_CONFIGS = {
         # Same tool list as the researcher node in workflow.json, so the eval
         # measures the production toolset. research_eval.py can replace it
         # via tools_override for toolset A/B runs.
-        'tools': ['read_file', 'write_file', 'list_files', 'get_summary', 'get_threat_model', 'get_plan', 'report_findings', 'get_findings', 'find_symbol', 'find_callers', 'find_callees', 'get_function_boundary'],
-        'instruction': 'You are the researcher stage in the Mantis review pipeline. Perform an in-depth code audit of the target to discover real, exploitable vulnerabilities. Trace data flow from untrusted sources to dangerous sinks, including flows that cross file boundaries, and report every distinct finding via report_findings with a precise title, filepath, line_numbers, and a description naming the end-to-end mechanism. Prefer the structural navigation tools when they are available: find_symbol to locate definitions, get_function_boundary to read one function instead of a whole file, and find_callers/find_callees to walk call chains across files; fall back to read_file when they report the index is unavailable. Before reporting a finding, verify the claim structurally: confirm the sink is reachable by walking callers, and read the enclosing function rather than reasoning from memory.'
+        'tools': [
+            'read_file', 'write_file', 'list_files', 'get_summary', 'get_threat_model',
+            'get_plan', 'report_findings', 'get_findings', 'find_symbol', 'find_callers',
+            'find_callees', 'get_function_boundary', 'record_regression_check',
+        ],
+        'instruction': get_stage_prompt('researcher', 'mantis-researcher'),
     },
     'deduplicator': {
         'skill': 'mantis-dedupe',
-        'tools': ['read_file', 'write_file', 'get_findings', 'report_findings', 'dedupe_findings'],
-        'instruction': 'You are the deduplicator stage in the Mantis review pipeline. Retrieve findings using get_findings, analyze duplicate clusters carefully, and merge true duplicates using dedupe_findings. Do NOT merge distinct vulnerabilities.'
+        'tools': ['read_file', 'write_file', 'list_files', 'get_findings', 'report_findings', 'dedupe_findings'],
+        'instruction': get_stage_prompt('deduplicator', 'mantis-dedupe'),
     },
     'reviewer': {
         'skill': 'mantis-review',
-        'tools': ['read_file', 'get_findings', 'get_threat_model', 'get_summary', 'find_symbol', 'find_callers', 'find_callees', 'get_function_boundary'],
-        'instruction': 'You are the reviewer stage in the Mantis review pipeline. Evaluate findings against the active codebase and 13 triage rejection constraints. Check each finding mechanically before trusting it: use get_function_boundary to re-read the enclosing function and confirm the cited guard or missing check is quoted correctly, and find_callers to confirm the sink is actually reachable from the claimed source. Return a ReviewVerdict with route="confirmed" for true vulnerabilities or route="false_positive" for benign/mock/unreachable/hygiene code.'
+        'tools': [
+            'read_file', 'get_findings', 'get_threat_model', 'get_summary', 'find_symbol',
+            'find_callers', 'find_callees', 'get_function_boundary', 'record_regression_check',
+        ],
+        'instruction': get_stage_prompt('reviewer', 'mantis-review'),
     },
     'critic': {
         'skill': 'mantis-critic',
-        'tools': ['read_file', 'get_findings', 'get_threat_model', 'find_symbol', 'find_callers', 'find_callees', 'get_function_boundary'],
-        'instruction': 'You are the critic stage in the Mantis review pipeline. Assess technical exploit viability and untrusted attacker reachability. Use find_callers and get_function_boundary to challenge reachability: a sink with no callers, a guard the finding misquotes, or an input the attacker cannot control are grounds for rejection. Return a CriticVerdict with route="viable" if reachable and exploitable, or route="non_viable" if blocked by framework invariants or missing attack vectors.'
+        'tools': [
+            'read_file', 'get_findings', 'get_threat_model', 'find_symbol',
+            'find_callers', 'find_callees', 'get_function_boundary',
+        ],
+        'instruction': get_stage_prompt('critic', 'mantis-critic'),
     },
     'calibrator': {
         'skill': 'mantis-calibrate',
-        'tools': ['score_risk', 'calibrate_finding', 'get_findings', 'get_threat_model', 'read_file'],
-        'instruction': 'You are the calibrator stage in the Mantis review pipeline. Evaluate finding severity, impact, likelihood, and sanity caps. Call calibrate_finding or score_risk to assign risk scores on the 0.1 - 10.0 scale and priority levels.'
+        'tools': ['score_risk', 'calibrate_finding', 'get_findings', 'get_threat_model', 'read_file', 'write_file'],
+        'instruction': get_stage_prompt('calibrator', 'mantis-calibrate'),
     },
     'reproducer': {
         'skill': 'mantis-reproduce',
-        'tools': ['run_sandbox', 'run_sandbox_with_evidence', 'get_findings', 'get_threat_model', 'read_file', 'write_file', 'get_function_boundary', 'find_callers'],
-        'instruction': 'You are the reproducer stage in the Mantis review pipeline. Execute exploit PoCs in the sandbox. Return ReproVerdict with route="success" if the exploit triggers, or route="failed_repro" if not.'
+        'tools': [
+            'run_sandbox', 'run_sandbox_with_evidence', 'get_findings', 'get_threat_model',
+            'read_file', 'write_file', 'get_function_boundary', 'find_callers',
+            'get_prior_poc', 'record_regression_check',
+        ],
+        'instruction': get_stage_prompt('reproducer', 'mantis-reproduce'),
     },
     'patcher': {
         'skill': 'mantis-coder',
-        'tools': ['apply_patch', 'run_sandbox', 'read_file', 'write_file', 'get_findings'],
-        'instruction': 'You are the patcher stage in the Mantis review pipeline. Synthesize minimal unified diff patches using apply_patch and verify that PoC reattack is blocked (VERIFIED_SECURE).'
+        'tools': [
+            'apply_patch', 'record_patch', 'run_sandbox', 'run_sandbox_with_evidence',
+            'read_file', 'write_file', 'get_findings', 'get_security_guidance',
+            'query_lineage', 'find_symbol', 'find_callers', 'find_callees', 'get_function_boundary',
+        ],
+        'instruction': get_stage_prompt('patcher', 'mantis-coder'),
     },
     'reflector': {
         'skill': 'mantis-reflect',
         'tools': ['read_file', 'write_file', 'get_findings', 'record_learning'],
-        'instruction': 'You are the reflector stage in the Mantis review pipeline. Extract strategic cross-pass learnings and call record_learning with appropriate categories and tags.'
+        'instruction': get_stage_prompt('reflector', 'mantis-reflect'),
     },
     'reporter': {
         'skill': 'mantis-report',
         'tools': ['read_file', 'write_file', 'get_findings', 'get_plan', 'get_threat_model', 'get_summary', 'generate_report'],
-        'instruction': 'You are the reporter stage in the Mantis review pipeline. Compile the final executive review packet and call generate_report with an ExecutiveReport object.'
+        'instruction': get_stage_prompt('reporter', 'mantis-report'),
     },
 }
 
@@ -110,29 +128,59 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
     planned arms): production nodes run with include_contents="none", a
     forked stage carries the fork callback, and a stage that is not first
     gets its briefing in its instruction since it sees no seed message.
-    ``instruction_override`` replaces the stage's own instruction (the skill
-    guidance still follows it): a per-file campaign's planner must not be
-    told to list and read the whole application.
+    ``instruction_override`` replaces the stage's own instruction: a per-file
+    campaign's planner must not be told to list and read the whole application.
     """
     model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.8-flash')
     reasoning_effort = reasoning_effort or os.environ.get('EVAL_REASONING_EFFORT', 'low')
-    
+
     _, llm_kwargs = get_llm_kwargs(model_id=model_id, reasoning_effort=reasoning_effort)
-    
-    cfg = STAGE_CONFIGS.get(stage_name, {'skill': f'mantis-{stage_name}', 'tools': list(TOOLS.keys()), 'instruction': f'You are the {stage_name} stage.'})
+
+    cfg = STAGE_CONFIGS.get(
+        stage_name,
+        {
+            'skill': f'mantis-{stage_name}',
+            'tools': list(TOOLS.keys()),
+            'instruction': get_stage_prompt(stage_name, f'mantis-{stage_name}'),
+        },
+    )
     tool_names = tools_override if tools_override is not None else cfg['tools']
-    skill_path = Path(__file__).resolve().parent.parent.parent / cfg['skill']
     tools_list = [TOOLS[t] for t in tool_names if t in TOOLS]
-    
+
     instruction = instruction_override if instruction_override else cfg['instruction']
-    if skill_path.is_dir() and (skill_path / 'SKILL.md').exists():
-        skill_obj = load_skill_from_dir(str(skill_path))
-        if hasattr(skill_obj, 'instructions') and skill_obj.instructions:
-            instruction = f"{instruction}\n\n[SKILL GUIDANCE]\n{skill_obj.instructions[:1000]}"
     if instruction_suffix:
         instruction = f"{instruction}\n\n{instruction_suffix}"
 
+    guard_text = UNTRUSTED_CODE_AUDIT_GUARD.strip()
+    if guard_text not in instruction:
+        instruction = f"{instruction.rstrip()}\n\n{guard_text}"
+
     output_schema = STAGE_OUTPUT_SCHEMAS.get(stage_name)
+    if output_schema is not None:
+        schema_label = "ReviewVerdict" if stage_name == "reviewer" else output_schema.__name__
+        instruction = (
+            f"{instruction.rstrip()}\n\n"
+            f"CRITICAL TERMINATION CONTRACT: When your analysis for this stage is complete, "
+            f"submit your final verdict using the 'set_model_response' tool (e.g. set_model_response(route=..., reason=...)) "
+            f"or emit it directly as raw JSON response text conforming to '{schema_label}' "
+            f"(e.g. {{\"route\": \"...\", \"reason\": \"...\"}}). "
+            f"Do NOT call write_file, run_sandbox, or any other general tool to signal completion, and do NOT write dummy marker or verdict files "
+            f"(e.g. do NOT write 'verdict.json', 'done.txt', or 'status.json'). Also do NOT run probe shell commands "
+            f"(e.g. do NOT run 'echo done', 'echo 1', 'true', or 'exit 0')."
+        )
+        if stage_name == "reviewer" and output_schema is ExtendedReviewVerdict:
+            instruction = (
+                f"{instruction}\n\n"
+                f"PER-FINDING VERDICTS: Each finding returned by get_findings is an INDEPENDENT "
+                f"vulnerability claim and deserves its own judgment. When more than one finding is "
+                f"in scope, your verdict JSON MUST include a \"finding_verdicts\" list with exactly one "
+                f"entry per finding: {{\"finding_id\": <numeric id from get_findings>, \"route\": "
+                f"\"confirmed\" | \"false_positive\", \"reason\": \"<one sentence for THIS finding>\"}}. "
+                f"Never let one finding's weakness dismiss its siblings, and never let one finding's "
+                f"strength confirm them. The top-level route/reason then summarize the overall outcome "
+                f"(confirmed if ANY finding is confirmed)."
+            )
+
     from core.graph_loader import LiteralInstruction, _make_after_tool_guard_callback
 
     after_tool_cb = _make_after_tool_guard_callback(stage_name, tool_names, model=model_id)
