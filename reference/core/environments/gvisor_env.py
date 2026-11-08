@@ -39,6 +39,14 @@ from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 # sentinel reads as "the PoC never got there".
 MAX_OUTPUT = 16000
 _MAX_EXEC_CAPTURE_BYTES = MAX_OUTPUT * 4 + 4096
+MAX_CONTAINER_LIFETIME_SECONDS = 6 * 3600
+ALLOWED_GVISOR_RUNTIMES = frozenset({
+    "runsc",
+    "runsc-kvm",
+    "runsc-systrap",
+    "runsc-ptrace",
+    "gvisor",
+})
 
 
 class GvisorEnvironment(BaseEnvironment):
@@ -61,9 +69,14 @@ class GvisorEnvironment(BaseEnvironment):
         workdir: str = "/workspace",
     ):
         super().__init__()
+        norm_runtime = str(runtime or "").strip()
+        if norm_runtime not in ALLOWED_GVISOR_RUNTIMES:
+            raise ValueError(
+                f"Invalid gVisor runtime '{runtime}'. Must be one of {sorted(ALLOWED_GVISOR_RUNTIMES)}."
+            )
         self.target_path = os.path.abspath(target_path) if target_path else ""
         self.image = image
-        self.runtime = runtime
+        self.runtime = norm_runtime
         self.timeout = timeout_seconds
         self._workdir = Path(workdir)
 
@@ -92,14 +105,17 @@ class GvisorEnvironment(BaseEnvironment):
 
     def _run_cmd(self, argv: list[str], stdin: Optional[str] = None, timeout: Optional[int] = None) -> tuple[int, str]:
         t = timeout or self.timeout
+        run_kwargs: dict = {
+            "capture_output": True,
+            "text": True,
+            "timeout": t,
+        }
+        if stdin is None:
+            run_kwargs["stdin"] = subprocess.DEVNULL
+        else:
+            run_kwargs["input"] = stdin
         try:
-            p = subprocess.run(
-                argv,
-                input=stdin or "",
-                capture_output=True,
-                text=True,
-                timeout=t,
-            )
+            p = subprocess.run(argv, **run_kwargs)
             out = (p.stdout or "") + (p.stderr or "")
             return p.returncode, out
         except subprocess.TimeoutExpired:
@@ -114,19 +130,22 @@ class GvisorEnvironment(BaseEnvironment):
                 return
 
             def _init():
-                # 1. Create container with runsc runtime, no network, and strict resource ceilings
+                # 1. Create container with runsc runtime, no network, dropped capabilities, and strict resource ceilings
                 create_cmd = [
                     self.tool, "create",
                     "--pull=never",
                     "--name", self.container_name,
                     f"--runtime={self.runtime}",
                     "--network=none",
+                    "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges",
+                    "--tmpfs=/tmp:rw,nosuid,nodev,size=512m",
                     "--pids-limit=256",
                     "--memory=4g",
                     "--cpus=2.0",
                     "-w", str(self._workdir),
                     self.image,
-                    "sleep", "infinity",
+                    "sleep", str(MAX_CONTAINER_LIFETIME_SECONDS),
                 ]
                 rc, out = self._run_cmd(create_cmd)
                 if rc != 0:
@@ -283,10 +302,14 @@ class GvisorEnvironment(BaseEnvironment):
         resolved_path = self._resolve_guest_path(path)
         parent_dir = str(resolved_path.parent)
         data = content.encode("utf-8") if isinstance(content, str) else content
+        if len(data) > MAX_GUEST_FILE_BYTES:
+            raise ValueError(
+                f"File '{path}' ({len(data)} bytes) exceeds maximum sandbox write size ({MAX_GUEST_FILE_BYTES} bytes)."
+            )
 
         def _write():
             mkdir_cmd = [self.tool, "exec", self.container_name, "mkdir", "-p", parent_dir]
-            subprocess.run(mkdir_cmd, capture_output=True, timeout=self.timeout)
+            subprocess.run(mkdir_cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=self.timeout)
 
             # SECURITY: Pass destination as positional argument to prevent shell quoting injection
             write_cmd = [

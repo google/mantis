@@ -331,5 +331,39 @@ class GceHardeningTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("199.36.153.4", ISOLATION_PROBE_SCRIPT)
 
 
+class GvisorHardeningTest(unittest.IsolatedAsyncioTestCase):
+    """gVisor containers validate runtime, drop capabilities, block new privileges, and bound lifetime."""
+
+    async def test_gvisor_validates_runtime_and_hardens_container_create(self):
+        import subprocess
+        from core.environments import gvisor_env
+
+        with mock.patch("shutil.which", return_value="/usr/bin/docker"):
+            with self.assertRaises(ValueError):
+                gvisor_env.GvisorEnvironment(runtime="runc", container_tool="docker")
+            with self.assertRaises(ValueError):
+                gvisor_env.GvisorEnvironment(runtime="crun", container_tool="docker")
+            gv = gvisor_env.GvisorEnvironment(runtime="runsc", container_tool="docker")
+
+        calls: list[tuple[list[str], dict]] = []
+
+        def _fake_run(argv, **kwargs):
+            calls.append((list(argv), dict(kwargs)))
+            return mock.MagicMock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", side_effect=_fake_run):
+            await gv.initialize()
+
+        create_argv, create_kwargs = calls[0]
+        self.assertEqual(create_kwargs.get("stdin"), subprocess.DEVNULL)
+        self.assertIn("--runtime=runsc", create_argv)
+        self.assertIn("--network=none", create_argv)
+        self.assertIn("--cap-drop=ALL", create_argv)
+        self.assertIn("--security-opt=no-new-privileges", create_argv)
+        self.assertIn("--tmpfs=/tmp:rw,nosuid,nodev,size=512m", create_argv)
+        self.assertNotIn("infinity", create_argv)
+        self.assertIn(str(gvisor_env.MAX_CONTAINER_LIFETIME_SECONDS), create_argv)
+
+
 if __name__ == "__main__":
     unittest.main()
