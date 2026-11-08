@@ -134,5 +134,80 @@ class MicrosandboxCreationTest(unittest.TestCase):
         self.assertIn("network=Network.none()", src)
 
 
+class BoundedGuestStreamTest(unittest.IsolatedAsyncioTestCase):
+    """Host memory stays bounded even when a guest emits unbounded stdout or files."""
+
+    def test_run_bounded_subprocess_caps_buffered_bytes_and_preserves_total(self):
+        from core.environments.base import format_bounded_output, run_bounded_subprocess
+        from core.truncation import TRUNCATION_MARKER_PREFIX
+
+        res = run_bounded_subprocess(
+            [sys.executable, "-c", "import sys; sys.stdout.write('A' * 300000)"],
+            timeout=10.0,
+            max_stdout_bytes=65536,
+            max_stderr_bytes=4096,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertFalse(res.timed_out)
+        self.assertTrue(res.stdout_overflowed)
+        self.assertEqual(len(res.stdout), 65536)
+        self.assertEqual(res.stdout_total_bytes, 300000)
+
+        formatted = format_bounded_output(
+            res.stdout, res.stdout_total_bytes, 16000, what="sandbox stdout"
+        )
+        self.assertTrue(formatted.startswith("A" * 16000 + "\n" + TRUNCATION_MARKER_PREFIX))
+        self.assertIn("after 16000 of 300000 chars", formatted)
+
+    def test_run_bounded_subprocess_kills_early_on_overflow_when_requested(self):
+        from core.environments.base import run_bounded_subprocess
+
+        res = run_bounded_subprocess(
+            [
+                sys.executable,
+                "-c",
+                "import sys\nwhile True:\n    sys.stdout.buffer.write(b'X' * 65536)\n",
+            ],
+            timeout=10.0,
+            max_stdout_bytes=131072,
+            max_stderr_bytes=4096,
+            kill_on_stdout_overflow=True,
+        )
+        self.assertTrue(res.stdout_overflowed)
+        self.assertEqual(len(res.stdout), 131072)
+
+    async def test_gvisor_and_gce_read_file_reject_oversized_guest_files(self):
+        import base64
+        from core.environments import gce_env, gvisor_env
+
+        with mock.patch("shutil.which", return_value="/usr/bin/docker"):
+            gv = gvisor_env.GvisorEnvironment(container_tool="docker")
+        gv._ensure = mock.AsyncMock(return_value=None)
+
+        with mock.patch.object(gvisor_env, "MAX_GUEST_FILE_BYTES", 1024):
+            with mock.patch(
+                "subprocess.run",
+                return_value=mock.MagicMock(returncode=0, stdout=b"Z" * 2048, stderr=b""),
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    await gv.read_file("huge.bin")
+        self.assertIn("exceeds maximum sandbox read size", str(ctx.exception))
+
+        gce = gce_env.GceEnvironment(project="proj", gcloud_bin="/bin/true")
+        gce._ensure = mock.AsyncMock(return_value=None)
+        oversized_b64 = base64.b64encode(b"Y" * 2048)
+        with (
+            mock.patch.object(gce_env, "MAX_GUEST_FILE_BYTES", 1024),
+            mock.patch.object(gce_env, "_MAX_B64_GUEST_FILE_BYTES", 1400),
+            mock.patch(
+                "subprocess.run",
+                return_value=mock.MagicMock(returncode=0, stdout=oversized_b64, stderr=b""),
+            ),
+        ):
+            with self.assertRaises(ValueError) as ctx2:
+                await gce.read_file("huge.bin")
+        self.assertIn("exceeds maximum sandbox read size", str(ctx2.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

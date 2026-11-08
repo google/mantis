@@ -25,7 +25,12 @@ import uuid
 
 from google.adk.environment import ExecutionResult
 from core.truncation import truncate_with_marker
-from .base import BaseEnvironment
+from .base import (
+    BaseEnvironment,
+    MAX_GUEST_FILE_BYTES,
+    format_bounded_output,
+    run_bounded_subprocess,
+)
 from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 
 # Per-stream cap on what one execute() or apply_patch() hands back. Must stay
@@ -33,6 +38,7 @@ from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 # reads this trace for the reached-sink sentinel, and a silent cut before the
 # sentinel reads as "the PoC never got there".
 MAX_OUTPUT = 16000
+_MAX_EXEC_CAPTURE_BYTES = MAX_OUTPUT * 4 + 4096
 
 
 class GvisorEnvironment(BaseEnvironment):
@@ -167,28 +173,33 @@ class GvisorEnvironment(BaseEnvironment):
 
         def _exec():
             try:
-                p = subprocess.run(
+                res = run_bounded_subprocess(
                     [
                         self.tool, "exec",
                         self.container_name,
                         "/bin/sh", "-c", command,
                     ],
-                    capture_output=True,
-                    text=True,
                     timeout=t,
+                    max_stdout_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                    max_stderr_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                    mock_text=True,
                 )
+                if res.timed_out:
+                    return ExecutionResult(
+                        stdout="",
+                        stderr=f"SANDBOX-TIMEOUT: command exceeded {t}s.",
+                        exit_code=-1,
+                        timed_out=True,
+                    )
                 return ExecutionResult(
-                    stdout=truncate_with_marker(p.stdout or "", MAX_OUTPUT, what="sandbox stdout"),
-                    stderr=truncate_with_marker(p.stderr or "", MAX_OUTPUT, what="sandbox stderr"),
-                    exit_code=p.returncode,
+                    stdout=format_bounded_output(
+                        res.stdout, res.stdout_total_bytes, MAX_OUTPUT, what="sandbox stdout"
+                    ),
+                    stderr=format_bounded_output(
+                        res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
+                    ),
+                    exit_code=res.returncode,
                     timed_out=False,
-                )
-            except subprocess.TimeoutExpired:
-                return ExecutionResult(
-                    stdout="",
-                    stderr=f"SANDBOX-TIMEOUT: command exceeded {t}s.",
-                    exit_code=-1,
-                    timed_out=True,
                 )
             except Exception as e:
                 return ExecutionResult(
@@ -245,17 +256,25 @@ class GvisorEnvironment(BaseEnvironment):
         resolved_path = self._resolve_guest_path(path)
 
         def _read():
-            try:
-                p_exec = subprocess.run(
-                    [self.tool, "exec", self.container_name, "cat", str(resolved_path)],
-                    capture_output=True,
-                    timeout=self.timeout,
-                )
-            except subprocess.TimeoutExpired:
+            res = run_bounded_subprocess(
+                [self.tool, "exec", self.container_name, "cat", str(resolved_path)],
+                timeout=self.timeout,
+                max_stdout_bytes=MAX_GUEST_FILE_BYTES,
+                max_stderr_bytes=65536,
+                kill_on_stdout_overflow=True,
+                mock_text=False,
+            )
+            if res.timed_out:
                 raise TimeoutError(f"Read timed out in gVisor container: {path}")
-            if p_exec.returncode != 0:
-                raise FileNotFoundError(f"File not found in gVisor container: {path} ({p_exec.stderr.decode('utf-8', errors='replace')})")
-            return p_exec.stdout
+            if res.stdout_overflowed:
+                raise ValueError(
+                    f"File '{path}' exceeds maximum sandbox read size ({MAX_GUEST_FILE_BYTES} bytes)."
+                )
+            if res.returncode != 0:
+                raise FileNotFoundError(
+                    f"File not found in gVisor container: {path} ({res.stderr.decode('utf-8', errors='replace')})"
+                )
+            return res.stdout
 
         return await asyncio.to_thread(_read)
 

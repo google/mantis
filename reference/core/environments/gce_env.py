@@ -27,7 +27,12 @@ import uuid
 
 from google.adk.environment import ExecutionResult
 from core.truncation import truncate_with_marker
-from .base import BaseEnvironment
+from .base import (
+    BaseEnvironment,
+    MAX_GUEST_FILE_BYTES,
+    format_bounded_output,
+    run_bounded_subprocess,
+)
 from .staging import create_vetted_tar_archive
 
 logger = logging.getLogger(__name__)
@@ -114,6 +119,8 @@ print('ISOLATION_VERIFIED')
 # trace for the reached-sink sentinel, and a silent cut before the sentinel
 # reads as "the PoC never got there".
 MAX_OUTPUT = 16000
+_MAX_EXEC_CAPTURE_BYTES = MAX_OUTPUT * 4 + 4096
+_MAX_B64_GUEST_FILE_BYTES = ((MAX_GUEST_FILE_BYTES + 2) // 3) * 4 + 64
 
 
 class GceEnvironment(BaseEnvironment):
@@ -467,28 +474,31 @@ class GceEnvironment(BaseEnvironment):
 
         def _exec():
             try:
-                p = subprocess.run(
+                res = run_bounded_subprocess(
                     [self.gcloud_bin] + ssh_args,
-                    capture_output=True,
-                    text=True,
                     timeout=t,
-                    shell=False,
+                    max_stdout_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                    max_stderr_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                    mock_text=True,
                 )
+                if res.timed_out:
+                    return ExecutionResult(
+                        stdout=format_bounded_output(
+                            res.stdout, res.stdout_total_bytes, MAX_OUTPUT, what="sandbox stdout"
+                        ),
+                        stderr=f"SANDBOX-TIMEOUT: Command exceeded {t}s limit.",
+                        exit_code=124,
+                        timed_out=True,
+                    )
                 return ExecutionResult(
-                    stdout=truncate_with_marker(p.stdout or "", MAX_OUTPUT, what="sandbox stdout"),
-                    stderr=truncate_with_marker(p.stderr or "", MAX_OUTPUT, what="sandbox stderr"),
-                    exit_code=p.returncode,
+                    stdout=format_bounded_output(
+                        res.stdout, res.stdout_total_bytes, MAX_OUTPUT, what="sandbox stdout"
+                    ),
+                    stderr=format_bounded_output(
+                        res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
+                    ),
+                    exit_code=res.returncode,
                     timed_out=False,
-                )
-            except subprocess.TimeoutExpired as e:
-                partial = e.stdout if hasattr(e, "stdout") and e.stdout else ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", errors="replace")
-                return ExecutionResult(
-                    stdout=truncate_with_marker(partial, MAX_OUTPUT, what="sandbox stdout"),
-                    stderr=f"SANDBOX-TIMEOUT: Command exceeded {t}s limit.",
-                    exit_code=124,
-                    timed_out=True,
                 )
             except Exception as e:
                 return ExecutionResult(
@@ -557,28 +567,37 @@ class GceEnvironment(BaseEnvironment):
         ssh_args.extend(["--command", guest_cmd])
 
         def _read():
-            try:
-                p = subprocess.run(
-                    [self.gcloud_bin] + ssh_args,
-                    capture_output=True,
-                    text=False,
-                    timeout=self.timeout,
-                    shell=False,
-                )
-            except subprocess.TimeoutExpired:
+            res = run_bounded_subprocess(
+                [self.gcloud_bin] + ssh_args,
+                timeout=self.timeout,
+                max_stdout_bytes=_MAX_B64_GUEST_FILE_BYTES,
+                max_stderr_bytes=65536,
+                kill_on_stdout_overflow=True,
+                mock_text=False,
+            )
+            if res.timed_out:
                 raise TimeoutError(f"Read timed out in GCE VM: {path}")
-            if p.returncode != 0:
-                stderr = p.stderr.decode("utf-8", errors="replace") if isinstance(p.stderr, bytes) else str(p.stderr)
+            if res.stdout_overflowed:
+                raise ValueError(
+                    f"File '{path}' exceeds maximum sandbox read size ({MAX_GUEST_FILE_BYTES} bytes)."
+                )
+            if res.returncode != 0:
+                stderr = res.stderr.decode("utf-8", errors="replace")
                 if "No such file" in stderr:
                     raise FileNotFoundError(f"File not found in GCE VM: {path}")
                 if "Permission denied" in stderr:
                     raise PermissionError(f"Permission denied reading file in GCE VM: {path}")
                 raise RuntimeError(f"Error reading file {path} from GCE VM: {stderr}")
             try:
-                raw_b64 = p.stdout.strip()
-                return base64.b64decode(raw_b64)
+                raw_b64 = res.stdout.strip()
+                decoded = base64.b64decode(raw_b64)
             except Exception as e:
                 raise RuntimeError(f"Failed to decode file {path} content: {e}")
+            if len(decoded) > MAX_GUEST_FILE_BYTES:
+                raise ValueError(
+                    f"File '{path}' exceeds maximum sandbox read size ({MAX_GUEST_FILE_BYTES} bytes)."
+                )
+            return decoded
 
         return await asyncio.to_thread(_read)
 
