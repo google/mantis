@@ -92,7 +92,8 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
+from pathlib import Path
+from typing import Any, Iterable, Optional, Sequence
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -784,6 +785,260 @@ def record_run_scan_mode(db_path: str, run_id: str, scan_mode: str) -> bool:
                 conn.close()
             except sqlite3.Error:
                 pass
+
+
+def _rel_under_root(path: str, root: str) -> Optional[str]:
+    """Portable slash-separated relative path under `root` ('.' when equal)."""
+    if not path or not root:
+        return None
+    try:
+        real_p = os.path.realpath(str(path))
+        real_r = os.path.realpath(str(root))
+        if real_p == real_r:
+            return "."
+        if os.path.commonpath([real_p, real_r]) != real_r:
+            return None
+        return os.path.relpath(real_p, real_r).replace(os.sep, "/")
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve_under_root(rel: str, root: str) -> Optional[str]:
+    """Resolves a stored relative path under `root` with CP-3 symlink checks."""
+    if not rel or not root:
+        return None
+    try:
+        from core.paths import find_escaping_symlink_component
+
+        parts = [p for p in str(rel).split("/") if p]
+        if ".." in parts:
+            return None
+        real_r = os.path.realpath(str(root))
+        cand = Path(real_r) if str(rel) == "." else Path(real_r).joinpath(*parts)
+        if find_escaping_symlink_component(cand) is not None:
+            return None
+        real_p = os.path.realpath(str(cand))
+        if real_p != real_r and os.path.commonpath([real_p, real_r]) != real_r:
+            return None
+        if not os.path.exists(real_p):
+            return None
+        return real_p
+    except Exception:
+        return None
+
+
+def record_run_plan(
+    db_path: str,
+    run_id: str,
+    targets: Sequence[str],
+    target_root: str,
+    plan_groups: Optional[Sequence[dict]] = None,
+    campaign_plan: Optional[dict] = None,
+    focus_files: Optional[Sequence[str]] = None,
+    focus_groups: Optional[Sequence[dict]] = None,
+    overwrite: bool = False,
+) -> bool:
+    """Persists a run's initial planned targets and campaign groupings in
+    `runs.metadata_json` (as relative paths under `target_root`) so `--resume`
+    reloads the original plan instead of re-deriving all files or re-running
+    `propose_campaigns`. Never raises (INV-6)."""
+    if not db_path or not run_id or not target_root or not os.path.exists(db_path):
+        return False
+    rel_targets = [
+        r for t in (targets or []) if (r := _rel_under_root(str(t), target_root))
+    ]
+    if not rel_targets:
+        return False
+
+    payload: dict[str, Any] = {"targets": rel_targets}
+    if plan_groups:
+        stored_groups = []
+        for g in plan_groups:
+            if not isinstance(g, dict):
+                continue
+            members = [
+                r
+                for m in (g.get("targets") or [])
+                if (r := _rel_under_root(str(m), target_root))
+            ]
+            if not members:
+                continue
+            entry: dict[str, Any] = {
+                "targets": members,
+                "hypothesis": g.get("hypothesis"),
+                "chain": g.get("chain") or None,
+            }
+            if g.get("chain_id"):
+                entry["chain_id"] = str(g["chain_id"])
+            stored_groups.append(entry)
+        if stored_groups:
+            payload["plan_groups"] = stored_groups
+
+    if isinstance(campaign_plan, dict) and campaign_plan.get("available"):
+        rel_hyps = {}
+        for k, v in (campaign_plan.get("hypotheses") or {}).items():
+            rk = _rel_under_root(str(k), target_root)
+            if rk and isinstance(v, dict):
+                rel_hyps[rk] = v
+        payload["campaign_plan"] = {"available": True, "hypotheses": rel_hyps}
+
+    if focus_files is not None:
+        payload["focus_files"] = [
+            r for f in focus_files if (r := _rel_under_root(str(f), target_root))
+        ]
+    if focus_groups is not None:
+        stored_fg = []
+        for fg in focus_groups:
+            if not isinstance(fg, dict):
+                continue
+            rdir = _rel_under_root(str(fg.get("dir") or ""), target_root)
+            rfiles = [
+                r
+                for f in (fg.get("files") or [])
+                if (r := _rel_under_root(str(f), target_root))
+            ]
+            if rdir and rfiles:
+                stored_fg.append({"dir": rdir, "files": rfiles})
+        payload["focus_groups"] = stored_fg
+
+    conn = None
+    try:
+        conn = _connect(db_path)
+        with conn:
+            has_runs = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+            ).fetchone()
+            if not has_runs:
+                return False
+            row = conn.execute(
+                "SELECT metadata_json FROM runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                meta = json.loads(row[0] or "{}")
+                if not isinstance(meta, dict):
+                    meta = {}
+            except ValueError:
+                meta = {}
+            if meta.get("scan_plan") and not overwrite:
+                return True
+            meta["scan_plan"] = payload
+            conn.execute(
+                "UPDATE runs SET metadata_json = ? WHERE run_id = ?",
+                (json.dumps(meta), str(run_id)),
+            )
+        return True
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def load_run_plan(db_path: str, run_id: str, target_root: str) -> Optional[dict]:
+    """Reloads a run's persisted initial scan plan, resolving stored relative
+    paths under `target_root` with CP-3 validation. Returns None when no plan
+    was recorded (legacy runs) or on any read error (INV-6)."""
+    if not db_path or not run_id or not target_root or not os.path.exists(db_path):
+        return None
+    conn = None
+    try:
+        conn = _connect(db_path)
+        rrow = conn.execute(
+            "SELECT metadata_json FROM runs WHERE run_id = ?",
+            (str(run_id),),
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    if not rrow or not rrow[0]:
+        return None
+    try:
+        meta = json.loads(rrow[0])
+        raw_plan = meta.get("scan_plan") if isinstance(meta, dict) else None
+        if not isinstance(raw_plan, dict):
+            return None
+        targets = [
+            p
+            for r in (raw_plan.get("targets") or [])
+            if (p := _resolve_under_root(str(r), target_root))
+        ]
+        if not targets:
+            return None
+
+        plan_groups: list[dict] = []
+        for g in raw_plan.get("plan_groups") or []:
+            if not isinstance(g, dict):
+                continue
+            members = [
+                p
+                for r in (g.get("targets") or [])
+                if (p := _resolve_under_root(str(r), target_root))
+            ]
+            if not members:
+                continue
+            entry: dict[str, Any] = {
+                "targets": members,
+                "hypothesis": g.get("hypothesis"),
+                "chain": g.get("chain") or None,
+            }
+            if g.get("chain_id"):
+                entry["chain_id"] = str(g["chain_id"])
+            plan_groups.append(entry)
+
+        campaign_plan: dict[str, Any] = {"available": False}
+        raw_cp = raw_plan.get("campaign_plan")
+        if isinstance(raw_cp, dict) and raw_cp.get("available"):
+            hyps = {}
+            for rk, v in (raw_cp.get("hypotheses") or {}).items():
+                pk = _resolve_under_root(str(rk), target_root)
+                if pk and isinstance(v, dict):
+                    hyps[pk] = v
+            campaign_plan = {
+                "available": True,
+                "targets": list(targets),
+                "hypotheses": hyps,
+            }
+
+        out: dict[str, Any] = {
+            "targets": targets,
+            "plan_groups": plan_groups,
+            "campaign_plan": campaign_plan,
+        }
+        if "focus_files" in raw_plan and isinstance(raw_plan["focus_files"], list):
+            out["focus_files"] = [
+                p
+                for r in raw_plan["focus_files"]
+                if (p := _resolve_under_root(str(r), target_root))
+            ]
+        if "focus_groups" in raw_plan and isinstance(raw_plan["focus_groups"], list):
+            fgs = []
+            for fg in raw_plan["focus_groups"]:
+                if not isinstance(fg, dict):
+                    continue
+                pdir = _resolve_under_root(str(fg.get("dir") or ""), target_root)
+                pfiles = [
+                    p
+                    for r in (fg.get("files") or [])
+                    if (p := _resolve_under_root(str(r), target_root))
+                ]
+                if pdir and pfiles:
+                    fgs.append({"dir": pdir, "files": pfiles})
+            out["focus_groups"] = fgs
+        return out
+    except Exception:
+        return None
 
 
 def run_scan_mode(db_path: str, run_id: str) -> str:

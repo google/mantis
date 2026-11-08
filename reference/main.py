@@ -2602,6 +2602,16 @@ async def pipeline(
         scope_out=scan_scope,
         changed_files_override=changed_files_override,
     )
+    saved_plan = None
+    if resume_run_id:
+        try:
+            from core.cost import load_run_plan
+
+            saved_plan = load_run_plan(db_path, run_id, str(target_path))
+        except Exception:
+            saved_plan = None
+    if saved_plan and saved_plan.get("targets"):
+        targets_to_scan = list(saved_plan["targets"])
     # `changed` with nothing changed is a complete answer, not an empty plan:
     # the resolver printed it, and a run that scans nothing must not confirm
     # a work plan, open campaigns, or write an empty report.
@@ -2613,8 +2623,16 @@ async def pipeline(
         record_run_scan_mode(db_path, run_id, scan_mode)
     except Exception:
         pass
-    focus_files: list[str] = list(scan_scope.get("focus_files") or [])
-    focus_groups: list[dict] = list(scan_scope.get("focus_groups") or [])
+    focus_files: list[str] = list(
+        saved_plan["focus_files"]
+        if (saved_plan and "focus_files" in saved_plan)
+        else (scan_scope.get("focus_files") or [])
+    )
+    focus_groups: list[dict] = list(
+        saved_plan["focus_groups"]
+        if (saved_plan and "focus_groups" in saved_plan)
+        else (scan_scope.get("focus_groups") or [])
+    )
     if focus_files and not focus_groups:
         focus_groups = [{"dir": str(target_path), "files": list(focus_files)}]
     # The files whose content changed, target-relative: the only ones a
@@ -2731,7 +2749,22 @@ async def pipeline(
     # cannot gain a kwarg.
     _WORK_PLAN_DISCLOSURE["focus"] = str(focus or "")
     campaign_plan = {"available": False}
-    if scan_mode == SCAN_MODE_CROSS_FUNCTIONAL:
+    if resume_run_id and saved_plan is not None:
+        saved_cp = saved_plan.get("campaign_plan")
+        if isinstance(saved_cp, dict) and saved_cp.get("available"):
+            campaign_plan = saved_cp
+        plan_groups = _normalize_campaign_groups(saved_plan.get("plan_groups"))
+        if replan_enabled and campaign_plan.get("available"):
+            try:
+                planner_model_id = config.get("planner_model") or config.get("default_model")
+                if planner_model_id:
+                    from core.config import get_llm_kwargs
+
+                    _, planner_kwargs = get_llm_kwargs(planner_model_id, config=config)
+                    planner_llm = ResilientLiteLlm(**planner_kwargs)
+            except Exception:
+                planner_llm = None
+    elif scan_mode == SCAN_MODE_CROSS_FUNCTIONAL:
         planning_attempted = False
         try:
             from core.planner import (
@@ -2830,6 +2863,23 @@ async def pipeline(
     # completed by default and is counted once on stderr; with
     # --rescan-changed-harness it is scanned again. A row with no stamp
     # predates the stamp and is completed for every harness (INV-6).
+    if not resume_run_id:
+        try:
+            from core.cost import record_run_plan
+
+            record_run_plan(
+                db_path,
+                run_id,
+                targets_to_scan,
+                target_root=str(target_path),
+                plan_groups=plan_groups,
+                campaign_plan=campaign_plan,
+                focus_files=focus_files if scan_mode == SCAN_MODE_CHANGED else None,
+                focus_groups=focus_groups if scan_mode == SCAN_MODE_CHANGED else None,
+            )
+        except Exception:
+            pass
+
     if resume_run_id:
         from core.cost import coverage_verdict, run_ledger
 
@@ -3028,6 +3078,21 @@ async def pipeline(
     # once here, and again only for groups a replan adds; a failure inside
     # costs the lineage record, never the scan.
     _open_chains_for_groups(db_path, run_id, campaign_groups)
+    if not resume_run_id and plan_groups and any(g.get("chain_id") for g in campaign_groups):
+        try:
+            from core.cost import record_run_plan as _refresh_run_plan
+
+            _refresh_run_plan(
+                db_path,
+                run_id,
+                targets_to_scan,
+                target_root=str(target_path),
+                plan_groups=campaign_groups,
+                campaign_plan=campaign_plan,
+                overwrite=True,
+            )
+        except Exception:
+            pass
 
     # Name what was consulted, and what each source was permitted to conclude.
     #

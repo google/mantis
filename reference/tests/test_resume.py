@@ -255,6 +255,160 @@ class ResumeRunTest(unittest.TestCase):
         self.assertIn("no earlier run recorded", out)
         self.assertNotIn("Work plan", out)
 
+    def test_resume_auto_uncovered_sweep_keeps_initial_uncovered_plan(self):
+        """When auto mode chooses file-by-file over ONLY uncovered files,
+        resuming that run must keep the saved uncovered subset instead of
+        re-planning every discovered file in the repository."""
+        import asyncio
+        from unittest.mock import patch
+
+        import main as mantis_main
+        from core.budget import BudgetExceededError
+
+        import json
+
+        wf_data = json.loads((_REF_ROOT / "workflow.json").read_text(encoding="utf-8"))
+        wf_data.setdefault("config", {})["surveyor"] = {"min_source_files": 4}
+        wf_path = os.path.join(self.tmp, "wf_auto.json")
+        Path(wf_path).write_text(json.dumps(wf_data), encoding="utf-8")
+
+        # Add 2 more files (6 total > min_source_files=4). Cover a..d in 'r0',
+        # leaving exactly 2 uncovered files: e.py and f.py.
+        e_file = os.path.join(self.repo, "e.py")
+        f_file = os.path.join(self.repo, "f.py")
+        Path(e_file).write_text("def e():\n    return 5\n")
+        Path(f_file).write_text("def f():\n    return 6\n")
+        for p in self.files.values():
+            record_spend(self.db, "r0", p, "file-by-file", tokens=500, metadata={"failed": False})
+
+        seen_first: list[str] = []
+
+        async def _first_exec(_runner, _ss, filepath, _rid, **kw):
+            seen_first.append(filepath)
+            if len(seen_first) == 1:
+                kw["budget_controller"].audit_code_reads += 1
+                return False
+            raise BudgetExceededError("max_tokens", 1000, 1000, _rid)
+
+        out1, err1 = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), \
+             patch.object(mantis_main, "execute_sub_task", side_effect=_first_exec), \
+             contextlib.redirect_stdout(out1), \
+             contextlib.redirect_stderr(err1):
+            rc1 = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=self.repo,
+                    workflow_path=wf_path,
+                    load_local=False,
+                    db_override=self.db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    scan_mode_override="auto",
+                    assume_yes=True,
+                )
+            )
+        self.assertEqual(rc1, 2, out1.getvalue() + err1.getvalue())
+        self.assertEqual(seen_first, [e_file, f_file])
+
+        seen_resume: list[str] = []
+
+        async def _resume_exec(_runner, _ss, filepath, _rid, **kw):
+            seen_resume.append(filepath)
+            kw["budget_controller"].audit_code_reads += 1
+            return False
+
+        out2, err2 = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), \
+             patch.object(mantis_main, "execute_sub_task", side_effect=_resume_exec), \
+             contextlib.redirect_stdout(out2), \
+             contextlib.redirect_stderr(err2):
+            rc2 = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=self.repo,
+                    workflow_path=wf_path,
+                    load_local=False,
+                    db_override=self.db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    resume_run_id="latest",
+                    assume_yes=True,
+                )
+            )
+        combined2 = out2.getvalue() + err2.getvalue()
+        self.assertEqual(rc2, 0, combined2)
+        self.assertIn(
+            "1 of 2 campaign(s) completed; 0 failed and 1 never started: 1 to scan.",
+            combined2,
+        )
+        self.assertEqual(seen_resume, [f_file])
+
+    def test_resume_cross_functional_reuses_saved_plan_without_rerunning_propose_campaigns(self):
+        """A cross-functional run that saved a campaign plan reloads its
+        planned targets and groups on --resume without calling propose_campaigns."""
+        import asyncio
+        from unittest.mock import patch
+
+        import main as mantis_main
+        from core.cost import record_run_plan
+        from core.database import init_db, record_run
+        import core.planner as planner_mod
+
+        sub_a = os.path.join(self.repo, "svc_a")
+        sub_b = os.path.join(self.repo, "svc_b")
+        os.makedirs(sub_a)
+        os.makedirs(sub_b)
+        Path(os.path.join(sub_a, "x.py")).write_text("x = 1\n")
+        Path(os.path.join(sub_b, "y.py")).write_text("y = 2\n")
+
+        run = "22222222-3333-4444-5555-666666666666"
+        init_db(self.db)
+        record_run(self.db, run, "openai/nonexistent")
+        record_spend(self.db, run, sub_a, "cross-functional", tokens=500, metadata={"failed": False})
+        saved = record_run_plan(
+            self.db,
+            run,
+            targets=[sub_a, sub_b],
+            target_root=self.repo,
+            plan_groups=[
+                {"targets": [sub_a], "hypothesis": "check a", "chain": None},
+                {"targets": [sub_b], "hypothesis": "check b", "chain": None},
+            ],
+            campaign_plan={
+                "available": True,
+                "hypotheses": {sub_b: {"hypothesis": "check b", "priority": 1}},
+            },
+        )
+        self.assertTrue(saved)
+
+        confirmed_counts: list[int] = []
+
+        def _capture_confirm(*, scan_mode, campaigns, budget, assume_yes, estimate=None):
+            confirmed_counts.append(campaigns)
+            return False  # stop cleanly right after planning & confirmation
+
+        with patch.dict(os.environ, self.env, clear=True), \
+             patch.object(planner_mod, "propose_campaigns", side_effect=AssertionError("propose_campaigns must not run on resume")), \
+             patch.object(mantis_main, "_confirm_work_plan", side_effect=_capture_confirm), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            rc = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=self.repo,
+                    db_override=self.db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    resume_run_id=run,
+                )
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(confirmed_counts, [1])
+
 
 if __name__ == "__main__":
     unittest.main()
