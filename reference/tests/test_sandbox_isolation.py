@@ -208,6 +208,24 @@ class BoundedGuestStreamTest(unittest.IsolatedAsyncioTestCase):
                 await gce.read_file("huge.bin")
         self.assertIn("exceeds maximum sandbox read size", str(ctx2.exception))
 
+    async def test_static_only_read_file_caps_bytes_read_from_disk(self):
+        import tempfile
+        from core.environments import static_env
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            small = root / "ok.txt"
+            small.write_bytes(b"hello world")
+            big = root / "huge.bin"
+            big.write_bytes(b"B" * 4096)
+
+            env = static_env.StaticOnlyEnvironment(target_path=str(root))
+            with mock.patch.object(static_env, "MAX_STATIC_READ_BYTES", 1024):
+                self.assertEqual(await env.read_file(Path("ok.txt")), b"hello world")
+                with self.assertRaises(ValueError) as ctx:
+                    await env.read_file(Path("huge.bin"))
+            self.assertIn("exceeds maximum static read size", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

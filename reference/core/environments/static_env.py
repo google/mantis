@@ -42,6 +42,10 @@ PROTECTED_METADATA_FILES = {
     ".pre-commit-config.yml",
 }
 
+MAX_STATIC_READ_BYTES = int(
+    os.environ.get("MANTIS_MAX_STATIC_READ_BYTES", str(16 * 1024 * 1024))
+)
+
 
 class StaticOnlyEnvironment(BaseEnvironment):
     """No-op sandbox for static-only vulnerability pipelines. Dynamic execution is disabled."""
@@ -162,7 +166,8 @@ class StaticOnlyEnvironment(BaseEnvironment):
         # SECURITY (INV-4): a hard link inside the checkout aliases arbitrary host file
         # content on the same device, and has no distinct target path for realpath()
         # containment to reject. Refuse multiply-linked files.
-        if os.lstat(resolved_target).st_nlink > 1:
+        st = os.lstat(resolved_target)
+        if st.st_nlink > 1:
             raise PermissionError(
                 f"Permission denied. Refusing to read hard-linked file '{path}'; it may alias content outside the scan target."
             )
@@ -173,8 +178,18 @@ class StaticOnlyEnvironment(BaseEnvironment):
         if any(d in parts for d in PROTECTED_VCS_DIRS) or parts[-1] in PROTECTED_METADATA_FILES:
             raise PermissionError(f"Permission denied. Refusing to read version-control metadata or credential files ('{rel_from_base}').")
 
+        if st.st_size > MAX_STATIC_READ_BYTES:
+            raise ValueError(
+                f"File '{path}' exceeds maximum static read size ({MAX_STATIC_READ_BYTES} bytes)."
+            )
+
         with open(resolved_target, "rb") as f:
-            return f.read()
+            data = f.read(MAX_STATIC_READ_BYTES + 1)
+        if len(data) > MAX_STATIC_READ_BYTES:
+            raise ValueError(
+                f"File '{path}' exceeds maximum static read size ({MAX_STATIC_READ_BYTES} bytes)."
+            )
+        return data
 
     async def write_file(self, path: Path, content: Union[str, bytes]) -> None:
         if os.environ.get("MANTIS_ALLOW_STATIC_WRITE") != "1":
