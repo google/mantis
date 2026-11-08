@@ -210,11 +210,17 @@ SCENARIOS = {
          '["config", "--file", str(cfg_candidate), "--no-includes", "--name-only", "-z", "-l"]',
          '["config", "--file", str(cfg_candidate), "--no-includes", "--name-only", "-l"]'),
         ("tools/research_tools.py",
+         '["config", "--file", str(entry), "--no-includes", "--name-only", "-z", "-l"]',
+         '["config", "--file", str(entry), "--no-includes", "--name-only", "-l"]'),
+        ("tools/research_tools.py",
          r'for line in cfg_out.split("\0"):',
          'for line in cfg_out.splitlines():'),
         ("tools/research_tools.py",
          r'for line in f_out.split("\0"):',
          'for line in f_out.splitlines():'),
+        ("tools/research_tools.py",
+         r'for line in c_out.split("\0"):',
+         'for line in c_out.splitlines():'),
     ],
 
     # ---- Large-repository scaling controls ----
