@@ -246,5 +246,83 @@ class TestStageAgentAlignment(unittest.TestCase):
             self.assertEqual(cfg["tools"], wf_tools[stage], f"tool drift on stage '{stage}'")
 
 
+class TestEvalToolContextVisibility(unittest.IsolatedAsyncioTestCase):
+    """Regression tests ensuring run_eval seeds findings under the active eval run_id and scope."""
+
+    async def test_eval_calibrator_tools_see_and_update_seeded_findings(self):
+        from tools.research_tools import calibrate_finding, get_findings
+
+        async def _tool_driving_calibrator(runner_self, *args, **kwargs):
+            raw = get_findings()
+            self.assertNotIn("NO_DATA:", raw)
+            # Extract JSON array inside untrusted fence
+            start = raw.find("[")
+            end = raw.rfind("]")
+            rows = json.loads(raw[start : end + 1])
+            self.assertEqual(len(rows), 3)
+            for row in rows:
+                out = calibrate_finding(
+                    finding_id=row["id"],
+                    mantis_risk_score=9.5,
+                    impact_score=5,
+                    likelihood_score=5,
+                    priority="CRITICAL",
+                )
+                self.assertIn("SUCCESS:", out)
+            yield _event("done")
+
+        with patch.object(run_eval.Runner, "run_async", _tool_driving_calibrator):
+            res = await run_eval.eval_calibrator("test-model", "low", _CALIBRATE_DS)
+        self.assertEqual(res["errors"], 0)
+        self.assertEqual(res["unscored"], 0)
+        self.assertIsNotNone(res["mae"])
+
+    async def test_eval_deduplicator_tools_see_and_merge_seeded_findings(self):
+        from tools.research_tools import dedupe_findings, get_findings
+
+        syn_ds = _EVALS_DIR / "synthetic_dataset.json"
+
+        async def _tool_driving_deduper(runner_self, *args, **kwargs):
+            raw = get_findings()
+            self.assertNotIn("NO_DATA:", raw)
+            start = raw.find("[")
+            end = raw.rfind("]")
+            rows = json.loads(raw[start : end + 1])
+            self.assertGreaterEqual(len(rows), 2)
+            out = dedupe_findings(
+                primary_title=rows[0]["title"],
+                duplicate_titles=[rows[1]["title"]],
+                reason="same root cause",
+            )
+            self.assertIn("Deduplicated 1 finding", out)
+            yield _event("done")
+
+        with patch.object(run_eval.Runner, "run_async", _tool_driving_deduper):
+            res = await run_eval.eval_deduplicator("test-model", "low", syn_ds)
+        self.assertEqual(res["schema_errors"], 0)
+        self.assertGreaterEqual(res["tp"], 1)
+
+    async def test_eval_reviewer_isolates_per_case_findings_and_parses_compact_json(self):
+        from tools.research_tools import get_findings
+
+        routes = _title_routes(_REVIEW_DS)
+
+        async def _case_checking_reviewer(runner_self, *args, **kwargs):
+            raw = get_findings()
+            self.assertNotIn("NO_DATA:", raw)
+            start = raw.find("[")
+            end = raw.rfind("]")
+            rows = json.loads(raw[start : end + 1])
+            self.assertEqual(len(rows), 1, "each reviewer eval case must see only its own finding")
+            route = routes[rows[0]["title"]]
+            yield _event(f'{{"route":"{route}","reason":"ok"}}')
+
+        with patch.object(run_eval.Runner, "run_async", _case_checking_reviewer):
+            res = await run_eval.eval_reviewer("test-model", "low", _REVIEW_DS)
+        self.assertEqual(res["tp"], 2)
+        self.assertEqual(res["tn"], 4)
+        self.assertEqual(res["no_verdict"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

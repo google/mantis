@@ -88,181 +88,280 @@ def score_dedup_partition(db_findings: List[Dict[str, Any]], ground_truth: Dict[
     safety = tn / (tn + fp) if (tn + fp) > 0 else 1.0
     return {"tp": tp, "fn": fn, "fp": fp, "tn": tn, "precision": precision, "recall": recall, "f1": f1, "safety": safety, "false_merges": false_merges, "missed_merges": missed_merges}
 
+def _extract_route_from_event(event: Any, valid_routes: tuple[str, ...]) -> str | None:
+    """Extracts a route verdict from an ADK event (JSON text, set_model_response call, or prose)."""
+    if not hasattr(event, "content") or not event.content:
+        return None
+    found = None
+    for p in getattr(event.content, "parts", None) or []:
+        fc = getattr(p, "function_call", None)
+        if fc is not None and getattr(fc, "name", "") == "set_model_response":
+            args = getattr(fc, "args", None)
+            if isinstance(args, dict):
+                r = str(args.get("route") or "").strip().lower()
+                if r in valid_routes:
+                    found = r
+        txt_raw = getattr(p, "text", None)
+        if txt_raw:
+            stripped = txt_raw.strip()
+            if stripped.startswith("{"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        r = str(parsed.get("route") or "").strip().lower()
+                        if r in valid_routes:
+                            found = r
+                            continue
+                except ValueError:
+                    pass
+            txt = txt_raw.lower()
+            for candidate in valid_routes:
+                if (
+                    f'"route": "{candidate}"' in txt
+                    or f'"route":"{candidate}"' in txt
+                    or f"'route': '{candidate}'" in txt
+                    or f"'route':'{candidate}'" in txt
+                    or f"route: {candidate}" in txt
+                ):
+                    found = candidate
+    return found
+
+
 async def eval_deduplicator(model_id: str, effort: str, dataset_path: Path) -> Dict[str, Any]:
+    import shutil
+
     with open(dataset_path, "r", encoding="utf-8") as f:
         syn = json.load(f)
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_dedupe_")
-    db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
-    write_findings(db_path, "", syn["findings"])
-    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
-    agent = build_stage_agent("deduplicator", model_id=model_id, reasoning_effort=effort)
-    session_service = InMemorySessionService()
-    runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
-    session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
-    prompt = "You are the deduplicator stage. 1. Call get_findings() to retrieve all recorded findings. 2. Disambiguate findings. 3. Call dedupe_findings(primary_title, duplicate_titles, reason) for true duplicates. 4. Do NOT merge distinct vulnerabilities (stored vs reflected XSS, timing vs expiry, concurrency vs arithmetic)."
-    content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-    t0 = time.time(); schema_err = 0
+    db_path = os.path.join(temp_dir, "eval.db")
+    init_db(db_path)
+    ctx, tok = install_eval_run_context(temp_dir, db_path, "")
     try:
-        async for _ in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content): pass
-    except Exception: schema_err += 1
-    latency = time.time() - t0
-    findings = read_findings(db_path)
-    res = score_dedup_partition(findings, syn)
-    res["latency"] = latency; res["schema_errors"] = schema_err
-    import shutil
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    return res
+        write_findings(db_path, "", syn["findings"], run_id=ctx.run_id)
+        agent = build_stage_agent("deduplicator", model_id=model_id, reasoning_effort=effort)
+        session_service = InMemorySessionService()
+        runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
+        session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
+        prompt = (
+            "You are the deduplicator stage. 1. Call get_findings() to retrieve all recorded findings "
+            "(this benchmark provides finding records only; no source tree is mounted on disk). "
+            "2. Disambiguate findings. 3. Call dedupe_findings(primary_title, duplicate_titles, reason) "
+            "for true duplicates. 4. Do NOT merge distinct vulnerabilities (stored vs reflected XSS, "
+            "timing vs expiry, concurrency vs arithmetic)."
+        )
+        content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        t0 = time.time()
+        schema_err = 0
+        try:
+            async for _ in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
+                pass
+        except Exception:
+            schema_err += 1
+        latency = time.time() - t0
+        findings = read_findings(db_path, run_id=ctx.run_id)
+        res = score_dedup_partition(findings, syn)
+        res["latency"] = latency
+        res["schema_errors"] = schema_err
+        return res
+    finally:
+        current_run_context.reset(tok)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
 
 async def eval_reviewer(model_id: str, effort: str, dataset_path: Path) -> Dict[str, Any]:
+    import shutil
+
     with open(dataset_path, "r", encoding="utf-8") as f:
         rdata = json.load(f)
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_rev_")
-    db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
-    write_findings(db_path, "", [c["finding"] for c in rdata["cases"]])
-    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
-    agent = build_stage_agent("reviewer", model_id=model_id, reasoning_effort=effort)
-    session_service = InMemorySessionService()
-    runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
-    tp = 0; fp = 0; tn = 0; fn = 0; no_verdict = 0; errors = 0; t0 = time.time()
-    for case in rdata["cases"]:
-        session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
-        finding = case["finding"]; exp_route = case["ground_truth"]["expected_route"]
-        prompt = f"Review finding: Title: {finding['title']} at {finding['filepath']}. Description: {finding['description']}. Output a ReviewVerdict with route='confirmed' or route='false_positive'."
-        content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-        # None until a verdict is actually parsed: a case where the model never
-        # answers, or the call fails, must not inherit the negative class and
-        # score as a correct rejection (issue #8).
-        last_route = None
-        try:
-            async for event in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
-                if hasattr(event, "content") and event.content:
-                    for p in event.content.parts:
-                        if p.text:
-                            txt = p.text.lower()
-                            if '"route": "confirmed"' in txt or "'route': 'confirmed'" in txt or "route: confirmed" in txt:
-                                last_route = "confirmed"
-                            elif '"route": "false_positive"' in txt or "'route': 'false_positive'" in txt or "route: false_positive" in txt:
-                                last_route = "false_positive"
-        except Exception:
-            errors += 1
-        if last_route is None:
-            no_verdict += 1
-        elif exp_route == "confirmed":
-            if last_route == "confirmed": tp += 1
-            else: fn += 1
-        else:
-            if last_route == "false_positive": tn += 1
-            else: fp += 1
-    latency = time.time() - t0
-    total_cases = len(rdata["cases"])
-    total_pos = sum(1 for c in rdata["cases"] if c["ground_truth"]["expected_route"] == "confirmed")
-    # Classifier metrics are computed over parsed verdicts only; precision is
-    # undefined (not perfect) when the model never made a positive prediction.
-    precision = tp / (tp + fp) if (tp + fp) > 0 else None
-    # Operational metrics keep counting silence: a real finding with no verdict
-    # is still a dropped finding, exactly like an explicit dismissal.
-    recall = tp / total_pos if total_pos > 0 else 0.0
-    fatal_drops = total_pos - tp
-    safety = (total_cases - fatal_drops) / total_cases if total_cases > 0 else 1.0
-    import shutil
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "no_verdict": no_verdict, "errors": errors, "precision": precision, "recall": recall, "safety": safety, "fatal_drops": fatal_drops, "noise_admitted": fp, "latency": latency}
+    try:
+        agent = build_stage_agent("reviewer", model_id=model_id, reasoning_effort=effort)
+        session_service = InMemorySessionService()
+        runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
+        tp = 0; fp = 0; tn = 0; fn = 0; no_verdict = 0; errors = 0; t0 = time.time()
+        for idx, case in enumerate(rdata["cases"]):
+            case_db = os.path.join(temp_dir, f"eval_{idx}.db")
+            init_db(case_db)
+            ctx, tok = install_eval_run_context(temp_dir, case_db, "")
+            try:
+                finding = case["finding"]
+                exp_route = case["ground_truth"]["expected_route"]
+                write_findings(case_db, "", [finding], run_id=ctx.run_id)
+                session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
+                prompt = (
+                    f"Review finding: Title: {finding['title']} at {finding['filepath']}. "
+                    f"Description: {finding['description']}. "
+                    "Note: This synthetic triage benchmark provides only the finding metadata via "
+                    "get_findings() (no source files are mounted on disk; evaluate strictly from the "
+                    "finding record and do not reject merely because source files cannot be opened). "
+                    "Output a ReviewVerdict with route='confirmed' or route='false_positive'."
+                )
+                content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+                # None until a verdict is actually parsed: a case where the model never
+                # answers, or the call fails, must not inherit the negative class and
+                # score as a correct rejection (issue #8).
+                last_route = None
+                try:
+                    async for event in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
+                        extracted = _extract_route_from_event(event, ("confirmed", "false_positive"))
+                        if extracted is not None:
+                            last_route = extracted
+                except Exception:
+                    errors += 1
+                if last_route is None:
+                    no_verdict += 1
+                elif exp_route == "confirmed":
+                    if last_route == "confirmed":
+                        tp += 1
+                    else:
+                        fn += 1
+                else:
+                    if last_route == "false_positive":
+                        tn += 1
+                    else:
+                        fp += 1
+            finally:
+                current_run_context.reset(tok)
+        latency = time.time() - t0
+        total_cases = len(rdata["cases"])
+        total_pos = sum(1 for c in rdata["cases"] if c["ground_truth"]["expected_route"] == "confirmed")
+        # Classifier metrics are computed over parsed verdicts only; precision is
+        # undefined (not perfect) when the model never made a positive prediction.
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        # Operational metrics keep counting silence: a real finding with no verdict
+        # is still a dropped finding, exactly like an explicit dismissal.
+        recall = tp / total_pos if total_pos > 0 else 0.0
+        fatal_drops = total_pos - tp
+        safety = (total_cases - fatal_drops) / total_cases if total_cases > 0 else 1.0
+        return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "no_verdict": no_verdict, "errors": errors, "precision": precision, "recall": recall, "safety": safety, "fatal_drops": fatal_drops, "noise_admitted": fp, "latency": latency}
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
 
 async def eval_critic(model_id: str, effort: str, dataset_path: Path) -> Dict[str, Any]:
+    import shutil
+
     with open(dataset_path, "r", encoding="utf-8") as f:
         cdata = json.load(f)
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_crit_")
-    db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
-    write_findings(db_path, "", [c["finding"] for c in cdata["cases"]])
-    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
-    agent = build_stage_agent("critic", model_id=model_id, reasoning_effort=effort)
-    session_service = InMemorySessionService()
-    runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
-    tp = 0; fp = 0; tn = 0; fn = 0; no_verdict = 0; errors = 0; t0 = time.time()
-    for case in cdata["cases"]:
-        session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
-        finding = case["finding"]; exp_route = case["ground_truth"]["expected_route"]
-        prompt = f"Assess exploit viability: Title: {finding['title']} at {finding['filepath']}. Description: {finding['description']}. Output a CriticVerdict with route='viable' or route='non_viable'."
-        content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-        # None until a verdict is actually parsed; see eval_reviewer (issue #8).
-        last_route = None
-        try:
-            async for event in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
-                if hasattr(event, "content") and event.content:
-                    for p in event.content.parts:
-                        if p.text:
-                            txt = p.text.lower()
-                            if '"route": "viable"' in txt or "'route': 'viable'" in txt or "route: viable" in txt:
-                                last_route = "viable"
-                            elif '"route": "non_viable"' in txt or "'route': 'non_viable'" in txt or "route: non_viable" in txt:
-                                last_route = "non_viable"
-        except Exception:
-            errors += 1
-        if last_route is None:
-            no_verdict += 1
-        elif exp_route == "viable":
-            if last_route == "viable": tp += 1
-            else: fn += 1
-        else:
-            if last_route == "non_viable": tn += 1
-            else: fp += 1
-    latency = time.time() - t0
-    total_pos = sum(1 for c in cdata["cases"] if c["ground_truth"]["expected_route"] == "viable")
-    precision = tp / (tp + fp) if (tp + fp) > 0 else None
-    recall = tp / total_pos if total_pos > 0 else 0.0
-    import shutil
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "no_verdict": no_verdict, "errors": errors, "precision": precision, "recall": recall, "latency": latency}
+    try:
+        agent = build_stage_agent("critic", model_id=model_id, reasoning_effort=effort)
+        session_service = InMemorySessionService()
+        runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
+        tp = 0; fp = 0; tn = 0; fn = 0; no_verdict = 0; errors = 0; t0 = time.time()
+        for idx, case in enumerate(cdata["cases"]):
+            case_db = os.path.join(temp_dir, f"eval_{idx}.db")
+            init_db(case_db)
+            ctx, tok = install_eval_run_context(temp_dir, case_db, "")
+            try:
+                finding = case["finding"]
+                exp_route = case["ground_truth"]["expected_route"]
+                write_findings(case_db, "", [finding], run_id=ctx.run_id)
+                session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
+                prompt = (
+                    f"Assess exploit viability: Title: {finding['title']} at {finding['filepath']}. "
+                    f"Description: {finding['description']}. "
+                    "Note: This synthetic viability benchmark provides only the finding metadata via "
+                    "get_findings() (no source files are mounted on disk; assess viability strictly "
+                    "from the finding record and do not reject merely because source files cannot be opened). "
+                    "Output a CriticVerdict with route='viable' or route='non_viable'."
+                )
+                content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+                # None until a verdict is actually parsed; see eval_reviewer (issue #8).
+                last_route = None
+                try:
+                    async for event in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
+                        extracted = _extract_route_from_event(event, ("viable", "non_viable"))
+                        if extracted is not None:
+                            last_route = extracted
+                except Exception:
+                    errors += 1
+                if last_route is None:
+                    no_verdict += 1
+                elif exp_route == "viable":
+                    if last_route == "viable":
+                        tp += 1
+                    else:
+                        fn += 1
+                else:
+                    if last_route == "non_viable":
+                        tn += 1
+                    else:
+                        fp += 1
+            finally:
+                current_run_context.reset(tok)
+        latency = time.time() - t0
+        total_pos = sum(1 for c in cdata["cases"] if c["ground_truth"]["expected_route"] == "viable")
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        recall = tp / total_pos if total_pos > 0 else 0.0
+        return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "no_verdict": no_verdict, "errors": errors, "precision": precision, "recall": recall, "latency": latency}
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
 
 async def eval_calibrator(model_id: str, effort: str, dataset_path: Path) -> Dict[str, Any]:
+    import shutil
+
     with open(dataset_path, "r", encoding="utf-8") as f:
         cdata = json.load(f)
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_cal_")
-    db_path = os.path.join(temp_dir, "eval.db"); init_db(db_path)
-    write_findings(db_path, "", [c["finding"] for c in cdata["cases"]])
-    ctx, _ = install_eval_run_context(temp_dir, db_path, "workspace/app")
-    agent = build_stage_agent("calibrator", model_id=model_id, reasoning_effort=effort)
-    session_service = InMemorySessionService()
-    runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
-    session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
-    prompt = "You are the calibrator stage. 1. Call get_findings() to retrieve findings. 2. Call calibrate_finding(finding_id, mantis_risk_score, impact_score, likelihood_score, priority) for each finding on the 0.1-10.0 scale."
-    content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-    t0 = time.time(); errors = 0
+    db_path = os.path.join(temp_dir, "eval.db")
+    init_db(db_path)
+    ctx, tok = install_eval_run_context(temp_dir, db_path, "")
     try:
-        async for _ in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content): pass
-    except Exception:
-        errors += 1
-    latency = time.time() - t0
-    findings = read_findings(db_path)
-    f_by_title = {f.get("title", ""): f for f in findings}
-    correct_priorities = 0
-    score_errors = []
-    unscored = 0
-    for case in cdata["cases"]:
-        f_title = case["finding"].get("title", "")
-        f_row = f_by_title.get(f_title, {})
-        gt = case["ground_truth"]
-        assigned_score = f_row.get("mantis_risk_score")
-        if assigned_score is None:
-            # No substitute score: a run that scored nothing must not earn an
-            # MAE measured from an invented 5.0 (issue #8). Unscored findings
-            # are excluded from the MAE and reported separately.
-            unscored += 1
-        else:
-            min_s = gt.get("expected_min_score", 1.0)
-            max_s = gt.get("expected_max_score", 10.0)
-            mid_s = (min_s + max_s) / 2.0
-            score_errors.append(abs(assigned_score - mid_s))
-        assigned_prio = str(f_row.get("priority") or "").upper()
-        expected_prio = str(gt.get("expected_priority", "")).upper()
-        if expected_prio and (expected_prio in assigned_prio or any(p in assigned_prio for p in expected_prio.split("_") if p)):
-            correct_priorities += 1
-    mae = sum(score_errors) / len(score_errors) if score_errors else None
-    prio_acc = correct_priorities / len(cdata["cases"]) if cdata["cases"] else 0.0
-    import shutil
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    return {"mae": mae, "priority_accuracy": prio_acc, "unscored": unscored, "errors": errors, "latency": latency}
+        write_findings(db_path, "", [c["finding"] for c in cdata["cases"]], run_id=ctx.run_id)
+        agent = build_stage_agent("calibrator", model_id=model_id, reasoning_effort=effort)
+        session_service = InMemorySessionService()
+        runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
+        session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
+        prompt = (
+            "You are the calibrator stage. 1. Call get_findings() to retrieve findings and their numeric "
+            "database `id` values. 2. Call calibrate_finding(finding_id, mantis_risk_score, impact_score, "
+            "likelihood_score, priority) for EVERY finding returned by get_findings() on the 0.1-10.0 scale."
+        )
+        content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        t0 = time.time()
+        errors = 0
+        try:
+            async for _ in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
+                pass
+        except Exception:
+            errors += 1
+        latency = time.time() - t0
+        findings = read_findings(db_path, run_id=ctx.run_id)
+        f_by_title = {f.get("title", ""): f for f in findings}
+        correct_priorities = 0
+        score_errors = []
+        unscored = 0
+        for case in cdata["cases"]:
+            f_title = case["finding"].get("title", "")
+            f_row = f_by_title.get(f_title, {})
+            gt = case["ground_truth"]
+            assigned_score = f_row.get("mantis_risk_score")
+            if assigned_score is None:
+                # No substitute score: a run that scored nothing must not earn an
+                # MAE measured from an invented 5.0 (issue #8). Unscored findings
+                # are excluded from the MAE and reported separately.
+                unscored += 1
+            else:
+                min_s = gt.get("expected_min_score", 1.0)
+                max_s = gt.get("expected_max_score", 10.0)
+                mid_s = (min_s + max_s) / 2.0
+                score_errors.append(abs(assigned_score - mid_s))
+            assigned_prio = str(f_row.get("priority") or "").upper()
+            expected_prio = str(gt.get("expected_priority", "")).upper()
+            if expected_prio and (expected_prio in assigned_prio or any(p in assigned_prio for p in expected_prio.split("_") if p)):
+                correct_priorities += 1
+        mae = sum(score_errors) / len(score_errors) if score_errors else None
+        prio_acc = correct_priorities / len(cdata["cases"]) if cdata["cases"] else 0.0
+        return {"mae": mae, "priority_accuracy": prio_acc, "unscored": unscored, "errors": errors, "latency": latency}
+    finally:
+        current_run_context.reset(tok)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
 async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1, toolset: str = "baseline"):
     os.environ["VERTEXAI_LOCATION"] = os.environ.get("VERTEXAI_LOCATION", "global")
