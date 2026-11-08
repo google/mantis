@@ -122,6 +122,36 @@ class RefreshOpensPullRequestsPolitelyTest(unittest.TestCase):
         self.assertIn("else", tail)
         self.assertNotIn("exit 1", tail)
 
+    def test_gitignore_allows_staging_mantis_knowledge_while_ignoring_runtime_state(self):
+        import subprocess
+
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", ".mantis/scratch.tmp"],
+            cwd=_REPO,
+            check=False,
+        )
+        self.assertEqual(ignored.returncode, 0, "runtime .mantis/* files must remain ignored")
+        allowed = subprocess.run(
+            ["git", "check-ignore", "-q", ".mantis/knowledge/manifest.json"],
+            cwd=_REPO,
+            check=False,
+        )
+        self.assertEqual(
+            allowed.returncode,
+            1,
+            ".mantis/knowledge/ must not be gitignored so mantis-knowledge-refresh.yml can stage it",
+        )
+
+    def test_readme_builtin_tool_count_matches_registry(self):
+        ref_root = str(_REPO / "reference")
+        if ref_root not in sys.path:
+            sys.path.insert(0, ref_root)
+        from tools import TOOLS
+
+        readme = (_REPO / "reference" / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"The {len(TOOLS)} built-in tools", readme)
+        self.assertIn(f"The built-in {len(TOOLS)}", readme)
+
 
 if __name__ == "__main__":
     unittest.main()

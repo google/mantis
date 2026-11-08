@@ -94,7 +94,9 @@ deterministic, zero-LLM surveyor ranking benchmark and LLM stage evals
   [`scripts/launch.py`](scripts/launch.py)): Autonomous campaign launcher.
   Auto-heals unconfigured placeholders (e.g. `YOUR_PROJECT_ID`) into
   `workflow.local.json`, validates preflight readiness, accepts CLI overrides,
-  and executes the 16-agent review graph over target files or repositories.
+  and executes the 19-node review graph (14 LLM stages, 1 deterministic
+  structural indexer, and 4 deterministic classifiers) over target files or
+  repositories.
 - **`mantis-advise`** ([`scripts/advise.py`](scripts/advise.py)): Developer
   security advisor. Queries threat models, historical lineages, verified patch
   diffs, and triaged false positives from `knowledge.db`.
@@ -522,7 +524,7 @@ cut still counts; only silence from a cut trace is refused.
 
 ## Custom Tools
 
-The 28 built-in tools are a closed set, and a workflow naming anything else
+The 31 built-in tools are a closed set, and a workflow naming anything else
 fails validation. Without a way in, a site with an internal taint engine or a
 house SAST tool has exactly one option: fork. A fork never receives the next
 security fix, so leaving the set closed does not prevent custom tools — it makes
@@ -530,7 +532,7 @@ the unsafe way the only way.
 
 ### Why a declared tool inherits no trust
 
-The built-in 28 are not safe because they are confined. Most run on the host
+The built-in 31 are not safe because they are confined. Most run on the host
 with the host's full privilege: nothing in the process stops `read_file` from
 opening `~/.ssh/id_rsa`. They are safe because they **are** the enforcement —
 `read_file` is the containment for reads, `run_sandbox` for execution,
@@ -778,15 +780,17 @@ complete vulnerability campaign lifecycle:
     isolated sandbox (`ReproVerdict`).
 11. **`chainer`**: Chains related findings into multi-stage exploit
     trajectories.
-12. **`patcher`**: Autonomous remediation conductor with strict separation of
-    duties; delegates code authoring to isolated subagents, commissions
-    independent third-party re-attackers with parallel adversarial trajectory
-    search, and enforces dual-gate sandbox verification.
-13. **`calibrator`**: Calibrates final risk scores (0–100) and justification.
+12. **`patcher`**: Synthesizes minimal unified diff patches (`apply_patch`),
+    re-runs dynamic exploit PoCs (`run_sandbox_with_evidence`) to verify the
+    vulnerability is blocked, and persists verified fixes via `record_patch`
+    (deterministically gated on per-finding sandbox evidence).
+13. **`calibrator`**: Calibrates final risk scores (0.1–10.0) and justification.
 14. **`reflector`**: Rotates learnings and feedback into the knowledge base
     (`workspace/learnings.jsonl`).
 15. **`reporter`**: Compiles the final review packet and executive summary
-    (`workspace/report/review_packet-latest.md`).
+    (stored virtually in SQLite `campaign_artifacts` under
+    `workspace/review_packet-latest.md` and
+    `workspace/.structured/report.json`).
 
 ## Sandboxing & Isolation
 
@@ -973,12 +977,17 @@ strictly-typed domain tools backed by Pydantic models and SQLite persistence:
 - **`record_summary(summary)`**: Validates `CodebaseSummary` and records
   `mantis-summary.md`.
 - **`record_exploit_chain(chain)`**: Validates and records `ExploitChain`.
-- **`score_risk(score, reasoning)`**: Validates $0 \\le \\text{score} \\le 100$
-  and records risk calibration.
+- **`record_patch(finding_id, patch_diff, reattack_status, remediation)`**:
+  Validates dynamic re-attack evidence and records a verified fix
+  (`patch_verified`).
+- **`score_risk(score, reasoning)`**: Validates $0.0 \\le \\text{score} \\le
+  10.0$ (normalizing legacy 0–100 inputs) and records risk calibration.
 - **`record_learning(learning)`**: Validates `LearningEntry` and rotates
   learnings into SQLite.
-- **`generate_report(report)`**: Validates `ExecutiveReport` and writes
-  `review_packet-latest.md`.
+- **`generate_report(report)`**: Validates `ExecutiveReport` and persists
+  `workspace/review_packet-latest.md` and `workspace/.structured/report.json` in
+  SQLite `campaign_artifacts` (writing SARIF to disk only when `sarif_output` is
+  configured).
 
 ## Schema Single-Source-of-Truth
 
