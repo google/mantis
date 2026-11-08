@@ -742,6 +742,31 @@ class TestUntrustedContentFramingAndScrubbing(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[ESCAPED_UNTRUSTED_DATA_START]", inner)
         self.assertIn("[ESCAPED_UNTRUSTED_DATA_END]", inner)
 
+    def test_secret_scrubber_remains_linear_on_adversarial_near_misses(self):
+        import time
+
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEpAIBAAKCAQEAtestpayload\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        scrubbed = SecretScrubber.scrub(f"{pem}\nAuthorization: Bearer {jwt}\n")
+        self.assertIn("[REDACTED_PRIVATE_KEY]", scrubbed)
+        self.assertNotIn("MIIEpAIBAAKCAQEAtestpayload", scrubbed)
+
+        adversarial = (
+            ("-----BEGIN RSA PRIVATE KEY-----\n" * 4000)
+            + ("ey" * 30000 + "!\n")
+            + (("bearer" + " " * 1000 + "short\n") * 100)
+            + (("token:" + " " * 1000 + "short\n") * 100)
+        )
+        t0 = time.monotonic()
+        out = SecretScrubber.scrub(adversarial)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(out, adversarial)
+        self.assertLess(elapsed, 0.5, f"SecretScrubber took {elapsed:.3f}s on adversarial input")
+
 
 class TestAdvisoryOutputSafety(unittest.TestCase):
     """Section D: Advisory output safety, fence tracking, trust tiers, and notices."""

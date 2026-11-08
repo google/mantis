@@ -58,46 +58,49 @@ PRESUBMIT_SYSTEM_PROMPT_GUARD = UNTRUSTED_CODE_AUDIT_GUARD
 
 
 class SecretScrubber:
-    """Deterministic regex-based secret scrubber to prevent credential leakage."""
+    """Deterministic linear-time secret scrubber to prevent credential leakage."""
+
+    _PEM_BEGIN_RE: Pattern[str] = re.compile(
+        r"-----BEGIN (?:[A-Z0-9_-]{1,32}[ \t]{1,16})?PRIVATE KEY-----"
+    )
+    _PEM_END_RE: Pattern[str] = re.compile(
+        r"-----END (?:[A-Z0-9_-]{1,32}[ \t]{1,16})?PRIVATE KEY-----"
+    )
 
     PATTERNS: List[Tuple[Pattern[str], str]] = [
         # Google / Gemini API Keys (AIza + 30-40 characters)
-        (re.compile(r"AIza[0-9A-Za-z-_]{30,40}"), "[REDACTED_GOOGLE_API_KEY]"),
+        (re.compile(r"(?<![0-9A-Za-z_-])AIza[0-9A-Za-z-_]{30,40}"), "[REDACTED_GOOGLE_API_KEY]"),
         # Google / Vertex OAuth Access Tokens
-        (re.compile(r"ya29\.[0-9A-Za-z\-_]{25,}"), "[REDACTED_GOOGLE_OAUTH_TOKEN]"),
+        (re.compile(r"(?<![0-9A-Za-z_-])ya29\.[0-9A-Za-z\-_]{25,}"), "[REDACTED_GOOGLE_OAUTH_TOKEN]"),
         # Anthropic API Keys
-        (re.compile(r"sk-ant-[0-9a-zA-Z_\-]{20,}"), "[REDACTED_ANTHROPIC_KEY]"),
+        (re.compile(r"(?<![0-9a-zA-Z_-])sk-ant-[0-9a-zA-Z_\-]{20,}"), "[REDACTED_ANTHROPIC_KEY]"),
         # OpenAI API Keys (legacy and project tokens)
-        (re.compile(r"sk-(?:proj-)?[0-9a-zA-Z_\-]{30,}"), "[REDACTED_OPENAI_KEY]"),
+        (re.compile(r"(?<![0-9a-zA-Z_-])sk-(?:proj-)?[0-9a-zA-Z_\-]{30,}"), "[REDACTED_OPENAI_KEY]"),
         # GitHub Personal Access Tokens & App Tokens
-        (re.compile(r"ghp_[0-9a-zA-Z]{36}"), "[REDACTED_GITHUB_PAT]"),
-        (re.compile(r"github_pat_[0-9a-zA-Z_]{82}"), "[REDACTED_GITHUB_FINE_GRAINED_PAT]"),
-        (re.compile(r"gh[osru]_[0-9a-zA-Z]{36}"), "[REDACTED_GITHUB_TOKEN]"),
+        (re.compile(r"(?<![0-9a-zA-Z_])ghp_[0-9a-zA-Z]{36}"), "[REDACTED_GITHUB_PAT]"),
+        (re.compile(r"(?<![0-9a-zA-Z_])github_pat_[0-9a-zA-Z_]{82}"), "[REDACTED_GITHUB_FINE_GRAINED_PAT]"),
+        (re.compile(r"(?<![0-9a-zA-Z_])gh[osru]_[0-9a-zA-Z]{36}"), "[REDACTED_GITHUB_TOKEN]"),
         # Slack Tokens (Bot, User, App)
-        (re.compile(r"xox[baprs]-[0-9a-zA-Z]{10,48}(?:-[0-9a-zA-Z]{10,48})?"), "[REDACTED_SLACK_TOKEN]"),
+        (re.compile(r"(?<![0-9a-zA-Z_-])xox[baprs]-[0-9a-zA-Z]{10,48}(?:-[0-9a-zA-Z]{10,48})?"), "[REDACTED_SLACK_TOKEN]"),
         # AWS Access Key ID & Secrets
-        (re.compile(r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"), "[REDACTED_AWS_KEY_ID]"),
+        (re.compile(r"(?<![A-Z0-9])(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"), "[REDACTED_AWS_KEY_ID]"),
         (
-            re.compile(r"(?i)(aws[_-]?secret[_-]?(?:access[_-]?)?key)\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?"),
+            re.compile(r"(?i)(aws[_-]?secret[_-]?(?:access[_-]?)?key)[ \t]{0,16}[:=][ \t]{0,16}['\"]?([A-Za-z0-9/+=]{40})['\"]?"),
             r"\1: [REDACTED_AWS_SECRET_KEY]",
         ),
-        # Private Keys (Standard PKCS#8, RSA, EC, DSA, OPENSSH, PGP)
-        (
-            re.compile(
-                r"-----BEGIN (?:[A-Z0-9_-]+\s+)?PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z0-9_-]+\s+)?PRIVATE KEY-----"
-            ),
-            "[REDACTED_PRIVATE_KEY]",
-        ),
         # JSON Web Tokens (JWT)
-        (re.compile(r"ey[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_.+/=-]{10,}"), "[REDACTED_JWT_TOKEN]"),
+        (
+            re.compile(r"(?<![A-Za-z0-9_-])ey[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_+/=-]{10,}"),
+            "[REDACTED_JWT_TOKEN]",
+        ),
         # Generic Bearer / API Key headers and assignments (supports Base64 chars /, +, =)
         (
-            re.compile(r"(?i)(bearer\s+)[A-Za-z0-9_\-\.\/\+=]{20,}"),
+            re.compile(r"(?i)(bearer[ \t]{1,16})[A-Za-z0-9_\-\.\/\+=]{20,}"),
             r"\1[REDACTED_BEARER_TOKEN]",
         ),
         (
             re.compile(
-                r"(?i)(api[_-]?key|secret|token|password|auth_token)\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.\/\+=]{16,})['\"]?"
+                r"(?i)(api[_-]?key|secret|token|password|auth_token)[ \t]{0,16}[:=][ \t]{0,16}['\"]?([A-Za-z0-9_\-\.\/\+=]{16,})['\"]?"
             ),
             r"\1: [REDACTED_CREDENTIAL]",
         ),
@@ -113,11 +116,36 @@ class SecretScrubber:
     ]
 
     @classmethod
+    def _scrub_pem_private_keys(cls, text: str) -> str:
+        """Redacts PEM private key blocks in a single linear pass without backtracking."""
+        if "PRIVATE KEY-----" not in text or "-----BEGIN " not in text:
+            return text
+        out: List[str] = []
+        pos = 0
+        end_iter = cls._PEM_END_RE.finditer(text)
+        cur_end = next(end_iter, None)
+        for b in cls._PEM_BEGIN_RE.finditer(text):
+            if b.start() < pos:
+                continue
+            while cur_end is not None and cur_end.start() < b.end():
+                cur_end = next(end_iter, None)
+            if cur_end is None:
+                break
+            out.append(text[pos : b.start()])
+            out.append("[REDACTED_PRIVATE_KEY]")
+            pos = cur_end.end()
+            cur_end = next(end_iter, None)
+        if pos == 0:
+            return text
+        out.append(text[pos:])
+        return "".join(out)
+
+    @classmethod
     def scrub(cls, text: str) -> str:
         """Sanitizes text by replacing all matched sensitive credential patterns."""
         if not text:
             return ""
-        scrubbed = str(text)
+        scrubbed = cls._scrub_pem_private_keys(str(text))
         for pattern, replacement in cls.PATTERNS:
             scrubbed = pattern.sub(replacement, scrubbed)
         return scrubbed
