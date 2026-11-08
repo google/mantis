@@ -171,6 +171,50 @@ class TestDiscovery(unittest.TestCase):
         finally:
             current_run_context.reset(token)
 
+    def test_discover_files_rejects_symlink_dirs_hardlinks_env_and_bad_git_jail(self):
+        import main as main_mod
+
+        repo = make_tree(self.tmp, git=True)
+        outside_dir = Path(self.tmp) / "outside_host_dir"
+        outside_dir.mkdir()
+        outside_file = outside_dir / "secret_target.py"
+        outside_file.write_text("SECRET = 1\n", encoding="utf-8")
+
+        # 1. Stage a file in git under `escape/secret_target.py`, then replace `escape` with a symlink
+        #    pointing outside the repository so `git ls-files` emits `escape/secret_target.py` while
+        #    `(repo / "escape/secret_target.py").is_symlink()` is False!
+        escape_dir = repo / "escape"
+        escape_dir.mkdir()
+        (escape_dir / "secret_target.py").write_text("x = 1\n", encoding="utf-8")
+        (repo / ".env").write_text("API_KEY=supersecret\n", encoding="utf-8")
+        _git(repo, "add", "-f", "escape/secret_target.py", ".env")
+        shutil.rmtree(escape_dir)
+        escape_dir.symlink_to(outside_dir)
+
+        # 2. Hardlink inside checkout aliasing `outside_file`
+        hardlink_path = repo / "src" / "hardlinked.py"
+        os.link(outside_file, hardlink_path)
+
+        rels = self.rel(repo, main_mod.discover_files(repo))
+        self.assertIn("src/app.py", rels)
+        self.assertNotIn("escape/secret_target.py", rels)
+        self.assertNotIn(".env", rels)
+        self.assertNotIn("src/hardlinked.py", rels)
+
+        # 3. Unvetted git config causes `_validate_git_jail` to fail; `discover_files` skips git
+        #    without executing git filters and still rejects symlinked dirs and hardlinks on fallback walk.
+        marker = Path(self.tmp) / "git_filter_ran"
+        (repo / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+        with open(repo / ".git" / "config", "a", encoding="utf-8") as fh:
+            fh.write(f'\n[filter "evil"]\n\tclean = touch {marker}\n')
+
+        rels_fallback = self.rel(repo, main_mod.discover_files(repo))
+        self.assertFalse(marker.exists())
+        self.assertIn("src/app.py", rels_fallback)
+        self.assertNotIn("escape/secret_target.py", rels_fallback)
+        self.assertNotIn("src/hardlinked.py", rels_fallback)
+        self.assertNotIn(".env", rels_fallback)
+
 
 class TestCli(unittest.TestCase):
     def test_exclude_flag_is_repeatable_and_comma_separated(self):

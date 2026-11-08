@@ -524,34 +524,104 @@ def is_binary_file(path: Path, block_size: int = 1024) -> bool:
     except OSError:
         return True
 
+def _is_safe_discovered_file(path: Path, target: Path, target_real: Path, db_path: str = "") -> bool:
+    """True when `path` is a regular, singly-linked, non-credential file strictly inside
+    `target_real` with zero symlink or VCS-metadata components."""
+    import stat as _stat
+    from core.environments.static_env import PROTECTED_METADATA_FILES, PROTECTED_VCS_DIRS
+
+    if db_path and str(path) == db_path:
+        return False
+    try:
+        rel = os.path.relpath(str(path), str(target))
+    except ValueError:
+        return False
+    if rel in ("", ".") or rel.startswith(".."):
+        return False
+    parts = Path(rel).parts
+    if any(part in ("..", "") or part.lower() in PROTECTED_VCS_DIRS for part in parts):
+        return False
+    if parts[-1].lower() in PROTECTED_METADATA_FILES:
+        return False
+    curr = target
+    for part in parts:
+        curr = curr / part
+        if curr.is_symlink():
+            return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not _stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        return False
+    try:
+        real_p = Path(os.path.realpath(str(path)))
+        real_p.relative_to(target_real)
+    except ValueError:
+        return False
+    return not is_binary_file(path)
+
+
 def discover_files(target: Path, db_path: str = "", exclude: tuple = ()) -> list[str]:
     """Source files under `target`. Uses git's own view when available —
     a repo already declares what isn't source. Excludes binary files, and
     anything matching the operator's `exclude` patterns (core.exclusions)."""
+    if target.is_symlink():
+        return []
     if target.is_file():
+        import stat as _stat
+        from core.environments.static_env import PROTECTED_METADATA_FILES, PROTECTED_VCS_DIRS
+
+        try:
+            st = os.lstat(target)
+        except OSError:
+            return []
+        if not _stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+            return []
+        if target.name.lower() in PROTECTED_METADATA_FILES or target.name.lower() in PROTECTED_VCS_DIRS:
+            return []
         return [str(target)] if not is_binary_file(target) else []
+    target_real = Path(os.path.realpath(str(target)))
     found: Optional[list[str]] = None
     try:
-        from tools.research_tools import _run_safe_git_command
-        out, ok = _run_safe_git_command(
-            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            target,
-            ceiling_dir="",
-        )
-        if ok and out:
-            paths = [target / p for p in out.split("\0") if p]
-            if paths:
-                found = [
-                    str(p) for p in sorted(paths)
-                    if p.is_file() and not p.is_symlink() and str(p) != db_path and not is_binary_file(p)
-                ]
+        from tools.research_tools import _run_safe_git_command, _validate_git_jail
+
+        valid_git, _ = _validate_git_jail(target, target)
+        if valid_git:
+            out, ok = _run_safe_git_command(
+                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                target,
+                ceiling_dir="",
+            )
+            if ok and out:
+                raw_entries = [p for p in out.split("\0") if p]
+                if raw_entries:
+                    found = [
+                        str(target / p)
+                        for p in sorted(raw_entries)
+                        if _is_safe_discovered_file(target / p, target, target_real, db_path=db_path)
+                    ]
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     if found is None:
-        found = [
-            str(p) for p in sorted(target.rglob("*"))
-            if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
-        ]
+        from core.environments.static_env import PROTECTED_VCS_DIRS
+
+        walked: list[str] = []
+        for root, dirs, filenames in os.walk(str(target), followlinks=False):
+            dirs[:] = sorted(
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d.lower() not in PROTECTED_VCS_DIRS
+                and not (Path(root) / d).is_symlink()
+            )
+            for fn in sorted(filenames):
+                if fn.startswith("."):
+                    continue
+                cand = Path(root) / fn
+                if _is_safe_discovered_file(cand, target, target_real, db_path=db_path):
+                    walked.append(str(cand))
+        found = sorted(walked)
     # Tool state is never source. git's view includes a committed
     # .mantis/knowledge; the dot-prefix rule above already drops it on the
     # other path.
