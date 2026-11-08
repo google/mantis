@@ -286,5 +286,50 @@ class StagingBudgetTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("MANTIS_MAX_STAGING_BYTES", str(ctx_msb.exception))
 
 
+class GceHardeningTest(unittest.IsolatedAsyncioTestCase):
+    """GCE ssh calls isolate host stdin, disable agent forwarding, and probe PGA VIPs by IP."""
+
+    async def test_gce_ssh_isolates_stdin_and_disables_forwarding(self):
+        import subprocess
+        from core.environments import gce_env
+
+        gce = gce_env.GceEnvironment(project="proj", zone="us-central1-a", gcloud_bin="/bin/true")
+        gce._ensure = mock.AsyncMock(return_value=None)
+
+        # 1. _run_gcloud without stdin binds stdin=DEVNULL (never inheriting parent stdin)
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0, stdout="ok", stderr="")
+            gce._run_gcloud(["compute", "instances", "list"])
+            _, kwargs = mock_run.call_args
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertNotIn("input", kwargs)
+
+        # 2. list_files binds stdin=DEVNULL and passes SSH forwarding hardening flags
+        with mock.patch("subprocess.run") as mock_list:
+            mock_list.return_value = mock.MagicMock(returncode=0, stdout="/workspace/a.py\n", stderr="")
+            files = await gce.list_files("")
+            self.assertEqual(files, ["a.py"])
+            argv, kwargs = mock_list.call_args
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertIn("--ssh-flag=-oForwardAgent=no", argv[0])
+            self.assertIn("--ssh-flag=-oClearAllForwardings=yes", argv[0])
+
+        # 3. execute also carries SSH forwarding hardening flags
+        with mock.patch("subprocess.run") as mock_exec:
+            mock_exec.return_value = mock.MagicMock(returncode=0, stdout="hi\n", stderr="")
+            await gce.execute("echo hi")
+            argv_exec, _ = mock_exec.call_args
+            self.assertIn("--ssh-flag=-oForwardAgent=no", argv_exec[0])
+            self.assertIn("--ssh-flag=-oClearAllForwardings=yes", argv_exec[0])
+
+    def test_gce_isolation_probe_checks_pga_vips_directly_by_ip(self):
+        from core.environments.gce_env import ISOLATION_PROBE_SCRIPT
+
+        compiled = compile(ISOLATION_PROBE_SCRIPT, "<probe>", "exec")
+        self.assertIsNotNone(compiled)
+        self.assertIn("199.36.153.8", ISOLATION_PROBE_SCRIPT)
+        self.assertIn("199.36.153.4", ISOLATION_PROBE_SCRIPT)
+
+
 if __name__ == "__main__":
     unittest.main()

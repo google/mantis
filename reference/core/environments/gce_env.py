@@ -71,13 +71,16 @@ try:
 except Exception:
     pass
 
-# 4. Probe Google APIs
-try:
-    s = socket.create_connection(('storage.googleapis.com', 443), timeout=1.5)
-    s.close()
-    errors.append('GCP: Private Google Access enabled (set --no-enable-private-ip-google-access)')
-except Exception:
-    pass
+# 4. Probe Google APIs (hostname + direct Private/Restricted Google Access VIPs
+#    so a Cloud DNS *. -> 0.0.0.0 sinkhole cannot mask enabled PGA)
+for pga_host in ('storage.googleapis.com', '199.36.153.8', '199.36.153.4'):
+    try:
+        s = socket.create_connection((pga_host, 443), timeout=1.5)
+        s.close()
+        errors.append('GCP: Private Google Access enabled via ' + pga_host + ' (set --no-enable-private-ip-google-access)')
+        break
+    except Exception:
+        pass
 
 # 5. Probe Direct IPv6 Internet Egress (dual-stack subnets)
 for v6 in ('2606:4700:4700::1111', '2001:4860:4860::8888'):
@@ -203,20 +206,36 @@ class GceEnvironment(BaseEnvironment):
     def working_dir(self) -> Path:
         return self._workdir
 
+    def _ssh_args(self) -> list[str]:
+        """Builds hardened `gcloud compute ssh` arguments with agent/port forwarding disabled."""
+        args = [
+            "compute", "ssh", self.instance_name,
+            f"--project={self.project}",
+            f"--zone={self.zone}",
+            "--ssh-flag=-oForwardAgent=no",
+            "--ssh-flag=-oClearAllForwardings=yes",
+        ]
+        if self.tunnel_through_iap:
+            args.append("--tunnel-through-iap")
+        return args
+
     def _run_gcloud(
         self, argv: list[str], stdin: Optional[str] = None, timeout: Optional[int] = None
     ) -> tuple[int, str]:
         t = timeout or self.timeout
         cmd = [self.gcloud_bin] + argv
+        run_kwargs: dict = {
+            "capture_output": True,
+            "text": True,
+            "timeout": t,
+            "shell": False,
+        }
+        if stdin is None:
+            run_kwargs["stdin"] = subprocess.DEVNULL
+        else:
+            run_kwargs["input"] = stdin
         try:
-            p = subprocess.run(
-                cmd,
-                input=stdin or "",
-                capture_output=True,
-                text=True,
-                timeout=t,
-                shell=False,
-            )
+            p = subprocess.run(cmd, **run_kwargs)
             out = (p.stdout or "") + (p.stderr or "")
             return p.returncode, out
         except subprocess.TimeoutExpired:
@@ -335,14 +354,7 @@ class GceEnvironment(BaseEnvironment):
 
                 # 2. Wait for SSH readiness / create workspace directory
                 mkdir_cmd = f"sudo mkdir -p {self._workdir} && sudo chown -R $(whoami) {self._workdir}"
-                ssh_args = [
-                    "compute", "ssh", self.instance_name,
-                    f"--project={self.project}",
-                    f"--zone={self.zone}",
-                ]
-                if self.tunnel_through_iap:
-                    ssh_args.append("--tunnel-through-iap")
-                ssh_args.extend(["--command", mkdir_cmd])
+                ssh_args = self._ssh_args() + ["--command", mkdir_cmd]
 
                 # Retry loop waiting for VM boot & guest agent SSH readiness
                 ready = False
@@ -372,6 +384,8 @@ class GceEnvironment(BaseEnvironment):
                             remote_tar = f"{self._workdir}/.mantis-staging-{uuid.uuid4().hex}.tar.gz"
                             scp_args = [
                                 "compute", "scp",
+                                "--scp-flag=-oForwardAgent=no",
+                                "--scp-flag=-oClearAllForwardings=yes",
                             ]
                             if self.tunnel_through_iap:
                                 scp_args.append("--tunnel-through-iap")
@@ -388,14 +402,7 @@ class GceEnvironment(BaseEnvironment):
                                 )
 
                             extract_cmd = f"tar -xzf {remote_tar} -C {self._workdir} && rm -f {remote_tar}"
-                            ssh_args = [
-                                "compute", "ssh", self.instance_name,
-                                f"--project={self.project}",
-                                f"--zone={self.zone}",
-                            ]
-                            if self.tunnel_through_iap:
-                                ssh_args.append("--tunnel-through-iap")
-                            ssh_args.extend(["--command", extract_cmd])
+                            ssh_args = self._ssh_args() + ["--command", extract_cmd]
                             rc, out = self._run_gcloud(ssh_args, timeout=60)
                             if rc != 0:
                                 raise RuntimeError(
@@ -435,14 +442,7 @@ class GceEnvironment(BaseEnvironment):
         """Executes active in-guest probes to verify zero internet access, no IAM token leak, and no public DNS recursion."""
         b64_probe = base64.b64encode(ISOLATION_PROBE_SCRIPT.encode("utf-8")).decode("ascii")
         guest_cmd = f"echo '{b64_probe}' | base64 -d | python3 -"
-        ssh_args = [
-            "compute", "ssh", self.instance_name,
-            f"--project={self.project}",
-            f"--zone={self.zone}",
-        ]
-        if self.tunnel_through_iap:
-            ssh_args.append("--tunnel-through-iap")
-        ssh_args.extend(["--command", guest_cmd])
+        ssh_args = self._ssh_args() + ["--command", guest_cmd]
 
         rc, out = self._run_gcloud(ssh_args, timeout=20)
         if rc == 42 or "ISOLATION_FAILURE" in out:
@@ -463,14 +463,7 @@ class GceEnvironment(BaseEnvironment):
         t = timeout or self.timeout
 
         guest_cmd = f"cd {shlex.quote(str(self._workdir))} && {command}"
-        ssh_args = [
-            "compute", "ssh", self.instance_name,
-            f"--project={self.project}",
-            f"--zone={self.zone}",
-        ]
-        if self.tunnel_through_iap:
-            ssh_args.append("--tunnel-through-iap")
-        ssh_args.extend(["--command", guest_cmd])
+        ssh_args = self._ssh_args() + ["--command", guest_cmd]
 
         def _exec():
             try:
@@ -557,14 +550,7 @@ class GceEnvironment(BaseEnvironment):
         await self._ensure()
         resolved_path = self._resolve_guest_path(path)
         guest_cmd = f"base64 -w 0 {shlex.quote(str(resolved_path))}"
-        ssh_args = [
-            "compute", "ssh", self.instance_name,
-            f"--project={self.project}",
-            f"--zone={self.zone}",
-        ]
-        if self.tunnel_through_iap:
-            ssh_args.append("--tunnel-through-iap")
-        ssh_args.extend(["--command", guest_cmd])
+        ssh_args = self._ssh_args() + ["--command", guest_cmd]
 
         def _read():
             res = run_bounded_subprocess(
@@ -609,14 +595,7 @@ class GceEnvironment(BaseEnvironment):
         parent_dir = str(resolved_path.parent)
 
         guest_cmd = f"mkdir -p {shlex.quote(parent_dir)} && cat > {shlex.quote(str(resolved_path))}"
-        ssh_args = [
-            "compute", "ssh", self.instance_name,
-            f"--project={self.project}",
-            f"--zone={self.zone}",
-        ]
-        if self.tunnel_through_iap:
-            ssh_args.append("--tunnel-through-iap")
-        ssh_args.extend(["--command", guest_cmd])
+        ssh_args = self._ssh_args() + ["--command", guest_cmd]
 
         def _write():
             p = subprocess.run(
@@ -640,18 +619,12 @@ class GceEnvironment(BaseEnvironment):
             f"if [ ! -d {shlex.quote(target_dir)} ]; then exit 44; fi; "
             f"find {shlex.quote(target_dir)} -maxdepth 5 -type f ! -path '*/.*' | sort"
         )
-        ssh_args = [
-            "compute", "ssh", self.instance_name,
-            f"--project={self.project}",
-            f"--zone={self.zone}",
-        ]
-        if self.tunnel_through_iap:
-            ssh_args.append("--tunnel-through-iap")
-        ssh_args.extend(["--command", guest_cmd])
+        ssh_args = self._ssh_args() + ["--command", guest_cmd]
 
         def _list():
             p = subprocess.run(
                 [self.gcloud_bin] + ssh_args,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
@@ -678,14 +651,7 @@ class GceEnvironment(BaseEnvironment):
         """Applies a unified diff patch inside the guest VM workspace via stdin streaming without argv limits."""
         await self._ensure()
         guest_cmd = f"patch -p1 -d {shlex.quote(str(self._workdir))}"
-        ssh_args = [
-            "compute", "ssh", self.instance_name,
-            f"--project={self.project}",
-            f"--zone={self.zone}",
-        ]
-        if self.tunnel_through_iap:
-            ssh_args.append("--tunnel-through-iap")
-        ssh_args.extend(["--command", guest_cmd])
+        ssh_args = self._ssh_args() + ["--command", guest_cmd]
 
         def _patch():
             p = subprocess.run(
