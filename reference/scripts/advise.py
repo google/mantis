@@ -94,13 +94,39 @@ def find_default_db(custom_path: str = "") -> Optional[str]:
 
 try:
     from core.database import (
+        active_target_root,
         canonical_filepath,
+        _canonical_query_filepath,
         _compact_threat_model,
         _compact_vulnerability_pattern,
         _extract_first_sentence_or_bullet,
+        run_belongs_to_active_target,
+        run_target_roots,
     )
 except (ImportError, ModuleNotFoundError):
     import posixpath
+
+    def active_target_root(explicit_target: str = "") -> str:
+        return ""
+
+    def run_target_roots(db_path: str) -> Dict[str, str]:
+        return {}
+
+    def run_belongs_to_active_target(
+        db_path: str,
+        row_run_id: Any,
+        *,
+        active_root: Optional[str] = None,
+        roots_map: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        return True
+
+    def _canonical_query_filepath(
+        filepath: str,
+        eff_root: str = "",
+        roots_map: Optional[Dict[str, str]] = None,
+    ) -> str:
+        return canonical_filepath(filepath, target_file=filepath) if filepath else ""
 
     def canonical_filepath(fp: str, target_file: str = "") -> str:
         """Normalizes finding and risk score filepaths to a consistent repo-relative representation."""
@@ -253,7 +279,17 @@ except (ImportError, ModuleNotFoundError):
 
 def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -> Dict[str, Any]:
     """Queries knowledge.db directly using standard sqlite3 to generate an advisory dossier."""
-    norm_fp = canonical_filepath(filepath, target_file=filepath)
+    eff_root = active_target_root(filepath)
+    roots_map = run_target_roots(db_path) if eff_root else {}
+
+    def _same_target(row_run_id: Any) -> bool:
+        if not eff_root:
+            return True
+        return run_belongs_to_active_target(
+            db_path, row_run_id, active_root=eff_root, roots_map=roots_map
+        )
+
+    norm_fp = _canonical_query_filepath(filepath, eff_root, roots_map)
     conn = _connect(resolve_db_path(db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -271,7 +307,7 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
                 """, (norm_fp,))
             else:
                 cursor.execute("SELECT * FROM okf_concepts ORDER BY id ASC")
-            scoped_okf = [dict(r) for r in cursor.fetchall()]
+            scoped_okf = [dict(r) for r in cursor.fetchall() if _same_target(r["run_id"])]
     except Exception:
         pass
 
@@ -289,14 +325,17 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
             threat_model_content = "\n\n".join(f"### {c.get('title')}\n{_compact_threat_model(c.get('body_markdown', ''))}" for c in threat_concepts)
     else:
         try:
-            cursor.execute("SELECT content FROM campaign_artifacts WHERE artifact_type = 'threat_model' ORDER BY id DESC LIMIT 1")
-            row = cursor.fetchone()
-            if row and row["content"]:
-                raw_tm = row["content"]
-            else:
-                cursor.execute("SELECT content FROM campaign_artifacts WHERE filepath LIKE '%THREAT_MODEL%' ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                raw_tm = row["content"] if (row and row["content"]) else ""
+            raw_tm = ""
+            for tm_sql in (
+                "SELECT run_id, content FROM campaign_artifacts WHERE artifact_type = 'threat_model' ORDER BY id DESC",
+                "SELECT run_id, content FROM campaign_artifacts WHERE filepath LIKE '%THREAT_MODEL%' ORDER BY id DESC",
+            ):
+                for row in cursor.execute(tm_sql).fetchall():
+                    if _same_target(row["run_id"]) and row["content"]:
+                        raw_tm = row["content"]
+                        break
+                if raw_tm:
+                    break
             threat_model_content = raw_tm.strip() if full else _compact_threat_model(raw_tm)
         except Exception:
             pass
@@ -319,6 +358,8 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
             """)
         confirmed_rows = []
         for r in cursor.fetchall():
+            if not _same_target(r["run_id"]):
+                continue
             row_dict = dict(r)
             row_dict.pop("embedding", None)
             confirmed_rows.append(row_dict)
@@ -342,6 +383,8 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
                 ORDER BY timestamp DESC, id DESC
             """)
         for r in cursor.fetchall():
+            if not _same_target(r["run_id"]):
+                continue
             row_dict = dict(r)
             row_dict.pop("embedding", None)
             fp_rows.append(row_dict)
@@ -351,30 +394,64 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
     # 4. Recurrent Lineages
     recurrent_lineages = []
     try:
-        if norm_fp:
-            cursor.execute("""
-                SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
-                       MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
-                       GROUP_CONCAT(DISTINCT status) as observed_statuses
-                FROM findings
-                WHERE filepath = ?
-                  AND lineage_id IS NOT NULL AND lineage_id != ''
-                GROUP BY lineage_id
-                HAVING COUNT(*) >= 2
-                ORDER BY occurrence_count DESC
-            """, (norm_fp,))
+        if eff_root:
+            if norm_fp:
+                cursor.execute(
+                    "SELECT lineage_id, run_id, signature, title, timestamp, status FROM findings "
+                    "WHERE filepath = ? AND lineage_id IS NOT NULL AND lineage_id != ''",
+                    (norm_fp,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT lineage_id, run_id, signature, title, timestamp, status FROM findings "
+                    "WHERE lineage_id IS NOT NULL AND lineage_id != ''"
+                )
+            grouped: Dict[str, List[sqlite3.Row]] = {}
+            for r in cursor.fetchall():
+                if _same_target(r["run_id"]):
+                    grouped.setdefault(str(r["lineage_id"]), []).append(r)
+            for lid, items in grouped.items():
+                if len(items) < 2:
+                    continue
+                sigs = [str(it["signature"]) for it in items if it["signature"] is not None]
+                titles = [str(it["title"]) for it in items if it["title"] is not None]
+                stamps = [str(it["timestamp"]) for it in items if it["timestamp"] is not None]
+                obs = sorted({str(it["status"]) for it in items if it["status"] is not None})
+                recurrent_lineages.append({
+                    "lineage_id": lid,
+                    "signature": min(sigs) if sigs else None,
+                    "title": min(titles) if titles else None,
+                    "occurrence_count": len(items),
+                    "first_seen": min(stamps) if stamps else None,
+                    "last_seen": max(stamps) if stamps else None,
+                    "observed_statuses": ",".join(obs),
+                })
+            recurrent_lineages.sort(key=lambda d: d["occurrence_count"], reverse=True)
         else:
-            cursor.execute("""
-                SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
-                       MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
-                       GROUP_CONCAT(DISTINCT status) as observed_statuses
-                FROM findings
-                WHERE lineage_id IS NOT NULL AND lineage_id != ''
-                GROUP BY lineage_id
-                HAVING COUNT(*) >= 2
-                ORDER BY occurrence_count DESC
-            """)
-        recurrent_lineages = [dict(r) for r in cursor.fetchall()]
+            if norm_fp:
+                cursor.execute("""
+                    SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
+                           MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
+                           GROUP_CONCAT(DISTINCT status) as observed_statuses
+                    FROM findings
+                    WHERE filepath = ?
+                      AND lineage_id IS NOT NULL AND lineage_id != ''
+                    GROUP BY lineage_id
+                    HAVING COUNT(*) >= 2
+                    ORDER BY occurrence_count DESC
+                """, (norm_fp,))
+            else:
+                cursor.execute("""
+                    SELECT lineage_id, MIN(signature) as signature, MIN(title) as title, COUNT(*) as occurrence_count,
+                           MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
+                           GROUP_CONCAT(DISTINCT status) as observed_statuses
+                    FROM findings
+                    WHERE lineage_id IS NOT NULL AND lineage_id != ''
+                    GROUP BY lineage_id
+                    HAVING COUNT(*) >= 2
+                    ORDER BY occurrence_count DESC
+                """)
+            recurrent_lineages = [dict(r) for r in cursor.fetchall()]
     except Exception:
         pass
 
@@ -382,7 +459,7 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
     learnings = []
     try:
         cursor.execute("SELECT * FROM learnings ORDER BY id ASC")
-        learnings = [dict(r) for r in cursor.fetchall()]
+        learnings = [dict(r) for r in cursor.fetchall() if _same_target(r["run_id"])]
     except Exception:
         pass
 
@@ -537,7 +614,9 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
 
 def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str = "", filepath: str = "") -> List[Dict[str, Any]]:
     """Queries lineage history directly from knowledge.db."""
-    norm_fp = canonical_filepath(filepath, target_file=filepath) if filepath else ""
+    eff_root = active_target_root(filepath)
+    roots_map = run_target_roots(db_path) if eff_root else {}
+    norm_fp = _canonical_query_filepath(filepath, eff_root, roots_map) if filepath else ""
     conn = _connect(resolve_db_path(db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -561,6 +640,10 @@ def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str 
     cursor.execute(query, params)
     rows = []
     for r in cursor.fetchall():
+        if eff_root and not run_belongs_to_active_target(
+            db_path, r["run_id"], active_root=eff_root, roots_map=roots_map
+        ):
+            continue
         row_dict = dict(r)
         row_dict.pop("embedding", None)
         rows.append(row_dict)
@@ -571,40 +654,54 @@ def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str 
 
 def query_remediation_standalone(db_path: str, finding_id_or_target: str, full: bool = False) -> Dict[str, Any]:
     """Generates a structured Architectural Remediation Dossier for a specific finding or target."""
+    target_str = str(finding_id_or_target or "").strip()
+    eff_root = active_target_root(target_str)
+    roots_map = run_target_roots(db_path) if eff_root else {}
+
+    def _same_target(row_run_id: Any) -> bool:
+        if not eff_root:
+            return True
+        return run_belongs_to_active_target(
+            db_path, row_run_id, active_root=eff_root, roots_map=roots_map
+        )
+
+    def _first_matching(sql: str, sql_params: tuple = ()) -> Optional[sqlite3.Row]:
+        for cand in cursor.execute(sql, sql_params).fetchall():
+            if _same_target(cand["run_id"]):
+                return cand
+        return None
+
     conn = _connect(resolve_db_path(db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     finding_row = None
-    target_str = str(finding_id_or_target or "").strip()
     if target_str.isdigit():
-        cursor.execute("SELECT * FROM findings WHERE id = ?", (int(target_str),))
-        finding_row = cursor.fetchone()
+        finding_row = _first_matching("SELECT * FROM findings WHERE id = ?", (int(target_str),))
 
     if not finding_row and target_str:
-        cursor.execute("SELECT * FROM findings WHERE lineage_id = ? ORDER BY id DESC LIMIT 1", (target_str,))
-        finding_row = cursor.fetchone()
+        finding_row = _first_matching(
+            "SELECT * FROM findings WHERE lineage_id = ? ORDER BY id DESC", (target_str,)
+        )
 
     if not finding_row and target_str:
-        norm = canonical_filepath(target_str, target_file=target_str)
-        cursor.execute(
-            "SELECT * FROM findings WHERE filepath = ? AND status IN ('dynamic_confirmed', 'static_confirmed', 'reported', 'reproduced') ORDER BY id DESC LIMIT 1",
-            (norm,)
-        )
-        finding_row = cursor.fetchone()
+        norm = _canonical_query_filepath(target_str, eff_root, roots_map)
+        if norm:
+            finding_row = _first_matching(
+                "SELECT * FROM findings WHERE filepath = ? AND status IN ('dynamic_confirmed', 'static_confirmed', 'reported', 'reproduced', 'patch_verified') ORDER BY id DESC",
+                (norm,),
+            )
 
     if not finding_row and target_str:
-        cursor.execute(
-            "SELECT * FROM findings WHERE title LIKE ? ORDER BY id DESC LIMIT 1",
-            (f"%{target_str}%",)
+        finding_row = _first_matching(
+            "SELECT * FROM findings WHERE title LIKE ? ORDER BY id DESC",
+            (f"%{target_str}%",),
         )
-        finding_row = cursor.fetchone()
 
-    if not finding_row:
-        cursor.execute(
-            "SELECT * FROM findings WHERE status IN ('dynamic_confirmed', 'static_confirmed', 'reported', 'reproduced') ORDER BY id DESC LIMIT 1"
+    if not finding_row and not target_str:
+        finding_row = _first_matching(
+            "SELECT * FROM findings WHERE status IN ('dynamic_confirmed', 'static_confirmed', 'reported', 'reproduced') ORDER BY id DESC"
         )
-        finding_row = cursor.fetchone()
 
     conn.close()
 
@@ -616,8 +713,10 @@ def query_remediation_standalone(db_path: str, finding_id_or_target: str, full: 
 
     f_dict = dict(finding_row)
     fp = f_dict.get("filepath", "")
+    row_root = (roots_map or run_target_roots(db_path)).get(str(f_dict.get("run_id") or ""), "") or eff_root
+    fp_for_guidance = os.path.join(row_root, fp) if (row_root and fp and not os.path.isabs(fp)) else fp
 
-    guidance = query_guidance_standalone(db_path, filepath=fp, full=full)
+    guidance = query_guidance_standalone(db_path, filepath=fp_for_guidance, full=full)
 
     clean_title = safe_markdown_span(str(f_dict.get('title', '')))
     desc = safe_markdown_inline(str(f_dict.get("description", "No description provided.")).strip())

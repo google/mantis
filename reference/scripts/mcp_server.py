@@ -321,12 +321,18 @@ def _finding_view(f: Dict[str, Any]) -> Dict[str, Any]:
 def get_findings(state: MantisState, filepath: str = "", status: str = "") -> Dict[str, Any]:
     if not state.db_exists():
         return {"findings": [], "hint": "No findings database yet. Run mantis_scan_change."}
-    from core.database import read_findings
+    from core.database import read_findings, run_belongs_to_active_target, run_target_roots
 
     rows = read_findings(state.db_path)
+    roots_map = run_target_roots(state.db_path)
+    repo_root = str(state.repo)
     rel = state.rel(filepath) if filepath else ""
     out = []
     for f in rows:
+        if not run_belongs_to_active_target(
+            state.db_path, f.get("run_id"), active_root=repo_root, roots_map=roots_map
+        ):
+            continue
         if rel and not _finding_matches(state, str(f.get("filepath") or ""), rel):
             continue
         if status and str(f.get("status") or "").lower() != status.lower():
@@ -340,7 +346,9 @@ def security_guidance(state: MantisState, filepath: str, full: bool = False) -> 
         return {"hint": "No knowledge database yet. Run mantis_scan_change to build one."}
     from core.database import query_security_guidance
 
-    return query_security_guidance(state.db_path, state.rel(filepath), full=full)
+    return query_security_guidance(
+        state.db_path, state.rel(filepath), full=full, target_root=str(state.repo)
+    )
 
 
 # Operator resolutions. The operator owns the repository and the database;
@@ -643,9 +651,15 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
     # Findings intersecting the change and its radius.
     hits: List[Dict[str, Any]] = []
     if state.db_exists():
-        from core.database import read_findings
+        from core.database import read_findings, run_belongs_to_active_target, run_target_roots
 
+        roots_map = run_target_roots(state.db_path)
+        repo_root = str(state.repo)
         for f in read_findings(state.db_path):
+            if not run_belongs_to_active_target(
+                state.db_path, f.get("run_id"), active_root=repo_root, roots_map=roots_map
+            ):
+                continue
             if str(f.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
                 continue
             f_fp = str(f.get("filepath") or "")

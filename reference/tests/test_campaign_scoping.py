@@ -801,6 +801,56 @@ class CrossTargetSharedDbIsolationTest(_DbTest):
         self.assertIn("RepoA-only trajectory rule", guidance_a)
         self.assertNotIn("RepoB-XSS", guidance_a)
 
+    def test_standalone_cli_and_mcp_queries_isolate_absolute_and_uncreated_paths(self):
+        import shutil
+        from core.database import query_historical_lineage, query_security_guidance
+        from scripts import advise, mcp_server
+
+        # Clear active RunContext to simulate standalone CLI (`advise.py`) and MCP server calls.
+        tok = current_run_context.set(None)
+        self.addCleanup(current_run_context.reset, tok)
+
+        repo_c = os.path.join(self.tmp, "repo_c_empty")
+        os.makedirs(repo_c, exist_ok=True)
+        uncreated_c = os.path.join(repo_c, "app", "auth.py")
+        abs_b_auth = os.path.join(self.repo_b, "app", "auth.py")
+
+        # 1. Absolute file query into Repo B outside RunContext preserves repo-relative filepath
+        #    and never leaks Repo A's findings, threat model, FPs, or learnings.
+        g_b = query_security_guidance(self.db, abs_b_auth)
+        self.assertEqual(g_b["filepath"], "app/auth.py")
+        self.assertEqual([f["title"] for f in g_b["confirmed_vulnerabilities"]], ["RepoB-XSS"])
+        self.assertEqual(g_b["false_positives"], [])
+        self.assertEqual(g_b["learned_invariants"], [])
+        self.assertNotIn("RepoA Confidential Payments Core", g_b["guidance_summary"])
+
+        # 2. Uncreated file inside a third repository (`repo_c_empty`) does NOT fall back to
+        #    whole-DB unanchored leakage in either core.database or advise.py standalone helpers.
+        g_c = query_security_guidance(self.db, uncreated_c)
+        self.assertEqual(g_c["filepath"], "app/auth.py")
+        self.assertEqual(g_c["confirmed_vulnerabilities"], [])
+        self.assertEqual(g_c["threat_model"], "")
+        self.assertEqual(g_c["learned_invariants"], [])
+
+        adv_c = advise.query_guidance_standalone(self.db, uncreated_c)
+        self.assertEqual(adv_c["confirmed_vulnerabilities"], [])
+        self.assertEqual(advise.query_lineage_standalone(self.db, filepath=uncreated_c), [])
+        self.assertEqual(query_historical_lineage(self.db, filepath=uncreated_c), [])
+        rem_c = advise.query_remediation_standalone(self.db, uncreated_c)
+        self.assertIn("error", rem_c)
+
+        # 3. MCP server pointing at a shared state directory scopes findings, check_change,
+        #    and security_guidance strictly to `state.repo`.
+        mcp_home = os.path.join(self.tmp, "shared_mcp_state")
+        os.makedirs(mcp_home, exist_ok=True)
+        shutil.copy2(self.db, os.path.join(mcp_home, "knowledge.db"))
+        state_c = mcp_server.MantisState(repo_c, home=mcp_home)
+        self.assertEqual(mcp_server.get_findings(state_c)["findings"], [])
+        mcp_g_c = mcp_server.security_guidance(state_c, "app/auth.py")
+        self.assertEqual(mcp_g_c["confirmed_vulnerabilities"], [])
+        gate_c = mcp_server.check_change(state_c, files=["app/auth.py"], include_coverage=False)
+        self.assertEqual(gate_c["verdict"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()

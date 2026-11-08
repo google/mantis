@@ -938,6 +938,7 @@ def _ownership_clause(scope_path: Optional[str], campaign: Optional[str]) -> "tu
 def active_target_root(explicit_target: str = "") -> str:
     """Derives the canonical realpath of the active scan target root from `RunContext`
     or an explicit filesystem path, returning `""` when unanchored."""
+    import tempfile
     from core.context import current_run_context
 
     ctx = current_run_context.get()
@@ -952,12 +953,59 @@ def active_target_root(explicit_target: str = "") -> str:
                 return os.path.dirname(real_jd).rstrip("/")
             return real_jd.rstrip("/")
     cand = str(explicit_target or "").strip()
-    if cand and os.path.isabs(cand) and os.path.exists(cand):
-        real_c = os.path.realpath(cand)
-        if os.path.isfile(real_c):
-            return os.path.dirname(real_c).rstrip("/")
-        return real_c.rstrip("/")
+    if cand and os.path.isabs(cand):
+        if os.path.exists(cand):
+            real_c = os.path.realpath(cand)
+            if os.path.isfile(real_c):
+                return os.path.dirname(real_c).rstrip("/")
+            return real_c.rstrip("/")
+        probe = os.path.dirname(cand.rstrip("/"))
+        while probe and probe != "/" and not os.path.exists(probe):
+            probe = os.path.dirname(probe)
+        if probe and os.path.isdir(probe):
+            real_probe = os.path.realpath(probe).rstrip("/")
+            sys_tmp = os.path.realpath(tempfile.gettempdir()).rstrip("/")
+            home_dir = os.path.realpath(os.path.expanduser("~")).rstrip("/")
+            if real_probe not in ("", "/", sys_tmp, home_dir):
+                return real_probe
     return ""
+
+
+def _canonical_query_filepath(
+    filepath: str,
+    eff_root: str = "",
+    roots_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """Normalizes a query `filepath` relative to its matched recorded `target_root`
+    (or `eff_root`), preventing an absolute file path outside `RunContext` from
+    collapsing to `""` (whole-repository scope)."""
+    raw = str(filepath or "").strip()
+    if not raw:
+        return ""
+    if not os.path.isabs(raw):
+        return canonical_filepath(raw, target_file=raw)
+    real_raw = os.path.realpath(raw)
+    if os.path.isdir(real_raw):
+        return ""
+    anchor_dir = ""
+    best_len = -1
+    for rec_root in set((roots_map or {}).values()):
+        rr = os.path.realpath(str(rec_root or "")).rstrip("/")
+        if not rr:
+            continue
+        if (real_raw == rr or real_raw.startswith(rr + os.sep)) and run_targets_compatible(
+            eff_root or os.path.dirname(real_raw), rr
+        ):
+            if len(rr) > best_len:
+                best_len = len(rr)
+                anchor_dir = rr
+    if not anchor_dir and eff_root:
+        er = os.path.realpath(eff_root).rstrip("/")
+        if real_raw.startswith(er + os.sep):
+            anchor_dir = er
+    if anchor_dir:
+        return canonical_filepath(real_raw, target_file=anchor_dir)
+    return canonical_filepath(real_raw, target_file=os.path.dirname(real_raw))
 
 
 def _ensure_run_target_root(conn: sqlite3.Connection, run_id: Any, target_root: str) -> None:
@@ -2888,7 +2936,7 @@ def query_historical_lineage(
             query += " AND signature = ?"
             params.append(signature)
         elif filepath:
-            norm_fp = canonical_filepath(filepath, target_file=filepath)
+            norm_fp = _canonical_query_filepath(filepath, eff_root, roots_map)
             query += " AND filepath = ?"
             params.append(norm_fp)
         else:
@@ -3039,7 +3087,7 @@ def query_security_guidance(
 
     with _db(db_path) as conn:
         cursor = conn.cursor()
-        norm_fp = canonical_filepath(filepath, target_file=filepath)
+        norm_fp = _canonical_query_filepath(filepath, eff_root, roots_map)
 
         # 1. OKF Concepts (Scoped to Target File)
         scoped_okf = read_okf_concepts(db_path, resource=norm_fp, run_id=run_id, include_repo_wide=True) if norm_fp else read_okf_concepts(db_path, run_id=run_id)
