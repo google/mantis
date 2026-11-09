@@ -45,6 +45,7 @@ def clip(value: Any, limit: int) -> str:
 
 
 def event_transcript_rows(event: Any, *, node: str = "",
+                          campaign: str = "",
                           text_limit: int = TRANSCRIPT_TEXT_LIMIT,
                           payload_limit: int = TRANSCRIPT_PAYLOAD_LIMIT) -> List[Dict[str, Any]]:
     """Flattens one ADK event into ordered transcript rows. Never raises."""
@@ -56,6 +57,8 @@ def event_transcript_rows(event: Any, *, node: str = "",
         base = {"author": author}
         if node:
             base["node"] = node
+        if campaign:
+            base["campaign"] = campaign
         error_code = getattr(event, "error_code", None)
         if error_code:
             rows.append({**base, "type": "error", "name": str(error_code),

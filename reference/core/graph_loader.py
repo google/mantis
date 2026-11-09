@@ -1085,6 +1085,12 @@ def _make_prefix_reuse_callbacks(node_id: str):
     # run_id -> the campaign (target) whose completed stage is reused.
     completed_runs: dict[str, str] = {}
 
+    def _runs_map(ctx) -> dict[str, str]:
+        shared = getattr(ctx, "shared_prefix_runs", None)
+        if isinstance(shared, dict):
+            return shared.setdefault(node_id, {})
+        return completed_runs
+
     def _shares_jail(ctx) -> bool:
         return prefix_reuse_applies(getattr(ctx, "scan_mode", ""), getattr(ctx, "jail_dir", ""),
                                     getattr(ctx, "path_root", ""), getattr(ctx, "target_file", ""))
@@ -1098,14 +1104,15 @@ def _make_prefix_reuse_callbacks(node_id: str):
                 return None
             if not _shares_jail(ctx):
                 return None
-            if ctx.run_id not in completed_runs:
+            runs_map = _runs_map(ctx)
+            if ctx.run_id not in runs_map:
                 return None
             from core.database import read_artifact, record_artifact
             from core.paths import resolve_db_path
 
             db = resolve_db_path(ctx.db_path)
             kind = _PREFIX_REUSE_ARTIFACTS[node_id]
-            producer = completed_runs[ctx.run_id]
+            producer = runs_map[ctx.run_id]
             artifact = read_artifact(db, artifact_type=kind, run_id=ctx.run_id, resource=producer)
             if not _artifact_says_something(artifact):
                 return None
@@ -1135,7 +1142,7 @@ def _make_prefix_reuse_callbacks(node_id: str):
 
             ctx = current_run_context.get()
             if ctx and ctx.run_id and _shares_jail(ctx):
-                completed_runs.setdefault(ctx.run_id, str(getattr(ctx, "target_file", "") or ""))
+                _runs_map(ctx).setdefault(ctx.run_id, str(getattr(ctx, "target_file", "") or ""))
         except Exception:
             pass
         return None

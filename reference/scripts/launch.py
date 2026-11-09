@@ -383,6 +383,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--retry-unexamined",
+        action="store_true",
+        help=(
+            "With --resume: also re-run campaigns that previously exited without reading "
+            "any target code ([COVERAGE GUARD])."
+        ),
+    )
+    parser.add_argument(
         "--inspect",
         action="store_true",
         help="Preview synthesized workflow layout and prompt before execution",
@@ -476,6 +484,7 @@ def run_launch(
     cache_discount: Optional[float] = None,
     import_knowledge: str = "",
     rescan_changed_harness: bool = False,
+    retry_unexamined: bool = False,
     transcript_out: str = "",
     changed_files: Optional[list] = None,
     max_campaign_tokens: int = 0,
@@ -826,6 +835,7 @@ def run_launch(
                 cache_discount_override=cache_discount,
                 import_knowledge_dir=import_knowledge,
                 rescan_changed_harness=rescan_changed_harness,
+                retry_unexamined=retry_unexamined,
                 transcript_out=transcript_out,
                 changed_files_override=changed_files,
                 max_campaign_tokens=max_campaign_tokens,
@@ -933,6 +943,7 @@ def main() -> int:
             cache_discount=cache_discount,
             import_knowledge=args.import_knowledge,
             rescan_changed_harness=args.rescan_changed_harness,
+            retry_unexamined=args.retry_unexamined,
             transcript_out=args.transcript_out,
             changed_files=args.changed_files,
             max_campaign_tokens=max_campaign_tokens,

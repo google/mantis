@@ -405,6 +405,39 @@ async def _drive_campaign(
     last_banner: tuple[str | None, str | None] = (None, None)
     current_active_node: str | None = None
     streamed_partial_text: bool = False
+    ctx_init = current_run_context.get()
+    is_parallel = bool(ctx_init and int(getattr(ctx_init, "parallel_workers", 1) or 1) > 1)
+    camp_tag = ""
+    if filepath:
+        jail_for_tag = str(getattr(ctx_init, "jail_dir", "") or "") if ctx_init else ""
+        try:
+            if jail_for_tag and os.path.realpath(filepath).startswith(os.path.realpath(jail_for_tag) + os.sep):
+                camp_tag = os.path.relpath(os.path.realpath(filepath), os.path.realpath(jail_for_tag)).replace(os.sep, "/")
+            else:
+                camp_tag = os.path.basename(filepath.rstrip("/")) or filepath
+        except Exception:
+            camp_tag = os.path.basename(filepath.rstrip("/")) or filepath
+    line_buf: list[str] = []
+
+    def _flush_parallel_lines(*, force: bool = False) -> None:
+        if not is_parallel or not line_buf:
+            return
+        joined = "".join(line_buf)
+        line_buf.clear()
+        if force:
+            for ln in joined.splitlines():
+                if ln.strip():
+                    cprint(f"[{camp_tag}] {ln}", flush=True)
+            return
+        if "\n" not in joined:
+            line_buf.append(joined)
+            return
+        parts = joined.split("\n")
+        for ln in parts[:-1]:
+            if ln.strip():
+                cprint(f"[{camp_tag}] {ln}", flush=True)
+        if parts[-1]:
+            line_buf.append(parts[-1])
 
     max_calls = 0
     if budget_controller and budget_controller.config.max_llm_calls > 0:
@@ -426,11 +459,15 @@ async def _drive_campaign(
             route = getattr(getattr(event, "actions", None), "route", None)
             if transcript is not None:
                 transcript.write(event_transcript_rows(
-                    event, node=(node_path.split("/")[-1].split("@")[0] if node_path else (current_active_node or ""))))
+                    event,
+                    node=(node_path.split("/")[-1].split("@")[0] if node_path else (current_active_node or "")),
+                    campaign=camp_tag if is_parallel else "",
+                ))
 
             if node_path:
                 node_name = node_path.split("/")[-1].split("@")[0]
                 if node_name != current_active_node:
+                    _flush_parallel_lines(force=True)
                     current_active_node = node_name
                     streamed_partial_text = False
                     ctx = current_run_context.get()
@@ -462,15 +499,18 @@ async def _drive_campaign(
 
             banner = (node_path, route)
             if (node_path or route) and banner != last_banner:
+                _flush_parallel_lines(force=True)
+                pfx = f"[{camp_tag}] " if is_parallel and camp_tag else ""
                 if node_path and route:
-                    print(f"\n-- {node_path} -> {route}")
+                    print(f"\n{pfx}-- {node_path} -> {route}")
                 elif node_path:
-                    print(f"\n-- {node_path}")
+                    print(f"\n{pfx}-- {node_path}")
                 elif route:
-                    print(f"\n-- {last_banner[0] or ''} -> {route}")
+                    print(f"\n{pfx}-- {last_banner[0] or ''} -> {route}")
                 last_banner = banner
 
             if getattr(event, "error_code", None):
+                _flush_parallel_lines(force=True)
                 node_key = node_path or "unknown"
                 errored.add(node_key)
                 err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
@@ -510,11 +550,21 @@ async def _drive_campaign(
                             # In streaming mode, print partial chunks incrementally.
                             # Skip final aggregated non-partial text only if partial text was already streamed.
                             if is_partial:
-                                cprint(part.text, end="", flush=True)
+                                if is_parallel:
+                                    line_buf.append(part.text)
+                                    _flush_parallel_lines(force=False)
+                                else:
+                                    cprint(part.text, end="", flush=True)
                                 streamed_partial_text = True
                             elif not streamed_partial_text or run_cfg.streaming_mode != StreamingMode.SSE:
-                                cprint(part.text, end="", flush=True)
+                                if is_parallel:
+                                    line_buf.append(part.text)
+                                    _flush_parallel_lines(force=True)
+                                else:
+                                    cprint(part.text, end="", flush=True)
                             if not is_partial:
+                                if is_parallel:
+                                    _flush_parallel_lines(force=True)
                                 streamed_partial_text = False
                                 # No usage object at all: estimate. A response
                                 # that carries usage -- including the zero
@@ -543,10 +593,12 @@ async def _drive_campaign(
                             # final event. Only the final event is a call.
                             if is_partial:
                                 continue
+                            _flush_parallel_lines(force=True)
                             call = part.function_call
                             call_name = getattr(call, "name", "unknown_tool")
                             call_args = getattr(call, "args", {})
-                            cprint(f"\n[TOOL CALL: {call_name}] args={call_args}", flush=True)
+                            pfx = f"[{camp_tag}] " if is_parallel and camp_tag else ""
+                            cprint(f"\n{pfx}[TOOL CALL: {call_name}] args={call_args}", flush=True)
                             if budget_controller:
                                 budget_controller.record_tool_call(current_active_node or "unknown", call_name)
                         elif hasattr(part, 'function_response') and part.function_response:
@@ -578,13 +630,14 @@ async def _drive_campaign(
                                 and "SANDBOX-UNAVAILABLE" not in resp_text
                             )
 
+                            pfx = f"[{camp_tag}] " if is_parallel and camp_tag else ""
                             if is_fatal:
                                 errored.add(f"tool:{fn_name}")
-                                cprint(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
+                                cprint(f"\n{pfx}[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
                             elif is_validation_feedback:
-                                cprint(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
+                                cprint(f"\n{pfx}[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
                             else:
-                                cprint(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}", flush=True)
+                                cprint(f"\n{pfx}[TOOL RESPONSE: {fn_name}] {resp_text[:500]}", flush=True)
     except LlmCallsLimitExceededError as le:
         limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
         raise BudgetExceededError(
@@ -602,7 +655,7 @@ async def _drive_campaign(
         raise
     finally:
         # Session trajectories are retained in session_service database for auditability and rehydration
-        pass
+        _flush_parallel_lines(force=True)
             
     print("\n" + "-" * 60)
     return bool(errored)
@@ -861,8 +914,14 @@ class _PatientSqliteSessionService(SqliteSessionService):
                     pass
                 await db.execute(_s.PRAGMA_FOREIGN_KEYS)
                 if not self._schema_ready:
-                    await db.executescript(_s.CREATE_SCHEMA_SQL)
-                    self._schema_ready = True
+                    lock = getattr(self, "_mantis_schema_lock", None)
+                    if lock is None:
+                        lock = asyncio.Lock()
+                        self._mantis_schema_lock = lock
+                    async with lock:
+                        if not self._schema_ready:
+                            await db.executescript(_s.CREATE_SCHEMA_SQL)
+                            self._schema_ready = True
                 yield db
 
         return _conn()
@@ -2457,6 +2516,7 @@ async def pipeline(
     save_config: bool = False,
     db_timeout: Optional[float] = None,
     rescan_changed_harness: bool = False,
+    retry_unexamined: bool = False,
     transcript_out: str = "",
     changed_files_override: Optional[list] = None,
     max_campaign_tokens: int = 0,
@@ -3077,8 +3137,24 @@ async def pipeline(
             def _key(p: str) -> str:
                 return os.path.realpath(str(p)).rstrip("/")
 
-            completed = {_key(t) for t, row in ledger.items() if not row.get("failed")}
+            completed = {
+                _key(t)
+                for t, row in ledger.items()
+                if not row.get("failed") and not (retry_unexamined and row.get("unexamined"))
+            }
             failed = {_key(t) for t, row in ledger.items() if row.get("failed")} - completed
+            unexamined_completed = {
+                _key(t)
+                for t, row in ledger.items()
+                if not row.get("failed") and row.get("unexamined")
+            }
+            if unexamined_completed and not retry_unexamined:
+                print(
+                    f"[RESUME] {len(unexamined_completed)} earlier campaign(s) exited without "
+                    "reading target code ([COVERAGE GUARD]). Pass --retry-unexamined with --resume "
+                    "to re-scan them in this run.",
+                    file=sys.stderr,
+                )
             # Which harness completed each one. Judged by the same rule as
             # cross-run coverage (cost.coverage_verdict): stale only when
             # every completing row carries a different, non-empty stamp.
@@ -3463,6 +3539,7 @@ async def pipeline(
         session_service=session_service
     )
 
+    worker_count = max(1, int(parallel or 1))
     base_ctx = RunContext(
         jail_dir=jail_dir,
         db_path=db_path,
@@ -3475,6 +3552,8 @@ async def pipeline(
         exclude=exclude,
         model=run_model,
         harness_fingerprint=harness_fingerprint,
+        parallel_workers=worker_count,
+        shared_prefix_runs={},
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -3525,9 +3604,10 @@ async def pipeline(
     # run's other changed files (_render_shared_prefix_note).
     shared_prefix = {"briefed": False}
 
-    async def _campaign_worker():
+    async def _campaign_worker(worker_runner: Optional[Runner] = None):
         nonlocal campaign_queue, failures, successes, paused
         nonlocal replan_notice_shown, pause_banner_shown
+        active_runner = worker_runner or runner
         while campaign_queue and not paused:
             group = campaign_queue.pop(0)
             # The group primary. Everything below -- the spend ledger, the
@@ -3709,7 +3789,7 @@ async def pipeline(
                     except Exception as exc:
                         print(f"[REGRESSION WARNING] {exc}", file=sys.stderr)
                 task_failed = await execute_sub_task(
-                    runner,
+                    active_runner,
                     session_service,
                     scan_item,
                     run_id,
@@ -3724,6 +3804,24 @@ async def pipeline(
                     hypotheses=hypotheses_text,
                     transcript=_transcript_writer,
                 )
+                campaign_tokens = budget_ctrl.accumulated_tokens - tokens_before
+                campaign_llm_calls = budget_ctrl.llm_calls - llm_calls_before
+                code_reads = budget_ctrl.audit_code_reads - reads_before
+                empty_ends = int(
+                    (budget_ctrl.spend_snapshot().get("requests") or {}).get("empty_turn_ends", 0)
+                )
+                # A campaign whose upstream stream yielded 0 tokens and 0 billed
+                # LLM calls before exhausting empty-turn retries never executed a
+                # single model turn: mark failed so --resume retries it cleanly.
+                if (
+                    not task_failed
+                    and campaign_tokens == 0
+                    and campaign_llm_calls == 0
+                    and code_reads == 0
+                    and empty_ends > 0
+                ):
+                    task_failed = True
+                earned_coverage = should_credit_coverage(task_failed, code_reads)
                 # What this campaign actually cost. Recorded for completed campaigns
                 # only -- including failed ones, which still ran the graph and are a
                 # real observation. The budget-pause path below deliberately does NOT
@@ -3733,16 +3831,19 @@ async def pipeline(
                 try:
                     from core.cost import record_spend
 
+                    spend_meta: dict[str, Any] = {"failed": bool(task_failed)}
+                    if not task_failed and not earned_coverage:
+                        spend_meta["unexamined"] = True
                     record_spend(
                         db_path,
                         run_id,
                         scan_item,
                         scan_mode,
-                        tokens=budget_ctrl.accumulated_tokens - tokens_before,
-                        llm_calls=budget_ctrl.llm_calls - llm_calls_before,
+                        tokens=campaign_tokens,
+                        llm_calls=campaign_llm_calls,
                         graph_steps=budget_ctrl.graph_steps - steps_before,
                         elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,
-                        metadata={"failed": bool(task_failed)},
+                        metadata=spend_meta,
                         harness_fingerprint=harness_fingerprint,
                     )
                 except Exception as exc:
@@ -3776,8 +3877,7 @@ async def pipeline(
                     # Recording either as examined would tell every later run
                     # that ground is covered when nobody looked -- a silent
                     # permanent blind spot, strictly worse than no ledger.
-                    code_reads = budget_ctrl.audit_code_reads - reads_before
-                    if should_credit_coverage(task_failed, code_reads):
+                    if earned_coverage:
                         examined_areas.append(scan_item)
                         # Member stamps live behind the SAME gate as the
                         # primary: a failed or zero-read campaign examined its
@@ -4024,11 +4124,31 @@ async def pipeline(
     # worker's stop (an auth failure's EXIT_AUTH, an abort's 1) surfaces
     # exactly where the sequential loop's return always did -- before any
     # post-loop reporting.
-    worker_count = max(1, int(parallel or 1))
     ramp = max(0.0, float(parallel_ramp_seconds or 0.0))
+    extra_runners: list[Runner] = []
     if worker_count > 1:
         print(f"⚡ Parallel campaigns: up to {worker_count} in flight."
               + (f" Workers start {ramp:g}s apart." if ramp else ""))
+        for _ in range(1, worker_count):
+            worker_wf, _ = load_workflow_from_json(
+                workflow_path,
+                model_override=model_override,
+                api_base_override=api_base_override,
+                sandbox_override=effective_sandbox_override,
+                db_override=db_override,
+                timeout_override=timeout_override,
+                reasoning_effort_override=reasoning_effort_override,
+                load_local=effective_load_local,
+            )
+            worker_app = App(
+                name=APP_NAME,
+                root_agent=worker_wf,
+                events_compaction_config=compaction_config,
+                context_cache_config=context_cache_config,
+                resumability_config=ResumabilityConfig(is_resumable=True),
+            )
+            extra_runners.append(Runner(app=worker_app, session_service=session_service))
+    worker_runners: list[Runner] = [runner] + extra_runners
 
     async def _staggered_worker(index: int):
         # The herd: N workers starting at once means N guests booting, N
@@ -4038,7 +4158,7 @@ async def pipeline(
         # different lengths keep the pool spread out on their own.
         if ramp and index:
             await asyncio.sleep(index * ramp)
-        return await _campaign_worker()
+        return await _campaign_worker(worker_runners[index])
 
     try:
         worker_results = await asyncio.gather(
@@ -4046,6 +4166,8 @@ async def pipeline(
         )
     finally:
         await runner.close()
+        for r in extra_runners:
+            await r.close()
         if _transcript_writer is not None:
             _transcript_writer.close()
     # A worker that stopped the run returns its exit code (EXIT_AUTH for a

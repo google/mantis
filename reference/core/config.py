@@ -2740,7 +2740,9 @@ class ResilientLiteLlm(LiteLlm):
             current = 0
         if current and current <= int(cap):
             return False
-        additional["max_tokens"] = int(cap)
+        copied = dict(additional)
+        copied["max_tokens"] = int(cap)
+        self._additional_args = copied
         return True
 
     async def generate_content_async(
@@ -2778,6 +2780,7 @@ class ResilientLiteLlm(LiteLlm):
         current_stream = stream
         while True:
             streamed_content = False  # per attempt: has this turn yielded an answer yet
+            yielded_any = False       # per attempt: did upstream yield any LlmResponse at all
             pending_empty = None      # a final with no answer, held until the stream shows what follows
             try:
                 from google.genai import types as genai_types
@@ -2794,6 +2797,7 @@ class ResilientLiteLlm(LiteLlm):
                     if pending_empty is not None:
                         # Something followed it, so it was not the end of the
                         # turn: pass it on as it came.
+                        yielded_any = True
                         yield self._sanitize_structured_response(pending_empty, schema_cls)
                         pending_empty = None
                     if is_empty_stop_response(response) and not streamed_content:
@@ -2811,6 +2815,7 @@ class ResilientLiteLlm(LiteLlm):
                         continue
                     if response_has_meaningful_content(response):
                         streamed_content = True
+                    yielded_any = True
                     yield self._sanitize_structured_response(response, schema_cls)
                 if pending_empty is not None:
                     # The turn ended on it: an empty turn. Billed, so charged,
@@ -2821,6 +2826,10 @@ class ResilientLiteLlm(LiteLlm):
                     raise MantisEmptyResponseError(
                         "The model returned no content (finish_reason=STOP with empty parts)",
                         response=pending_empty,
+                    )
+                if not yielded_any:
+                    raise MantisEmptyResponseError(
+                        "The model stream ended with zero chunks (empty response stream)"
                     )
                 return
             except (json.decoder.JSONDecodeError, ValueError, MantisStreamingTruncationError) as e:

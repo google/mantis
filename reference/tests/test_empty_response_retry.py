@@ -300,6 +300,16 @@ class EmptyTurnRetryTest(unittest.TestCase):
         self.assertEqual(len(upstream.seen), 2)
         self.assertIn("[LLM RETRY]", err)
 
+    def test_a_zero_chunk_stream_is_retried_as_an_empty_turn(self):
+        """A saturated endpoint closing an SSE stream with zero chunks is retried
+        instead of silently ending the model turn with 0 tokens."""
+        self.with_budget()
+        upstream = ScriptedUpstream([[], [good("chunk", partial=True), good("done")]])
+        out, err = self.run_turn(upstream, stream=True)
+        self.assertEqual([r.content.parts[0].text for r in out], ["chunk", "done"])
+        self.assertEqual(len(upstream.seen), 2)
+        self.assertIn("[LLM RETRY]", err)
+
 
 class _EmptyTurnServer:
     """An OpenAI-compatible endpoint whose every answer is an empty STOP turn
@@ -421,7 +431,12 @@ class EndToEndTest(unittest.TestCase):
         rows = self.ledger()
         self.assertEqual(len(rows), 1, out[-2000:])
         tokens, calls, meta = rows[0]
-        self.assertEqual(json.loads(meta).get("failed"), False, "not a failure: nothing for --resume to re-run")
+        parsed_meta = json.loads(meta)
+        self.assertEqual(parsed_meta.get("failed"), False, "not a failure: nothing for --resume to re-run")
+        self.assertEqual(parsed_meta.get("unexamined"), True, "coverage guard records unexamined so uncovered_files and --retry-unexamined know")
+        from core.cost import uncovered_files
+        self.assertEqual(uncovered_files(self.db, [self.target]), [self.target],
+                         "unexamined campaign does not stamp target as covered for future auto runs")
         self.assertGreater(self.server.requests, 6, "retried, not just passed on")
         self.assertEqual(self.server.streamed, self.server.requests, "the default path streams every turn")
         self.assertEqual((tokens, calls), (1000 * self.server.requests, self.server.requests),

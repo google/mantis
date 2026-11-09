@@ -479,6 +479,14 @@ def _row_failed(metadata_json: Any) -> bool:
     return isinstance(meta, dict) and bool(meta.get("failed"))
 
 
+def _row_unexamined(metadata_json: Any) -> bool:
+    try:
+        meta = json.loads(metadata_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(meta, dict) and bool(meta.get("unexamined"))
+
+
 def _completed_coverage(db_path: str, model: str = "") -> Optional[dict]:
     """Every target a completed campaign covered, mapped to the harness
     fingerprints of the rows that covered it (None for a row recorded before
@@ -521,7 +529,7 @@ def _completed_coverage(db_path: str, model: str = "") -> Optional[dict]:
     targets: dict = {}
     for target, metadata_json, fingerprint in rows:
         t = str(target or "").rstrip("/")
-        if t and not _row_failed(metadata_json):
+        if t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
             targets.setdefault(t, set()).add(str(fingerprint) if fingerprint else None)
     return targets
 
@@ -732,10 +740,13 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
         for target, metadata_json, fingerprint in rows:
             t = str(target or "").rstrip("/")
             if t:
-                out[t] = {
+                entry: dict = {
                     "failed": _row_failed(metadata_json),
                     "harness_fingerprint": str(fingerprint) if fingerprint else None,
                 }
+                if _row_unexamined(metadata_json):
+                    entry["unexamined"] = True
+                out[t] = entry
         return out
     except Exception:
         return None

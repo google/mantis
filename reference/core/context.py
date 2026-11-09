@@ -85,6 +85,13 @@ class RunContext:
     # researchers, reviewer and critic (core.graph_loader.CONTEXT_STAGES).
     # Each block carries its own fencing. Empty means none.
     campaign_context: str = ""
+    # Number of concurrent campaign workers active in this pipeline invocation
+    # (1 = sequential default). Used to line-buffer and prefix console output
+    # so concurrent campaigns do not interleave mid-word.
+    parallel_workers: int = 1
+    # Optional run-scoped prefix-reuse ledger shared across worker Workflow
+    # instances inside one pipeline() call; None falls back to per-callback dict.
+    shared_prefix_runs: Optional[dict[str, dict[str, str]]] = None
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None
