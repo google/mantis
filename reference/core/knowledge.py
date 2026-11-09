@@ -719,6 +719,7 @@ def _import_findings(conn: sqlite3.Connection, path: Path) -> Tuple[int, int]:
                      if isinstance(x, int) and not isinstance(x, bool) and 0 < x < 10**7]
             code_paths = [_clean_rel_path(x) or _scrub(x, MAX_SHORT_CHARS)
                           for x in _parse_list(rec.get("code_paths")) if isinstance(x, str)]
+            from core.schemas import normalize_mantis_risk_score
             conn.execute(
                 """INSERT OR IGNORE INTO findings
                    (run_id, filepath, title, severity, description, line_numbers, remediation,
@@ -727,7 +728,8 @@ def _import_findings(conn: sqlite3.Connection, path: Path) -> Tuple[int, int]:
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (_short(rec.get("run_id")) or "imported", filepath, title,
                  _short(rec.get("severity")), _scrub(rec.get("description")), json.dumps(lines),
-                 _scrub(rec.get("remediation")), status, _number(rec.get("mantis_risk_score")),
+                 _scrub(rec.get("remediation")), status,
+                 normalize_mantis_risk_score(_number(rec.get("mantis_risk_score")), min_score=0.0),
                  _number(rec.get("impact_score")), _number(rec.get("likelihood_score")),
                  _short(rec.get("priority")), signature or None, lineage or None,
                  _short(rec.get("cwe")), _scrub(rec.get("triage_reasoning")),

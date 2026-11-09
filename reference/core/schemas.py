@@ -16,8 +16,33 @@
 
 
 from __future__ import annotations
+import math
 from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, ConfigDict, AliasChoices, field_validator, model_validator
+
+
+def normalize_mantis_risk_score(
+    value: Any, *, min_score: float = 0.0
+) -> Optional[float]:
+    """Normalizes a risk score onto the canonical [min_score, 10.0] scale.
+
+    Models occasionally emit 0-100 percentages (e.g. 98.0 instead of 9.8) when
+    filling FindingSchema directly in report_findings or workspace JSON files.
+    Values strictly in (10.0, 100.0] are scaled by 1/10; values > 100.0 or
+    below min_score are clamped; None/blank/bool/non-finite inputs return None.
+    """
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val):
+        return None
+    if 10.0 < val <= 100.0:
+        val = val / 10.0
+    clamped = max(float(min_score), min(10.0, val))
+    return round(clamped, 2)
 
 # ---------------------------------------------------------------------------
 # Canonical Models (Generated Dynamically by Inspecting schema.json $defs)
@@ -130,7 +155,7 @@ class FindingSchema(BaseModel):
     likelihood_score: Optional[int] = Field(default=None, description="Probability of occurrence (1-5) based on proven exploitability.")
     availability_tier: Optional[Literal["CRITICAL", "STANDARD", "LOW_CRITICALITY"]] = Field(default=None, description="Availability criticality of the component if availability impact exists.")
     inferred_exposure: Optional[Literal["EXPOSED", "INTERNAL", "PRIVILEGED"]] = Field(default=None, description="Resolved network/trust exposure tier based on threat model.")
-    mantis_risk_score: Optional[float] = Field(default=None, description="Final calculated risk score (Hazard = (Impact + Likelihood) * Multiplier).")
+    mantis_risk_score: Optional[float] = Field(default=None, description="Final calculated risk score on the 0.0-10.0 scale (Hazard = (Impact + Likelihood) * Multiplier).")
     priority: Optional[Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]] = Field(default=None, description="Qualitative priority bucket.")
     sanity_triage_applied: Optional[str] = Field(default="", description="Semicolon-separated list of sanity triage caps and downgrades that fired.")
     triage_checklist: Optional[TriageChecklistSchema] = Field(default=None)
@@ -149,7 +174,7 @@ class FindingSchema(BaseModel):
     filepath: Optional[str] = Field(default=None, description="Relative file path where flaw is located")
     remediation: Optional[str] = Field(default='', validation_alias=AliasChoices('remediation', 'mitigation'), description="Fix instructions")
     line_numbers: Optional[List[int]] = Field(default=None, description="Line numbers where flaw occurs")
-    score: Optional[int] = Field(default=None, description="Calibrated risk score (0-100)")
+    score: Optional[float] = Field(default=None, description="Deprecated alias for mantis_risk_score (0.0-10.0 scale).")
 
     @field_validator('id', mode='before')
     @classmethod
@@ -165,8 +190,15 @@ class FindingSchema(BaseModel):
             return v.upper()
         return v
 
+    @field_validator('mantis_risk_score', 'score', mode='before')
+    @classmethod
+    def normalize_risk_fields(cls, v: Any) -> Optional[float]:
+        return normalize_mantis_risk_score(v, min_score=0.0)
+
     @model_validator(mode='after')
     def validate_invariants(self) -> FindingSchema:
+        if self.mantis_risk_score is None and self.score is not None:
+            self.mantis_risk_score = self.score
         # INV-1 / INV-2: VERIFIED_SECURE requires failed_to_bypass reattack_status
         if self.patch_status == "VERIFIED_SECURE":
             if self.reattack_status != "failed_to_bypass":
@@ -428,10 +460,10 @@ class FindingCalibration(BaseModel):
     @field_validator("mantis_risk_score", mode="before")
     @classmethod
     def normalize_score(cls, v: Any) -> float:
-        val = float(v)
-        if val > 10.0 and val <= 100.0:
-            val = val / 10.0
-        return max(0.1, min(10.0, val))
+        normalized = normalize_mantis_risk_score(v, min_score=0.1)
+        if normalized is None:
+            raise ValueError(f"Invalid mantis_risk_score: {v!r}")
+        return normalized
 
     @field_validator("priority", mode="before")
     @classmethod

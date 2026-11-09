@@ -26,6 +26,7 @@ from typing import Optional, List, Dict, Any, Union, Sequence
 import yaml
 
 from core.paths import resolve_db_path
+from core.schemas import normalize_mantis_risk_score
 
 logger = logging.getLogger(__name__)
 
@@ -1388,10 +1389,16 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     patch_status = str(prev[1] or "")
                 if prev and not patch_diff:
                     patch_diff = str(prev[2] or "")
+                raw_risk_score = (
+                    finding.get("mantis_risk_score")
+                    if finding.get("mantis_risk_score") is not None
+                    else finding.get("score")
+                )
+                normalized_risk_score = normalize_mantis_risk_score(raw_risk_score, min_score=0.0)
                 cursor.execute("""
                     UPDATE findings SET
                         filepath = ?, title = ?, severity = ?, description = ?, line_numbers = ?,
-                        remediation = ?, status = ?, mantis_risk_score = ?, impact_score = ?, likelihood_score = ?,
+                        remediation = ?, status = ?, mantis_risk_score = COALESCE(?, mantis_risk_score), impact_score = ?, likelihood_score = ?,
                         priority = ?, signature = ?, lineage_id = ?, cwe = ?, triage_reasoning = ?, patch_diff = ?,
                         patch_status = ?, rca_summary = ?, code_paths = ?,
                         campaign = COALESCE(NULLIF(campaign, ''), ?)
@@ -1404,7 +1411,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     line_numbers,
                     finding.get("remediation"),
                     finding_status,
-                    finding.get("mantis_risk_score"),
+                    normalized_risk_score,
                     finding.get("impact_score"),
                     finding.get("likelihood_score"),
                     finding.get("priority"),
@@ -1420,6 +1427,12 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     target_id,
                 ))
             else:
+                raw_risk_score = (
+                    finding.get("mantis_risk_score")
+                    if finding.get("mantis_risk_score") is not None
+                    else finding.get("score")
+                )
+                normalized_risk_score = normalize_mantis_risk_score(raw_risk_score, min_score=0.0)
                 cursor.execute("""
                     INSERT OR REPLACE INTO findings (
                         run_id, filepath, title, severity, description, line_numbers,
@@ -1437,7 +1450,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     line_numbers,
                     finding.get("remediation"),
                     finding_status,
-                    finding.get("mantis_risk_score"),
+                    normalized_risk_score,
                     finding.get("impact_score"),
                     finding.get("likelihood_score"),
                     finding.get("priority"),
@@ -1465,6 +1478,9 @@ def update_finding_calibration(
     campaign: Optional[str] = None,
 ):
     """Updates per-finding calibration metrics on the canonical 0.1 - 10.0 scale."""
+    normalized_score = normalize_mantis_risk_score(mantis_risk_score, min_score=0.1)
+    if normalized_score is None:
+        normalized_score = 0.1
     own_clause, own_params = _ownership_clause(scope_path, campaign)
     own_sql = f" AND {own_clause}" if own_clause else ""
     with _db(db_path) as conn:
@@ -1476,7 +1492,7 @@ def update_finding_calibration(
                 likelihood_score = ?,
                 priority = ?
             WHERE id = ? AND (run_id = ? OR run_id = ''){own_sql}
-        """, (mantis_risk_score, impact_score, likelihood_score, priority, finding_id, run_id, *own_params))
+        """, (normalized_score, impact_score, likelihood_score, priority, finding_id, run_id, *own_params))
 
 def _terminal_clause_for(status: str) -> str:
     """SQL guard keeping status transitions monotonic.

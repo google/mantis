@@ -1360,35 +1360,60 @@ async def write_file(filepath: str, content: str) -> str:
                 "snapshot_id": getattr(ctx, "snapshot_id", ""),
                 "agent_authored": True,
             }
-            record_artifact(ctx.db_path, ctx.run_id, "workspace_file", clean_fp, content, metadata=meta)
-            # Sync any per-finding calibration updates into the findings table
+            parsed_findings = None
             if clean_fp.startswith("workspace/findings") or clean_fp == "workspace/findings_update.json":
                 try:
+                    from core.schemas import normalize_mantis_risk_score
+
                     parsed = json.loads(content)
-                    items = parsed if isinstance(parsed, list) else [parsed]
+                    items = parsed if isinstance(parsed, list) else ([parsed] if isinstance(parsed, dict) else [])
+                    mutated = False
                     for item in items:
-                        f_id = item.get("id")
-                        if f_id is not None and "mantis_risk_score" in item:
-                            try:
-                                val = float(item["mantis_risk_score"])
-                                if val > 10.0 and val <= 100.0:
-                                    val = val / 10.0
-                                scope = getattr(ctx, "target_file", None) or None
-                                update_finding_calibration(
-                                    ctx.db_path,
-                                    int(f_id),
-                                    val,
-                                    impact_score=int(item["impact_score"]) if "impact_score" in item else None,
-                                    likelihood_score=int(item["likelihood_score"]) if "likelihood_score" in item else None,
-                                    priority=str(item.get("priority")),
-                                    run_id=ctx.run_id or "",
-                                    scope_path=scope,
-                                    campaign=scope,
-                                )
-                            except (ValueError, TypeError):
-                                pass
+                        if not isinstance(item, dict):
+                            continue
+                        if "mantis_risk_score" in item:
+                            norm = normalize_mantis_risk_score(item.get("mantis_risk_score"), min_score=0.1)
+                            if norm is not None and item.get("mantis_risk_score") != norm:
+                                item["mantis_risk_score"] = norm
+                                mutated = True
+                        if "score" in item:
+                            norm_s = normalize_mantis_risk_score(item.get("score"), min_score=0.0)
+                            if norm_s is not None and item.get("score") != norm_s:
+                                item["score"] = norm_s
+                                mutated = True
+                    if mutated:
+                        content = json.dumps(parsed, indent=2)
+                    parsed_findings = items
                 except Exception:
-                    pass
+                    parsed_findings = None
+            record_artifact(ctx.db_path, ctx.run_id, "workspace_file", clean_fp, content, metadata=meta)
+            # Sync any per-finding calibration updates into the findings table
+            if parsed_findings:
+                from core.schemas import normalize_mantis_risk_score
+
+                for item in parsed_findings:
+                    if not isinstance(item, dict):
+                        continue
+                    f_id = item.get("id")
+                    if f_id is not None and "mantis_risk_score" in item:
+                        try:
+                            val = normalize_mantis_risk_score(item["mantis_risk_score"], min_score=0.1)
+                            if val is None:
+                                continue
+                            scope = getattr(ctx, "target_file", None) or None
+                            update_finding_calibration(
+                                ctx.db_path,
+                                int(f_id),
+                                val,
+                                impact_score=int(item["impact_score"]) if "impact_score" in item else None,
+                                likelihood_score=int(item["likelihood_score"]) if "likelihood_score" in item else None,
+                                priority=str(item.get("priority")),
+                                run_id=ctx.run_id or "",
+                                scope_path=scope,
+                                campaign=scope,
+                            )
+                        except (ValueError, TypeError):
+                            pass
         # If dynamic sandbox is active, also sync artifact into guest workspace filesystem
         if ctx.sandbox is not None and hasattr(ctx.sandbox, "write_file") and type(ctx.sandbox).__name__ != "StaticOnlyEnvironment":
             try:
