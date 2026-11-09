@@ -852,5 +852,69 @@ class CrossTargetSharedDbIsolationTest(_DbTest):
         self.assertEqual(gate_c["verdict"], "PASS")
 
 
+class DirectorySliceScopingTest(unittest.IsolatedAsyncioTestCase):
+    """Cross-functional directory slices default list_files('') to their slice
+    and require in-slice source reads before crediting coverage."""
+
+    async def test_cross_functional_slice_defaults_list_files_and_gates_coverage_reads(self):
+        import json
+        from core.budget import BudgetConfig, BudgetController
+        from core.environments.static_env import StaticOnlyEnvironment
+        from main import _is_in_scope_code_read, _render_slice_scope_directive
+        from tools.research_tools import list_files
+
+        with tempfile.TemporaryDirectory() as td:
+            root = os.path.realpath(td)
+            svc_a = os.path.join(root, "aaa_repo_a")
+            svc_b = os.path.join(root, "zzz_service_b")
+            os.makedirs(svc_a)
+            os.makedirs(svc_b)
+            Path(os.path.join(svc_a, "noise.py")).write_text("x = 1\n")
+            Path(os.path.join(svc_b, "billing.py")).write_text("y = 2\n")
+
+            ctx = RunContext(
+                jail_dir=root,
+                db_path="",
+                target_file=svc_b,
+                group_targets=(svc_b,),
+                scan_mode="cross-functional",
+                sandbox=StaticOnlyEnvironment(target_path=root),
+            )
+            tok = current_run_context.set(ctx)
+            try:
+                default_list = json.loads(await list_files(""))
+                self.assertEqual(default_list, ["zzz_service_b/billing.py"])
+                root_list = json.loads(await list_files("/"))
+                self.assertEqual(root_list, ["aaa_repo_a/noise.py", "zzz_service_b/billing.py"])
+            finally:
+                current_run_context.reset(tok)
+
+            directive = _render_slice_scope_directive(svc_b, {"targets": [svc_b]}, root)
+            self.assertIn("'zzz_service_b/'", directive)
+
+            ctrl = BudgetController(BudgetConfig(), run_id="r")
+            # Workspace artifact read: never counts as source examination
+            ctrl.record_tool_call(
+                "researcher",
+                "read_file",
+                in_scope=_is_in_scope_code_read(ctx, "read_file", {"filepath": "workspace/plan.json"}),
+            )
+            self.assertEqual(ctrl.audit_code_reads, 0)
+            # Out-of-slice sibling read: allowed for caller/callee context, does not stamp svc_b covered
+            ctrl.record_tool_call(
+                "researcher",
+                "read_file",
+                in_scope=_is_in_scope_code_read(ctx, "read_file", {"filepath": "aaa_repo_a/noise.py"}),
+            )
+            self.assertEqual(ctrl.audit_code_reads, 0)
+            # In-slice source read: credits coverage
+            ctrl.record_tool_call(
+                "researcher",
+                "read_file",
+                in_scope=_is_in_scope_code_read(ctx, "read_file", {"filepath": "zzz_service_b/billing.py"}),
+            )
+            self.assertEqual(ctrl.audit_code_reads, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

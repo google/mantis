@@ -1562,6 +1562,25 @@ async def list_files(directory: str = "") -> str:
                 + "\nNOTE: single-file campaign: this is the scanned file's own directory. The rest of the "
                 "tree is reachable through find_symbol, find_callers, find_callees and get_function_boundary.")
 
+    # Directory-slice campaigns in cross-functional mode default an empty
+    # list_files("") call to their assigned slice directory rather than dumping
+    # the top 1,000 alphabetical files of the entire parent tree; passing "/"
+    # or an explicit sibling path still lists outside the slice when needed.
+    if directory.strip() == "/":
+        directory = ""
+    elif (
+        directory.strip() in ("", ".")
+        and getattr(ctx, "scan_mode", "") == "cross-functional"
+        and ctx.target_file
+        and ctx.jail_dir
+        and os.path.isdir(ctx.target_file)
+        and os.path.isdir(ctx.jail_dir)
+    ):
+        jail_real = os.path.realpath(ctx.jail_dir)
+        slice_real = os.path.realpath(ctx.target_file)
+        if slice_real != jail_real and slice_real.startswith(jail_real + os.sep):
+            directory = os.path.relpath(slice_real, jail_real).replace(os.sep, "/")
+
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:
             files = await ctx.sandbox.list_files(directory)

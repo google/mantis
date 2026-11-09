@@ -149,6 +149,37 @@ class PrefixReuseCallbackTest(_CallbackTest):
         self.assertIsNotNone(content)
         self.assertIn("Reused the threat_model", content.parts[0].text)
 
+    def test_distinct_nested_git_subrepos_do_not_cross_pollinate_prefixes(self):
+        """When jail_dir is a parent folder over multiple git repositories
+        (repoA/.git, repoB/.git), Repo A's summary/threat_model is reused within
+        Repo A slices but never copied into Repo B."""
+        repo_a_slice1 = os.path.join(self.tmp, "repoA", "svc1")
+        repo_a_slice2 = os.path.join(self.tmp, "repoA", "svc2")
+        repo_b_slice1 = os.path.join(self.tmp, "repoB", "api")
+        for d in (repo_a_slice1, repo_a_slice2, repo_b_slice1):
+            os.makedirs(d, exist_ok=True)
+        os.makedirs(os.path.join(self.tmp, "repoA", ".git"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp, "repoB", ".git"), exist_ok=True)
+
+        before, after = _make_prefix_reuse_callbacks("architect")
+        ctx_a1 = self.install_ctx()
+        ctx_a1.target_file = repo_a_slice1
+        record_artifact(
+            self.db, "r1", "summary", "workspace/.structured/summary.json",
+            json.dumps({"overview": "REPO-A"}), metadata={"resource": repo_a_slice1},
+        )
+        after()
+
+        # Second slice inside repoA reuses repoA's summary
+        ctx_a2 = self.install_ctx()
+        ctx_a2.target_file = repo_a_slice2
+        self.assertIsNotNone(before())
+
+        # Slice inside repoB has its own .git root -> must run its own architect
+        ctx_b1 = self.install_ctx()
+        ctx_b1.target_file = repo_b_slice1
+        self.assertIsNone(before())
+
 
 class VocabularyPinTest(unittest.TestCase):
     def test_loader_literal_matches_main(self):

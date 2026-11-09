@@ -499,10 +499,12 @@ class BudgetController:
             self.accumulated_tokens += count
         self.check_budget()
 
-    def record_tool_call(self, node_name: str = "", tool_name: str = "") -> None:
+    def record_tool_call(
+        self, node_name: str = "", tool_name: str = "", *, in_scope: bool = True
+    ) -> None:
         """Records a tool call executed by an agent node and enforces the per-node tool ceiling."""
         clean_node = node_name.split("/")[-1].split("@")[0] if node_name else "unknown"
-        if clean_node in AUDIT_NODES and tool_name in CODE_READ_TOOLS:
+        if clean_node in AUDIT_NODES and tool_name in CODE_READ_TOOLS and in_scope:
             self.audit_code_reads += 1
         visit_idx = self.node_visit_counts.get(clean_node, 1)
         key = f"{clean_node}@{visit_idx}"

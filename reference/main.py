@@ -385,6 +385,91 @@ def _build_seed_message(
     )
 
 
+def _is_in_scope_code_read(
+    ctx: Optional[RunContext], tool_name: str, call_args: Any
+) -> bool:
+    """True when `tool_name(call_args)` reads source code inside the campaign's
+    assigned target scope (never `workspace/*` artifacts or unrelated sibling
+    subtrees on a directory-slice campaign)."""
+    from core.budget import CODE_READ_TOOLS
+
+    if tool_name not in CODE_READ_TOOLS:
+        return True
+    if not isinstance(call_args, dict):
+        return False
+    raw_fp = str(call_args.get("filepath") or "").strip()
+    if not raw_fp:
+        return False
+    clean_fp = raw_fp.replace("\\", "/").lstrip("./")
+    if (
+        clean_fp in ("workspace", "findings", "mantis-summary.md", "learnings.jsonl")
+        or clean_fp.startswith("workspace/")
+        or clean_fp.startswith("findings/")
+    ):
+        return False
+    if ctx is None or not ctx.jail_dir or not ctx.target_file:
+        return True
+    try:
+        jail_real = os.path.realpath(ctx.jail_dir).rstrip("/")
+        if os.path.isfile(ctx.target_file):
+            return True
+        scope_roots = [
+            os.path.realpath(str(p)).rstrip("/")
+            for p in (ctx.target_file, *getattr(ctx, "group_targets", ()))
+            if p
+        ]
+        if not scope_roots or any(sr == jail_real for sr in scope_roots):
+            return True
+        sb = getattr(ctx, "sandbox", None)
+        workdir = str(getattr(sb, "working_dir", "") or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+        rel_cand = clean_fp
+        if rel_cand == workdir or rel_cand.startswith(workdir + "/"):
+            rel_cand = rel_cand[len(workdir):].lstrip("/")
+        candidates = [os.path.realpath(os.path.join(jail_real, rel_cand)).rstrip("/")]
+        path_root = str(getattr(ctx, "path_root", "") or "").strip()
+        if path_root and os.path.isdir(path_root):
+            candidates.append(os.path.realpath(os.path.join(path_root, rel_cand)).rstrip("/"))
+        return any(
+            cand == sr or cand.startswith(sr + os.sep)
+            for cand in candidates
+            for sr in scope_roots
+        )
+    except OSError:
+        return True
+
+
+def _render_slice_scope_directive(
+    scan_item: str, group: dict, jail_dir: str
+) -> str:
+    """Operator-authored scope directive anchoring a directory-slice campaign
+    to its assigned slice directory (or grouped slice directories)."""
+    if not scan_item or not jail_dir:
+        return ""
+    try:
+        jail_real = os.path.realpath(str(jail_dir)).rstrip("/")
+        targets = [str(t) for t in (group.get("targets") or [scan_item]) if t]
+        rels = []
+        for t in targets:
+            t_real = os.path.realpath(t).rstrip("/")
+            if not os.path.isdir(t_real) or t_real == jail_real:
+                continue
+            if t_real.startswith(jail_real + os.sep):
+                rels.append(os.path.relpath(t_real, jail_real).replace(os.sep, "/"))
+        if not rels:
+            return ""
+        shown = ", ".join(f"'{r}/'" for r in rels[:6])
+        primary = rels[0]
+        return (
+            f"\nAssigned Campaign Target Scope: {shown}. "
+            f"Focus your enumeration, planning, and source reads on {shown} first "
+            f"(list_files('') defaults to '{primary}/'). You may inspect callers or "
+            "callees outside this slice to verify cross-boundary dataflow, but "
+            f"coverage credit requires auditing source files inside {shown}."
+        )
+    except OSError:
+        return ""
+
+
 async def _drive_campaign(
     runner: Runner,
     session_id: str,
@@ -600,7 +685,13 @@ async def _drive_campaign(
                             pfx = f"[{camp_tag}] " if is_parallel and camp_tag else ""
                             cprint(f"\n{pfx}[TOOL CALL: {call_name}] args={call_args}", flush=True)
                             if budget_controller:
-                                budget_controller.record_tool_call(current_active_node or "unknown", call_name)
+                                budget_controller.record_tool_call(
+                                    current_active_node or "unknown",
+                                    call_name,
+                                    in_scope=_is_in_scope_code_read(
+                                        current_run_context.get(), call_name, call_args
+                                    ),
+                                )
                         elif hasattr(part, 'function_response') and part.function_response:
                             fn_resp = part.function_response
                             fn_name = getattr(fn_resp, "name", "unknown_tool")
@@ -3646,9 +3737,13 @@ async def pipeline(
                 change_focus += _render_shared_prefix_note(
                     [f for g in campaign_groups if g is not group for f in (g.get("focus") or [])],
                     str(target_path))
+            effective_directive = change_focus or _render_slice_scope_directive(
+                scan_item, group, jail_dir
+            )
             branch_ctx = dataclasses.replace(
                 base_ctx,
                 target_file=scan_item,
+                group_targets=tuple(group.get("targets") or (scan_item,)),
                 sandbox=sandbox,
                 budget_controller=budget_ctrl,
                 # replace() copies field values, so a dict field would be one
@@ -3659,7 +3754,7 @@ async def pipeline(
                 # What this campaign is about, when narrower than its target.
                 # Reaches every node through its instructions: the seed
                 # message below is seen by the first node only.
-                campaign_directive=change_focus,
+                campaign_directive=effective_directive,
             )
             current_run_context.set(branch_ctx)
             # Tell this campaign what the survey found here and which sibling areas are

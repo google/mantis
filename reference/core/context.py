@@ -92,6 +92,8 @@ class RunContext:
     # Optional run-scoped prefix-reuse ledger shared across worker Workflow
     # instances inside one pipeline() call; None falls back to per-callback dict.
     shared_prefix_runs: Optional[dict[str, dict[str, str]]] = None
+    # All directory/file targets grouped into this campaign (primary + secondaries).
+    group_targets: tuple = ()
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

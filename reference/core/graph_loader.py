@@ -1051,6 +1051,30 @@ def _artifact_says_something(content: Any) -> bool:
     return not empty(parsed)
 
 
+def _enclosing_subrepo_key(jail_dir: str, target_file: str) -> str:
+    """When `jail_dir` is a multi-repository parent directory and `target_file`
+    sits inside a nested git checkout (`<jail>/<repo>/.git`), returns the real
+    path of that nested checkout so Repo A's summary/threat_model is never
+    reused for Repo B. Returns '' when `target_file` shares the root checkout."""
+    if not jail_dir or not target_file:
+        return ""
+    try:
+        jail_real = os.path.realpath(str(jail_dir)).rstrip("/")
+        cur = os.path.realpath(str(target_file)).rstrip("/")
+        if os.path.isfile(cur):
+            cur = os.path.dirname(cur)
+        while cur and cur != jail_real and cur.startswith(jail_real + os.sep):
+            if os.path.exists(os.path.join(cur, ".git")):
+                return cur
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    except OSError:
+        return ""
+    return ""
+
+
 def _make_prefix_reuse_callbacks(node_id: str):
     """Before/after callbacks that let a repo-scope prefix stage reuse itself.
 
@@ -1091,6 +1115,12 @@ def _make_prefix_reuse_callbacks(node_id: str):
             return shared.setdefault(node_id, {})
         return completed_runs
 
+    def _run_key(ctx) -> str:
+        subrepo = _enclosing_subrepo_key(
+            getattr(ctx, "jail_dir", ""), getattr(ctx, "target_file", "")
+        )
+        return f"{ctx.run_id}::{subrepo}" if subrepo else str(ctx.run_id)
+
     def _shares_jail(ctx) -> bool:
         return prefix_reuse_applies(getattr(ctx, "scan_mode", ""), getattr(ctx, "jail_dir", ""),
                                     getattr(ctx, "path_root", ""), getattr(ctx, "target_file", ""))
@@ -1105,14 +1135,15 @@ def _make_prefix_reuse_callbacks(node_id: str):
             if not _shares_jail(ctx):
                 return None
             runs_map = _runs_map(ctx)
-            if ctx.run_id not in runs_map:
+            rkey = _run_key(ctx)
+            if rkey not in runs_map:
                 return None
             from core.database import read_artifact, record_artifact
             from core.paths import resolve_db_path
 
             db = resolve_db_path(ctx.db_path)
             kind = _PREFIX_REUSE_ARTIFACTS[node_id]
-            producer = runs_map[ctx.run_id]
+            producer = runs_map[rkey]
             artifact = read_artifact(db, artifact_type=kind, run_id=ctx.run_id, resource=producer)
             if not _artifact_says_something(artifact):
                 return None
@@ -1142,7 +1173,7 @@ def _make_prefix_reuse_callbacks(node_id: str):
 
             ctx = current_run_context.get()
             if ctx and ctx.run_id and _shares_jail(ctx):
-                _runs_map(ctx).setdefault(ctx.run_id, str(getattr(ctx, "target_file", "") or ""))
+                _runs_map(ctx).setdefault(_run_key(ctx), str(getattr(ctx, "target_file", "") or ""))
         except Exception:
             pass
         return None
