@@ -101,6 +101,9 @@ class RunContext:
     pass_index: int = 1
     artifact_resource: str = ""
     reported_in_pass: bool = False
+    # True on multi-campaign runs so per-campaign reporter defers to the single
+    # post-run consolidated report pass.
+    defer_reporter: bool = False
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

@@ -2956,6 +2956,137 @@ def merge_findings(
         return merged_count
 
 
+FINDING_ASSURANCE_RANK: Dict[str, int] = {
+    "patch_verified": 5,
+    "dynamic_confirmed": 4,
+    "reproduced": 4,
+    "static_confirmed": 3,
+    "confirmed": 2,
+    "viable": 2,
+    "reported": 1,
+    "candidate": 1,
+}
+
+
+def finding_assurance_rank(status: Any) -> int:
+    return FINDING_ASSURANCE_RANK.get(str(status or "").strip().lower(), 0)
+
+
+def consolidate_duplicate_findings(
+    db_path: str,
+    run_id: str,
+    primary_id: int,
+    duplicate_ids: Sequence[int],
+    reason: str = "",
+) -> "tuple[int, int]":
+    """Post-run cross-campaign duplicate consolidation with monotonic assurance protection.
+
+    Deterministically elects the highest-assurance open finding among
+    `{primary_id} | set(duplicate_ids)` as the true primary so machine-verified
+    proof (`patch_verified` / `dynamic_confirmed`) can NEVER be folded into a
+    lower-assurance row, even if an LLM adjudicator nominated a weaker row as
+    primary. Preserves calibrated scores and patches onto the surviving primary.
+    Returns `(elected_primary_id, merged_count)`.
+    """
+    if not db_path or not run_id or not duplicate_ids:
+        return int(primary_id), 0
+    cand_ids = sorted({int(primary_id), *(int(i) for i in duplicate_ids if int(i) > 0)})
+    if len(cand_ids) < 2:
+        return int(primary_id), 0
+
+    placeholders = ",".join("?" for _ in cand_ids)
+    with _db(db_path) as conn:
+        cursor = conn.cursor()
+        rows = [
+            dict(r)
+            for r in cursor.execute(
+                f"SELECT id, title, status, mantis_risk_score, impact_score, likelihood_score,"
+                f" priority, patch_diff, patch_status FROM findings"
+                f" WHERE run_id = ? AND id IN ({placeholders})",
+                (str(run_id), *cand_ids),
+            ).fetchall()
+        ]
+        open_rows = [
+            r for r in rows if str(r.get("status") or "").strip().lower() in ACTIVE_STATUSES
+        ]
+        if len(open_rows) < 2:
+            return int(primary_id), 0
+
+        # Deterministic election: highest assurance rank -> has verified/non-empty patch ->
+        # highest risk score -> explicit caller preference -> lowest id.
+        open_rows.sort(
+            key=lambda r: (
+                -finding_assurance_rank(r.get("status")),
+                -(1 if str(r.get("patch_status") or "").upper() == "VERIFIED_SECURE" else 0),
+                -(1 if str(r.get("patch_diff") or "").strip() else 0),
+                -float(r.get("mantis_risk_score") or 0.0),
+                0 if int(r["id"]) == int(primary_id) else 1,
+                int(r["id"]),
+            )
+        )
+        winner = open_rows[0]
+        elected_id = int(winner["id"])
+        elected_title = str(winner.get("title") or f"#{elected_id}")
+        elected_rank = finding_assurance_rank(winner.get("status"))
+
+        # Carry over calibration or patch_diff from duplicates if the elected primary lacks them.
+        best_score = winner.get("mantis_risk_score")
+        best_imp = winner.get("impact_score")
+        best_lik = winner.get("likelihood_score")
+        best_pri = winner.get("priority")
+        best_diff = str(winner.get("patch_diff") or "")
+        best_pstat = str(winner.get("patch_status") or "")
+        for other in open_rows[1:]:
+            if best_score is None and other.get("mantis_risk_score") is not None:
+                best_score = other.get("mantis_risk_score")
+                best_imp = other.get("impact_score")
+                best_lik = other.get("likelihood_score")
+                best_pri = other.get("priority")
+            if not best_diff.strip() and str(other.get("patch_diff") or "").strip():
+                best_diff = str(other.get("patch_diff") or "")
+                if not best_pstat and str(other.get("patch_status") or "").upper() != "VERIFIED_SECURE":
+                    best_pstat = str(other.get("patch_status") or "")
+
+        cursor.execute(
+            """
+            UPDATE findings
+            SET mantis_risk_score = COALESCE(?, mantis_risk_score),
+                impact_score = COALESCE(?, impact_score),
+                likelihood_score = COALESCE(?, likelihood_score),
+                priority = COALESCE(?, priority),
+                patch_diff = CASE WHEN COALESCE(patch_diff, '') = '' THEN ? ELSE patch_diff END,
+                patch_status = CASE WHEN COALESCE(patch_status, '') = '' THEN ? ELSE patch_status END
+            WHERE id = ? AND run_id = ?
+            """,
+            (best_score, best_imp, best_lik, best_pri, best_diff, best_pstat, elected_id, str(run_id)),
+        )
+
+        merged = 0
+        clean_reason = str(reason or "Same underlying root-cause defect across campaigns")[:500]
+        for dup in open_rows[1:]:
+            dup_id = int(dup["id"])
+            if dup_id == elected_id:
+                continue
+            if finding_assurance_rank(dup.get("status")) > elected_rank:
+                continue
+            cursor.execute(
+                """
+                UPDATE findings
+                SET status = 'duplicate_merged',
+                    description = description || ?
+                WHERE id = ? AND run_id = ?
+                  AND LOWER(COALESCE(status, '')) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'archived')
+                """,
+                (
+                    f"\n[CONSOLIDATED: Duplicate of #{elected_id} ({elected_title}) - Reason: {clean_reason}]",
+                    dup_id,
+                    str(run_id),
+                ),
+            )
+            merged += int(cursor.rowcount or 0)
+        return elected_id, merged
+
+
 def query_historical_lineage(
     db_path: str,
     signature: str = "",

@@ -188,15 +188,24 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
             # Check findings virtual paths
             if clean_path.startswith("workspace/findings") or clean_path.startswith("findings"):
                 finding_target = clean_path.split("/")[-1].removesuffix(".json") if "/" in clean_path else ""
-                findings = read_findings(resolved_db, run_id=ctx.run_id)
+                if finding_target in ("*", "findings", ""):
+                    return get_findings()
+                active_node = str(getattr(ctx, "active_node", "") or "")
+                own_scope = None if active_node in _RUN_WIDE_FINDINGS_NODES else (getattr(ctx, "target_file", "") or None)
+                findings = read_findings(
+                    resolved_db, run_id=ctx.run_id, scope_path=own_scope, campaign=own_scope
+                )
                 if findings:
                     for f in findings:
                         f_id = str(f.get("id"))
                         f_lineage = str(f.get("lineage_id") or "")
-                        if finding_target in (f_id, f_lineage) or finding_target in ("*", "findings", ""):
-                            payload = f if finding_target not in ("*", "findings", "") else findings
-                            return wrap_untrusted_content(json.dumps(payload, indent=2), filename=clean_path)
-                    return wrap_untrusted_content(json.dumps(findings, indent=2), filename=clean_path)
+                        if finding_target in (f_id, f_lineage):
+                            raw_json = json.dumps(f, indent=2, default=str)
+                            bounded_json, cut_note = split_truncation(
+                                raw_json, MAX_READ_SIZE, what=f"finding '{finding_target}'"
+                            )
+                            return wrap_untrusted_content(bounded_json, filename=clean_path) + cut_note
+                    return get_findings()
 
             # Check learnings virtual JSONL
             if clean_path in ("workspace/learnings.jsonl", "learnings.jsonl"):
@@ -1149,6 +1158,7 @@ _FINDING_INDEX_FIELDS = ("id", "filepath", "title", "severity", "status", "cwe",
 # for the rest. Characters of JSON, about a quarter of the compaction
 # threshold in tokens, so one tool response can never trip it alone.
 GET_FINDINGS_FULL_CHARS = 400_000
+MAX_FINDING_INDEX_ENTRIES = 500
 
 _CLOSED_FINDING_STATUSES = frozenset({
     "false_positive", "non_viable", "duplicate_merged", "mitigated", "archived",
@@ -1165,13 +1175,13 @@ def _finding_index_entry(finding: dict) -> dict:
 def _bounded_findings(own: list, others: list) -> list:
     """Own findings in full, the run's others as index entries; the full
     records trimmed to GET_FINDINGS_FULL_CHARS by indexing closed ones first,
-    then the oldest."""
+    then the oldest, and the index tail capped at MAX_FINDING_INDEX_ENTRIES."""
     full = list(own)
     index = [_finding_index_entry(f) for f in others]
     size = lambda rows: len(json.dumps(rows, indent=2, default=str))  # noqa: E731
     if size(full) > GET_FINDINGS_FULL_CHARS:
-        keep = [f for f in full if str(f.get("status") or "") not in _CLOSED_FINDING_STATUSES]
-        demoted = [f for f in full if str(f.get("status") or "") in _CLOSED_FINDING_STATUSES]
+        keep = [f for f in full if str(f.get("status") or "").lower() not in _CLOSED_FINDING_STATUSES]
+        demoted = [f for f in full if str(f.get("status") or "").lower() in _CLOSED_FINDING_STATUSES]
         while keep and size(keep) > GET_FINDINGS_FULL_CHARS:
             demoted.insert(0, keep.pop(0))
         for f in demoted:
@@ -1180,6 +1190,22 @@ def _bounded_findings(own: list, others: list) -> list:
             e["detail"] = "index entry (payload cap); get_findings(filepath) returns the full record"
             index.append(e)
         full = keep
+    if len(index) > MAX_FINDING_INDEX_ENTRIES:
+        open_idx = [
+            e for e in index if str(e.get("status") or "").lower() not in _CLOSED_FINDING_STATUSES
+        ]
+        closed_idx = [
+            e for e in index if str(e.get("status") or "").lower() in _CLOSED_FINDING_STATUSES
+        ]
+        prioritized = (open_idx + closed_idx)[:MAX_FINDING_INDEX_ENTRIES]
+        omitted = len(index) - len(prioritized)
+        prioritized.append({
+            "id": 0,
+            "scope": "index_truncated",
+            "omitted_entries": omitted,
+            "detail": f"{omitted} additional finding index entries omitted; pass filepath to get_findings(filepath).",
+        })
+        index = prioritized
     rows = full + index
     rows.sort(key=lambda f: int(f.get("id") or 0))
     return rows
@@ -1214,8 +1240,9 @@ def get_findings(filepath: str = "") -> str:
             return "NO_DATA: Zero findings recorded in this pass yet."
         run_wide = active_node in _RUN_WIDE_FINDINGS_NODES
         if clean_fp:
-            # An explicit file: the full records for that file, as always.
-            findings = read_findings(resolved_db, filepath=clean_fp, run_id=ctx.run_id)
+            # An explicit file: the full records for that file, bounded if huge.
+            raw_file_findings = read_findings(resolved_db, filepath=clean_fp, run_id=ctx.run_id)
+            findings = _bounded_findings(raw_file_findings, [])
         else:
             own = read_findings(resolved_db, run_id=ctx.run_id, scope_path=own_scope, campaign=own_scope)
             others: list = []

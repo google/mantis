@@ -2089,6 +2089,62 @@ def _make_campaign_directive_before_model_callback(node_id: str):
     return _before_model
 
 
+def _make_reporter_skip_before_agent_callback(node_id: str):
+    """Short-circuits per-campaign `reporter` LLM execution when either:
+    1. `ctx.defer_reporter` is True (multi-campaign sweeps, which run a single
+       post-run consolidated report after cross-campaign deduplication), or
+    2. the campaign is provably clean (`campaign_has_findings_to_triage` is False).
+
+    Preserves the `reporter` node in the ADK event stream and `workflow.json`
+    topology while saving thousands of no-op LLM calls across large sweeps.
+    """
+    def _before(callback_context=None):
+        try:
+            from core.context import current_run_context
+            from core.database import read_artifact, record_artifact
+            from core.paths import resolve_db_path
+
+            ctx = current_run_context.get()
+            if ctx is None:
+                return None
+            if bool(getattr(ctx, "defer_reporter", False)):
+                return types.Content(
+                    role="model",
+                    parts=[types.Part(text=(
+                        f"[{node_id}] Deferred per-campaign report to post-run "
+                        "consolidated reporting."
+                    ))],
+                )
+            if not ctx.db_path or not ctx.run_id:
+                return None
+            db = resolve_db_path(ctx.db_path)
+            has_live = campaign_has_findings_to_triage(
+                db, ctx.run_id, str(getattr(ctx, "target_file", "") or "")
+            )
+            if has_live is False:
+                if not read_artifact(db, artifact_type="report", run_id=ctx.run_id):
+                    clean_rpt = json.dumps({
+                        "executive_summary": "No active vulnerability findings were confirmed in scope.",
+                        "critical_findings_count": 0,
+                        "recommendations": [],
+                    }, indent=2)
+                    record_artifact(
+                        db, ctx.run_id, "report", "workspace/.structured/report.json", clean_rpt
+                    )
+                return types.Content(
+                    role="model",
+                    parts=[types.Part(text=(
+                        f"[{node_id}] Zero active findings in scope; recorded "
+                        "clean report summary without LLM call."
+                    ))],
+                )
+        except Exception:
+            return None
+        return None
+
+    return _before
+
+
 def _make_reflector_after_model_callback(node_id: str):
     """Parses and persists the <experience> blocks emitted by the reflector.
 
@@ -3044,6 +3100,13 @@ def load_workflow_from_json(
                 before_reuse, after_reuse = _make_prefix_reuse_callbacks(node_id)
                 agent_kwargs["before_agent_callback"] = before_reuse
                 agent_kwargs["after_agent_callback"] = after_reuse
+            elif (
+                node_id == "reporter"
+                or (node_cfg.skill and "mantis-report" in node_cfg.skill)
+            ) and "before_agent_callback" not in agent_kwargs:
+                agent_kwargs["before_agent_callback"] = (
+                    _make_reporter_skip_before_agent_callback(node_id)
+                )
 
             # Every agent node: bounds each tool response to its model's window
             # and, where the node has structural navigation, steers repeated

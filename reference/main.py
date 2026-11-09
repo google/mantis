@@ -3647,6 +3647,7 @@ async def pipeline(
     )
 
     worker_count = max(1, int(parallel or 1))
+    multi_campaign_run = len(campaign_groups) > 1
     base_ctx = RunContext(
         jail_dir=jail_dir,
         db_path=db_path,
@@ -3661,6 +3662,7 @@ async def pipeline(
         harness_fingerprint=harness_fingerprint,
         parallel_workers=worker_count,
         shared_prefix_runs={},
+        defer_reporter=multi_campaign_run,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -4320,6 +4322,25 @@ async def pipeline(
             print(f"[COVERAGE WARNING] {exc}", file=sys.stderr)
 
 
+    if multi_campaign_run:
+        try:
+            from core.consolidator import consolidate_run_findings
+
+            dedupe_stats = await consolidate_run_findings(
+                db_path, run_id, config=config
+            )
+            merged_total = int(dedupe_stats.get("tier1_merged", 0)) + int(
+                dedupe_stats.get("tier2_merged", 0)
+            )
+            if merged_total > 0:
+                print(
+                    f"\n🧹 Post-run consolidation: merged {merged_total} cross-campaign "
+                    f"duplicate finding(s) ({dedupe_stats.get('tier1_merged', 0)} exact, "
+                    f"{dedupe_stats.get('tier2_merged', 0)} semantic)."
+                )
+        except Exception as exc:
+            print(f"[CONSOLIDATION WARNING] {exc}", file=sys.stderr)
+
     findings = read_findings(db_path, run_id=run_id)
     scores = read_risk_scores(db_path, run_id=run_id)
 
@@ -4347,6 +4368,15 @@ async def pipeline(
     from core.database import is_suppressed
 
     active_findings = [f for f in findings if not is_suppressed(f.get("status"))]
+    if multi_campaign_run:
+        try:
+            from core.consolidator import synthesize_aggregate_report
+
+            await synthesize_aggregate_report(
+                db_path, run_id, active_findings, config=config
+            )
+        except Exception as exc:
+            print(f"[AGGREGATE REPORT WARNING] {exc}", file=sys.stderr)
     # What the run spent and how it kept within the model window, from the
     # same snapshot --spend-report writes. Counts only.
     try:
