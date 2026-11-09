@@ -153,6 +153,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-input-tokens",
+        type=str,
+        default=None,
+        help=(
+            "Per-request input token ceiling, e.g. 128k or 200000 (also MANTIS_MAX_INPUT_TOKENS). "
+            "Sizes context editing, tool-response caps, node context ceilings, and the "
+            "pre-dispatch guard -- recommended for custom/on-prem models whose window size "
+            "is not in LiteLLM's registry."
+        ),
+    )
+    parser.add_argument(
         "--spend-report",
         type=str,
         default="",
@@ -468,10 +479,13 @@ def run_launch(
     transcript_out: str = "",
     changed_files: Optional[list] = None,
     max_campaign_tokens: int = 0,
+    max_input_tokens: Optional[int] = None,
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
         os.environ["VERTEX_FLEX"] = "1"
+    if max_input_tokens is not None and max_input_tokens > 0:
+        os.environ["MANTIS_MAX_INPUT_TOKENS"] = str(int(max_input_tokens))
 
     # SECURITY (INV-4): component-wise symlink validation. A leaf-only is_symlink()
     # check is bypassed by a hostile checkout shipping an intermediate symlink
@@ -815,6 +829,7 @@ def run_launch(
                 transcript_out=transcript_out,
                 changed_files_override=changed_files,
                 max_campaign_tokens=max_campaign_tokens,
+                max_input_tokens=max_input_tokens,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -856,6 +871,14 @@ def main() -> int:
             max_campaign_tokens = parse_token_budget(args.max_campaign_tokens)
         except ValueError as exc:
             parser.error(f"--max-campaign-tokens: {exc}")
+    max_input_tokens: Optional[int] = None
+    if args.max_input_tokens is not None:
+        try:
+            max_input_tokens = parse_token_budget(args.max_input_tokens)
+            if max_input_tokens <= 0:
+                raise ValueError("must be positive")
+        except ValueError as exc:
+            parser.error(f"--max-input-tokens: {exc}")
 
     # The spend report is written however the run ended -- a driver that
     # allotted this process a budget needs the number even when the process
@@ -913,6 +936,7 @@ def main() -> int:
             transcript_out=args.transcript_out,
             changed_files=args.changed_files,
             max_campaign_tokens=max_campaign_tokens,
+            max_input_tokens=max_input_tokens,
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)

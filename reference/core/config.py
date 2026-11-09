@@ -1091,6 +1091,21 @@ def _context_editing_off(config: Optional[dict]) -> bool:
     return isinstance(config, dict) and str(config.get("context_editing", "auto") or "").strip().lower() in _OFF_WORDS
 
 
+def _effective_context_window(model: Any) -> Optional[int]:
+    """Effective context window in tokens for `model`, or None when unknown.
+
+    Uses the tighter of the model's known input limit and the operator's
+    per-request cap (`MANTIS_MAX_INPUT_TOKENS`) so an unrecognized custom or
+    on-prem endpoint with `MANTIS_MAX_INPUT_TOKENS` set still activates
+    50%-window context editing, and a large-window model served behind a
+    smaller server `--max-model-len` triggers editing before overflowing.
+    """
+    if not str(model or "").strip():
+        return None
+    limits = [l for l in (resolve_context_limit(model), resolve_input_token_cap()) if l]
+    return min(limits) if limits else None
+
+
 def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Optional[dict]:
     """The `context_management` parameter for `model`, or None when it must not
     be sent: not a Claude model, switched off (config `context_editing: off`
@@ -1099,7 +1114,7 @@ def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Opti
         return None
     if _context_editing_off(config):
         return None
-    limit = resolve_context_limit(model)
+    limit = _effective_context_window(model)
     if not limit:
         return None
     return {"edits": [{
@@ -1121,7 +1136,7 @@ def client_context_editing(model: Any, config: Optional[dict] = None) -> Optiona
         return None
     if _context_editing_off(config):
         return None
-    limit = resolve_context_limit(model)
+    limit = _effective_context_window(model)
     if not limit:
         return None
     return {

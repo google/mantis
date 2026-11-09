@@ -2364,8 +2364,11 @@ async def pipeline(
     transcript_out: str = "",
     changed_files_override: Optional[list] = None,
     max_campaign_tokens: int = 0,
+    max_input_tokens: Optional[int] = None,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
+    if max_input_tokens is not None and max_input_tokens > 0:
+        os.environ["MANTIS_MAX_INPUT_TOKENS"] = str(int(max_input_tokens))
     # SQLite serializes writers, and every parallel campaign writes findings
     # and spend rows to the same file. The busy timeout is what separates a
     # queued write from a dead campaign ("database is locked"), so it scales
@@ -2401,6 +2404,8 @@ async def pipeline(
         banner_resume_flags["--timeout"] = timeout_override
     if reasoning_effort_override:
         banner_resume_flags["--reasoning-effort"] = reasoning_effort_override
+    if max_input_tokens is not None and max_input_tokens > 0:
+        banner_resume_flags["--max-input-tokens"] = max_input_tokens
 
     effective_sandbox_override = sandbox_override
     # Auto-resolve unconfigured placeholders if enabled
@@ -2546,6 +2551,17 @@ async def pipeline(
         record_run(db_path, run_id, run_model, metadata={"target_root": _run_target_anchor})
     except Exception as exc:
         print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
+    if run_model:
+        from core.config import resolve_context_limit, resolve_input_token_cap
+
+        if resolve_context_limit(run_model) is None and resolve_input_token_cap() is None:
+            print(
+                f"[CONTEXT WARNING] Unknown context window for model '{run_model}' and "
+                "MANTIS_MAX_INPUT_TOKENS is unset: context editing, tool-output caps, and "
+                "pre-dispatch window guards are inactive. Pass --max-input-tokens (e.g. "
+                "--max-input-tokens 128k) or set MANTIS_MAX_INPUT_TOKENS to enable them.",
+                file=sys.stderr,
+            )
     # Memory from the repository: a checked-in knowledge export, read into
     # this database before anything chooses what to scan (coverage feeds auto
     # mode) and under this run id (so the threat model and architecture are

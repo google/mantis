@@ -44,6 +44,7 @@ class ParameterTest(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         os.environ.pop(C._CONTEXT_EDITING_ENV, None)
+        os.environ.pop("MANTIS_MAX_INPUT_TOKENS", None)
         os.environ.pop("VERTEXAI_PROJECT", None)
         os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
 
@@ -71,6 +72,12 @@ class ParameterTest(unittest.TestCase):
             os.environ.pop(C._CONTEXT_EDITING_ENV)
         with patch.object(C, "resolve_context_limit", return_value=None):
             self.assertIsNone(C.anthropic_context_editing(CLAUDE), "no window to size against: not sent")
+            os.environ["MANTIS_MAX_INPUT_TOKENS"] = "128000"
+            capped = C.anthropic_context_editing(CLAUDE)
+            self.assertIsNotNone(capped, "operator input cap sizes context editing when model window is unknown")
+            self.assertEqual(capped["edits"][0]["trigger"]["value"], 64_000)
+            self.assertEqual(capped["edits"][0]["clear_at_least"]["value"], 25_600)
+            os.environ.pop("MANTIS_MAX_INPUT_TOKENS", None)
 
     def test_get_llm_kwargs_carries_it_for_claude_and_nothing_else(self):
         os.environ["VERTEXAI_PROJECT"] = "example-project"
@@ -218,6 +225,21 @@ class ClientSideEditingTest(unittest.TestCase):
             os.environ.pop(C._CONTEXT_EDITING_ENV)
         with patch.object(C, "resolve_context_limit", return_value=None):
             self.assertIsNone(C.client_context_editing(GEMINI))
+            os.environ["MANTIS_MAX_INPUT_TOKENS"] = "128000"
+            self.assertEqual(
+                C.client_context_editing("openai/qwen-onprem"),
+                {"trigger_tokens": 64_000, "keep": C.CONTEXT_EDITING_KEEP_TOOL_USES, "clear_at_least_tokens": 25_600},
+            )
+            self.assertIsNone(C.client_context_editing(""))
+            os.environ.pop("MANTIS_MAX_INPUT_TOKENS", None)
+        with patch.object(C, "resolve_context_limit", return_value=1_000_000):
+            os.environ["MANTIS_MAX_INPUT_TOKENS"] = "128000"
+            self.assertEqual(
+                C.client_context_editing(GEMINI),
+                {"trigger_tokens": 64_000, "keep": C.CONTEXT_EDITING_KEEP_TOOL_USES, "clear_at_least_tokens": 25_600},
+                "tighter operator cap governs context editing trigger",
+            )
+            os.environ.pop("MANTIS_MAX_INPUT_TOKENS", None)
         self.assertIsNone(C.client_context_editing(""))
 
     @staticmethod
