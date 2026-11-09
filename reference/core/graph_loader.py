@@ -1499,16 +1499,56 @@ def _stored_handoff(node_id: str) -> tuple[str, int]:
         return "", 0
 
 
-async def _write_handoff(node_id: str, llm: Any, llm_request: Any) -> tuple[str, int]:
+async def _write_handoff(
+    node_id: str, llm: Any, llm_request: Any, limit_tokens: Optional[int] = None
+) -> tuple[str, int]:
     """Asks the stage's model for the handoff: one more request on the same
-    prefix -- instruction, tools and history exactly as sent -- plus the
-    handoff prompt as a new user turn, tools switched off for the answer.
+    prefix -- instruction, tools and history as sent -- plus the handoff prompt
+    as a new user turn, tools switched off for the answer. When the accumulated
+    request has already grown close to or past the pre-dispatch budget guard
+    (>=85% of `limit_tokens`), oldest tool responses are cleared on the copy
+    (and thinking signatures stripped) so the handoff call itself cannot
+    overflow and leave an empty handoff.
     Returns (handoff text, tokens used); ("", 0) when no model is available
     or the call fails, which must never block the continuation."""
     if llm is None:
         return "", 0
     try:
         request = llm_request.model_copy(deep=True)
+        eff_limit = limit_tokens
+        if not eff_limit:
+            try:
+                from core.config import _effective_context_window
+                eff_limit = _effective_context_window(
+                    getattr(llm, "model", None) or getattr(llm_request, "model", None)
+                )
+            except Exception:
+                eff_limit = None
+        if eff_limit and eff_limit > 0:
+            est_tokens = (
+                _request_chars(request) + len(NODE_CONTEXT_HANDOFF_PROMPT)
+            ) // NODE_CONTEXT_CHARS_PER_TOKEN
+            if est_tokens >= int(eff_limit * 0.85):
+                target_tokens = max(1, int(eff_limit * 0.65))
+                # Strip thinking blocks/signatures before trimming earlier turns
+                # so providers that bind thinking to prefix accept the trimmed copy.
+                cleaned_contents = []
+                for content in list(request.contents or []):
+                    kept_parts = []
+                    for part in getattr(content, "parts", None) or []:
+                        if getattr(part, "thought", False):
+                            continue
+                        if getattr(part, "thought_signature", None):
+                            part = part.model_copy(update={"thought_signature": None})
+                        kept_parts.append(part)
+                    if kept_parts:
+                        content.parts = kept_parts
+                        cleaned_contents.append(content)
+                request.contents = cleaned_contents
+                for content, idx, _chars in _function_response_parts(request):
+                    if _request_chars(request) // NODE_CONTEXT_CHARS_PER_TOKEN <= target_tokens:
+                        break
+                    _clear_function_response(content, idx)
         request.contents = list(request.contents or []) + [
             types.Content(role="user", parts=[types.Part.from_text(text=NODE_CONTEXT_HANDOFF_PROMPT)])
         ]
@@ -1844,7 +1884,7 @@ def _make_node_context_ceiling_before_model_callback(
             return None
         may_continue = slot is not None and continuations < _cap()
         if may_continue:
-            handoff, used = await _write_handoff(node_id, _llm(), llm_request)
+            handoff, used = await _write_handoff(node_id, _llm(), llm_request, limit_tokens=limit)
             if used:
                 try:
                     from core.context import current_run_context

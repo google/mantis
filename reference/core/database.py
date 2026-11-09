@@ -2666,6 +2666,31 @@ def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run
     return rec["content"] if rec else None
 
 
+def reset_campaign_handoffs(db_path: str, run_id: str, resource: str = "") -> int:
+    """Deletes stored per-stage continuation handoff rows for `(run_id, resource)`
+    when an overflowed resumed campaign restarts in a fresh session, so the
+    restarted campaign begins with a full continuation budget instead of
+    inheriting exhausted continuation counters."""
+    if not db_path or not run_id or not os.path.exists(db_path):
+        return 0
+    want = str(resource or "")
+    try:
+        with _db(db_path) as conn:
+            rows = conn.execute(
+                "SELECT id, metadata_json FROM campaign_artifacts WHERE run_id = ? AND artifact_type = 'handoff'",
+                (str(run_id),),
+            ).fetchall()
+            doomed = [r[0] for r in rows if _artifact_resource(r[1]) == want]
+            if doomed:
+                conn.execute(
+                    f"DELETE FROM campaign_artifacts WHERE id IN ({','.join('?' * len(doomed))})",
+                    doomed,
+                )
+            return len(doomed)
+    except Exception:
+        return 0
+
+
 def artifact_is_imported(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None,
                          resource: Optional[str] = None) -> bool:
     """Whether the artifact a read would return came from a knowledge import

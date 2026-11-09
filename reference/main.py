@@ -196,6 +196,22 @@ async def execute_sub_task(
         )
         if budget_controller is not None:
             budget_controller.observe("overflow_restarts")
+        if _ctx_for_context is not None and hasattr(_ctx_for_context, "node_context"):
+            _ctx_for_context.node_context.clear()
+        restart_handoff = _prepare_overflow_restart_handoff(db_path, run_id, filepath)
+        if _ctx_for_context is not None and restart_handoff:
+            _ctx_for_context.campaign_context = "".join(
+                part
+                for part in (
+                    slice_briefing,
+                    restart_handoff,
+                    prior_memory,
+                    hypotheses,
+                    coverage_note,
+                    focus_directive,
+                )
+                if part
+            )
         await session_service.delete_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
         await session_service.create_session(
             app_name=APP_NAME, user_id=USER_ID, session_id=session_id,
@@ -203,13 +219,56 @@ async def execute_sub_task(
         )
         fresh = _build_seed_message(
             seed_prompt_template, sanitized_filepath, run_id,
-            slice_briefing, prior_memory, hypotheses, coverage_note, focus_directive,
+            slice_briefing + restart_handoff, prior_memory, hypotheses, coverage_note, focus_directive,
         )
         return await _drive_campaign(
             runner, session_id, fresh, None,
             filepath=filepath, run_id=run_id, db_path=db_path, status_map=status_map,
             budget_controller=budget_controller, transcript=transcript,
         )
+
+
+def _prepare_overflow_restart_handoff(db_path: str, run_id: str, filepath: str) -> str:
+    """Clears exhausted continuation handoffs and renders a bounded, CP-4-fenced
+    summary of artifacts already saved for `(run_id, filepath)` before the
+    resumed invocation overflowed."""
+    if not db_path or not run_id or not os.path.exists(db_path):
+        return ""
+    try:
+        from core.database import read_artifact, read_findings, reset_campaign_handoffs
+        from core.llm_gateway import wrap_untrusted_content
+
+        reset_campaign_handoffs(db_path, run_id, resource=filepath or "")
+        sections: list[str] = []
+        for label, kind in (
+            ("Saved Architecture Summary", "summary"),
+            ("Saved Threat Model", "threat_model"),
+            ("Saved Review Plan", "plan"),
+        ):
+            raw = read_artifact(db_path, artifact_type=kind, run_id=run_id, resource=filepath or None)
+            if raw and str(raw).strip():
+                snippet = str(raw).strip()[:1200]
+                sections.append(f"### {label}\n{snippet}")
+        saved_findings = read_findings(
+            db_path, run_id=run_id, scope_path=filepath or None, campaign=filepath or None
+        )
+        if saved_findings:
+            lines = [
+                f"- #{f.get('id')}: [{f.get('severity')}] {f.get('filepath')} — "
+                f"{str(f.get('title') or '')[:120]} (status={f.get('status')})"
+                for f in saved_findings[:15]
+            ]
+            sections.append("### Already-Recorded Campaign Findings\n" + "\n".join(lines))
+        if not sections:
+            return ""
+        body = (
+            "Prior interrupted attempt on this campaign persisted the following "
+            "artifacts in the database before context restart (avoid duplicating "
+            "findings already recorded below):\n\n" + "\n\n".join(sections)
+        )
+        return "\n\n" + wrap_untrusted_content(body, filename="overflow_restart_handoff")
+    except Exception:
+        return ""
 
 
 # Provider wording for "this request does not fit the model's window". Used
@@ -223,17 +282,54 @@ _CONTEXT_OVERFLOW_MARKERS = (
     "maximum context",
     "exceeds the maximum number of tokens",
     "input token count",
+    "max_model_len",
+    "too many tokens",
+    "token limit",
+    "request too large",
+)
+
+# Exception class-name tokens emitted by provider SDKs and LiteLLM when an
+# HTTP 400/413/422 context-window rejection occurs. Generic Python classes
+# (RuntimeError, ValueError, Exception) are deliberately excluded so target
+# code or tool strings cannot trigger a restart by text alone.
+_PROVIDER_OVERFLOW_CLASS_TOKENS = (
+    "badrequest",
+    "invalidrequest",
+    "invalidargument",
+    "apierror",
+    "openaierror",
+    "clienterror",
+    "unprocessableentity",
+    "httperror",
+    "litellm",
 )
 
 
-def _is_context_overflow(exc: BaseException) -> bool:
+def _single_exc_is_overflow(exc: BaseException) -> bool:
     name = type(exc).__name__.lower()
     text = f"{name} {exc}".lower()
-    # Mantis's own pre-dispatch refusal (core.config.enforce_context_budget)
-    # and litellm's typed overflow: deterministic in the request, by class.
-    if "contextbudgetexceeded" in name or "contextwindowexceeded" in name:
+    # Mantis's own pre-dispatch refusal, node context ceiling exhaustion, and
+    # litellm's typed overflow: deterministic in the request, by class.
+    if (
+        "contextbudgetexceeded" in name
+        or "contextwindowexceeded" in name
+        or "nodecontextexhausted" in name
+    ):
         return True
-    return "badrequest" in name and any(m in text for m in _CONTEXT_OVERFLOW_MARKERS)
+    return any(tok in name for tok in _PROVIDER_OVERFLOW_CLASS_TOKENS) and any(
+        m in text for m in _CONTEXT_OVERFLOW_MARKERS
+    )
+
+
+def _is_context_overflow(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if _single_exc_is_overflow(cur):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
 
 
 def _build_seed_message(
