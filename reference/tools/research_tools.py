@@ -94,11 +94,16 @@ def _resolve_entry_cap(env_var: str, default: int) -> int:
 
 
 def _own_resource(ctx) -> str:
-    """The campaign an artifact read belongs to: this campaign's target.
+    """The campaign an artifact read belongs to: this campaign's target (or
+    per-pass resource override under --passes > 1).
     Campaigns of one run share the run id; under --parallel they share the
     clock too, so a read scoped by run alone can return a sibling's plan or
     notes. '' when the context has no target (outside a campaign)."""
-    return str(getattr(ctx, "target_file", "") or "")
+    return str(
+        getattr(ctx, "artifact_resource", "")
+        or getattr(ctx, "target_file", "")
+        or ""
+    )
 
 
 def _resolve_context_db(ctx: Any) -> Optional[str]:
@@ -117,7 +122,7 @@ def _persist_artifact(ctx, artifact_type: str, filepath: str, content: str):
     resolved_db = _resolve_context_db(ctx)
     if resolved_db:
         meta = {
-            "resource": getattr(ctx, "target_file", ""),
+            "resource": _own_resource(ctx),
             "snapshot_id": getattr(ctx, "snapshot_id", ""),
         }
         record_artifact(resolved_db, ctx.run_id, artifact_type, filepath, content, metadata=meta)
@@ -1118,6 +1123,7 @@ def report_findings(report: VulnerabilityReport) -> str:
         write_findings(ctx.db_path, ctx.target_file, findings, run_id=ctx.run_id,
                        verified_evidence=bool(getattr(ctx, "sandbox_executed", False)),
                        finding_evidence=dict(getattr(ctx, "finding_evidence", None) or {}))
+        ctx.reported_in_pass = True
         return f"SUCCESS: Saved {len(findings)} finding(s) to database."
     except Exception as e:
         return f"ERROR SAVING DB: {e}"
@@ -1196,7 +1202,17 @@ def get_findings(filepath: str = "") -> str:
         # campaigns' findings -- which downstream stages could not even open
         # under the single-file jail. Same subtree rule as update_status.
         own_scope = getattr(ctx, "target_file", "") or None
-        run_wide = getattr(ctx, "active_node", "") in _RUN_WIDE_FINDINGS_NODES
+        active_node = str(getattr(ctx, "active_node", "") or "")
+        # In blind repeat passes (--passes > 1), researcher starts blind to
+        # earlier passes' findings until it submits its own report_findings,
+        # preventing anchor bias against undiscovered vulnerability classes.
+        if (
+            int(getattr(ctx, "pass_index", 1) or 1) > 1
+            and not bool(getattr(ctx, "reported_in_pass", False))
+            and (active_node == "researcher" or active_node.startswith("researcher_"))
+        ):
+            return "NO_DATA: Zero findings recorded in this pass yet."
+        run_wide = active_node in _RUN_WIDE_FINDINGS_NODES
         if clean_fp:
             # An explicit file: the full records for that file, as always.
             findings = read_findings(resolved_db, filepath=clean_fp, run_id=ctx.run_id)
@@ -1356,7 +1372,7 @@ async def write_file(filepath: str, content: str) -> str:
 
         if ctx.db_path:
             meta = {
-                "resource": getattr(ctx, "target_file", ""),
+                "resource": _own_resource(ctx),
                 "snapshot_id": getattr(ctx, "snapshot_id", ""),
                 "agent_authored": True,
             }

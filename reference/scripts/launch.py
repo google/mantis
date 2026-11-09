@@ -209,6 +209,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--passes",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent blind audit passes to run over each planned "
+            "campaign slice (default: 1). With --passes N (N > 1), each pass "
+            "runs in an isolated session without cross-pass coverage suppression "
+            "and unions discovered findings into the consolidated run."
+        ),
+    )
+    parser.add_argument(
         "--parallel-ramp",
         type=float,
         default=0.0,
@@ -463,6 +474,7 @@ def run_launch(
     no_budget: bool = False,
     no_replan: bool = False,
     parallel: int = 1,
+    passes: int = 1,
     parallel_ramp: float = 0.0,
     db_timeout: Optional[float] = None,
     focus: str = "",
@@ -822,6 +834,7 @@ def run_launch(
                 max_node_tool_calls_override=cli_budget_overrides.get("max_node_tool_calls"),
                 enable_replan=False if no_replan else None,
                 parallel=parallel,
+                passes=passes,
                 parallel_ramp_seconds=parallel_ramp,
                 db_timeout=db_timeout,
                 focus=focus,
@@ -889,6 +902,8 @@ def main() -> int:
                 raise ValueError("must be positive")
         except ValueError as exc:
             parser.error(f"--max-input-tokens: {exc}")
+    if args.passes is not None and int(args.passes) < 1:
+        parser.error("--passes: must be >= 1")
 
     # The spend report is written however the run ended -- a driver that
     # allotted this process a budget needs the number even when the process
@@ -922,6 +937,7 @@ def main() -> int:
             no_budget=args.no_budget,
             no_replan=args.no_replan,
             parallel=args.parallel,
+            passes=args.passes,
             parallel_ramp=args.parallel_ramp,
             db_timeout=args.db_timeout,
             focus=args.focus,

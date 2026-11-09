@@ -106,11 +106,12 @@ async def execute_sub_task(
     coverage_note: str = "",
     hypotheses: str = "",
     transcript: Optional["TranscriptWriter"] = None,
+    session_suffix: str = "",
 ) -> bool:
     """Executes the workflow graph for a single target file. Returns True if an error was encountered."""
     sanitized_filepath = str(filepath).replace("\n", "").replace("\r", "").strip()
     target_hash = hashlib.sha256(sanitized_filepath.encode("utf-8")).hexdigest()[:8]
-    session_id = f"session_run_{run_id}_{target_hash}"
+    session_id = f"session_run_{run_id}_{target_hash}{session_suffix}"
     existing_session = await session_service.get_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
     if existing_session is None:
         initial_state = {"db_path": db_path, "run_id": run_id, "filepath": sanitized_filepath}
@@ -2600,6 +2601,7 @@ async def pipeline(
     no_budget: bool = False,
     enable_replan: Optional[bool] = None,
     parallel: int = 1,
+    passes: int = 1,
     parallel_ramp_seconds: float = 0.0,
     focus: str = "",
     seed_report_path: str = "",
@@ -2653,6 +2655,9 @@ async def pipeline(
         banner_resume_flags["--reasoning-effort"] = reasoning_effort_override
     if max_input_tokens is not None and max_input_tokens > 0:
         banner_resume_flags["--max-input-tokens"] = max_input_tokens
+    total_passes = max(1, int(passes or 1))
+    if total_passes > 1:
+        banner_resume_flags["--passes"] = total_passes
 
     effective_sandbox_override = sandbox_override
     # Auto-resolve unconfigured placeholders if enabled
@@ -3432,6 +3437,17 @@ async def pipeline(
     # once here, and again only for groups a replan adds; a failure inside
     # costs the lineage record, never the scan.
     _open_chains_for_groups(db_path, run_id, campaign_groups)
+    if total_passes > 1:
+        base_campaign_groups = list(campaign_groups)
+        campaign_groups = [
+            {**g, "pass_index": p}
+            for p in range(1, total_passes + 1)
+            for g in base_campaign_groups
+        ]
+        print(
+            f"\n🔁 Multi-pass audit enabled: {total_passes} independent blind pass(es) "
+            f"across {len(base_campaign_groups)} campaign slice(s) ({len(campaign_groups)} total campaign executions)."
+        )
     if not resume_run_id and plan_groups and any(g.get("chain_id") for g in campaign_groups):
         try:
             from core.cost import record_run_plan as _refresh_run_plan
@@ -3707,6 +3723,9 @@ async def pipeline(
             # beyond the first ride along in the campaign's briefing text and
             # are stamped into coverage after the spend is recorded.
             scan_item = str((group.get("targets") or [""])[0])
+            pass_idx = max(1, int(group.get("pass_index", 1) or 1))
+            pass_suffix = f"_pass{pass_idx}" if pass_idx > 1 else ""
+            pass_resource = f"{scan_item}#pass{pass_idx}" if pass_idx > 1 else ""
             # Started (not completed): the replan stale-filter must exclude
             # anything a sibling is ALREADY running, not just what finished.
             started_targets.add(scan_item)
@@ -3751,6 +3770,10 @@ async def pipeline(
                 # campaign, like sandbox_executed.
                 finding_evidence={},
                 node_context={},
+                audit_checklist=None,
+                pass_index=pass_idx,
+                artifact_resource=pass_resource,
+                reported_in_pass=False,
                 # What this campaign is about, when narrower than its target.
                 # Reaches every node through its instructions: the seed
                 # message below is seen by the first node only.
@@ -3827,11 +3850,12 @@ async def pipeline(
             # opened". Operator-authored text selected by a band key; carries no
             # repository bytes.
             coverage_note = ""
-            try:
-                from core.planner import render_coverage_note
-                coverage_note = render_coverage_note(coverage_plan, scan_item)
-            except Exception as exc:
-                print(f"[COVERAGE PLAN WARNING] {exc}", file=sys.stderr)
+            if pass_idx == 1:
+                try:
+                    from core.planner import render_coverage_note
+                    coverage_note = render_coverage_note(coverage_plan, scan_item)
+                except Exception as exc:
+                    print(f"[COVERAGE PLAN WARNING] {exc}", file=sys.stderr)
             # Campaign boundary. Resets the per-campaign runaway-loop guards
             # (graph steps, node visits, per-visit tool calls) so a guard sized
             # for ONE campaign is never charged with the whole sweep: measured
@@ -3894,10 +3918,11 @@ async def pipeline(
                     budget_controller=budget_ctrl,
                     slice_briefing=briefing,
                     focus_directive=focus,
-                    prior_memory=prior_memory,
+                    prior_memory=prior_memory if pass_idx == 1 else "",
                     coverage_note=coverage_note,
-                    hypotheses=hypotheses_text,
+                    hypotheses=hypotheses_text if pass_idx == 1 else "",
                     transcript=_transcript_writer,
+                    session_suffix=pass_suffix,
                 )
                 campaign_tokens = budget_ctrl.accumulated_tokens - tokens_before
                 campaign_llm_calls = budget_ctrl.llm_calls - llm_calls_before

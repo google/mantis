@@ -94,6 +94,13 @@ class RunContext:
     shared_prefix_runs: Optional[dict[str, dict[str, str]]] = None
     # All directory/file targets grouped into this campaign (primary + secondaries).
     group_targets: tuple = ()
+    # Lazily computed deterministic AST/lexical sink & entrypoint checklist for
+    # planner and researcher stages (None = not yet computed, "" = none found).
+    audit_checklist: Optional[str] = None
+    # Multi-pass audit tracking (1-indexed; >1 = independent blind repeat pass).
+    pass_index: int = 1
+    artifact_resource: str = ""
+    reported_in_pass: bool = False
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

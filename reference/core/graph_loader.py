@@ -1147,7 +1147,7 @@ def _make_prefix_reuse_callbacks(node_id: str):
             artifact = read_artifact(db, artifact_type=kind, run_id=ctx.run_id, resource=producer)
             if not _artifact_says_something(artifact):
                 return None
-            own = str(getattr(ctx, "target_file", "") or "")
+            own = str(getattr(ctx, "artifact_resource", "") or getattr(ctx, "target_file", "") or "")
             if own != producer:
                 record_artifact(db, ctx.run_id, kind, _PREFIX_REUSE_PATHS[kind], artifact,
                                 metadata={"resource": own, "snapshot_id": getattr(ctx, "snapshot_id", ""),
@@ -1173,7 +1173,8 @@ def _make_prefix_reuse_callbacks(node_id: str):
 
             ctx = current_run_context.get()
             if ctx and ctx.run_id and _shares_jail(ctx):
-                _runs_map(ctx).setdefault(_run_key(ctx), str(getattr(ctx, "target_file", "") or ""))
+                own_res = str(getattr(ctx, "artifact_resource", "") or getattr(ctx, "target_file", "") or "")
+                _runs_map(ctx).setdefault(_run_key(ctx), own_res)
         except Exception:
             pass
         return None
@@ -1980,12 +1981,17 @@ def _make_node_context_ceiling_before_model_callback(
 
 CAMPAIGN_DIRECTIVE_MARKER = "[CAMPAIGN DIRECTIVE]"
 CAMPAIGN_CONTEXT_MARKER = "[CAMPAIGN CONTEXT]"
+AUDIT_CHECKLIST_MARKER = "[DETERMINISTIC AUDIT CHECKLIST]"
 #: Characters of campaign context appended per node. Larger than the stage
 #: experience cap: the memory block alone lists every earlier finding here.
 MAX_CAMPAIGN_CONTEXT_CHARS = 8000
 #: Characters of campaign directive appended per node: the change-scoped
 #: file list, the prior-findings brief and the PoC re-run note together.
 MAX_CAMPAIGN_DIRECTIVE_CHARS = 12000
+#: Stages that receive the deterministic slice sink/entrypoint checklist so
+#: planning and vulnerability discovery cover indexed sinks systematically
+#: without biasing independent downstream review/critic stages.
+CHECKLIST_STAGES = ("planner", "researcher")
 #: The stages that decide where to look. Matched by node id prefix, so
 #: `researcher_2` in a parallel archetype counts. The reproducer, patcher,
 #: calibrator, reflector and reporter work from this run's findings through
@@ -1997,6 +2003,11 @@ CONTEXT_STAGES = ("architect", "threat_modeler", "planner", "researcher", "revie
 def _wants_campaign_context(node_id: str) -> bool:
     nid = str(node_id or "")
     return any(nid == s or nid.startswith(s + "_") or nid.startswith(s + "-") for s in CONTEXT_STAGES)
+
+
+def _wants_audit_checklist(node_id: str) -> bool:
+    nid = str(node_id or "")
+    return any(nid == s or nid.startswith(s + "_") or nid.startswith(s + "-") for s in CHECKLIST_STAGES)
 
 
 def _close_open_fence(text: str) -> str:
@@ -2029,6 +2040,7 @@ def _make_campaign_directive_before_model_callback(node_id: str):
     fails.
     """
     wants_context = _wants_campaign_context(node_id)
+    wants_checklist = _wants_audit_checklist(node_id)
 
     def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
         try:
@@ -2041,7 +2053,16 @@ def _make_campaign_directive_before_model_callback(node_id: str):
                 return None
             directive = str(getattr(ctx, "campaign_directive", "") or "")
             context = str(getattr(ctx, "campaign_context", "") or "") if wants_context else ""
-            if not directive and not context:
+            checklist = ""
+            if wants_checklist:
+                cached_cl = getattr(ctx, "audit_checklist", None)
+                if cached_cl is None:
+                    from core.checklist import build_slice_audit_checklist
+
+                    cached_cl = build_slice_audit_checklist(ctx)
+                    ctx.audit_checklist = cached_cl
+                checklist = str(cached_cl or "")
+            if not directive and not context and not checklist:
                 return None
             sys_inst = str(
                 getattr(getattr(llm_request, "config", None), "system_instruction", "") or ""
@@ -2052,6 +2073,8 @@ def _make_campaign_directive_before_model_callback(node_id: str):
                 if len(block) > MAX_CAMPAIGN_CONTEXT_CHARS:
                     block = _close_open_fence(block[:MAX_CAMPAIGN_CONTEXT_CHARS]) + "\n[campaign context truncated]"
                 blocks.append(block)
+            if checklist and AUDIT_CHECKLIST_MARKER not in sys_inst:
+                blocks.append(_close_open_fence(checklist))
             if directive and CAMPAIGN_DIRECTIVE_MARKER not in sys_inst:
                 block = f"\n\n{CAMPAIGN_DIRECTIVE_MARKER}{directive}"
                 if len(block) > MAX_CAMPAIGN_DIRECTIVE_CHARS:
