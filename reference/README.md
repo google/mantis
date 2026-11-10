@@ -804,6 +804,10 @@ The reference harness implements ADK's `BaseEnvironment` interface:
   Networkless (`Network.none()`), guest-isolated filesystem at `/workspace`.
 - **`GvisorEnvironment`**: OCI container isolation via gVisor (`runsc`).
   Networkless (`--network=none`), container-isolated filesystem at `/workspace`.
+- **`RemoteTargetEnvironment`**: Split-plane execution against an
+  operator-provisioned multi-container stack, hardware simulator, or appliance
+  target (`container`, hardened `ssh`, or `exec_argv`), while keeping static
+  code reads strictly read-only on the local checkout (`INV-4`).
 - **`StaticOnlyEnvironment`**: Safe no-op environment for static-only scans.
 
 ### Configuring the Sandbox Backend in `workflow.json`
@@ -873,12 +877,43 @@ Ephemeral cloud VM in an isolated VPC with link-local DNS blackholing.
 }
 ```
 
-| Sandbox Type         | Dynamic Execution | Prerequisites                                       |
-| :------------------- | :---------------: | :-------------------------------------------------- |
-| **`"static-only"`**  |        ❌         | None                                                |
-| **`"gvisor"`**       |        ✅         | Docker/Podman + `runsc` runtime                     |
-| **`"microsandbox"`** |        ✅         | Hardware virtualization (`/dev/kvm`)                |
-| **`"gce"`**          |        ✅         | GCP Project, Isolated VPC/Subnet, Custom Disk Image |
+#### 5. Split-Plane Remote Target (`"remote"`)
+
+Targets an already-running multi-container product stack, simulator, or hardened
+SSH test appliance without copying or rebuilding the whole product inside a
+single-VM sandbox. Static source reads and listings remain strictly read-only on
+the local checkout (`StaticOnlyEnvironment`, `INV-4`), while dynamic PoCs,
+sidecar sentinels (`INV-1`/`INV-2`), patches/rebuilds, and campaign resets run
+on the configured target.
+
+```json
+"sandbox": {
+  "type": "remote",
+  "options": {
+    "transport": "container",
+    "container": "product-api-test",
+    "workdir": "/workspace",
+    "healthcheck_cmd": "true",
+    "reset_cmd": "git checkout -- . && git clean -fd",
+    "rebuild_cmd": "make build && supervisorctl restart api",
+    "log_cmd": "tail -n 100 /var/log/target-asan.log",
+    "timeout_seconds": 120
+  }
+}
+```
+
+Supported transports under `options`: `container` (`docker`/`podman exec`),
+`ssh` (`host`, optional `ssh_user`, `port`, `identity_file`,
+`strict_host_key_checking` in `yes`|`accept-new` with agent/port forwarding
+disabled), or `exec` (`exec_argv` command prefix executed with `shell=False`).
+
+| Sandbox Type         | Dynamic Execution | Prerequisites                                              |
+| :------------------- | :---------------: | :--------------------------------------------------------- |
+| **`"static-only"`**  |        ❌         | None                                                       |
+| **`"gvisor"`**       |        ✅         | Docker/Podman + `runsc` runtime                            |
+| **`"microsandbox"`** |        ✅         | Hardware virtualization (`/dev/kvm`)                       |
+| **`"gce"`**          |        ✅         | GCP Project, Isolated VPC/Subnet, Custom Disk Image        |
+| **`"remote"`**       |        ✅         | Pre-provisioned container, SSH appliance, or custom runner |
 
 ### Target Boundary & Isolation Model
 

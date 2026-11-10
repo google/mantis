@@ -20,6 +20,7 @@ from core.environments import (
     GvisorEnvironment,
     StaticOnlyEnvironment,
     GceEnvironment,
+    RemoteTargetEnvironment,
     ENVIRONMENTS,
     build_environment,
 )
@@ -29,6 +30,7 @@ StaticOnlySandbox = StaticOnlyEnvironment
 GvisorSandbox = GvisorEnvironment
 MicrosandboxSandbox = MicrosandboxEnvironment
 GceSandbox = GceEnvironment
+RemoteSandbox = RemoteTargetEnvironment
 
 class Sandbox(Protocol):
     """Executes commands in isolation on behalf of the reproducer and patcher nodes."""

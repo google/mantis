@@ -218,9 +218,11 @@ async def execute_sub_task(
             app_name=APP_NAME, user_id=USER_ID, session_id=session_id,
             state={"db_path": db_path, "run_id": run_id, "filepath": sanitized_filepath},
         )
+        if restart_handoff:
+            slice_briefing = slice_briefing + restart_handoff
         fresh = _build_seed_message(
             seed_prompt_template, sanitized_filepath, run_id,
-            slice_briefing + restart_handoff, prior_memory, hypotheses, coverage_note, focus_directive,
+            slice_briefing, prior_memory, hypotheses, coverage_note, focus_directive,
         )
         return await _drive_campaign(
             runner, session_id, fresh, None,
@@ -656,7 +658,19 @@ async def _drive_campaign(
                                 # that carries usage -- including the zero
                                 # usage of a harness-authored final answer,
                                 # which no model billed -- is charged from it.
-                                if budget_controller and usage is None:
+                                # Harness before_agent_callback short-circuits
+                                # (prefix reuse, clean/deferred reporter skip)
+                                # carry no usage_metadata because ADK wraps bare
+                                # types.Content; never bill them as LLM calls.
+                                _is_shortcircuit = any(
+                                    m in part.text
+                                    for m in (
+                                        "] Reused the ",
+                                        "] Deferred per-campaign report ",
+                                        "] Zero active findings in scope; recorded clean report summary without LLM call.",
+                                    )
+                                )
+                                if budget_controller and usage is None and not _is_shortcircuit:
                                     budget_controller.record_tokens(len(part.text) // 4)
                             if current_active_node == "reporter" and db_path and run_id:
                                 try:
@@ -1801,7 +1815,12 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
     """
     from core.database import read_artifact, record_regression_check
     from core.poc_scaffold import restore_poc_companions
-    from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN, check_reached_sink_evidence, poc_ran
+    from tools.sandbox_tools import (
+        MANTIS_SENTINEL_TOKEN,
+        _guest_file_reader,
+        check_reached_sink_evidence,
+        poc_ran,
+    )
 
     sandbox = getattr(ctx, "sandbox", None)
     if sandbox is None or type(sandbox).__name__ in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
@@ -1836,8 +1855,9 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
                       + (f", {len(skipped)} skipped (present in the current tree)" if skipped else ""),
                       file=sys.stderr)
             await sandbox.write_file(Path(guest_path), content)
+            sentinel_reader = _guest_file_reader(sandbox)
             try:
-                existing = await sandbox.read_file(Path(sentinel))
+                existing = await sentinel_reader(Path(sentinel))
                 if MANTIS_SENTINEL_TOKEN in existing.decode("utf-8", errors="replace"):
                     await sandbox.write_file(Path(sentinel), "")
             except Exception:
@@ -1848,7 +1868,7 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
             exit_code = int(getattr(res, "exit_code", 1) or 0)
             sentinel_content = ""
             try:
-                sentinel_content = (await sandbox.read_file(Path(sentinel))).decode("utf-8", errors="replace")
+                sentinel_content = (await sentinel_reader(Path(sentinel))).decode("utf-8", errors="replace")
             except Exception:
                 pass
             present, reason = check_reached_sink_evidence(
@@ -3961,8 +3981,8 @@ async def pipeline(
                         run_id,
                         scan_item,
                         scan_mode,
-                        tokens=campaign_tokens,
-                        llm_calls=campaign_llm_calls,
+                        tokens=budget_ctrl.accumulated_tokens - tokens_before,
+                        llm_calls=budget_ctrl.llm_calls - llm_calls_before,
                         graph_steps=budget_ctrl.graph_steps - steps_before,
                         elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,
                         metadata=spend_meta,

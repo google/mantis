@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sandbox",
         "-s",
         type=str,
-        choices=["static-only", "static", "gvisor", "microsandbox", "gce"],
+        choices=["static-only", "static", "gvisor", "microsandbox", "gce", "remote"],
         help="Sandbox execution override",
     )
     parser.add_argument(

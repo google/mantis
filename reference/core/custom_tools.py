@@ -342,6 +342,8 @@ _ENV_CLASS_TO_BACKEND = {
     "GvisorEnvironment": "gvisor",
     "MicrosandboxEnvironment": "microsandbox",
     "GceEnvironment": "gce",
+    "RemoteTargetEnvironment": "remote",
+    "RemoteSandbox": "remote",
 }
 
 

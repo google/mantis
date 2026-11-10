@@ -1607,12 +1607,13 @@ async def list_files(directory: str = "") -> str:
 
     # Directory-slice campaigns in cross-functional mode default an empty
     # list_files("") call to their assigned slice directory rather than dumping
-    # the top 1,000 alphabetical files of the entire parent tree; passing "/"
-    # or an explicit sibling path still lists outside the slice when needed.
-    if directory.strip() == "/":
+    # the top 1,000 alphabetical files of the entire parent tree; passing "."
+    # or an explicit sibling path still lists outside the slice when needed,
+    # while "/" remains rejected by the host boundary check.
+    if directory.strip() == ".":
         directory = ""
     elif (
-        directory.strip() in ("", ".")
+        directory.strip() == ""
         and getattr(ctx, "scan_mode", "") == "cross-functional"
         and ctx.target_file
         and ctx.jail_dir

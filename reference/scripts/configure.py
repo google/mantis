@@ -454,6 +454,17 @@ def is_default_or_unconfigured(config: dict) -> Tuple[bool, List[str]]:
             iso_ok, iso_msg = verify_microsandbox_isolation_primitives()
             if not iso_ok:
                 issues.append(f"Microsandbox isolation policy unverified: {iso_msg}")
+    elif sb_type == "remote":
+        has_target = (
+            (sb_opts.get("container") and not is_placeholder(sb_opts.get("container")))
+            or (sb_opts.get("host") and not is_placeholder(sb_opts.get("host")))
+            or (sb_opts.get("ssh_host") and not is_placeholder(sb_opts.get("ssh_host")))
+            or (isinstance(sb_opts.get("exec_argv"), list) and len(sb_opts.get("exec_argv")) > 0)
+        )
+        if not has_target:
+            issues.append(
+                "Remote sandbox requires 'options.container', 'options.host', or 'options.exec_argv' in workflow.local.json."
+            )
 
     # Model checks
     model = config.get("default_model", DEFAULT_MODEL)
@@ -552,6 +563,20 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
                 "(the sandbox never pulls at run time). Run ./install.sh to provision one."
             )
         return True, f"Microsandbox ready ({virt_msg} Guest image: {cached})."
+
+    if sb_type == "remote":
+        try:
+            from core.environments.remote_env import RemoteTargetEnvironment
+
+            opts = dict(sandbox_cfg.get("options", {}) or {})
+            for k, v in sandbox_cfg.items():
+                if k not in ("type", "options") and v is not None:
+                    opts.setdefault(k, v)
+            env = RemoteTargetEnvironment(target_path=target_path, **opts)
+            await env.preflight()
+            return True, f"Remote split-plane sandbox ready (transport={env.transport}, workdir={env.working_dir})."
+        except Exception as e:
+            return False, f"Remote sandbox preflight failed: {e}"
 
     return False, f"Unknown sandbox type '{sb_type}'."
 
@@ -1014,7 +1039,10 @@ async def ensure_configured_async(
 
     sb_type = cfg.get("sandbox", {}).get("type", "static-only")
     sb_opts = dict(cfg.get("sandbox", {}).get("options", {}))
-    sb_available = sb_type in caps.get("available_sandboxes", ["static-only"])
+    if sb_type == "remote":
+        sb_available, _ = await _check_sandbox_preflight(cfg.get("sandbox", {}))
+    else:
+        sb_available = sb_type in caps.get("available_sandboxes", ["static-only"])
 
     # Auto-promotion: a 'static-only' floor inherited from the tracked
     # workflow.json is a default, not an operator decision. When this host can
@@ -1108,6 +1136,16 @@ async def ensure_configured_async(
                 )
                 print(
                     "⚠️  [REPRO DISABLED] Operator-approved downgrade 'gce' -> 'static-only' for THIS SESSION ONLY."
+                )
+                downgraded_sandbox = {"type": "static-only", "options": {}}
+                cfg = {**cfg, "sandbox": dict(downgraded_sandbox)}
+        elif sb_type == "remote":
+            if not sb_available or sb_preflight_failed:
+                _refuse_silent_downgrade(
+                    "Remote target sandbox is unconfigured or failed preflight healthcheck."
+                )
+                print(
+                    "⚠️  [REPRO DISABLED] Operator-approved downgrade 'remote' -> 'static-only' for THIS SESSION ONLY."
                 )
                 downgraded_sandbox = {"type": "static-only", "options": {}}
                 cfg = {**cfg, "sandbox": dict(downgraded_sandbox)}
@@ -1405,7 +1443,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sandbox",
         "-s",
         type=str,
-        choices=["static-only", "static", "gvisor", "microsandbox", "gce"],
+        choices=["static-only", "static", "gvisor", "microsandbox", "gce", "remote"],
         help="Sandbox execution mechanism",
     )
     parser.add_argument(

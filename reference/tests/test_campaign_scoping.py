@@ -884,7 +884,7 @@ class DirectorySliceScopingTest(unittest.IsolatedAsyncioTestCase):
             try:
                 default_list = json.loads(await list_files(""))
                 self.assertEqual(default_list, ["zzz_service_b/billing.py"])
-                root_list = json.loads(await list_files("/"))
+                root_list = json.loads(await list_files("."))
                 self.assertEqual(root_list, ["aaa_repo_a/noise.py", "zzz_service_b/billing.py"])
             finally:
                 current_run_context.reset(tok)

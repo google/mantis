@@ -819,6 +819,8 @@ class ResearchGraphSynthesizer:
             final_sandbox = "static-only" if sandbox_type in ("static-only", "static") else sandbox_type
         else:
             final_sandbox = cfg_archetype.get("sandbox_type", "static-only")
+            if final_sandbox == "remote":
+                final_sandbox = "static-only"
 
         if isinstance(raw_cfg.get("sandbox"), dict) and raw_cfg["sandbox"].get("type"):
             requested_sb = str(raw_cfg["sandbox"]["type"]).strip()

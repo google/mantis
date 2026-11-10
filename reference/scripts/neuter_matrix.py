@@ -61,8 +61,8 @@ SCENARIOS = {
     ],
     "revert_sentinel_host_read": [
         ("tools/sandbox_tools.py",
-         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass",
-         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass\n        if not sentinel_content and Path(sentinel_path).exists():\n            sentinel_content = Path(sentinel_path).read_text(errors=\"replace\")"),
+         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass",
+         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass\n        if not sentinel_content and Path(sentinel_path).exists():\n            sentinel_content = Path(sentinel_path).read_text(errors=\"replace\")"),
     ],
     "revert_staging_vcs_and_hardlink": [
         ("core/environments/staging.py",
@@ -480,7 +480,7 @@ SCENARIOS = {
     ],
     "cost_revert_spend_recording": [
         ('main.py',
-         '                    record_spend(\n                        db_path,\n                        run_id,\n                        scan_item,\n                        scan_mode,\n                        tokens=budget_ctrl.accumulated_tokens - tokens_before,\n                        llm_calls=budget_ctrl.llm_calls - llm_calls_before,\n                        graph_steps=budget_ctrl.graph_steps - steps_before,\n                        elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,\n                        metadata={"failed": bool(task_failed)},\n                        harness_fingerprint=harness_fingerprint,\n                    )',
+         '                    record_spend(\n                        db_path,\n                        run_id,\n                        scan_item,\n                        scan_mode,\n                        tokens=budget_ctrl.accumulated_tokens - tokens_before,\n                        llm_calls=budget_ctrl.llm_calls - llm_calls_before,\n                        graph_steps=budget_ctrl.graph_steps - steps_before,\n                        elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,\n                        metadata=spend_meta,\n                        harness_fingerprint=harness_fingerprint,\n                    )',
          '                    pass  # NEUTERED: nothing is ever learned about what a campaign costs'),
     ],
     "cost_revert_spend_delta": [
@@ -899,7 +899,7 @@ SCENARIOS = {
     ],
     "memory_never_passed": [
         ("main.py",
-         "                    prior_memory=prior_memory,",
+         "                    prior_memory=prior_memory if pass_idx == 1 else \"\",",
          "                    # NEUTERED: assembled, then dropped"),
     ],
     "memory_never_reaches_prompt": [
@@ -1373,13 +1373,13 @@ SCENARIOS = {
         ("core/graph_loader.py",
          "            if not _shares_jail(ctx):\n"
          "                return None\n"
-         "            if ctx.run_id not in completed_runs:",
-         "            if ctx.run_id not in completed_runs:  # NEUTERED: any mode may reuse"),
+         "            runs_map = _runs_map(ctx)",
+         "            runs_map = _runs_map(ctx)  # NEUTERED: any mode may reuse"),
         ("core/graph_loader.py",
          "            if ctx and ctx.run_id and _shares_jail(ctx):\n"
-         "                completed_runs.setdefault(",
+         "                own_res =",
          "            if ctx and ctx.run_id:  # NEUTERED: any mode marks completion\n"
-         "                completed_runs.setdefault("),
+         "                own_res ="),
     ],
     # A reusing campaign's tools read its own rows: the reused artifact must be
     # recorded under it, or get_summary / get_threat_model answer NO_DATA.

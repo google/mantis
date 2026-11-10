@@ -326,6 +326,18 @@ def _has_dynamic_sandbox(ctx: Any) -> bool:
     return type(ctx.sandbox).__name__ not in ("StaticOnlyEnvironment", "StaticOnlySandbox")
 
 
+def _guest_file_reader(sandbox: Any):
+    """Returns the dynamic-plane file reader for sidecar sentinels (INV-1/INV-4).
+
+    Split-plane environments (RemoteTargetEnvironment) expose ``read_guest_file``
+    so sidecar sentinels are read exclusively from the remote runtime rather than
+    the local read-only checkout.
+    """
+    if getattr(type(sandbox), "read_guest_file", None) is not None:
+        return sandbox.read_guest_file
+    return sandbox.read_file
+
+
 async def run_sandbox(command: str) -> str:
     """Executes a command securely inside the configured sandbox. Use this to compile or run the reproduction script."""
     ctx = current_run_context.get()
@@ -477,7 +489,7 @@ async def run_sandbox_with_evidence(
         ctx_pre = current_run_context.get()
         if _has_dynamic_sandbox(ctx_pre):
             try:
-                existing = await ctx_pre.sandbox.read_file(Path(sentinel_path))
+                existing = await _guest_file_reader(ctx_pre.sandbox)(Path(sentinel_path))
                 if MANTIS_SENTINEL_TOKEN in existing.decode("utf-8", errors="replace"):
                     await ctx_pre.sandbox.write_file(Path(sentinel_path), "")
             except Exception:
@@ -504,7 +516,7 @@ async def run_sandbox_with_evidence(
         # reached-sink evidence without any dynamic execution.
         if _has_dynamic_sandbox(ctx):
             try:
-                content_bytes = await ctx.sandbox.read_file(Path(sentinel_path))
+                content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))
                 sentinel_content = content_bytes.decode("utf-8", errors="replace")
             except Exception:
                 pass

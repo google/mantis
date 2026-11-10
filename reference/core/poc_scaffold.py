@@ -168,7 +168,12 @@ async def capture_poc_scaffold(
         if host_root and _host_has(host_root, rel):
             continue  # a target file the PoC edited: a patch, not a scaffold
         try:
-            data = await sandbox.read_file(Path(rel))
+            reader = (
+                sandbox.read_guest_file
+                if getattr(type(sandbox), "read_guest_file", None) is not None
+                else sandbox.read_file
+            )
+            data = await reader(Path(rel))
         except Exception:
             continue
         if not isinstance(data, (bytes, bytearray)):
@@ -249,7 +254,12 @@ async def restore_poc_companions(sandbox, db_path: str, prior_run_id: str, findi
         in_target = not guest_path.startswith("workspace/")
         if in_target:
             try:
-                await sandbox.read_file(Path(guest_path))
+                reader = (
+                    sandbox.read_guest_file
+                    if getattr(type(sandbox), "read_guest_file", None) is not None
+                    else sandbox.read_file
+                )
+                await reader(Path(guest_path))
                 skipped.append(guest_path)
                 continue
             except Exception:

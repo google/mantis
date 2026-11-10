@@ -17,6 +17,7 @@ from .microsandbox_env import MicrosandboxEnvironment
 from .gvisor_env import GvisorEnvironment
 from .static_env import StaticOnlyEnvironment
 from .gce_env import GceEnvironment
+from .remote_env import RemoteTargetEnvironment
 
 ENVIRONMENTS: dict[str, type] = {
     "static-only": StaticOnlyEnvironment,
@@ -24,6 +25,7 @@ ENVIRONMENTS: dict[str, type] = {
     "gvisor": GvisorEnvironment,
     "microsandbox": MicrosandboxEnvironment,
     "gce": GceEnvironment,
+    "remote": RemoteTargetEnvironment,
 }
 
 
@@ -48,6 +50,7 @@ __all__ = [
     "GvisorEnvironment",
     "StaticOnlyEnvironment",
     "GceEnvironment",
+    "RemoteTargetEnvironment",
     "ENVIRONMENTS",
     "build_environment",
     "get_shared_proxy_environment",

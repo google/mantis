@@ -264,7 +264,7 @@ except Exception:  # pragma: no cover - only when pydantic itself is absent
     ExtendedReviewVerdict = None
 
 DEFAULT_MODEL = "vertex_ai/gemini-3.8-flash"
-SUPPORTED_SANDBOXES = ("static-only", "static", "gvisor", "microsandbox", "gce")
+SUPPORTED_SANDBOXES = ("static-only", "static", "gvisor", "microsandbox", "gce", "remote")
 RECOMMENDED_MODELS = (
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
