@@ -38,6 +38,7 @@ Design rules, in order:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -45,9 +46,16 @@ import os
 import re
 import stat
 import sqlite3
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    _fcntl = None  # type: ignore[assignment]
 
 from core.environments.staging import get_vetted_staging_files
 
@@ -640,6 +648,51 @@ def git_snapshot_id(code_root: str) -> str:
         return "unknown"
 
 
+_STATE_BUILD_LOCKS: Dict[str, threading.Lock] = {}
+_STATE_BUILD_LOCKS_GUARD = threading.Lock()
+
+
+@contextlib.contextmanager
+def _acquire_state_build_lock(state: Path):
+    """Serializes concurrent structural_index builds targeting the same state_dir."""
+    try:
+        lock_key = os.path.realpath(str(state))
+    except Exception:
+        lock_key = str(state)
+    with _STATE_BUILD_LOCKS_GUARD:
+        thread_lock = _STATE_BUILD_LOCKS.get(lock_key)
+        if thread_lock is None:
+            thread_lock = threading.Lock()
+            _STATE_BUILD_LOCKS[lock_key] = thread_lock
+
+    with thread_lock:
+        lock_file = None
+        if _fcntl is not None:
+            try:
+                state.mkdir(parents=True, exist_ok=True)
+                lock_file = open(state / ".build.lock", "a+", encoding="utf-8")
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+            except Exception:
+                if lock_file is not None:
+                    try:
+                        lock_file.close()
+                    except Exception:
+                        pass
+                    lock_file = None
+        try:
+            yield
+        finally:
+            if lock_file is not None:
+                try:
+                    _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    lock_file.close()
+                except Exception:
+                    pass
+
+
 def build_structural_index(
     code_root: str,
     state_dir: str,
@@ -654,7 +707,8 @@ def build_structural_index(
     snapshot_id = (snapshot_id or "unknown").strip() or "unknown"
 
     try:
-        return _build(code_root, state, snapshot_id, t0)
+        with _acquire_state_build_lock(state):
+            return _build(code_root, state, snapshot_id, t0)
     except Exception as exc:  # fail safe: an index is a hint, never a blocker
         logger.warning("structural index build failed: %r", exc)
         manifest = {
@@ -810,7 +864,9 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
         rebuilt += 1
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(json.dumps(unit), encoding="utf-8")
+            tmp_unit = (state / "tmp") / f"unit.{os.getpid()}.{uuid.uuid4().hex}.json.tmp"
+            tmp_unit.write_text(json.dumps(unit), encoding="utf-8")
+            os.replace(tmp_unit, cache_path)
         except Exception:
             pass  # cache misses are a cost, not a correctness problem
 
@@ -959,11 +1015,10 @@ def _resolve_callee_id(
 
 
 def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snapshot_id: str) -> None:
-    """Writes catalog.sqlite via tmp + atomic replace."""
-    tmp_path = state / "tmp" / "catalog.sqlite.tmp"
-    tmp_path.parent.mkdir(parents=True, exist_ok=True)
-    if tmp_path.exists():
-        tmp_path.unlink()
+    """Writes catalog.sqlite via unique tmp + atomic replace."""
+    tmp_dir = state / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"catalog.{os.getpid()}.{uuid.uuid4().hex}.sqlite.tmp"
 
     conn = sqlite3.connect(str(tmp_path))
     try:
@@ -1011,17 +1066,32 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
                  "ast" if indexed else None, cache_key or None, row_status),
             )
         conn.commit()
-    finally:
+    except Exception:
+        conn.close()
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    else:
         conn.close()
 
-    os.replace(tmp_path, state / "catalog.sqlite")
+    try:
+        os.replace(tmp_path, state / "catalog.sqlite")
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def _commit_manifest(state: Path, manifest: Dict[str, Any]) -> None:
-    """The manifest is the atomic commit point: written to tmp, renamed last."""
+    """The manifest is the atomic commit point: written to unique tmp, renamed last."""
     state.mkdir(parents=True, exist_ok=True)
-    (state / "tmp").mkdir(exist_ok=True)
-    tmp_manifest = state / "tmp" / "manifest.json"
+    tmp_dir = state / "tmp"
+    tmp_dir.mkdir(exist_ok=True)
+    tmp_manifest = tmp_dir / f"manifest.{os.getpid()}.{uuid.uuid4().hex}.json.tmp"
     tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     os.replace(tmp_manifest, state / "manifest.json")
 

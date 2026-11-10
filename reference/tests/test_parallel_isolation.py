@@ -550,5 +550,58 @@ class AuthFailureStopsTheRunTest(unittest.TestCase):
         self.assertNotIn("Pipeline Execution Completed", out, "no 'completed' summary after a credential failure")
 
 
+class ConcurrentStructuralIndexBuildTest(unittest.TestCase):
+    """Under --parallel N, multiple campaign workers enter structural_index
+    concurrently targeting the shared `<db>.structural_index` directory.
+    Builds must serialize cleanly without colliding on catalog.sqlite.tmp."""
+
+    def test_concurrent_builds_serialize_and_reuse_without_sqlite_collision(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from core.structural_index import StructuralIndex, build_structural_index
+
+        tmp = tempfile.mkdtemp(prefix="mantis_par_idx_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        for i in range(6):
+            Path(repo, f"mod_{i}.py").write_text(
+                f"def helper_{i}(x):\n    return x + {i}\n\n"
+                f"def entry_{i}(y):\n    return helper_{i}(y)\n",
+                encoding="utf-8",
+            )
+        state_dir = os.path.join(tmp, "state")
+
+        # 1. Pinned snapshot: 6 concurrent threads -> 1 build + 5 instant reuses, 0 failures
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            pinned = list(
+                pool.map(
+                    lambda _i: build_structural_index(repo, state_dir, snapshot_id="git:deadbeef1234"),
+                    range(6),
+                )
+            )
+        statuses = [m.get("status") for m in pinned]
+        self.assertTrue(all(s in ("complete", "partial", "empty") for s in statuses), pinned)
+        self.assertNotIn("failed", statuses, pinned)
+        if pinned[0].get("status") == "complete":
+            reused_count = sum(1 for m in pinned if m.get("reused"))
+            self.assertEqual(reused_count, 5, pinned)
+
+        # 2. Unpinned ("unknown") snapshot: 6 concurrent threads all rebuild safely without tmp collision
+        state_unpinned = os.path.join(tmp, "state_unpinned")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            unpinned = list(
+                pool.map(
+                    lambda _i: build_structural_index(repo, state_unpinned, snapshot_id="unknown"),
+                    range(6),
+                )
+            )
+        self.assertNotIn("failed", [m.get("status") for m in unpinned], unpinned)
+        idx = StructuralIndex(state_unpinned)
+        if idx.available():
+            res = idx.resolve_symbol("helper_0")
+            self.assertEqual(res["total"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
