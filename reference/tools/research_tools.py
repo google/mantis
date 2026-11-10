@@ -1135,6 +1135,14 @@ def report_findings(report: VulnerabilityReport) -> str:
         ctx.reported_in_pass = True
         return f"SUCCESS: Saved {len(findings)} finding(s) to database."
     except Exception as e:
+        from pydantic import ValidationError
+
+        if isinstance(e, ValidationError):
+            return (
+                f"Error: finding validation failed and findings were NOT saved: {e}. "
+                "Correct the invalid fields (for example, omit 'patch_status' and "
+                "'repro_status' during static research) and resubmit via report_findings."
+            )
         return f"ERROR SAVING DB: {e}"
 
 
@@ -1468,6 +1476,18 @@ async def write_file(filepath: str, content: str) -> str:
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "write_file"):
         try:
             await ctx.sandbox.write_file(Path(filepath), content)
+            if hasattr(ctx.sandbox, "run_rebuild") and getattr(ctx.sandbox, "rebuild_cmd", None):
+                rb_rc, rb_out = await ctx.sandbox.run_rebuild()
+                if rb_rc != 0:
+                    return (
+                        f"Error: Wrote {len(content)} characters to {filepath}, "
+                        f"but rebuild_cmd failed (exit={rb_rc}):\n{rb_out[:2000]}"
+                    )
+                if rb_out.strip():
+                    return (
+                        f"SUCCESS: Wrote {len(content)} characters to {filepath}\n"
+                        f"[REBUILD OK]\n{rb_out.strip()[:1000]}"
+                    )
             return f"SUCCESS: Wrote {len(content)} characters to {filepath}"
         except Exception as e:
             return f"Error writing file in sandbox: {e}"

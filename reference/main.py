@@ -3991,7 +3991,7 @@ async def pipeline(
                 except Exception as exc:
                     # Bookkeeping must never cost a scan that is finding real bugs.
                     print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
-                _note_campaign_spend(scan_item, campaign_files, budget_ctrl,
+                _note_campaign_spend(pass_resource or scan_item, campaign_files, budget_ctrl,
                                      "failed" if task_failed else "done",
                                      elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
 

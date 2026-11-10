@@ -38,9 +38,9 @@ from core.correlator import (
     _symbols_from_code_paths,
 )
 from core.database import (
-    ACTIVE_STATUSES,
     consolidate_duplicate_findings,
     finding_assurance_rank,
+    is_consolidatable_status,
     read_artifact,
     read_findings,
     record_artifact,
@@ -211,11 +211,43 @@ def _tier1_exact_groups(
     return groups
 
 
+_ARROW_SPLIT_RE = re.compile(r"\s*(?:->|=>|→)\s*")
+
+
+def _files_and_symbols_for_finding(f: Dict[str, Any], idx: Any) -> Tuple[Set[str], Set[str]]:
+    files: Set[str] = set()
+    fp = str(f.get("filepath") or "").strip()
+    if fp:
+        files.add(fp)
+    raw_cp = f.get("code_paths")
+    if isinstance(raw_cp, str):
+        try:
+            raw_cp = json.loads(raw_cp)
+        except Exception:
+            raw_cp = [raw_cp] if raw_cp.strip() else []
+    expanded_cp: List[str] = []
+    if isinstance(raw_cp, (list, tuple, set)):
+        for entry in raw_cp:
+            for hop in _ARROW_SPLIT_RE.split(str(entry or "")):
+                hop = hop.strip()
+                if not hop:
+                    continue
+                expanded_cp.append(hop)
+                head = hop.split(":", 1)[0].strip()
+                if ("/" in head or "." in head) and not head.isdigit():
+                    files.add(head)
+    syms = set(_symbols_from_code_paths(expanded_cp)) | set(
+        _enclosing_symbols_for_row(idx, f)
+    )
+    return files, syms
+
+
 def _candidate_semantic_clusters(
     findings: Sequence[Dict[str, Any]], idx: Any
 ) -> List[List[Dict[str, Any]]]:
     """Groups remaining open findings into small connected components sharing a
-    filepath, symbol, or direct AST call-graph edge for LLM duplicate review."""
+    filepath/code_path file, symbol, direct AST call-graph edge, or bounded CWE
+    for LLM duplicate review."""
     if len(findings) < 2:
         return []
     by_id = {int(f["id"]): f for f in findings}
@@ -224,23 +256,31 @@ def _candidate_semantic_clusters(
 
     by_file: Dict[str, List[int]] = {}
     by_sym: Dict[str, List[int]] = {}
+    by_cwe: Dict[str, List[int]] = {}
     row_syms: Dict[int, Set[str]] = {}
     for f in findings:
         fid = int(f["id"])
-        fp = str(f.get("filepath") or "").strip()
-        if fp:
+        files, syms = _files_and_symbols_for_finding(f, idx)
+        for fp in files:
             by_file.setdefault(fp, []).append(fid)
-        syms = set(_symbols_from_code_paths(f.get("code_paths"))) | set(
-            _enclosing_symbols_for_row(idx, f)
-        )
         row_syms[fid] = syms
         for s in syms:
             by_sym.setdefault(s, []).append(fid)
+        cwe = _norm_cwe(f)
+        if cwe:
+            by_cwe.setdefault(cwe, []).append(fid)
 
     for group_ids in (*by_file.values(), *by_sym.values()):
         if 2 <= len(group_ids) <= 20:
             for a in group_ids:
                 for b in group_ids:
+                    if a != b:
+                        adj[a].add(b)
+
+    for cwe_ids in by_cwe.values():
+        if 2 <= len(cwe_ids) <= 8:
+            for a in cwe_ids:
+                for b in cwe_ids:
                     if a != b:
                         adj[a].add(b)
 
@@ -297,6 +337,44 @@ def _can_call_llm(config: Optional[dict]) -> bool:
     return bool(model)
 
 
+async def _run_structured_one_shot(
+    prompt: str,
+    system_instruction: str,
+    schema_cls: Any,
+    config: Optional[dict],
+) -> Any:
+    """Executes a single structured ADK `set_model_response` LLM call against `schema_cls`."""
+    from core.config import ResilientLiteLlm, get_llm_kwargs, structured_llm_request
+
+    cfg = config or {}
+    _, llm_kw = get_llm_kwargs(
+        cfg.get("default_model"),
+        api_base=cfg.get("api_base"),
+        reasoning_effort=cfg.get("reasoning_effort"),
+        config=cfg,
+    )
+    llm = ResilientLiteLlm(**llm_kw)
+    req = structured_llm_request(prompt, system_instruction, schema_cls)
+    resp_text = ""
+    structured: Optional[Dict[str, Any]] = None
+    async for resp in llm.generate_content_async(req):
+        content = getattr(resp, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            fc = getattr(part, "function_call", None)
+            if fc is not None and getattr(fc, "name", "") == "set_model_response":
+                args = getattr(fc, "args", None)
+                if isinstance(args, dict):
+                    structured = dict(args)
+            elif getattr(part, "text", None):
+                resp_text += part.text
+    if structured is not None:
+        return schema_cls.model_validate(structured)
+    cleaned = resp_text.strip()
+    if "```" in cleaned:
+        cleaned = cleaned.split("```json")[-1].split("```")[0].strip()
+    return schema_cls.model_validate_json(cleaned)
+
+
 async def consolidate_run_findings(
     db_path: str,
     run_id: str,
@@ -312,9 +390,7 @@ async def consolidate_run_findings(
     summary = {"tier1_merged": 0, "tier2_merged": 0, "clusters_checked": 0}
     try:
         all_rows = read_findings(db_path, run_id=run_id)
-        active = [
-            f for f in all_rows if str(f.get("status") or "").strip().lower() in ACTIVE_STATUSES
-        ]
+        active = [f for f in all_rows if is_consolidatable_status(f.get("status"))]
         if len(active) < 2:
             return summary
 
@@ -330,7 +406,7 @@ async def consolidate_run_findings(
         # Refresh open findings after Tier 1
         active = [
             f for f in read_findings(db_path, run_id=run_id)
-            if str(f.get("status") or "").strip().lower() in ACTIVE_STATUSES
+            if is_consolidatable_status(f.get("status"))
         ]
         if len(active) < 2:
             return summary
@@ -381,21 +457,12 @@ async def consolidate_run_findings(
                 if llm_callable is not None:
                     result = await llm_callable(prompt, SemanticDedupeBatchResult)
                 else:
-                    from core.config import ResilientLiteLlm, get_llm_kwargs, structured_llm_request
-
-                    dedupe_model = (config or {}).get("default_model")
-                    _, llm_kw = get_llm_kwargs(dedupe_model, config=config)
-                    llm = ResilientLiteLlm(**llm_kw)
-                    raw_text = await structured_llm_request(
-                        llm_model=llm,
+                    result = await _run_structured_one_shot(
+                        prompt=prompt,
                         system_instruction=sys_inst,
-                        user_prompt=prompt,
-                        output_schema=SemanticDedupeBatchResult,
+                        schema_cls=SemanticDedupeBatchResult,
+                        config=config,
                     )
-                    cleaned = raw_text.strip()
-                    if "```" in cleaned:
-                        cleaned = cleaned.split("```json")[-1].split("```")[0].strip()
-                    result = SemanticDedupeBatchResult.model_validate_json(cleaned)
             except Exception as exc:
                 logger.debug("Semantic dedupe cluster skipped: %s", exc)
                 continue
@@ -497,11 +564,6 @@ async def synthesize_aggregate_report(
         rpt_obj, packet_md = _deterministic_executive_report(active_findings)
         if active_findings and _can_call_llm(config):
             try:
-                from core.config import ResilientLiteLlm, get_llm_kwargs, structured_llm_request
-
-                model_id = (config or {}).get("default_model")
-                _, llm_kw = get_llm_kwargs(model_id, config=config)
-                llm = ResilientLiteLlm(**llm_kw)
                 compact_items = [
                     {
                         "id": f.get("id"),
@@ -528,19 +590,15 @@ async def synthesize_aggregate_report(
                         filename="consolidated_active_findings",
                     )
                 )
-                raw_text = await structured_llm_request(
-                    llm_model=llm,
+                rpt_obj = await _run_structured_one_shot(
+                    prompt=prompt,
                     system_instruction=(
                         "Compile a concise, accurate executive vulnerability summary and "
                         "prioritized remediation list strictly grounded in the provided findings."
                     ),
-                    user_prompt=prompt,
-                    output_schema=ExecutiveReport,
+                    schema_cls=ExecutiveReport,
+                    config=config,
                 )
-                cleaned = raw_text.strip()
-                if "```" in cleaned:
-                    cleaned = cleaned.split("```json")[-1].split("```")[0].strip()
-                rpt_obj = ExecutiveReport.model_validate_json(cleaned)
             except Exception as exc:
                 logger.debug("Aggregate LLM report degraded to deterministic summary: %s", exc)
 

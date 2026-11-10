@@ -243,6 +243,120 @@ class ConsolidatorTest(unittest.IsolatedAsyncioTestCase):
         finally:
             current_run_context.reset(tok3)
 
+    async def test_valid_status_findings_consolidate_while_dismissed_stay_excluded(self):
+        write_findings(
+            self.db,
+            "api.py",
+            [
+                {
+                    "title": "SQLi in list_orders via customer filter",
+                    "filepath": "api.py",
+                    "line_numbers": [5],
+                    "cwe": "CWE-89",
+                    "status": "valid",
+                    "description": "Concatenates customer into SQL query.",
+                }
+            ],
+            run_id=self.run_id,
+        )
+        write_findings(
+            self.db,
+            "api.py",
+            [
+                {
+                    "title": "SQL injection in list_orders customer filter",
+                    "filepath": "api.py",
+                    "line_numbers": [6],
+                    "cwe": "CWE-89",
+                    "status": "valid",
+                    "description": "Concatenates customer into SQL query.",
+                },
+                {
+                    "title": "Dismissed SQLi lookalike in list_orders",
+                    "filepath": "api.py",
+                    "line_numbers": [5],
+                    "cwe": "CWE-89",
+                    "status": "false_positive",
+                    "description": "Concatenates customer into SQL query.",
+                },
+            ],
+            run_id=self.run_id,
+        )
+        stats = await consolidate_run_findings(self.db, self.run_id)
+        self.assertEqual(stats["tier1_merged"], 1)
+        rows = read_findings(self.db, run_id=self.run_id)
+        statuses = sorted(r["status"] for r in rows)
+        self.assertEqual(statuses, ["duplicate_merged", "false_positive", "valid"])
+
+    async def test_structured_one_shot_adapter_and_arrow_code_paths_cluster(self):
+        from unittest import mock
+
+        from google.adk.models.llm_response import LlmResponse
+        from google.genai import types
+
+        write_findings(
+            self.db,
+            "api/orders.py",
+            [
+                {
+                    "title": "SQLi in list_orders",
+                    "filepath": "api/orders.py",
+                    "line_numbers": [5],
+                    "cwe": "CWE-89",
+                    "code_paths": ["api/orders.py:5 -> db/raw.py:3"],
+                    "description": "Passes unsanitized clause to db/raw.py:3.",
+                }
+            ],
+            run_id=self.run_id,
+        )
+        write_findings(
+            self.db,
+            "db/raw.py",
+            [
+                {
+                    "title": "Unparameterized SQL in execute_filter",
+                    "filepath": "db/raw.py",
+                    "line_numbers": [3],
+                    "cwe": "CWE-89",
+                    "code_paths": ["api/orders.py:5 -> db/raw.py:3"],
+                    "description": "Concatenates raw_clause into SQL query.",
+                }
+            ],
+            run_id=self.run_id,
+        )
+        rows = read_findings(self.db, run_id=self.run_id)
+        id1, id2 = rows[0]["id"], rows[1]["id"]
+
+        async def _fake_gen(_self, _req, **_kw):
+            yield LlmResponse(
+                content=types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            function_call=types.FunctionCall(
+                                name="set_model_response",
+                                args={
+                                    "merges": [
+                                        {
+                                            "primary_id": id2,
+                                            "duplicate_ids": [id1],
+                                            "reason": "Same SQLi sink in db/raw.py:3",
+                                        }
+                                    ]
+                                },
+                            )
+                        )
+                    ],
+                )
+            )
+
+        with mock.patch("core.config.ResilientLiteLlm.generate_content_async", new=_fake_gen):
+            stats = await consolidate_run_findings(
+                self.db, self.run_id, config={"default_model": "vertex_ai/gemini-2.5-flash"}
+            )
+        self.assertEqual(stats["clusters_checked"], 1)
+        self.assertEqual(stats["tier2_merged"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

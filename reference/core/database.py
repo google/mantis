@@ -2963,9 +2963,20 @@ FINDING_ASSURANCE_RANK: Dict[str, int] = {
     "static_confirmed": 3,
     "confirmed": 2,
     "viable": 2,
+    "valid": 1,
     "reported": 1,
     "candidate": 1,
 }
+
+_CLOSED_CONSOLIDATION_STATUSES = frozenset(
+    s.lower() for s in (*FALSE_POSITIVE_STATUSES, "duplicate_merged", "archived", "mitigated")
+)
+
+
+def is_consolidatable_status(status: Any) -> bool:
+    """True when a finding row is open/candidate and eligible for duplicate consolidation."""
+    st = str(status or "").strip().lower()
+    return bool(st) and st not in _CLOSED_CONSOLIDATION_STATUSES
 
 
 def finding_assurance_rank(status: Any) -> int:
@@ -3006,9 +3017,7 @@ def consolidate_duplicate_findings(
                 (str(run_id), *cand_ids),
             ).fetchall()
         ]
-        open_rows = [
-            r for r in rows if str(r.get("status") or "").strip().lower() in ACTIVE_STATUSES
-        ]
+        open_rows = [r for r in rows if is_consolidatable_status(r.get("status"))]
         if len(open_rows) < 2:
             return int(primary_id), 0
 

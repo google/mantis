@@ -691,13 +691,37 @@ class RemoteTargetEnvironment(BaseEnvironment):
             return f"exit={rc}\n{truncate_with_marker(out, MAX_OUTPUT, what='patch output')}"
 
         if self.rebuild_cmd:
-            rb_rc, rb_out = await asyncio.to_thread(_run_patch_cmd, self.rebuild_cmd, None)
+            rb_rc, rb_out = await self.run_rebuild()
             if rb_rc != 0:
                 combined_err = f"[PATCH APPLIED; REBUILD FAILED]\n{rb_out}"
                 return f"exit={rb_rc}\n{truncate_with_marker(combined_err, MAX_OUTPUT, what='patch rebuild output')}"
             out = f"{out}\n[REBUILD OK]\n{rb_out}".strip()
 
         return f"exit=0\n{truncate_with_marker(out, MAX_OUTPUT, what='patch output')}"
+
+    async def run_rebuild(self) -> tuple[int, str]:
+        """Executes configured ``rebuild_cmd`` inside ``workdir``, returning ``(exit_code, output)``."""
+        if not self.rebuild_cmd:
+            return 0, ""
+        await self._ensure()
+
+        def _rebuild() -> tuple[int, str]:
+            res = run_bounded_subprocess(
+                self._build_transport_argv(self.rebuild_cmd, with_stdin=False),
+                timeout=self.timeout,
+                max_stdout_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                max_stderr_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                mock_text=False,
+            )
+            if res.timed_out:
+                return 124, f"SANDBOX-TIMEOUT: rebuild command exceeded {self.timeout}s."
+            combined = (
+                res.stdout.decode("utf-8", errors="replace")
+                + res.stderr.decode("utf-8", errors="replace")
+            )
+            return res.returncode, combined
+
+        return await asyncio.to_thread(_rebuild)
 
     async def close(self) -> None:
         """Restores remote target state via optional ``reset_cmd``/``reset_argv`` when configured."""

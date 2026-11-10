@@ -266,6 +266,53 @@ class RemoteTargetEnvironmentTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(spec_explicit.config.sandbox.type, "remote")
 
+    async def test_write_file_on_remote_target_triggers_rebuild_cmd_while_workspace_does_not(self):
+        import shutil
+        from core.context import RunContext, current_run_context
+        import tools.research_tools as rt
+
+        tmp = Path(tempfile.mkdtemp(prefix="mantis_rem_wf_"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        local_repo = tmp / "local_repo"
+        local_repo.mkdir(parents=True, exist_ok=True)
+        (local_repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        remote_dir = tmp / "remote_wf_rebuild"
+        remote_dir.mkdir(parents=True, exist_ok=True)
+        (remote_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+        env = RemoteTargetEnvironment(
+            transport="exec",
+            exec_argv=["/bin/sh", "-c"],
+            workdir=str(remote_dir),
+            rebuild_cmd="python3 -m py_compile app.py && printf '1' >> .rebuilds",
+        )
+        ctx = RunContext(
+            jail_dir=str(local_repo),
+            db_path=str(tmp / "wf.db"),
+            target_file=str(local_repo / "app.py"),
+            run_id="r-rebuild",
+            sandbox=env,
+        )
+        from core.database import init_db
+
+        init_db(ctx.db_path)
+        tok = current_run_context.set(ctx)
+        try:
+            res_ws = await rt.write_file("workspace/notes.md", "hello\n")
+            self.assertIn("SUCCESS", res_ws)
+            self.assertFalse((remote_dir / ".rebuilds").exists())
+
+            res_good = await rt.write_file("app.py", "def safe():\n    return 42\n")
+            self.assertIn("SUCCESS", res_good)
+            self.assertEqual((remote_dir / ".rebuilds").read_text(encoding="utf-8"), "1")
+
+            res_bad = await rt.write_file("app.py", "def broken(:\n")
+            self.assertTrue(res_bad.startswith("Error:"), res_bad)
+            self.assertIn("rebuild_cmd failed", res_bad)
+        finally:
+            current_run_context.reset(tok)
+            await env.close()
+
 
 if __name__ == "__main__":
     unittest.main()
