@@ -82,6 +82,8 @@ def connect(db_path: str, timeout: Optional[float] = None,
     structural catalog, scratch copies) keep their own connections.
     """
     wait = db_timeout() if timeout is None else timeout
+    if db_path and db_path != ":memory:":
+        db_path = resolve_db_path(db_path)
     if readonly:
         # mode=ro: SQLite will neither create the file nor write to it; the
         # journal pragmas below are skipped because they would be writes.
@@ -3111,7 +3113,13 @@ def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = 
         return fallback
 
 
-def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] = None) -> bool:
+def record_run(
+    db_path: str,
+    run_id: str,
+    model: str,
+    metadata: Optional[dict] = None,
+    started: Optional[str] = None,
+) -> bool:
     """Records which model a run used. Idempotent: a run that is recorded
     again keeps its first model (a resumed run is the same run). Never
     raises; this is bookkeeping (INV-6)."""
@@ -3128,11 +3136,18 @@ def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] =
                     metadata_json TEXT DEFAULT '{}'
                 )
             """)
-            cursor.execute(
-                "INSERT OR IGNORE INTO runs (run_id, model, metadata_json) VALUES (?, ?, ?)",
-                (str(run_id), str(model or ""), json.dumps(metadata or {})))
-            if metadata and metadata.get("target_root"):
-                _ensure_run_target_root(conn, run_id, str(metadata["target_root"]))
+            if started and str(started).strip():
+                cursor.execute(
+                    "INSERT OR IGNORE INTO runs (run_id, model, started, metadata_json) VALUES (?, ?, ?, ?)",
+                    (str(run_id), str(model or ""), str(started).strip(), json.dumps(metadata or {})),
+                )
+            else:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO runs (run_id, model, metadata_json) VALUES (?, ?, ?)",
+                    (str(run_id), str(model or ""), json.dumps(metadata or {})),
+                )
+            if metadata and (metadata.get("target_root") or metadata.get("target")):
+                _ensure_run_target_root(conn, run_id, str(metadata.get("target_root") or metadata.get("target")))
         return True
     except (sqlite3.Error, OSError, TypeError, ValueError):
         return False

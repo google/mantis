@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -275,6 +276,31 @@ def _record_finding_evidence(
         entry["reason"] = str(reason or "")
         if ran is not None:
             entry["ran"] = bool(ran)
+        if (
+            getattr(ctx, "active_node", "") != "patcher"
+            and entry.get("reproduced")
+            and getattr(ctx, "db_path", "")
+            and getattr(ctx, "run_id", "")
+        ):
+            from core.database import record_artifact
+
+            fid_int = int(finding_id)
+            res_key = str(getattr(ctx, "artifact_resource", "") or getattr(ctx, "target_file", "") or "")
+            record_artifact(
+                ctx.db_path,
+                ctx.run_id,
+                "finding_evidence",
+                f"workspace/.structured/evidence_{fid_int}.json",
+                json.dumps(
+                    {
+                        "finding_id": fid_int,
+                        "reproduced": True,
+                        "sink_symbol": entry.get("sink_symbol", ""),
+                        "reason": entry.get("reason", ""),
+                    }
+                ),
+                metadata={"resource": res_key, "finding_id": fid_int},
+            )
     except Exception:
         pass  # bookkeeping; never fails a run (and never sets anything on error)
 

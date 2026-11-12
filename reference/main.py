@@ -164,6 +164,17 @@ async def execute_sub_task(
         )
 
     if resumed_invocation_id:
+        # Bookkeeping only (INV-6): a malformed event must cost the resumed
+        # campaign its coverage/spend reconstruction, never the campaign.
+        try:
+            _rehydrate_session_metrics(
+                existing_session,
+                runner,
+                budget_controller=budget_controller,
+                run_ctx=_ctx_for_context,
+            )
+        except Exception as exc:
+            print(f"[RESUME METRICS WARNING] {filepath}: {exc}", file=sys.stderr)
         new_message = None
     else:
         new_message = _build_seed_message(
@@ -197,8 +208,13 @@ async def execute_sub_task(
         )
         if budget_controller is not None:
             budget_controller.observe("overflow_restarts")
-        if _ctx_for_context is not None and hasattr(_ctx_for_context, "node_context"):
-            _ctx_for_context.node_context.clear()
+        if _ctx_for_context is not None:
+            # pre_pause_tokens and resumed_mid_invocation stay as rehydrated:
+            # the pre-pause slices were real spend for this campaign, so the
+            # spend row records the full cost, and a campaign that was never
+            # flagged resumed is not flagged by the restart.
+            if hasattr(_ctx_for_context, "node_context"):
+                _ctx_for_context.node_context.clear()
         restart_handoff = _prepare_overflow_restart_handoff(db_path, run_id, filepath)
         if _ctx_for_context is not None and restart_handoff:
             _ctx_for_context.campaign_context = "".join(
@@ -229,6 +245,174 @@ async def execute_sub_task(
             filepath=filepath, run_id=run_id, db_path=db_path, status_map=status_map,
             budget_controller=budget_controller, transcript=transcript,
         )
+
+
+def _rehydrate_session_metrics(
+    existing_session: Any,
+    runner: Any,
+    budget_controller: Optional[BudgetController] = None,
+    run_ctx: Optional[RunContext] = None,
+) -> None:
+    """Reconstructs pre-pause `audit_code_reads` and `pre_pause_tokens` across
+    all prior slices of an unfinished session so multi-slice `--resume` runs
+    earn coverage credit when an earlier slice read target code and record the
+    full campaign token total on completion without billing prior slices against
+    the resumed process's fresh token allowance."""
+    if run_ctx is not None:
+        run_ctx.resumed_mid_invocation = True
+        run_ctx.pre_pause_tokens = 0
+    events = list(getattr(existing_session, "events", None) or [])
+    if not events:
+        return
+    from core.budget import AUDIT_NODES, CODE_READ_TOOLS
+
+    root_agent_name = getattr(getattr(runner, "agent", None), "name", None) or "mantis_vulnerability_pipeline"
+    start_idx = 0
+    for idx, ev in enumerate(events):
+        if (
+            getattr(getattr(ev, "actions", None), "end_of_agent", False)
+            and getattr(ev, "author", None) in (root_agent_name, "mantis_vulnerability_pipeline")
+        ):
+            start_idx = idx + 1
+    active_events = events[start_idx:]
+    if not active_events:
+        return
+
+    aborted_fc_ids: set[str] = set()
+    for ev in active_events:
+        if getattr(ev, "partial", False):
+            continue
+        for part in getattr(getattr(ev, "content", None), "parts", None) or []:
+            fn_resp = getattr(part, "function_response", None)
+            if fn_resp is None:
+                continue
+            fr_id = str(getattr(fn_resp, "id", "") or "")
+            raw_resp = getattr(fn_resp, "response", None)
+            if fr_id and isinstance(raw_resp, dict):
+                err_txt = str(raw_resp.get("error") or "")
+                if "Invocation was aborted" in err_txt or "Interrupted before tool completed" in err_txt:
+                    aborted_fc_ids.add(fr_id)
+
+    discount = budget_controller.config.cache_discount if budget_controller is not None else 0.1
+    prior_reads = 0
+    prior_tokens = 0
+    for ev in active_events:
+        if getattr(ev, "partial", False):
+            continue
+        usage = getattr(ev, "usage_metadata", None)
+        if usage and getattr(usage, "total_token_count", None):
+            total_t = max(0, int(usage.total_token_count or 0))
+            cached_t = max(0, min(int(getattr(usage, "cached_content_token_count", 0) or 0), total_t))
+            prior_tokens += max(0, int((total_t - cached_t) + cached_t * discount))
+        node_info = getattr(ev, "node_info", None)
+        npath = str(getattr(node_info, "path", "") or "") if node_info is not None else ""
+        clean_node = (
+            npath.rsplit("/", 1)[-1].split("@", 1)[0]
+            if npath
+            else str(getattr(ev, "author", "") or "")
+        ).split(":", 1)[0].strip()
+        for part in getattr(getattr(ev, "content", None), "parts", None) or []:
+            fc = getattr(part, "function_call", None)
+            if fc is None:
+                continue
+            fc_id = str(getattr(fc, "id", "") or "")
+            if fc_id and fc_id in aborted_fc_ids:
+                continue
+            call_name = str(getattr(fc, "name", "") or "")
+            call_args = getattr(fc, "args", None) or {}
+            if (
+                clean_node in AUDIT_NODES
+                and call_name in CODE_READ_TOOLS
+                and _is_in_scope_code_read(run_ctx, call_name, call_args)
+            ):
+                prior_reads += 1
+
+    if budget_controller is not None and prior_reads > 0:
+        budget_controller.audit_code_reads += prior_reads
+    if run_ctx is not None:
+        run_ctx.pre_pause_tokens = prior_tokens
+
+
+def _rehydrate_campaign_resume_state(
+    branch_ctx: RunContext,
+    db_path: str,
+    run_id: str,
+    scan_item: str,
+    pass_idx: int = 1,
+    pass_resource: str = "",
+) -> None:
+    """Restores persisted per-finding dynamic sink evidence (`reproduced` flags)
+    and reviewer/critic `promoted_finding_ids` for an interrupted campaign
+    resuming under `run_id`."""
+    if not db_path or not run_id:
+        return
+    try:
+        from core.database import CONFIRMED_LIVE_STATUSES, _artifact_resource, read_artifacts_like, read_findings
+
+        want_res = str(pass_resource or scan_item or "")
+        ev_rows = read_artifacts_like(
+            db_path, run_id, r"workspace/.structured/evidence\_%.json", artifact_type="finding_evidence"
+        )
+        for row in ev_rows:
+            owner = _artifact_resource(row.get("metadata_json"))
+            if want_res and owner not in (want_res, ""):
+                continue
+            try:
+                payload = json.loads(row.get("content") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or not payload.get("reproduced"):
+                continue
+            fid = payload.get("finding_id")
+            if fid is None:
+                continue
+            key = str(int(fid))
+            branch_ctx.finding_evidence[key] = {
+                "reproduced": True,
+                "reattacked": False,
+                "reattack_present": False,
+                "sink_symbol": str(payload.get("sink_symbol") or ""),
+                "reason": str(payload.get("reason") or ""),
+            }
+            branch_ctx.sandbox_executed = True
+
+        # The cohort graph_loader._persist_finding_promotions rebuilds after a
+        # campaign-level reviewer/critic verdict, so a resumed critic narrows
+        # to it.
+        confirmed_live = set(CONFIRMED_LIVE_STATUSES)
+        existing_rows = read_findings(
+            db_path,
+            run_id=run_id,
+            scope_path=scan_item or None,
+            campaign=scan_item or None,
+            pass_index=max(1, int(pass_idx or 1)),
+        )
+        promoted: set[int] = set()
+        for r in existing_rows:
+            rid_val = r.get("id")
+            if rid_val is None:
+                continue
+            fid_int = int(rid_val)
+            st = str(r.get("status") or "").strip().lower()
+            if st in confirmed_live:
+                promoted.add(fid_int)
+            if st in ("dynamic_confirmed", "patch_verified"):
+                slot = branch_ctx.finding_evidence.setdefault(
+                    str(fid_int),
+                    {
+                        "reproduced": True,
+                        "reattacked": False,
+                        "reattack_present": False,
+                        "sink_symbol": "",
+                        "reason": "rehydrated from finding status",
+                    },
+                )
+                slot["reproduced"] = True
+                branch_ctx.sandbox_executed = True
+        if promoted:
+            branch_ctx.promoted_finding_ids = promoted
+    except Exception:
+        pass
 
 
 def _prepare_overflow_restart_handoff(db_path: str, run_id: str, filepath: str) -> str:
@@ -488,7 +672,8 @@ async def _drive_campaign(
 ) -> bool:
     """Streams one campaign's graph run and applies the per-event bookkeeping.
     Returns True if an error was encountered."""
-    errored: set[str] = set()
+    pending_node_errors: dict[str, str] = {}
+    fatal_tool_errors: set[str] = set()
     stamped_nodes: set[str] = set()
     last_banner: tuple[str | None, str | None] = (None, None)
     current_active_node: str | None = None
@@ -597,30 +782,14 @@ async def _drive_campaign(
                     print(f"\n{pfx}-- {last_banner[0] or ''} -> {route}")
                 last_banner = banner
 
-            if getattr(event, "error_code", None):
+            err_code = getattr(event, "error_code", None)
+            if err_code and str(err_code) in _AUTH_ERROR_CODES:
                 _flush_parallel_lines(force=True)
-                node_key = node_path or "unknown"
-                errored.add(node_key)
-                err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
-                # Decided from the error CODE, which names an exception class
-                # or a provider status, never from the message: ADK copies
-                # model-authored text (a malformed call's finish message) into
-                # error_message, and a scanned file can put "unauthenticated"
-                # in that text. The code is not the model's to write.
-                if str(event.error_code) in _AUTH_ERROR_CODES:
-                    raise MantisAuthError(err_msg)
-                if event.error_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
-                    limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
-                    raise BudgetExceededError(
-                        trigger="llm_calls_limit" if event.error_code == "LlmCallsLimitExceededError" else "budget_exceeded",
-                        current_value="limit exceeded",
-                        limit_value=limit_val,
-                        run_id=run_id,
-                        details=str(err_msg),
-                    )
-                print(f"\n[EVENT ERROR {event.error_code}] {err_msg}", file=sys.stderr)
-            else:
-                usage = getattr(event, "usage_metadata", None)
+                err_msg = getattr(event, "error_message", None) or f"ADK Event error: {err_code}"
+                raise MantisAuthError(err_msg)
+
+            usage = getattr(event, "usage_metadata", None)
+            if not getattr(event, "partial", False):
                 if budget_controller and usage and getattr(usage, "total_token_count", None):
                     total_tokens = int(usage.total_token_count)
                     cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
@@ -630,6 +799,60 @@ async def _drive_campaign(
                         output_count=int(getattr(usage, "candidates_token_count", 0) or 0))
                 if budget_controller and getattr(getattr(event, "actions", None), "compaction", None):
                     budget_controller.observe("compactions")
+
+            if err_code:
+                _flush_parallel_lines(force=True)
+                err_msg = getattr(event, "error_message", None) or f"ADK Event error: {err_code}"
+                # Decided from the error CODE, which names an exception class
+                # or a provider status, never from the message: ADK copies
+                # model-authored text (a malformed call's finish message) into
+                # error_message, and a scanned file can put "unauthenticated"
+                # in that text. The code is not the model's to write.
+                if err_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
+                    limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
+                    prior_trigger = str(getattr(budget_controller, "pause_trigger", "") or "")
+                    eff_trigger = (
+                        "llm_calls_limit"
+                        if err_code == "LlmCallsLimitExceededError"
+                        else (prior_trigger or "budget_exceeded")
+                    )
+                    raise BudgetExceededError(
+                        trigger=eff_trigger,
+                        current_value="limit exceeded",
+                        limit_value=limit_val,
+                        run_id=run_id,
+                        details=str(err_msg),
+                    )
+                if str(err_code) == "NodeContextExhausted":
+                    print(f"\n[CONTEXT CONTINUATION] {err_msg}", file=sys.stderr)
+                else:
+                    node_key = node_path or current_active_node or "unknown"
+                    pending_node_errors[node_key] = str(err_code)
+                    print(f"\n[EVENT ERROR {err_code}] {err_msg}", file=sys.stderr)
+            else:
+                if not getattr(event, "partial", False):
+                    node_key = node_path or current_active_node or "unknown"
+                    if node_key in pending_node_errors and (
+                        getattr(event, "output", None) is not None
+                        or route is not None
+                        or bool(getattr(getattr(event, "actions", None), "end_of_agent", False))
+                        or bool(
+                            getattr(getattr(event, "node_info", None), "message_as_output", False)
+                            and getattr(event, "content", None)
+                        )
+                        or (
+                            getattr(event, "content", None) is not None
+                            and any(
+                                (getattr(p, "text", None) and not getattr(p, "thought", False))
+                                or (
+                                    getattr(p, "function_call", None) is not None
+                                    and getattr(p.function_call, "name", "") == "set_model_response"
+                                )
+                                for p in (getattr(event.content, "parts", None) or [])
+                            )
+                        )
+                    ):
+                        pending_node_errors.pop(node_key, None)
 
                 if hasattr(event, 'content') and event.content:
                     is_partial = getattr(event, "partial", False)
@@ -738,7 +961,7 @@ async def _drive_campaign(
 
                             pfx = f"[{camp_tag}] " if is_parallel and camp_tag else ""
                             if is_fatal:
-                                errored.add(f"tool:{fn_name}")
+                                fatal_tool_errors.add(f"tool:{fn_name}")
                                 cprint(f"\n{pfx}[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
                             elif is_validation_feedback:
                                 cprint(f"\n{pfx}[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
@@ -764,7 +987,7 @@ async def _drive_campaign(
         _flush_parallel_lines(force=True)
             
     print("\n" + "-" * 60)
-    return bool(errored)
+    return bool(fatal_tool_errors or pending_node_errors)
 
 # The directory a repository keeps Mantis's own state in (a committed
 # knowledge export lives at .mantis/knowledge). Never a scan target.
@@ -1033,8 +1256,15 @@ class _PatientSqliteSessionService(SqliteSessionService):
         return _conn()
 
 
-def _record_guard_failure(db_path: str, run_id: str, scan_item: str, scan_mode: str, trigger: str,
-                          harness_fingerprint: str = "") -> None:
+def _record_guard_failure(
+    db_path: str,
+    run_id: str,
+    scan_item: str,
+    scan_mode: str,
+    trigger: str,
+    harness_fingerprint: str = "",
+    pass_index: int = 1,
+) -> None:
     """A campaign stopped by its own runaway guard leaves a FAILED ledger row
     -- so it covers nothing and --resume retries it -- but no cost
     observation: tokens are recorded as zero, which the cost model's average
@@ -1043,8 +1273,11 @@ def _record_guard_failure(db_path: str, run_id: str, scan_item: str, scan_mode: 
     try:
         from core.cost import record_spend
 
+        meta: dict[str, Any] = {"failed": True, "guard": str(trigger or "")}
+        if int(pass_index or 1) > 1:
+            meta["pass_index"] = int(pass_index)
         record_spend(db_path, run_id, scan_item, scan_mode, tokens=0, llm_calls=0, graph_steps=0,
-                     elapsed_seconds=0.0, metadata={"failed": True, "guard": str(trigger or "")},
+                     elapsed_seconds=0.0, metadata=meta,
                      harness_fingerprint=harness_fingerprint)
     except Exception as exc:
         print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
@@ -1748,7 +1981,9 @@ def resolve_scan_targets(
     return targets, astm, SCAN_MODE_CROSS_FUNCTIONAL
 
 
-def _campaign_finding_counts(db_path: str, run_id: str, filepath: str) -> dict:
+def _campaign_finding_counts(
+    db_path: str, run_id: str, filepath: str, pass_index: Optional[int] = None
+) -> dict:
     """Per-status counts of the findings one campaign persisted.
 
     Read-only, and fails to an empty dict: this feeds the replanning dossier and
@@ -1759,8 +1994,21 @@ def _campaign_finding_counts(db_path: str, run_id: str, filepath: str) -> dict:
     """
     counts: dict[str, int] = {}
     try:
+        ctx = current_run_context.get()
+        if ctx is not None or os.path.isabs(str(filepath or "")):
+            rows = read_findings(
+                db_path,
+                run_id=run_id,
+                scope_path=filepath or None,
+                campaign=filepath or None,
+                pass_index=pass_index,
+            )
+            for row in rows:
+                key = str(row.get("status") or "reported").strip().lower()
+                counts[key] = counts.get(key, 0) + 1
+            return counts
         base = str(filepath).rstrip("/")
-        for row in read_findings(db_path, run_id=run_id):
+        for row in read_findings(db_path, run_id=run_id, pass_index=pass_index):
             owner = str(row.get("target_file") or row.get("filepath") or "")
             if owner != base and not owner.startswith(base + "/"):
                 continue
@@ -2402,6 +2650,7 @@ def _stamp_member_coverage(
     scan_item: str,
     scan_mode: str,
     harness_fingerprint: str = "",
+    pass_index: int = 1,
 ) -> int:
     """Coverage stamps for the members a multi-target campaign spanned beyond
     its primary.
@@ -2418,6 +2667,9 @@ def _stamp_member_coverage(
     try:
         from core.cost import record_spend
 
+        meta: dict[str, Any] = {"member_of": scan_item}
+        if int(pass_index or 1) > 1:
+            meta["pass_index"] = int(pass_index)
         for member in (group.get("targets") or [])[1:]:
             # record_spend never raises -- it reports failure by returning
             # False -- so the stamped count must come from its return value.
@@ -2430,7 +2682,7 @@ def _stamp_member_coverage(
                 llm_calls=0,
                 graph_steps=0,
                 elapsed_seconds=0.0,
-                metadata={"member_of": scan_item},
+                metadata=dict(meta),
                 harness_fingerprint=harness_fingerprint,
             ):
                 stamped += 1
@@ -2645,6 +2897,8 @@ async def pipeline(
     changed_files_override: Optional[list] = None,
     max_campaign_tokens: int = 0,
     max_input_tokens: Optional[int] = None,
+    no_memory: bool = False,
+    intra_run_learning: bool = False,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     if max_input_tokens is not None and max_input_tokens > 0:
@@ -2689,6 +2943,10 @@ async def pipeline(
     total_passes = max(1, int(passes or 1))
     if total_passes > 1:
         banner_resume_flags["--passes"] = total_passes
+    if no_memory:
+        banner_resume_flags["--no-memory"] = True
+    if intra_run_learning:
+        banner_resume_flags["--intra-run-learning"] = True
 
     effective_sandbox_override = sandbox_override
     # Auto-resolve unconfigured placeholders if enabled
@@ -2757,7 +3015,12 @@ async def pipeline(
         print(f"Error: {target_err}", file=sys.stderr)
         return 1
 
-    db_path = config.get("db_path", "knowledge.db")
+    try:
+        db_path = resolve_db_path(config.get("db_path", "knowledge.db"))
+    except PermissionError as pe:
+        print(f"Error: {pe}", file=sys.stderr)
+        return 1
+    config = {**config, "db_path": db_path}
     init_db(db_path)
 
     # What this run IS, for the coverage ledger: the loader hashed the
@@ -2807,6 +3070,33 @@ async def pipeline(
             )
             return 1
         print(f"Resuming the most recent run: {resume_run_id}", file=sys.stderr)
+    _run_target_anchor = (
+        os.path.realpath(os.path.expanduser(path_root)).rstrip("/")
+        if path_root and os.path.isdir(os.path.expanduser(path_root))
+        else os.path.realpath(str(target_path.parent if target_path.is_file() else target_path)).rstrip("/")
+    )
+    _run_exact_target = os.path.realpath(str(target_path)).rstrip("/")
+    if resume_run_id:
+        from core.cost import run_known
+        from core.database import run_targets_compatible
+
+        is_known, recorded_target = run_known(db_path, resume_run_id)
+        if not is_known:
+            print(
+                f"Error: --resume: run '{resume_run_id}' not found in {db_path}.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        if recorded_target and not (
+            run_targets_compatible(_run_exact_target, recorded_target)
+            or (_run_target_anchor and run_targets_compatible(_run_target_anchor, recorded_target))
+        ):
+            print(
+                f"Error: --resume: run '{resume_run_id}' was recorded for '{recorded_target}', "
+                f"not '{target_path}'.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
     if resume_run_id and scan_mode_override:
         mode_err = validate_resume_scan_mode(
             db_path, str(target_path), resume_run_id, scan_mode_override
@@ -2826,12 +3116,12 @@ async def pipeline(
         from core.database import record_run
 
         run_model = normalize_model_id(str(config.get("default_model") or ""))
-        _run_target_anchor = (
-            os.path.realpath(os.path.expanduser(path_root)).rstrip("/")
-            if path_root and os.path.isdir(os.path.expanduser(path_root))
-            else os.path.realpath(str(target_path.parent if target_path.is_file() else target_path)).rstrip("/")
+        record_run(
+            db_path,
+            run_id,
+            run_model,
+            metadata={"target_root": _run_target_anchor, "target": _run_exact_target},
         )
-        record_run(db_path, run_id, run_model, metadata={"target_root": _run_target_anchor})
     except Exception as exc:
         print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
     if run_model:
@@ -2986,6 +3276,9 @@ async def pipeline(
             saved_plan = None
     if saved_plan and saved_plan.get("targets"):
         targets_to_scan = list(saved_plan["targets"])
+    if saved_plan and int(saved_plan.get("passes") or 1) > 1 and int(passes or 1) <= 1:
+        total_passes = int(saved_plan["passes"])
+        banner_resume_flags["--passes"] = total_passes
     # `changed` with nothing changed is a complete answer, not an empty plan:
     # the resolver printed it, and a run that scans nothing must not confirm
     # a work plan, open campaigns, or write an empty report.
@@ -3250,16 +3543,95 @@ async def pipeline(
                 campaign_plan=campaign_plan,
                 focus_files=focus_files if scan_mode == SCAN_MODE_CHANGED else None,
                 focus_groups=focus_groups if scan_mode == SCAN_MODE_CHANGED else None,
+                passes=total_passes,
             )
         except Exception:
             pass
 
+    completed_pass_pairs: set[tuple[str, int]] = set()
     if resume_run_id:
-        from core.cost import coverage_verdict, run_ledger
+        from core.cost import coverage_verdict, run_ledger, run_pass_ledger
 
         ledger = run_ledger(db_path, run_id)
-        if ledger is None:
+        pass_ledger = run_pass_ledger(db_path, run_id) if total_passes > 1 else None
+        if ledger is None or (total_passes > 1 and pass_ledger is None):
             print("[RESUME] Ledger unreadable; scanning the full plan.", file=sys.stderr)
+        elif total_passes > 1 and pass_ledger is not None:
+            def _key(p: str) -> str:
+                return os.path.realpath(str(p)).rstrip("/")
+
+            norm_pass_ledger: dict[tuple[str, int], dict[str, Any]] = {
+                (_key(t), int(p_idx)): row for (t, p_idx), row in pass_ledger.items()
+            }
+            completed_pass_pairs = {
+                pair
+                for pair, row in norm_pass_ledger.items()
+                if not row.get("failed") and not (retry_unexamined and row.get("unexamined"))
+            }
+            failed_pairs = {pair for pair, row in norm_pass_ledger.items() if row.get("failed")} - completed_pass_pairs
+            unexamined_pairs = {
+                pair
+                for pair, row in norm_pass_ledger.items()
+                if not row.get("failed") and row.get("unexamined")
+            }
+            if unexamined_pairs and not retry_unexamined:
+                print(
+                    f"[RESUME] {len(unexamined_pairs)} earlier campaign pass(es) exited without "
+                    "reading target code ([COVERAGE GUARD]). Pass --retry-unexamined with --resume "
+                    "to re-scan them in this run.",
+                    file=sys.stderr,
+                )
+            stamps_p: dict[tuple[str, int], set] = {}
+            for pair, row in norm_pass_ledger.items():
+                if not row.get("failed"):
+                    stamps_p.setdefault(pair, set()).add(row.get("harness_fingerprint") or None)
+            planned = list(targets_to_scan)
+            planned_pairs = [(t, p_idx) for p_idx in range(1, total_passes + 1) for t in planned]
+            stale_pairs = [
+                (t, p_idx)
+                for (t, p_idx) in planned_pairs
+                if (_key(t), p_idx) in completed_pass_pairs
+                and coverage_verdict(stamps_p.get((_key(t), p_idx)), harness_fingerprint) == "mismatched"
+            ]
+            if stale_pairs:
+                stale_fps: dict = {}
+                for t, p_idx in stale_pairs:
+                    for fp in sorted(stamps_p.get((_key(t), p_idx)) or ()):
+                        stale_fps[fp] = stale_fps.get(fp, 0) + 1
+                print(
+                    _changed_harness_notice(
+                        len(stale_pairs), stale_fps, harness_fingerprint, bool(rescan_changed_harness)
+                    ),
+                    file=sys.stderr,
+                )
+                if rescan_changed_harness:
+                    completed_pass_pairs -= {(_key(t), p_idx) for (t, p_idx) in stale_pairs}
+            remaining_pairs = [(t, p_idx) for (t, p_idx) in planned_pairs if (_key(t), p_idx) not in completed_pass_pairs]
+            n_failed = sum(1 for (t, p_idx) in remaining_pairs if (_key(t), p_idx) in failed_pairs)
+            rescanned_pairs = {(_key(t), p_idx) for (t, p_idx) in stale_pairs} if rescan_changed_harness else set()
+            n_stale = sum(1 for (t, p_idx) in remaining_pairs if (_key(t), p_idx) in rescanned_pairs)
+            n_new = len(remaining_pairs) - n_failed - n_stale
+            breakdown = (
+                f"{n_failed} failed and {n_new} never started" if not n_stale else
+                f"{n_failed} failed, {n_stale} examined by a different harness and {n_new} never started"
+            )
+            print(
+                f"\n🔄 Resuming run {run_id}: {len(planned_pairs) - len(remaining_pairs)} of {len(planned_pairs)} "
+                f"campaign(s) completed; {breakdown}: "
+                f"{len(remaining_pairs)} to scan.",
+                file=sys.stderr,
+            )
+            if not remaining_pairs:
+                print("Nothing left to scan for this run. To scan again, start a new run.")
+                return 0
+            remaining_target_keys = {_key(t) for (t, _p) in remaining_pairs}
+            targets_to_scan = [t for t in planned if _key(t) in remaining_target_keys]
+            if plan_groups:
+                plan_groups = [
+                    {**g, "targets": [m for m in g["targets"] if _key(m) in remaining_target_keys]}
+                    for g in plan_groups
+                ]
+                plan_groups = [g for g in plan_groups if g["targets"]]
         else:
             def _key(p: str) -> str:
                 return os.path.realpath(str(p)).rstrip("/")
@@ -3420,7 +3792,16 @@ async def pipeline(
             targets_to_scan,
             coverage=load_coverage(db_path, str(target_path)),
             survey_diff=survey_diff,
-            memory=recall(db_path, target=str(target_path)),
+            memory=(
+                {"available": False}
+                if no_memory
+                else recall(
+                    db_path,
+                    target=str(target_path),
+                    active_root=_run_target_anchor,
+                    exclude_run_id=run_id if not intra_run_learning else None,
+                )
+            ),
         )
         if coverage_plan.get("available"):
             targets_to_scan = coverage_plan["order"]
@@ -3468,17 +3849,6 @@ async def pipeline(
     # once here, and again only for groups a replan adds; a failure inside
     # costs the lineage record, never the scan.
     _open_chains_for_groups(db_path, run_id, campaign_groups)
-    if total_passes > 1:
-        base_campaign_groups = list(campaign_groups)
-        campaign_groups = [
-            {**g, "pass_index": p}
-            for p in range(1, total_passes + 1)
-            for g in base_campaign_groups
-        ]
-        print(
-            f"\n🔁 Multi-pass audit enabled: {total_passes} independent blind pass(es) "
-            f"across {len(base_campaign_groups)} campaign slice(s) ({len(campaign_groups)} total campaign executions)."
-        )
     if not resume_run_id and plan_groups and any(g.get("chain_id") for g in campaign_groups):
         try:
             from core.cost import record_run_plan as _refresh_run_plan
@@ -3491,9 +3861,26 @@ async def pipeline(
                 plan_groups=campaign_groups,
                 campaign_plan=campaign_plan,
                 overwrite=True,
+                passes=total_passes,
             )
         except Exception:
             pass
+    if total_passes > 1:
+        base_campaign_groups = list(campaign_groups)
+        campaign_groups = [
+            {**g, "pass_index": p}
+            for p in range(1, total_passes + 1)
+            for g in base_campaign_groups
+            if (
+                os.path.realpath(str((g.get("targets") or [""])[0])).rstrip("/"),
+                p,
+            )
+            not in completed_pass_pairs
+        ]
+        print(
+            f"\n🔁 Multi-pass audit enabled: {total_passes} independent blind pass(es) "
+            f"across {len(base_campaign_groups)} campaign slice(s) ({len(campaign_groups)} total campaign executions)."
+        )
 
     # Name what was consulted, and what each source was permitted to conclude.
     #
@@ -3694,6 +4081,9 @@ async def pipeline(
         parallel_workers=worker_count,
         shared_prefix_runs={},
         defer_reporter=multi_campaign_run,
+        enable_memory=not bool(no_memory),
+        intra_run_learning=bool(intra_run_learning),
+        freeze_memory_to_prior_runs=not bool(intra_run_learning),
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -3803,15 +4193,23 @@ async def pipeline(
                 # campaign, like sandbox_executed.
                 finding_evidence={},
                 node_context={},
+                read_file_counts={},
                 audit_checklist=None,
                 pass_index=pass_idx,
                 artifact_resource=pass_resource,
                 reported_in_pass=False,
+                pre_pause_tokens=0,
+                resumed_mid_invocation=False,
+                promoted_finding_ids=None,
                 # What this campaign is about, when narrower than its target.
                 # Reaches every node through its instructions: the seed
                 # message below is seen by the first node only.
                 campaign_directive=effective_directive,
             )
+            if resume_run_id:
+                _rehydrate_campaign_resume_state(
+                    branch_ctx, db_path, run_id, scan_item, pass_idx=pass_idx, pass_resource=pass_resource
+                )
             current_run_context.set(branch_ctx)
             # Tell this campaign what the survey found here and which sibling areas are
             # also being examined. Without it a slice agent cannot know why it was sent
@@ -3957,6 +4355,9 @@ async def pipeline(
                     transcript=_transcript_writer,
                     session_suffix=pass_suffix,
                 )
+                pre_pause_tokens = int(getattr(branch_ctx, "pre_pause_tokens", 0) or 0)
+                if pre_pause_tokens > 0:
+                    tokens_before -= pre_pause_tokens
                 campaign_tokens = budget_ctrl.accumulated_tokens - tokens_before
                 campaign_llm_calls = budget_ctrl.llm_calls - llm_calls_before
                 code_reads = budget_ctrl.audit_code_reads - reads_before
@@ -3987,6 +4388,10 @@ async def pipeline(
                     spend_meta: dict[str, Any] = {"failed": bool(task_failed)}
                     if not task_failed and not earned_coverage:
                         spend_meta["unexamined"] = True
+                    if getattr(branch_ctx, "resumed_mid_invocation", False) and pre_pause_tokens == 0:
+                        spend_meta["resumed_tail"] = True
+                    if pass_idx > 1:
+                        spend_meta["pass_index"] = int(pass_idx)
                     record_spend(
                         db_path,
                         run_id,
@@ -4041,6 +4446,7 @@ async def pipeline(
                         _stamp_member_coverage(
                             db_path, run_id, group, scan_item, scan_mode,
                             harness_fingerprint=harness_fingerprint,
+                            pass_index=pass_idx,
                         )
                         # And as what content. Same gate as the stamps: a
                         # campaign that read nothing examined no version of
@@ -4065,7 +4471,9 @@ async def pipeline(
                 # findings -> "confirmed"; all recorded findings dismissed ->
                 # "dismissal"; zero findings or failed campaign -> ""), never
                 # invented when no finding verdict exists.
-                finding_counts = _campaign_finding_counts(db_path, run_id, scan_item)
+                finding_counts = _campaign_finding_counts(
+                    db_path, run_id, scan_item, pass_index=pass_idx if total_passes > 1 else None
+                )
                 from core.database import is_suppressed as _is_suppressed_status
 
                 open_findings_n = sum(
@@ -4113,6 +4521,7 @@ async def pipeline(
                 # RUN cannot continue, not that the revision was bad.
                 if (
                     replan_enabled
+                    and total_passes == 1
                     and campaign_plan.get("available")
                     and planner_llm is not None
                     and campaign_queue
@@ -4215,7 +4624,7 @@ async def pipeline(
                         file=sys.stderr,
                     )
                     _record_guard_failure(db_path, run_id, scan_item, scan_mode, str(be.trigger or ""),
-                                          harness_fingerprint=harness_fingerprint)
+                                          harness_fingerprint=harness_fingerprint, pass_index=pass_idx)
                     # Its own token share spent is a pause for that campaign,
                     # resumable; a runaway guard is a failure.
                     _note_campaign_spend(

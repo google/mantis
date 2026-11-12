@@ -224,20 +224,70 @@ def _run_models(conn: sqlite3.Connection) -> Dict[str, str]:
         return {}
 
 
-def _export_runs(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def _conn_run_roots(conn: sqlite3.Connection) -> Dict[str, str]:
+    """{run_id: target_root} from the runs table; empty when there is none."""
+    out: Dict[str, str] = {}
+    try:
+        rows = conn.execute("SELECT run_id, metadata_json FROM runs").fetchall()
+    except sqlite3.Error:
+        return out
+    for r in rows:
+        rid = str(r[0] or "").strip()
+        if not rid:
+            continue
+        try:
+            meta = json.loads(r[1] or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        if isinstance(meta, dict):
+            root = str(meta.get("target_root") or meta.get("target") or "").strip()
+            if root:
+                out[rid] = root
+    return out
+
+
+def _run_ok_for_export(rid: Any, repo_root: Optional[str], roots_map: Dict[str, str]) -> bool:
+    if not repo_root:
+        return True
+    s_rid = str(rid or "").strip()
+    if not s_rid:
+        return True
+    recorded = roots_map.get(s_rid, "")
+    if not recorded:
+        return True
+    from core.database import run_targets_compatible
+
+    return run_targets_compatible(repo_root, recorded)
+
+
+def _export_runs(
+    conn: sqlite3.Connection,
+    repo_root: Optional[str] = None,
+    roots_map: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    rmap = _conn_run_roots(conn) if (repo_root and roots_map is None) else (roots_map or {})
     try:
         rows = conn.execute("SELECT run_id, model, started FROM runs ORDER BY started ASC, run_id ASC").fetchall()
     except sqlite3.Error:
         return []
-    return [{"run_id": _scrub(r[0], MAX_SHORT_CHARS), "model": _scrub(r[1], MAX_SHORT_CHARS),
-             "started": _scrub(r[2], MAX_SHORT_CHARS)} for r in rows if r[0]]
+    return [
+        {"run_id": _scrub(r[0], MAX_SHORT_CHARS), "model": _scrub(r[1], MAX_SHORT_CHARS),
+         "started": _scrub(r[2], MAX_SHORT_CHARS)}
+        for r in rows
+        if r[0] and _run_ok_for_export(r[0], repo_root, rmap)
+    ]
 
 
-def _export_findings(conn: sqlite3.Connection, repo_root: Optional[str]) -> List[Dict[str, Any]]:
+def _export_findings(
+    conn: sqlite3.Connection,
+    repo_root: Optional[str],
+    roots_map: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     """Latest row per lineage (or per signature, or per location+title when the
     row predates both), as the export's view of each finding. Each carries
     the model of the run that wrote it, when the database knows it."""
     models = _run_models(conn)
+    rmap = _conn_run_roots(conn) if (repo_root and roots_map is None) else (roots_map or {})
     try:
         rows = conn.execute("SELECT * FROM findings ORDER BY id ASC").fetchall()
     except sqlite3.Error:
@@ -245,6 +295,8 @@ def _export_findings(conn: sqlite3.Connection, repo_root: Optional[str]) -> List
     latest: Dict[Tuple[str, str], sqlite3.Row] = {}
     for row in rows:
         r = dict(row)
+        if not _run_ok_for_export(r.get("run_id"), repo_root, rmap):
+            continue
         if r.get("lineage_id"):
             key = ("lineage", str(r["lineage_id"]))
         elif r.get("signature"):
@@ -255,6 +307,13 @@ def _export_findings(conn: sqlite3.Connection, repo_root: Optional[str]) -> List
     out: List[Dict[str, Any]] = []
     for row in latest.values():
         r = dict(row)
+        raw_fp = str(r.get("filepath") or "")
+        if os.path.isabs(raw_fp):
+            if repo_root:
+                rel_fp = _relativize(raw_fp, repo_root)
+                if not rel_fp or rel_fp == ".":
+                    continue
+                r["filepath"] = rel_fp
         rec: Dict[str, Any] = {}
         for f in FINDING_FIELDS:
             v = models.get(str(r.get("run_id") or ""), "") if f == "model" else r.get(f)
@@ -280,8 +339,13 @@ def _export_findings(conn: sqlite3.Connection, repo_root: Optional[str]) -> List
     return out
 
 
-def _export_learnings(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def _export_learnings(
+    conn: sqlite3.Connection,
+    repo_root: Optional[str] = None,
+    roots_map: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     models = _run_models(conn)
+    rmap = _conn_run_roots(conn) if (repo_root and roots_map is None) else (roots_map or {})
     try:
         rows = conn.execute(
             "SELECT run_id, timestamp, category, learning, tags FROM learnings ORDER BY id ASC"
@@ -291,6 +355,8 @@ def _export_learnings(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     seen: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
         r = dict(row)
+        if not _run_ok_for_export(r.get("run_id"), repo_root, rmap):
+            continue
         cat = _scrub(r.get("category"), MAX_SHORT_CHARS)
         text = _scrub(r.get("learning"))
         if not text:
@@ -306,8 +372,13 @@ def _export_learnings(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     return sorted(seen.values(), key=lambda x: (x["category"], x["learning"]))
 
 
-def _latest_artifact(conn: sqlite3.Connection, artifact_type: str = "",
-                     filepaths: Iterable[str] = ()) -> Optional[str]:
+def _latest_artifact(
+    conn: sqlite3.Connection,
+    artifact_type: str = "",
+    filepaths: Iterable[str] = (),
+    repo_root: Optional[str] = None,
+    roots_map: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     clauses, params = [], []
     if artifact_type:
         clauses.append("artifact_type = ?")
@@ -318,22 +389,68 @@ def _latest_artifact(conn: sqlite3.Connection, artifact_type: str = "",
         params.extend(fps)
     if not clauses:
         return None
+    rmap = _conn_run_roots(conn) if (repo_root and roots_map is None) else (roots_map or {})
+    canon_root = os.path.realpath(repo_root).rstrip("/") if repo_root else ""
     try:
-        row = conn.execute(
-            "SELECT content FROM campaign_artifacts WHERE " + " AND ".join(clauses)
-            + " ORDER BY id DESC LIMIT 1", params).fetchone()
+        rows = conn.execute(
+            "SELECT run_id, content, metadata_json FROM campaign_artifacts WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY id DESC",
+            params,
+        ).fetchall()
     except sqlite3.Error:
         return None
-    return str(row[0]) if row and row[0] is not None else None
+    fallback: Optional[str] = None
+    for row in rows:
+        rid, content, meta_json = row[0], row[1], row[2]
+        if content is None or not _run_ok_for_export(rid, repo_root, rmap):
+            continue
+        if not canon_root:
+            return str(content)
+        res = ""
+        try:
+            meta = json.loads(meta_json or "{}")
+            if isinstance(meta, dict):
+                res = str(meta.get("resource") or "").strip().rstrip("/")
+        except (TypeError, ValueError):
+            res = ""
+        if res in ("", canon_root):
+            return str(content)
+        if fallback is None and _resource_under_root(res, canon_root, rooted=bool(rmap.get(str(rid or "").strip()))):
+            fallback = str(content)
+    return fallback
 
 
-def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict[str, Any]:
+def _resource_under_root(res: str, canon_root: str, rooted: bool = False) -> bool:
+    """Whether an artifact's `metadata.resource` names something inside
+    `canon_root`. A `#passN` suffix is ignored. A relative resource is
+    accepted only from a run whose recorded root was already checked
+    against the export root; a rootless run's relative resource could
+    belong to any repository."""
+    path = str(res or "").split("#", 1)[0].strip().rstrip("/")
+    if not path or not canon_root:
+        return False
+    if not os.path.isabs(path):
+        return rooted
+    try:
+        real = os.path.realpath(path).rstrip("/")
+        return real == canon_root or os.path.commonpath([real, canon_root]) == canon_root
+    except (ValueError, OSError):
+        return False
+
+
+def _export_coverage(
+    conn: sqlite3.Connection,
+    repo_root: Optional[str],
+    roots_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Coverage as repository-relative paths: the ledger's examined areas per
     run, and every target a completed campaign recorded spend for -- per
     model, so a path one model covered is still open for another."""
     from core.memory import COVERAGE_ARTIFACT_TYPE
 
     models = _run_models(conn)
+    rmap = _conn_run_roots(conn) if (repo_root and roots_map is None) else (roots_map or {})
     runs: List[Dict[str, Any]] = []
     try:
         rows = conn.execute(
@@ -351,6 +468,8 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
             if not isinstance(entry, dict):
                 continue
             run_id = _scrub(entry.get("run_id"), MAX_SHORT_CHARS)
+            if not _run_ok_for_export(run_id, repo_root, rmap):
+                continue
             examined = sorted({_relativize(str(p), repo_root) for p in (entry.get("examined") or [])
                                if isinstance(p, str)} - {""})
             key = (run_id, tuple(examined))
@@ -364,7 +483,7 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
     scanned: Dict[str, Dict[str, Any]] = {}
     # The ledger grew `harness_fingerprint` after it first shipped; a database
     # last written by an older Mantis has no such column and must still export.
-    from core.cost import _row_failed, has_fingerprint_column
+    from core.cost import _row_failed, _row_unexamined, has_fingerprint_column
 
     try:
         fp_col = "harness_fingerprint" if has_fingerprint_column(conn) else "NULL AS harness_fingerprint"
@@ -374,7 +493,9 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
         spend = []
     for row in spend:
         r = dict(row)
-        if _row_failed(r.get("metadata_json")):
+        if _row_failed(r.get("metadata_json")) or _row_unexamined(r.get("metadata_json")):
+            continue
+        if not _run_ok_for_export(r.get("run_id"), repo_root, rmap):
             continue
         rel = _relativize(str(r.get("target") or ""), repo_root)
         if not rel:
@@ -397,6 +518,8 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
             for row in conn.execute(
                     "SELECT path, run_id, content_hash, size FROM coverage_files ORDER BY id ASC").fetchall():
                 r = dict(row)
+                if not _run_ok_for_export(r.get("run_id"), repo_root, rmap):
+                    continue
                 rel = _relativize(str(r.get("path") or ""), repo_root)
                 run_id = _scrub(r.get("run_id"), MAX_SHORT_CHARS)
                 digest = _scrub(r.get("content_hash"), MAX_SHORT_CHARS)
@@ -590,14 +713,18 @@ def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None
     out = _validate_knowledge_dir(out_dir, repo_root, create=True, err_cls=PermissionError)
     conn = _connect(db_path)
     try:
-        findings = _export_findings(conn, repo_root)
-        learnings = _export_learnings(conn)
-        tm_json = _latest_artifact(conn, artifact_type=_ART_THREAT_MODEL[0])
-        tm_md = _latest_artifact(conn, filepaths=("workspace/kb/THREAT_MODEL.md", "workspace/kb/threat_model.md"))
-        arch_md = _latest_artifact(conn, filepaths=(_ART_ARCHITECTURE[1],))
-        summary_json = _latest_artifact(conn, artifact_type=_ART_SUMMARY[0])
-        coverage = _export_coverage(conn, repo_root)
-        runs = _export_runs(conn)
+        rmap = _conn_run_roots(conn) if repo_root else {}
+        findings = _export_findings(conn, repo_root, roots_map=rmap)
+        learnings = _export_learnings(conn, repo_root, roots_map=rmap)
+        tm_json = _latest_artifact(conn, artifact_type=_ART_THREAT_MODEL[0], repo_root=repo_root, roots_map=rmap)
+        tm_md = _latest_artifact(
+            conn, filepaths=("workspace/kb/THREAT_MODEL.md", "workspace/kb/threat_model.md"),
+            repo_root=repo_root, roots_map=rmap,
+        )
+        arch_md = _latest_artifact(conn, filepaths=(_ART_ARCHITECTURE[1],), repo_root=repo_root, roots_map=rmap)
+        summary_json = _latest_artifact(conn, artifact_type=_ART_SUMMARY[0], repo_root=repo_root, roots_map=rmap)
+        coverage = _export_coverage(conn, repo_root, roots_map=rmap)
+        runs = _export_runs(conn, repo_root, roots_map=rmap)
     finally:
         conn.close()
 
@@ -692,6 +819,21 @@ def _number(value: Any) -> Optional[float]:
     return float(value) if value == value and abs(value) < 1e12 else None  # no NaN/inf
 
 
+_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$")
+
+
+def _sanitize_imported_ts(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    s = value.strip().replace("T", " ")[:19]
+    if not _TS_RE.match(s):
+        return None
+    from datetime import datetime, timezone
+
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return now_utc if s > now_utc else s
+
+
 def _import_findings(conn: sqlite3.Connection, path: Path) -> Tuple[int, int]:
     """Inserts findings the database has not seen: a lineage (or signature)
     already present is left alone, since the database's row is at least as
@@ -720,20 +862,41 @@ def _import_findings(conn: sqlite3.Connection, path: Path) -> Tuple[int, int]:
             code_paths = [_clean_rel_path(x) or _scrub(x, MAX_SHORT_CHARS)
                           for x in _parse_list(rec.get("code_paths")) if isinstance(x, str)]
             from core.schemas import normalize_mantis_risk_score
-            conn.execute(
-                """INSERT OR IGNORE INTO findings
-                   (run_id, filepath, title, severity, description, line_numbers, remediation,
-                    status, mantis_risk_score, impact_score, likelihood_score, priority,
-                    signature, lineage_id, cwe, triage_reasoning, patch_status, rca_summary, code_paths)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (_short(rec.get("run_id")) or "imported", filepath, title,
-                 _short(rec.get("severity")), _scrub(rec.get("description")), json.dumps(lines),
-                 _scrub(rec.get("remediation")), status,
-                 normalize_mantis_risk_score(_number(rec.get("mantis_risk_score")), min_score=0.0),
-                 _number(rec.get("impact_score")), _number(rec.get("likelihood_score")),
-                 _short(rec.get("priority")), signature or None, lineage or None,
-                 _short(rec.get("cwe")), _scrub(rec.get("triage_reasoning")),
-                 _short(rec.get("patch_status")), _scrub(rec.get("rca_summary")), json.dumps(code_paths)))
+            ts = _sanitize_imported_ts(rec.get("timestamp"))
+            imp_val = _number(rec.get("impact_score"))
+            lik_val = _number(rec.get("likelihood_score"))
+            base_vals = (
+                _short(rec.get("run_id")) or "imported", filepath, title,
+                _short(rec.get("severity")), _scrub(rec.get("description")), json.dumps(lines),
+                _scrub(rec.get("remediation")), status,
+                normalize_mantis_risk_score(_number(rec.get("mantis_risk_score")), min_score=0.0),
+                int(imp_val) if imp_val is not None else None,
+                int(lik_val) if lik_val is not None else None,
+                None if rec.get("priority") is None else _short(rec.get("priority")),
+                signature or None, lineage or None,
+                None if rec.get("cwe") is None else _short(rec.get("cwe")),
+                _scrub(rec.get("triage_reasoning")),
+                None if rec.get("patch_status") is None else _short(rec.get("patch_status")),
+                _scrub(rec.get("rca_summary")), json.dumps(code_paths),
+            )
+            if ts:
+                conn.execute(
+                    """INSERT OR IGNORE INTO findings
+                       (run_id, filepath, title, severity, description, line_numbers, remediation,
+                        status, mantis_risk_score, impact_score, likelihood_score, priority,
+                        signature, lineage_id, cwe, triage_reasoning, patch_status, rca_summary, code_paths, timestamp)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (*base_vals, ts),
+                )
+            else:
+                conn.execute(
+                    """INSERT OR IGNORE INTO findings
+                       (run_id, filepath, title, severity, description, line_numbers, remediation,
+                        status, mantis_risk_score, impact_score, likelihood_score, priority,
+                        signature, lineage_id, cwe, triage_reasoning, patch_status, rca_summary, code_paths)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    base_vals,
+                )
             inserted += 1
         except sqlite3.Error:
             skipped += 1
@@ -753,8 +916,17 @@ def _import_learnings(conn: sqlite3.Connection, path: Path) -> int:
                             (cat, text)).fetchone():
                 continue
             tags = [_scrub(t, MAX_SHORT_CHARS) for t in _parse_list(rec.get("tags")) if isinstance(t, str)]
-            conn.execute("INSERT INTO learnings (run_id, category, learning, tags) VALUES (?,?,?,?)",
-                         (run_id, cat, text, json.dumps(tags)))
+            ts = _sanitize_imported_ts(rec.get("timestamp"))
+            if ts:
+                conn.execute(
+                    "INSERT INTO learnings (run_id, timestamp, category, learning, tags) VALUES (?,?,?,?,?)",
+                    (run_id, ts, cat, text, json.dumps(tags)),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO learnings (run_id, category, learning, tags) VALUES (?,?,?,?)",
+                    (run_id, cat, text, json.dumps(tags)),
+                )
             n += 1
         except sqlite3.Error:
             continue
@@ -786,7 +958,7 @@ def _import_artifact(db_path: str, run_id: str, path: Path, artifact_type: str,
     return True
 
 
-def _import_runs(db_path: str, runs_path: Path, *record_paths: Path) -> int:
+def _import_runs(db_path: str, runs_path: Path, *record_paths: Path, repo_root: str = "") -> int:
     """Rebuilds the runs table (run id -> model) from the export: runs.jsonl
     when present, else whatever the records themselves say (a v2 export
     without the file, or one edited by hand). A v1 export says nothing and
@@ -794,19 +966,27 @@ def _import_runs(db_path: str, runs_path: Path, *record_paths: Path) -> int:
     from core.database import record_run
 
     pairs: Dict[str, str] = {}
+    unmodeled_runs: set[str] = set()
+    started_by_run: Dict[str, str] = {}
     if runs_path.exists():
         for rec in _iter_jsonl(runs_path):
             run_id = _short(rec.get("run_id"))
             if run_id and _IDENT_RE.match(run_id):
                 pairs.setdefault(run_id, _short(rec.get("model")))
+                ts = _sanitize_imported_ts(rec.get("started"))
+                if ts:
+                    started_by_run.setdefault(run_id, ts)
     for path in record_paths:
         if not path.exists():
             continue
         if path.suffix == ".jsonl":
             for rec in _iter_jsonl(path):
                 run_id, model = _short(rec.get("run_id")), _short(rec.get("model"))
-                if run_id and model and _IDENT_RE.match(run_id):
-                    pairs.setdefault(run_id, model)
+                if run_id and _IDENT_RE.match(run_id):
+                    if model:
+                        pairs.setdefault(run_id, model)
+                    else:
+                        unmodeled_runs.add(run_id)
         else:
             raw = _read_bounded(path)
             try:
@@ -819,12 +999,21 @@ def _import_runs(db_path: str, runs_path: Path, *record_paths: Path) -> int:
                         continue
                     run_id = _short(entry.get("run_id") or entry.get("last_run_id"))
                     model = _short(entry.get("model"))
-                    if run_id and model and _IDENT_RE.match(run_id):
-                        pairs.setdefault(run_id, model)
+                    if run_id and _IDENT_RE.match(run_id):
+                        if model:
+                            pairs.setdefault(run_id, model)
+                        else:
+                            unmodeled_runs.add(run_id)
+    meta: Dict[str, Any] = {"imported": True}
+    if repo_root:
+        meta["target_root"] = os.path.realpath(repo_root).rstrip("/")
     n = 0
     for run_id, model in pairs.items():
-        if record_run(db_path, run_id, model, metadata={"imported": True}):
+        if record_run(db_path, run_id, model, metadata=dict(meta), started=started_by_run.get(run_id)):
             n += 1
+    if repo_root:
+        for run_id in sorted(unmodeled_runs - set(pairs)):
+            record_run(db_path, run_id, "", metadata=dict(meta))
     return n
 
 
@@ -978,7 +1167,9 @@ def import_knowledge(db_path: str, in_dir: str, run_id: str, repo_root: str,
 
     init_db(db_path)
     counts: Dict[str, Any] = {}
-    counts["runs"] = _import_runs(db_path, src / RUNS, src / FINDINGS, src / LEARNINGS, src / COVERAGE)
+    counts["runs"] = _import_runs(
+        db_path, src / RUNS, src / FINDINGS, src / LEARNINGS, src / COVERAGE, repo_root=repo_root
+    )
     conn = _connect(db_path)
     try:
         with conn:

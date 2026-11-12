@@ -109,6 +109,13 @@ class RunContext:
     promoted_finding_ids: Optional[set[int]] = None
     # Count of synthesized Fallback: verdict turns observed in this campaign.
     verdict_fallbacks: int = 0
+    # Mid-invocation --resume accounting.
+    pre_pause_tokens: int = 0
+    resumed_mid_invocation: bool = False
+    # Cross-run memory policy controls (--no-memory / --intra-run-learning).
+    enable_memory: bool = True
+    intra_run_learning: bool = False
+    freeze_memory_to_prior_runs: bool = False
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

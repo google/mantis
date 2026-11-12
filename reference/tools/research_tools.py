@@ -1334,12 +1334,21 @@ def get_findings(filepath: str = "") -> str:
         ):
             return "NO_DATA: Zero findings recorded in this pass yet."
         run_wide = active_node in _RUN_WIDE_FINDINGS_NODES
+        pass_filter = None if run_wide else max(1, int(getattr(ctx, "pass_index", 1) or 1))
         if clean_fp:
             # An explicit file: the full records for that file, bounded if huge.
-            raw_file_findings = read_findings(resolved_db, filepath=clean_fp, run_id=ctx.run_id)
+            raw_file_findings = read_findings(
+                resolved_db, filepath=clean_fp, run_id=ctx.run_id, pass_index=pass_filter
+            )
             findings = _bounded_findings(raw_file_findings, [])
         else:
-            own = read_findings(resolved_db, run_id=ctx.run_id, scope_path=own_scope, campaign=own_scope)
+            own = read_findings(
+                resolved_db,
+                run_id=ctx.run_id,
+                scope_path=own_scope,
+                campaign=own_scope,
+                pass_index=pass_filter,
+            )
             others: list = []
             if run_wide and own_scope:
                 own_ids = {f.get("id") for f in own}

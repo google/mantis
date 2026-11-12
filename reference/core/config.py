@@ -2583,15 +2583,28 @@ class ResilientLiteLlm(LiteLlm):
         instruction = str(getattr(config, "system_instruction", "") or "") if config is not None else ""
         if header in instruction:
             return
+        pass_idx = max(1, int(getattr(ctx, "pass_index", 1) or 1))
+        active_node = str(getattr(ctx, "active_node", "") or "")
+        if (
+            pass_idx > 1
+            and not bool(getattr(ctx, "reported_in_pass", False))
+            and (
+                active_node in ("architect", "threat_modeler", "planner")
+                or active_node == "researcher"
+                or active_node.startswith("researcher_")
+            )
+        ):
+            return
         store = getattr(ctx, "node_context", None)
         snapshots = store.setdefault("_findings_snapshot", {}) if isinstance(store, dict) else {}
-        key = hashlib.sha256(instruction.encode("utf-8", "replace")).hexdigest()
+        key = f"{pass_idx}:{hashlib.sha256(instruction.encode('utf-8', 'replace')).hexdigest()}"
         if key not in snapshots:
             try:
                 findings = read_findings(
                     ctx.db_path, run_id=ctx.run_id,
                     scope_path=(getattr(ctx, "target_file", "") or None),
                     campaign=(getattr(ctx, "target_file", "") or None),
+                    pass_index=pass_idx,
                 )
             except Exception:
                 return
@@ -2876,6 +2889,7 @@ class ResilientLiteLlm(LiteLlm):
                         )
                         and "Tool call arguments were truncated" in str(getattr(response, "error_message", ""))
                     ):
+                        meter_response_usage(response)
                         raise MantisStreamingTruncationError(str(getattr(response, "error_message", "")))
                     if pending_empty is not None:
                         # Something followed it, so it was not the end of the
@@ -3034,7 +3048,15 @@ class ResilientLiteLlm(LiteLlm):
                     )
                     _observe("empty_turn_ends")
                     if schema_cls is not None:
-                        yield self._sanitize_structured_response(e.response, schema_cls)
+                        from google.genai import types as _genai_types
+
+                        giveup_resp = e.response if e.response is not None else empty_turn_final_response()
+                        giveup_resp.usage_metadata = _genai_types.GenerateContentResponseUsageMetadata(
+                            prompt_token_count=0,
+                            candidates_token_count=0,
+                            total_token_count=0,
+                        )
+                        yield self._sanitize_structured_response(giveup_resp, schema_cls)
                     else:
                         yield empty_turn_final_response()
                     return

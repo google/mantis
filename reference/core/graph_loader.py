@@ -878,7 +878,9 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
     return node(_classify, name=node_id)
 
 
-def campaign_has_findings_to_triage(db_path: str, run_id: str, target_file: str):
+def campaign_has_findings_to_triage(
+    db_path: str, run_id: str, target_file: str, pass_index: Optional[int] = None
+):
     """True if the current campaign recorded any finding still worth triaging.
 
     Returns None when the question cannot be answered (missing or unreadable
@@ -886,11 +888,34 @@ def campaign_has_findings_to_triage(db_path: str, run_id: str, target_file: str)
     may never skip stages.
     """
     from core.database import read_findings, FALSE_POSITIVE_STATUSES
+    from core.paths import resolve_db_path
 
-    if not db_path or not os.path.exists(db_path):
+    if not db_path:
         return None
     try:
-        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None, campaign=target_file or None)
+        resolved_db = resolve_db_path(db_path) if not os.path.isabs(str(db_path)) else db_path
+    except Exception:
+        resolved_db = db_path
+    if not os.path.exists(resolved_db):
+        return None
+    eff_pass = pass_index
+    if eff_pass is None:
+        try:
+            from core.context import current_run_context
+
+            rc = current_run_context.get()
+            if rc is not None:
+                eff_pass = max(1, int(getattr(rc, "pass_index", 1) or 1))
+        except Exception:
+            eff_pass = None
+    try:
+        rows = read_findings(
+            resolved_db,
+            run_id=run_id,
+            scope_path=target_file or None,
+            campaign=target_file or None,
+            pass_index=eff_pass,
+        )
     except Exception:
         return None
     inactive = set(FALSE_POSITIVE_STATUSES) | {"duplicate_merged"}
@@ -1594,6 +1619,10 @@ def _make_stage_experience_before_model_callback(node_id: str):
 
             ctx = current_run_context.get()
             if ctx is None or not ctx.db_path:
+                return None
+            if not bool(getattr(ctx, "enable_memory", True)):
+                return None
+            if int(getattr(ctx, "pass_index", 1) or 1) > 1:
                 return None
             resolved_db = resolve_db_path(ctx.db_path)
             if not os.path.exists(resolved_db):
@@ -2749,8 +2778,19 @@ def create_calibrator_node(
 
         run_ctx = current_run_context.get()
         db_path = (getattr(run_ctx, "db_path", None) or ctx.state.get("db_path") or "knowledge.db")
+        try:
+            from core.paths import resolve_db_path
+
+            if db_path and not os.path.isabs(str(db_path)):
+                db_path = resolve_db_path(str(db_path))
+        except Exception:
+            pass
         run_id = (getattr(run_ctx, "run_id", None) or ctx.state.get("run_id") or "")
         target_file = (getattr(run_ctx, "target_file", None) or "")
+        pass_idx = max(1, int(getattr(run_ctx, "pass_index", 1) or 1)) if run_ctx is not None else None
+        own_res = (
+            str(getattr(run_ctx, "artifact_resource", "") or target_file or "") or None
+        ) if run_ctx is not None else None
 
         findings = []
         if db_path and os.path.exists(db_path):
@@ -2758,10 +2798,20 @@ def create_calibrator_node(
                 # Campaign scope, not run scope: multi-target runs share one
                 # run_id, and an unscoped read re-calibrated every earlier
                 # campaign's findings on each later campaign.
-                findings = read_findings(db_path, run_id=run_id, scope_path=target_file or None,
-                                         campaign=target_file or None)
+                findings = read_findings(
+                    db_path,
+                    run_id=run_id,
+                    scope_path=target_file or None,
+                    campaign=target_file or None,
+                    pass_index=pass_idx,
+                )
                 if not findings and not run_id:
-                    findings = read_findings(db_path, scope_path=target_file or None, campaign=target_file or None)
+                    findings = read_findings(
+                        db_path,
+                        scope_path=target_file or None,
+                        campaign=target_file or None,
+                        pass_index=pass_idx,
+                    )
             except Exception:
                 findings = []
 
@@ -2773,7 +2823,9 @@ def create_calibrator_node(
             if str(f.get("production_viability") or "").upper() == "NON_VIABLE":
                 continue
             if os.path.exists(db_path):
-                art_raw = read_artifact(db_path, filepath=f"workspace/findings/{f.get('id')}.json", run_id=run_id)
+                art_raw = read_artifact(
+                    db_path, filepath=f"workspace/findings/{f.get('id')}.json", run_id=run_id, resource=own_res
+                )
                 if art_raw:
                     try:
                         art_data = json.loads(art_raw)
@@ -2794,9 +2846,9 @@ def create_calibrator_node(
 
         tm_text = ""
         if os.path.exists(db_path):
-            tm_text = read_artifact(db_path, artifact_type="threat_model", run_id=run_id) or ""
+            tm_text = read_artifact(db_path, artifact_type="threat_model", run_id=run_id, resource=own_res) or ""
             if not tm_text:
-                tm_text = read_artifact(db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=run_id) or ""
+                tm_text = read_artifact(db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=run_id, resource=own_res) or ""
 
         calibrated_results: list[FindingCalibration] = []
 

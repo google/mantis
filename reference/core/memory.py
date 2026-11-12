@@ -375,6 +375,9 @@ def recall(
     target: str = "",
     max_findings: int = _MAX_PRIOR_FINDINGS,
     max_learnings: int = _MAX_LEARNINGS,
+    *,
+    active_root: Optional[str] = None,
+    exclude_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assembles what earlier runs established about this target.
 
@@ -403,11 +406,40 @@ def recall(
     }
 
     try:
-        from core.database import read_findings, read_learnings
+        from core.database import (
+            active_target_root,
+            read_findings,
+            read_learnings,
+            run_belongs_to_active_target,
+            run_target_roots,
+        )
     except Exception as exc:  # pragma: no cover - import failure is environmental
         logger.warning("Memory unavailable (import): %s", exc)
         empty["reason"] = "knowledge base module unavailable"
         return empty
+
+    ctx = None
+    try:
+        from core.context import current_run_context
+
+        ctx = current_run_context.get()
+    except Exception:
+        ctx = None
+
+    if ctx is not None and not bool(getattr(ctx, "enable_memory", True)):
+        empty["reason"] = "cross-run memory disabled (--no-memory)"
+        return empty
+
+    eff_exclude_run_id = ""
+    if exclude_run_id is not None:
+        eff_exclude_run_id = str(exclude_run_id).strip()
+    elif ctx is not None and bool(getattr(ctx, "freeze_memory_to_prior_runs", False)):
+        eff_exclude_run_id = str(getattr(ctx, "run_id", "") or "").strip()
+
+    eff_root = active_target_root(target) if active_root is None else (
+        os.path.realpath(str(active_root)).rstrip("/") if str(active_root).strip() else ""
+    )
+    roots_map = run_target_roots(db_path) if eff_root else {}
 
     try:
         rows = read_findings(db_path)
@@ -421,6 +453,22 @@ def recall(
         logger.warning("Could not read prior learnings: %s", exc)
         learning_rows = []
 
+    if eff_root or eff_exclude_run_id:
+        def _row_allowed(r: Any) -> bool:
+            if not isinstance(r, dict):
+                return False
+            rid = str(r.get("run_id") or "").strip()
+            if eff_exclude_run_id and rid == eff_exclude_run_id:
+                return False
+            if eff_root and not run_belongs_to_active_target(
+                db_path, rid, active_root=eff_root, roots_map=roots_map
+            ):
+                return False
+            return True
+
+        rows = [r for r in rows if _row_allowed(r)]
+        learning_rows = [r for r in learning_rows if _row_allowed(r)]
+
     if not rows and not learning_rows:
         return empty
 
@@ -432,6 +480,17 @@ def recall(
     # Canonicalized once, outside the row loop: the target does not change per row,
     # and _canonicalize_for_match may consult the run context on every call.
     canon_target = _canonicalize_for_match(target) if target else ""
+    if target and active_root is not None and os.path.isabs(canon_target):
+        explicit_root = os.path.realpath(str(active_root)).rstrip("/") if str(active_root).strip() else ""
+        if explicit_root:
+            try:
+                rt = os.path.realpath(str(target)).rstrip("/")
+                if rt == explicit_root:
+                    canon_target = ""
+                elif rt.startswith(explicit_root + os.sep):
+                    canon_target = os.path.relpath(rt, explicit_root).replace(os.sep, "/")
+            except Exception:
+                pass
 
     for row in rows:
         if not isinstance(row, dict):
@@ -707,6 +766,9 @@ def recall_for_stage(
     target: str = "",
     include_general: bool = True,
     max_learnings: int = _MAX_LEARNINGS,
+    *,
+    active_root: Optional[str] = None,
+    exclude_run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Recalls prior learnings filtered to those targeting `stage`.
 
@@ -723,7 +785,13 @@ def recall_for_stage(
     stage_norm = str(stage or "").strip().lower()
     # Pass a wide pre-cap to recall() so stage-specific high-confidence lessons
     # are not evicted by recency slicing across unrelated stages before ranking.
-    mem = recall(db_path, target=target, max_learnings=max(max_learnings * 32, 500))
+    mem = recall(
+        db_path,
+        target=target,
+        max_learnings=max(max_learnings * 32, 500),
+        active_root=active_root,
+        exclude_run_id=exclude_run_id,
+    )
     all_learnings = mem.get("learnings") or []
     targeted: List[Dict[str, Any]] = []
     general: List[Dict[str, Any]] = []
@@ -741,6 +809,9 @@ def render_stage_learnings_for_agent(
     stage: str,
     target: str = "",
     max_learnings: int = _MAX_LEARNINGS,
+    *,
+    active_root: Optional[str] = None,
+    exclude_run_id: Optional[str] = None,
 ) -> str:
     """Renders stage-targeted `<experience>` lessons for `stage` with CP-4 fencing.
 
@@ -761,6 +832,8 @@ def render_stage_learnings_for_agent(
         target=target,
         include_general=False,
         max_learnings=max_learnings,
+        active_root=active_root,
+        exclude_run_id=exclude_run_id,
     )
     if not items:
         return ""

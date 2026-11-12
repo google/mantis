@@ -313,6 +313,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable ADK context caching",
     )
     parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help=(
+            "Disable cross-run memory recall and stage-experience injection for this run "
+            "(order-independent clean-slate audit)."
+        ),
+    )
+    parser.add_argument(
+        "--intra-run-learning",
+        action="store_true",
+        help=(
+            "Allow pass-1 campaigns to recall findings and lessons written by earlier "
+            "campaigns of the same run (by default recall is frozen to prior runs)."
+        ),
+    )
+    parser.add_argument(
         "--import-knowledge",
         type=str,
         default="",
@@ -501,6 +517,8 @@ def run_launch(
     changed_files: Optional[list] = None,
     max_campaign_tokens: int = 0,
     max_input_tokens: Optional[int] = None,
+    no_memory: bool = False,
+    intra_run_learning: bool = False,
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -853,6 +871,8 @@ def run_launch(
                 changed_files_override=changed_files,
                 max_campaign_tokens=max_campaign_tokens,
                 max_input_tokens=max_input_tokens,
+                no_memory=no_memory,
+                intra_run_learning=intra_run_learning,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -964,6 +984,8 @@ def main() -> int:
             changed_files=args.changed_files,
             max_campaign_tokens=max_campaign_tokens,
             max_input_tokens=max_input_tokens,
+            no_memory=args.no_memory,
+            intra_run_learning=args.intra_run_learning,
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)

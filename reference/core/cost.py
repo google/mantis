@@ -400,7 +400,7 @@ def _coverage_runs(db_path: str, model: str = "") -> tuple[dict, set]:
     targets: dict = {}
     for target, metadata_json, run in rows:
         t = str(target or "").rstrip("/")
-        if t and run and not _row_failed(metadata_json):
+        if t and run and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
             targets.setdefault(t, set()).add(str(run))
     return targets, recorded
 
@@ -705,6 +705,35 @@ def harness_mismatches(
         return None
 
 
+def _db_exists(db_path: str) -> bool:
+    if not db_path:
+        return False
+    if str(db_path) == ":memory:":
+        return True
+    try:
+        from core.paths import resolve_db_path
+
+        resolved = resolve_db_path(str(db_path)) if not os.path.isabs(str(db_path)) else str(db_path)
+        return os.path.exists(resolved)
+    except Exception:
+        return os.path.exists(db_path)
+
+
+def _row_pass_index(metadata_json: Any) -> int:
+    if not metadata_json:
+        return 1
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return 1
+    if not isinstance(meta, dict):
+        return 1
+    try:
+        return max(1, int(meta.get("pass_index", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
     """What one run's campaigns did, as
     `{target: {"failed": bool, "harness_fingerprint": str | None}}`, the
@@ -719,7 +748,7 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
     if not db_path or not run_id:
         return None
     try:
-        if not os.path.exists(db_path):
+        if not _db_exists(db_path):
             return {}
         conn = _connect(db_path)
         try:
@@ -747,6 +776,47 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
                 if _row_unexamined(metadata_json):
                     entry["unexamined"] = True
                 out[t] = entry
+        return out
+    except Exception:
+        return None
+
+
+def run_pass_ledger(db_path: str, run_id: str) -> Optional[dict[tuple[str, int], dict[str, Any]]]:
+    """Per-pass companion to `run_ledger()` for `--passes N` runs, returning
+    `{(target, pass_index): {"failed": bool, "harness_fingerprint": str | None, ...}}`
+    without altering `run_ledger()`'s single-pass dict contract."""
+    if not db_path or not run_id:
+        return None
+    try:
+        if not _db_exists(db_path):
+            return {}
+        conn = _connect(db_path)
+        try:
+            try:
+                fp_col = "harness_fingerprint" if has_fingerprint_column(conn) else "NULL"
+                rows = conn.execute(
+                    f"SELECT target, metadata_json, {fp_col} FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
+                    (str(run_id),),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return {}
+                raise
+        finally:
+            conn.close()
+        out: dict[tuple[str, int], dict[str, Any]] = {}
+        for target, metadata_json, fingerprint in rows:
+            t = str(target or "").rstrip("/")
+            if t:
+                p_idx = _row_pass_index(metadata_json)
+                entry: dict[str, Any] = {
+                    "failed": _row_failed(metadata_json),
+                    "harness_fingerprint": str(fingerprint) if fingerprint else None,
+                }
+                if _row_unexamined(metadata_json):
+                    entry["unexamined"] = True
+                out[(t, p_idx)] = entry
         return out
     except Exception:
         return None
@@ -848,12 +918,13 @@ def record_run_plan(
     focus_files: Optional[Sequence[str]] = None,
     focus_groups: Optional[Sequence[dict]] = None,
     overwrite: bool = False,
+    passes: Optional[int] = None,
 ) -> bool:
     """Persists a run's initial planned targets and campaign groupings in
     `runs.metadata_json` (as relative paths under `target_root`) so `--resume`
     reloads the original plan instead of re-deriving all files or re-running
     `propose_campaigns`. Never raises (INV-6)."""
-    if not db_path or not run_id or not target_root or not os.path.exists(db_path):
+    if not db_path or not run_id or not target_root or not _db_exists(db_path):
         return False
     rel_targets = [
         r for t in (targets or []) if (r := _rel_under_root(str(t), target_root))
@@ -862,6 +933,8 @@ def record_run_plan(
         return False
 
     payload: dict[str, Any] = {"targets": rel_targets}
+    if passes is not None and int(passes) > 1:
+        payload["passes"] = int(passes)
     if plan_groups:
         stored_groups = []
         for g in plan_groups:
@@ -1047,6 +1120,8 @@ def load_run_plan(db_path: str, run_id: str, target_root: str) -> Optional[dict]
                 if pdir and pfiles:
                     fgs.append({"dir": pdir, "files": pfiles})
             out["focus_groups"] = fgs
+        if isinstance(raw_plan.get("passes"), int) and not isinstance(raw_plan.get("passes"), bool) and raw_plan["passes"] > 1:
+            out["passes"] = int(raw_plan["passes"])
         return out
     except Exception:
         return None
@@ -1097,48 +1172,228 @@ def run_scan_mode(db_path: str, run_id: str) -> str:
         return ""
 
 
+def _norm_ts(raw: Any) -> str:
+    text = str(raw or "").strip().replace("T", " ")
+    return text[:19] if len(text) >= 19 else text
+
+
+# The run id the knowledge importer files records under when the export did
+# not say which run produced them. Never a run this database executed.
+_IMPORT_SENTINEL_RUN_ID = "imported"
+
+
+def _meta_imported(metadata_json: Any) -> bool:
+    if not metadata_json:
+        return False
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return False
+    return isinstance(meta, dict) and bool(meta.get("imported"))
+
+
+def _imported_run_ids(conn: sqlite3.Connection) -> set[str]:
+    """Run ids the knowledge importer recorded (`runs.metadata_json` carries
+    `imported: true`) plus the importer's sentinel id. Their history is
+    evidence from another database, never a run `--resume` can continue."""
+    out: set[str] = {_IMPORT_SENTINEL_RUN_ID}
+    try:
+        for rid, meta_json in conn.execute(
+            "SELECT run_id, metadata_json FROM runs WHERE run_id IS NOT NULL AND run_id != ''"
+        ).fetchall():
+            if _meta_imported(meta_json):
+                out.add(str(rid).strip())
+    except sqlite3.OperationalError:
+        pass
+    return out
+
+
+def run_known(db_path: str, run_id: str) -> tuple[bool, str]:
+    """Checks whether `run_id` exists in `runs`, `campaign_spend`, or `findings`,
+    and returns `(exists, recorded_target)`. A run the knowledge importer
+    recorded is not known: it never ran here, so there is nothing to resume.
+    Never raises (INV-6)."""
+    if not db_path or not run_id or not _db_exists(db_path):
+        return False, ""
+    rid = str(run_id).strip()
+    if not rid:
+        return False, ""
+    found = False
+    recorded_target = ""
+    conn = None
+    try:
+        conn = _connect(db_path)
+        if rid in _imported_run_ids(conn):
+            return False, ""
+        try:
+            rrow = conn.execute(
+                "SELECT metadata_json FROM runs WHERE run_id = ? LIMIT 1",
+                (rid,),
+            ).fetchone()
+            if rrow is not None:
+                found = True
+                try:
+                    meta = json.loads(rrow[0] or "{}")
+                except (TypeError, ValueError):
+                    meta = {}
+                if isinstance(meta, dict):
+                    recorded_target = str(meta.get("target") or meta.get("target_root") or "").strip()
+        except sqlite3.OperationalError:
+            pass
+        try:
+            srows = [
+                r
+                for r in conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL AND target != ''",
+                    (rid,),
+                ).fetchall()
+                if not _meta_imported(r[1])
+            ]
+            if srows:
+                found = True
+                if not recorded_target:
+                    spend_targets = sorted({os.path.realpath(str(r[0])).rstrip("/") for r in srows if r[0]})
+                    if len(spend_targets) == 1:
+                        recorded_target = spend_targets[0]
+                    elif spend_targets:
+                        try:
+                            recorded_target = os.path.commonpath(spend_targets).rstrip("/")
+                        except ValueError:
+                            recorded_target = spend_targets[0]
+        except sqlite3.OperationalError:
+            pass
+        if not found:
+            try:
+                frow = conn.execute(
+                    "SELECT 1 FROM findings WHERE run_id = ? LIMIT 1",
+                    (rid,),
+                ).fetchone()
+                if frow is not None:
+                    found = True
+            except sqlite3.OperationalError:
+                pass
+        return found, recorded_target
+    except Exception:
+        return False, ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
 def latest_run_id(db_path: str, target: str = "") -> str:
-    """The most recent run recorded in this database, preferring runs whose
-    ledger rows fall under `target` so `--resume` in one repository does not
-    pick up a run over another. Falls back to the findings table for a run
-    that never completed a campaign. '' when there is nothing to resume.
-    Never raises.
+    """The most recent run recorded in this database across `runs`,
+    `campaign_spend`, and `findings`, scoped to `target` so `--resume` in one
+    repository never picks up a run over another and a first-campaign pause
+    (before any `campaign_spend` row exists) is still found. Falls back only to
+    legacy rootless runs when `target` is given. '' when there is nothing to
+    resume. Never raises.
     """
-    if not db_path or not os.path.exists(db_path):
+    if not db_path or not _db_exists(db_path):
         return ""
-    root = os.path.realpath(target) if target else ""
+    root = os.path.realpath(target).rstrip("/") if target else ""
+    merged: dict[str, dict[str, Any]] = {}
+    seq = 0
+
+    def _touch(rid_raw: Any, ts_raw: Any, t_raw: Any = "") -> None:
+        nonlocal seq
+        rid = str(rid_raw or "").strip()
+        if not rid:
+            return
+        seq += 1
+        slot = merged.setdefault(rid, {"ts": "", "targets": set(), "seq": seq})
+        ts = _norm_ts(ts_raw)
+        if ts >= slot["ts"]:
+            slot["ts"] = ts
+            slot["seq"] = seq
+        t_str = str(t_raw or "").strip()
+        if t_str:
+            slot["targets"].add(t_str)
+
     try:
         conn = _connect(db_path)
         try:
-            candidates: list = []
-            for sql in (
-                "SELECT run_id, target, MAX(timestamp) AS ts FROM campaign_spend "
-                "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id",
-                "SELECT run_id, '' AS target, MAX(timestamp) AS ts FROM findings "
-                "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id",
-            ):
-                try:
-                    candidates += [tuple(r) for r in conn.execute(sql).fetchall()]
-                except sqlite3.OperationalError:
-                    continue
+            # Runs the knowledge importer recorded never ran here: the import
+            # stamps them with the current time and this repository's root,
+            # so counting them would hand `--resume` a foreign historic run.
+            imported = _imported_run_ids(conn)
+            try:
+                grouped: dict[tuple[str, Any], list[Any]] = {}
+                for run_id_col, spend_target, ts, row_id, meta_json in conn.execute(
+                    "SELECT run_id, target, timestamp, id, metadata_json FROM campaign_spend "
+                    "WHERE run_id IS NOT NULL AND run_id != '' ORDER BY id ASC"
+                ).fetchall():
+                    if str(run_id_col).strip() in imported or _meta_imported(meta_json):
+                        continue
+                    slot = grouped.setdefault((run_id_col, spend_target), [None, 0])
+                    if ts is not None and (slot[0] is None or str(ts) > str(slot[0])):
+                        slot[0] = ts
+                    slot[1] = row_id
+                for (run_id_col, spend_target), (ts, _max_id) in sorted(
+                    grouped.items(), key=lambda kv: kv[1][1]
+                ):
+                    _touch(run_id_col, ts, spend_target)
+            except sqlite3.OperationalError:
+                pass
+            try:
+                for run_id_col, ts, _max_id in conn.execute(
+                    "SELECT run_id, MAX(timestamp) AS ts, MAX(id) AS max_id FROM findings "
+                    "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id ORDER BY max_id ASC"
+                ).fetchall():
+                    if str(run_id_col).strip() in imported:
+                        continue
+                    _touch(run_id_col, ts, "")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                for run_id_col, meta_json, started in conn.execute(
+                    "SELECT run_id, metadata_json, started FROM runs "
+                    "WHERE run_id IS NOT NULL AND run_id != '' ORDER BY rowid ASC"
+                ).fetchall():
+                    if str(run_id_col).strip() in imported:
+                        continue
+                    r_target = ""
+                    try:
+                        meta = json.loads(meta_json or "{}")
+                        if isinstance(meta, dict):
+                            r_target = str(meta.get("target") or meta.get("target_root") or "").strip()
+                    except (TypeError, ValueError):
+                        r_target = ""
+                    _touch(run_id_col, started, r_target)
+            except sqlite3.OperationalError:
+                pass
         finally:
             conn.close()
     except Exception:
         return ""
-    if not candidates:
+    if not merged:
         return ""
 
-    def under_root(t: str) -> bool:
-        if not root or not t:
-            return not root
+    if not root:
+        ordered = sorted(merged.items(), key=lambda kv: (kv[1]["ts"], kv[1]["seq"]), reverse=True)
+        return str(ordered[0][0])
+
+    def _under_root(t: str) -> bool:
         try:
-            rt = os.path.realpath(t)
-            return rt == root or os.path.commonpath([rt, root]) == root
+            rt = os.path.realpath(t).rstrip("/")
+            return rt == root or os.path.commonpath([rt, root]).rstrip("/") == root
         except (ValueError, OSError):
             return False
 
-    scoped = [c for c in candidates if under_root(str(c[1] or ""))] or candidates
-    scoped.sort(key=lambda c: str(c[2] or ""), reverse=True)
+    scoped = [
+        (rid, info)
+        for rid, info in merged.items()
+        if info["targets"] and any(_under_root(t) for t in info["targets"])
+    ]
+    if not scoped:
+        # Legacy rootless fallback ONLY (never hijack to another known repository).
+        scoped = [(rid, info) for rid, info in merged.items() if not info["targets"]]
+    if not scoped:
+        return ""
+    scoped.sort(key=lambda kv: (kv[1]["ts"], kv[1]["seq"]), reverse=True)
     return str(scoped[0][0])
 
 
@@ -1205,6 +1460,18 @@ def record_spend(
                 pass
 
 
+def _usable_cost_row(metadata_json: Any) -> bool:
+    if not metadata_json:
+        return True
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return True
+    if not isinstance(meta, dict):
+        return True
+    return not bool(meta.get("unexamined") or meta.get("resumed_tail") or meta.get("partial"))
+
+
 def observed_campaign_cost(
     db_path: str, scan_mode: str = "", limit: int = 200
 ) -> tuple[Optional[int], int]:
@@ -1236,19 +1503,19 @@ def observed_campaign_cost(
             # and the member-stamp exclusion must not depend on its value.
             if scan_mode:
                 cur.execute(
-                    "SELECT tokens FROM campaign_spend WHERE scan_mode = ? "
+                    "SELECT tokens, metadata_json FROM campaign_spend WHERE scan_mode = ? "
                     "AND tokens > 0 AND tokens >= ? "
                     "ORDER BY id DESC LIMIT ?",
                     (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),
                 )
-                rows = [r[0] for r in cur.fetchall()]
+                rows = [r[0] for r in cur.fetchall() if _usable_cost_row(r[1])]
             if not rows:
                 cur.execute(
-                    "SELECT tokens FROM campaign_spend WHERE tokens > 0 AND tokens >= ? "
+                    "SELECT tokens, metadata_json FROM campaign_spend WHERE tokens > 0 AND tokens >= ? "
                     "ORDER BY id DESC LIMIT ?",
                     (_MIN_CREDIBLE_OBSERVATION, int(limit)),
                 )
-                rows = [r[0] for r in cur.fetchall()]
+                rows = [r[0] for r in cur.fetchall() if _usable_cost_row(r[1])]
     except (sqlite3.Error, OSError, TypeError, ValueError):
         return (None, 0)
     finally:

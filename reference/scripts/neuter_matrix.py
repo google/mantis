@@ -104,6 +104,9 @@ SCENARIOS = {
     ],
     "r3_revert_db_path_anchor": [
         ("core/database.py",
+         "    if db_path and db_path != \":memory:\":\n        db_path = resolve_db_path(db_path)",
+         "    pass  # NEUTERED"),
+        ("core/database.py",
          "    db_path = resolve_db_path(db_path)",
          "    pass  # NEUTERED"),
         ("scripts/advise.py",
@@ -510,7 +513,7 @@ SCENARIOS = {
     ],
     "cost_revert_mode_isolation": [
         ('core/cost.py',
-         '            if scan_mode:\n                cur.execute(\n                    "SELECT tokens FROM campaign_spend WHERE scan_mode = ? "\n                    "AND tokens > 0 AND tokens >= ? "\n                    "ORDER BY id DESC LIMIT ?",\n                    (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),\n                )\n                rows = [r[0] for r in cur.fetchall()]',
+         '            if scan_mode:\n                cur.execute(\n                    "SELECT tokens, metadata_json FROM campaign_spend WHERE scan_mode = ? "\n                    "AND tokens > 0 AND tokens >= ? "\n                    "ORDER BY id DESC LIMIT ?",\n                    (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),\n                )\n                rows = [r[0] for r in cur.fetchall() if _usable_cost_row(r[1])]',
          '            pass  # NEUTERED: cheap file scans make subsystem scans look affordable'),
     ],
     "cost_revert_sizing_lowers_only": [
@@ -1309,8 +1312,8 @@ SCENARIOS = {
          '                    "AND tokens > 0 AND tokens >= ? "',
          '                    "AND tokens >= ? "'),
         ("core/cost.py",
-         '                    "SELECT tokens FROM campaign_spend WHERE tokens > 0 AND tokens >= ? "',
-         '                    "SELECT tokens FROM campaign_spend WHERE tokens >= ? "'),
+         '                    "SELECT tokens, metadata_json FROM campaign_spend WHERE tokens > 0 AND tokens >= ? "',
+         '                    "SELECT tokens, metadata_json FROM campaign_spend WHERE tokens >= ? "'),
         ("core/cost.py",
          "                    (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),",
          "                    (str(scan_mode), 0, int(limit)),"),

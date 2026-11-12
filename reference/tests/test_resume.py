@@ -134,8 +134,8 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(latest_run_id(self.db, self.root), "new-here")
         self.assertEqual(latest_run_id(self.db, other), "new-elsewhere")
         self.assertEqual(latest_run_id(self.db), "new-elsewhere", "no target: the newest run anywhere")
-        self.assertEqual(latest_run_id(self.db, os.path.join(self.tmp, "nowhere")), "new-elsewhere",
-                         "nothing under the target: fall back to the newest run anywhere")
+        self.assertEqual(latest_run_id(self.db, os.path.join(self.tmp, "nowhere")), "",
+                         "nothing under the target and no legacy rootless run: return empty")
 
     def test_latest_run_id_falls_back_to_findings(self):
         from core.database import init_db, write_findings
