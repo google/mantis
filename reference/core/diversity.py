@@ -139,6 +139,10 @@ def measure(
         def _status(f: Dict[str, Any]) -> str:
             return str(f.get("status") or "").strip().lower()
 
+        # Closed prior-run/regression rows (mitigated, archived) are neither live
+        # claims nor triage rejections of this run.
+        rows = [f for f in rows if _status(f) not in ("mitigated", "archived")]
+
         # Three outcomes, not two. A finding still sitting at the schema default has not
         # been rejected -- nobody has looked at it yet.
         rejected_rows = [f for f in rows if _status(f) in _REJECTED]

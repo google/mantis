@@ -9345,7 +9345,8 @@ class TestSuppressionIsCaseInsensitive(unittest.TestCase):
 
         for status in ("FALSE_POSITIVE", "false_positive", "False_Positive",
                        "NON_VIABLE", "non_viable", "DUPLICATE_MERGED",
-                       "SAMPLE_OR_TEST", "REPORTED", "  false_positive  "):
+                       "SAMPLE_OR_TEST", "REPORTED", "mitigated", "MITIGATED",
+                       "  false_positive  "):
             with self.subTest(status=status):
                 self.assertTrue(
                     is_suppressed(status),
@@ -9929,13 +9930,13 @@ class TestStatusIntegrity(unittest.TestCase):
         # promotion path, not that the graph stalls.
         self.assertIsNotNone(event)
 
-    def test_confirmed_verdict_writes_nothing(self):
-        """Promotion statuses stay owned by on_enter_status stamps, which are
-        gated (dynamic requires sandbox_executed). The classifier must not
-        become a second, ungated promotion path."""
+    def test_confirmed_verdict_stamps_confirmed_never_dynamic_proof(self):
+        """Reviewer confirmation stamps Rank-2 static `confirmed` so findings
+        survive downstream fallbacks or static-only skips without ever claiming
+        sandbox-gated dynamic proof (`dynamic_confirmed` / `patch_verified`)."""
         self._seed("app.py", "r_cls")
         self._run_classifier({"route": "confirmed", "reason": "Real."})
-        self.assertEqual(self._status_of("app.py"), "reported")
+        self.assertEqual(self._status_of("app.py"), "confirmed")
 
     def test_verdict_persistence_survives_a_broken_database(self):
         """A broken database must never break routing."""

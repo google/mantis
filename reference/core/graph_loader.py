@@ -32,7 +32,7 @@ from google.genai import types
 from core.prompts import get_stage_prompt, STAGE_PROMPTS
 
 
-from core.config import get_llm_kwargs, resolve_model_id, DEFAULT_MODEL, ResilientLiteLlm, DeferredEnvLiteLlm, ExtendedReviewVerdict
+from core.config import get_llm_kwargs, resolve_model_id, DEFAULT_MODEL, ResilientLiteLlm, DeferredEnvLiteLlm, ExtendedReviewVerdict, ExtendedCriticVerdict
 from core.config import context_editing_keeps as _context_editing_keeps
 
 LiteLlm = ResilientLiteLlm
@@ -256,7 +256,33 @@ def _persist_dismissal_verdict(node_id: str, route, verdict) -> None:
         if rc is None or not rc.db_path or not rc.run_id or not rc.target_file:
             return
         from core.database import update_status
-        update_status(rc.db_path, rc.target_file, rc.run_id, route, campaign=rc.target_file)
+        rc_pass = int(getattr(rc, "pass_index", 1) or 1)
+        note = f"[{node_id}] {reason}" if reason else ""
+        promoted = getattr(rc, "promoted_finding_ids", None)
+        if promoted is not None:
+            if not promoted:
+                return
+            update_status(
+                rc.db_path,
+                rc.target_file,
+                rc.run_id,
+                route,
+                finding_ids=sorted(int(i) for i in promoted),
+                campaign=rc.target_file,
+                pass_index=rc_pass,
+                note=note,
+            )
+            rc.promoted_finding_ids = set()
+        else:
+            update_status(
+                rc.db_path,
+                rc.target_file,
+                rc.run_id,
+                route,
+                campaign=rc.target_file,
+                pass_index=rc_pass,
+                note=note,
+            )
     except Exception as exc:
         print(f"[{node_id}] could not persist '{route}' verdict: {exc}", file=sys.stderr)
 
@@ -351,14 +377,20 @@ def _persist_finding_dismissals(node_id: str, entries: list[dict]) -> None:
         from core.database import update_finding_status_by_id
 
         scope = getattr(rc, "target_file", None) or None
+        rc_pass = int(getattr(rc, "pass_index", 1) or 1)
+        promoted = getattr(rc, "promoted_finding_ids", None)
         for e in dismissals:
             if e["finding_id"] is None:
                 continue
             try:
+                note = f"[{node_id}] {e['reason']}" if e.get("reason") else ""
                 update_finding_status_by_id(
                     rc.db_path, e["finding_id"], rc.run_id, e["route"],
                     scope_path=scope, campaign=scope,
+                    pass_index=rc_pass, note=note,
                 )
+                if promoted is not None:
+                    promoted.discard(int(e["finding_id"]))
             except Exception as exc:
                 print(
                     f"[{node_id}] could not persist '{e['route']}' for finding {e['finding_id']}: {exc}",
@@ -368,7 +400,148 @@ def _persist_finding_dismissals(node_id: str, entries: list[dict]) -> None:
         print(f"[{node_id}] per-finding dismissal persistence skipped: {exc}", file=sys.stderr)
 
 
-def _derive_campaign_route(entries: list[dict]) -> str:
+_PROMOTION_ROUTE_STATUS = {
+    "confirmed": "confirmed",
+    "viable": "static_confirmed",
+}
+
+
+def _persist_finding_promotions(
+    node_id: str,
+    entries: list[dict],
+    route: Optional[str],
+    verdict: Any,
+) -> None:
+    """Stamps reviewer/critic promotions deterministically and tracks the
+    surviving promoted finding cohort on RunContext.promoted_finding_ids.
+
+    Placed strictly below _persist_dismissal_verdict so first-occurrence text
+    rewrites on _persist_dismissal_verdict never collide here.
+    """
+    try:
+        from core.context import current_run_context
+        rc = current_run_context.get()
+        if rc is None or not rc.db_path or not rc.run_id:
+            return
+        from core.database import CONFIRMED_LIVE_STATUSES, read_findings, update_finding_status_by_id, update_status
+
+        scope = getattr(rc, "target_file", None) or None
+        rc_pass = int(getattr(rc, "pass_index", 1) or 1)
+        prior_promoted = getattr(rc, "promoted_finding_ids", None)
+
+        if entries:
+            open_ids = set(
+                _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id, pass_index=rc_pass)
+            )
+            mentioned_ids = {int(e["finding_id"]) for e in entries if e.get("finding_id") is not None}
+            omitted = sorted(open_ids - mentioned_ids)
+            unknown = sorted(mentioned_ids - open_ids)
+            if omitted or unknown:
+                print(
+                    f"[{node_id}] partial finding_verdicts coverage (omitted={omitted}, out_of_scope={unknown}).",
+                    file=sys.stderr,
+                )
+
+            promo_entries = [
+                e for e in entries
+                if e.get("finding_id") is not None
+                and e.get("route") in _PROMOTION_ROUTE_STATUS
+                and not str(e.get("reason") or "").lstrip().startswith("Fallback:")
+            ]
+            has_non_fallback_judgment = any(
+                e.get("finding_id") is not None
+                and not str(e.get("reason") or "").lstrip().startswith("Fallback:")
+                for e in entries
+            )
+            is_critic_stage = "critic" in node_id or any(
+                e.get("route") in ("viable", "non_viable") for e in entries
+            )
+            surviving: set[int] = set()
+            for e in promo_entries:
+                fid = int(e["finding_id"])
+                if is_critic_stage and prior_promoted is not None and fid not in prior_promoted:
+                    print(
+                        f"[{node_id}] skipping promotion of unreviewed finding #{fid} (not in reviewer-promoted cohort).",
+                        file=sys.stderr,
+                    )
+                    continue
+                target_status = _PROMOTION_ROUTE_STATUS[e["route"]]
+                note = f"[{node_id}] {e['reason']}" if e.get("reason") else ""
+                try:
+                    update_finding_status_by_id(
+                        rc.db_path,
+                        fid,
+                        rc.run_id,
+                        target_status,
+                        scope_path=scope,
+                        campaign=scope,
+                        pass_index=rc_pass,
+                        note=note,
+                    )
+                    surviving.add(fid)
+                except Exception as exc:
+                    print(
+                        f"[{node_id}] could not persist '{target_status}' for finding {fid}: {exc}",
+                        file=sys.stderr,
+                    )
+            if has_non_fallback_judgment:
+                rc.promoted_finding_ids = surviving
+            return
+
+        # Empty finding_verdicts == INV-6 campaign-level fallback.
+        if route not in _PROMOTION_ROUTE_STATUS:
+            return
+        reason = ""
+        if isinstance(verdict, dict):
+            reason = str(verdict.get("reason") or "")
+        elif hasattr(verdict, "reason"):
+            reason = str(getattr(verdict, "reason") or "")
+        if str(reason or "").lstrip().startswith("Fallback:"):
+            return
+        if not rc.target_file:
+            return
+        target_status = _PROMOTION_ROUTE_STATUS[route]
+        note = f"[{node_id}] {reason}" if reason else ""
+        if prior_promoted is not None:
+            if not prior_promoted:
+                return
+            update_status(
+                rc.db_path,
+                rc.target_file,
+                rc.run_id,
+                target_status,
+                finding_ids=sorted(int(i) for i in prior_promoted),
+                campaign=rc.target_file,
+                pass_index=rc_pass,
+                note=note,
+            )
+        else:
+            update_status(
+                rc.db_path,
+                rc.target_file,
+                rc.run_id,
+                target_status,
+                campaign=rc.target_file,
+                pass_index=rc_pass,
+                note=note,
+            )
+            rows = read_findings(
+                rc.db_path,
+                run_id=rc.run_id,
+                scope_path=scope,
+                campaign=scope,
+                pass_index=rc_pass,
+            )
+            rc.promoted_finding_ids = {
+                int(r["id"])
+                for r in rows
+                if r.get("id") is not None and str(r.get("status") or "").lower() in CONFIRMED_LIVE_STATUSES
+            }
+    except Exception as exc:
+        print(f"[{node_id}] finding promotion persistence skipped: {exc}", file=sys.stderr)
+
+
+def _derive_campaign_route(entries: list[dict], declared_routes: Sequence[str] = ()) -> str:
     """Aggregates per-finding verdicts into the single campaign route.
 
     Any promoted finding routes the campaign forward: promotion means at
@@ -380,6 +553,11 @@ def _derive_campaign_route(entries: list[dict]) -> str:
     13-false_positive / 1-non_viable split reads as the false_positive
     campaign it substantively is.
     """
+    if declared_routes:
+        declared_set = {str(r).lower().strip() for r in declared_routes}
+        for e in entries:
+            if e["route"] in declared_set:
+                return e["route"]
     for e in entries:
         if e["route"] not in _DISMISSAL_ROUTES:
             return e["route"]
@@ -393,13 +571,24 @@ def _derive_campaign_route(entries: list[dict]) -> str:
     return max(order, key=lambda r: counts[r])
 
 
-def _active_campaign_finding_ids(db_path: str, target_file: str, run_id: str) -> list[int]:
+def _active_campaign_finding_ids(
+    db_path: str,
+    target_file: str,
+    run_id: str,
+    pass_index: Optional[int] = None,
+) -> list[int]:
     """Ids of the campaign's findings that a stamp could still move."""
     from core.database import read_findings
 
     closed = {"false_positive", "duplicate_merged", "non_viable", "sample_or_test", "mitigated", "patch_verified"}
     try:
-        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None, campaign=target_file or None)
+        rows = read_findings(
+            db_path,
+            run_id=run_id,
+            scope_path=target_file or None,
+            campaign=target_file or None,
+            pass_index=pass_index,
+        )
     except Exception:
         return []
     return [int(r["id"]) for r in rows
@@ -426,6 +615,11 @@ def stamp_finding_ids(rc, new_status: str) -> Optional[list[int]]:
     caller prints says so.
     """
     status = str(new_status or "").lower().strip()
+    if status == "static_confirmed":
+        promoted = getattr(rc, "promoted_finding_ids", None)
+        if promoted is not None:
+            return sorted(int(i) for i in promoted)
+        return None
     if status not in ("dynamic_confirmed", "patch_verified"):
         return None
     evidence = dict(getattr(rc, "finding_evidence", None) or {})
@@ -438,7 +632,8 @@ def stamp_finding_ids(rc, new_status: str) -> Optional[list[int]]:
     if earned:
         return sorted(set(earned))
     if status == "dynamic_confirmed" and getattr(rc, "sandbox_executed", False):
-        open_ids = _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id)
+        rc_pass = int(getattr(rc, "pass_index", 1) or 1)
+        open_ids = _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id, pass_index=rc_pass)
         if len(open_ids) == 1:
             return open_ids
     return []
@@ -457,15 +652,17 @@ def apply_completion_stamp(rc, new_status: str, node_id: str = "") -> Optional[l
     if status in ("dynamic_confirmed", "patch_verified") and not getattr(rc, "sandbox_executed", False):
         return []
     ids = stamp_finding_ids(rc, status)
+    rc_pass = int(getattr(rc, "pass_index", 1) or 1)
+    pass_kw = {"pass_index": rc_pass} if rc_pass > 1 else {}
     try:
         if ids is None:
-            update_status(rc.db_path, rc.target_file, rc.run_id, status, campaign=rc.target_file)
+            update_status(rc.db_path, rc.target_file, rc.run_id, status, campaign=rc.target_file, **pass_kw)
         else:
             if ids:
                 update_status(rc.db_path, rc.target_file, rc.run_id, status, finding_ids=ids,
-                              campaign=rc.target_file)
+                              campaign=rc.target_file, **pass_kw)
             if status in ("dynamic_confirmed", "patch_verified"):
-                left = [i for i in _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id)
+                left = [i for i in _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id, pass_index=rc_pass)
                         if i not in set(ids)]
                 tag = f"[{node_id}] " if node_id else ""
                 shown = ", ".join(str(i) for i in ids) if ids else "none"
@@ -521,6 +718,8 @@ def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
             if new_status in ("dynamic_confirmed", "patch_verified") and not rc.sandbox_executed:
                 return None
             apply_completion_stamp(rc, new_status, node_id)
+            if new_status == "static_confirmed" and getattr(rc, "sandbox_executed", False):
+                apply_completion_stamp(rc, "dynamic_confirmed", node_id)
         except Exception as exc:
             print(
                 f"[{node_id}] could not stamp completion status '{new_status}': {exc}",
@@ -584,13 +783,15 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
         finding_entries = _coerce_finding_verdicts(verdict)
         if finding_entries:
             _persist_finding_dismissals(node_id, finding_entries)
-            route = _derive_campaign_route(finding_entries)
+            _persist_finding_promotions(node_id, finding_entries, route, verdict)
+            route = _derive_campaign_route(finding_entries, declared_routes=routes)
         else:
             # Persisted on the PARSED route, before any routing decision: dismissal
             # routes are deliberately undeclared in workflow.json (they fall through
             # DEFAULT_ROUTE to the calibrator), so a declared-routes-only hook would
             # never see them -- which is precisely how they went unrecorded before.
             _persist_dismissal_verdict(node_id, route, verdict)
+            _persist_finding_promotions(node_id, [], route, verdict)
 
         if max_visits and max_visits > 1 and visits >= max_visits:
             return adk.Event(output=node_input, state={state_key: visits}, route="exceeded")
@@ -2738,6 +2939,129 @@ class _BarrierAgent(adk.Agent):
         return True
 
 
+def validate_workflow_topology(
+    spec: WorkflowSpec,
+    *,
+    strict_synthesis: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Pure static topology & promotion-path validator for WorkflowSpec.
+
+    When `strict_synthesis=True`, raises `ValueError` on any topology or
+    missing-promotion-path violation so the LLM synthesis compiler-feedback
+    loop repairs the graph instead of emitting a dead-end workflow.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    nodes_by_id = {n.id: n for n in spec.nodes}
+    adj: dict[str, set[str]] = {"START": set(), **{nid: set() for nid in nodes_by_id}}
+    seen_pairs: set[tuple[str, str]] = set()
+    classifier_out_routes: dict[str, set[str]] = {
+        n.id: set() for n in spec.nodes if isinstance(n, ClassifierNode)
+    }
+
+    for edge_cfg in spec.edges:
+        f_id = edge_cfg.from_node
+        t_id = edge_cfg.to_node
+        route = edge_cfg.on
+        if f_id != "START" and f_id not in nodes_by_id:
+            errors.append(f"Edge references unknown from_node: '{f_id}'")
+            continue
+        if t_id not in nodes_by_id:
+            errors.append(f"Edge references unknown to_node: '{t_id}'")
+            continue
+        if (f_id, t_id) in seen_pairs:
+            errors.append(f"Duplicate edge from '{f_id}' to '{t_id}'.")
+        seen_pairs.add((f_id, t_id))
+        adj.setdefault(f_id, set()).add(t_id)
+
+        if isinstance(route, list) and DEFAULT_ROUTE in route:
+            errors.append(
+                f"Edge from '{f_id}' to '{t_id}' cannot combine '{DEFAULT_ROUTE}' in a route list."
+            )
+        if f_id in classifier_out_routes:
+            if isinstance(route, list):
+                classifier_out_routes[f_id].update(str(r) for r in route)
+            elif route is not None:
+                classifier_out_routes[f_id].add(str(route))
+
+    if nodes_by_id:
+        out_sources = {e.from_node for e in spec.edges if e.from_node != "START"}
+        terminal_nodes = set(nodes_by_id.keys()) - out_sources
+        if len(terminal_nodes) == 0:
+            errors.append("Workflow must have at least one terminal sink node.")
+        elif len(terminal_nodes) > 1:
+            msg = (
+                f"Workflow has multiple terminal sink nodes {sorted(terminal_nodes)}; "
+                "converge all paths onto a single terminal sink node (e.g. 'reporter')."
+            )
+            if strict_synthesis:
+                errors.append(msg)
+            else:
+                warnings.append(msg)
+
+        # Reachability from START
+        visited: set[str] = set()
+        queue = list(adj.get("START", ()))
+        while queue:
+            cur = queue.pop(0)
+            if cur in visited:
+                continue
+            visited.add(cur)
+            for nxt in adj.get(cur, ()):
+                if nxt not in visited:
+                    queue.append(nxt)
+        unreachable = sorted(set(nodes_by_id.keys()) - visited)
+        if unreachable:
+            msg = f"Unreachable node(s) from START: {unreachable}."
+            if strict_synthesis:
+                errors.append(msg)
+            else:
+                warnings.append(msg)
+
+    for cid, used_routes in classifier_out_routes.items():
+        if DEFAULT_ROUTE not in used_routes:
+            msg = f"Classifier '{cid}' has no '{DEFAULT_ROUTE}' fallback edge."
+            if strict_synthesis:
+                errors.append(msg)
+            else:
+                warnings.append(msg)
+
+    # Guaranteed finding promotion path check (synthesizer-1):
+    reporting_nodes = [
+        n.id
+        for n in spec.nodes
+        if isinstance(n, AgentNode) and "report_findings" in (n.tools or [])
+    ]
+    if reporting_nodes:
+        has_verdict_classifier_pair = False
+        has_stamp_node = False
+        for n in spec.nodes:
+            if not isinstance(n, AgentNode):
+                continue
+            if str(n.on_enter_status or "").strip().lower() in NODE_STAMP_STATUSES:
+                has_stamp_node = True
+            if n.output_schema in ("ReviewVerdict", "CriticVerdict"):
+                for target_id in adj.get(n.id, ()):
+                    if isinstance(nodes_by_id.get(target_id), ClassifierNode):
+                        has_verdict_classifier_pair = True
+        if not (has_verdict_classifier_pair or has_stamp_node):
+            msg = (
+                f"Workflow declares 'report_findings' on {reporting_nodes} without any finding "
+                "promotion gate: include a 'ReviewVerdict'/'CriticVerdict' reviewer/critic node "
+                "followed by a classifier node (e.g. 'review_decision'), or a stage with "
+                "on_enter_status='static_confirmed', so confirmed findings exit 'reported' status."
+            )
+            if strict_synthesis:
+                errors.append(msg)
+            else:
+                warnings.append(msg)
+
+    if strict_synthesis and errors:
+        raise ValueError("Graph topology validation failed:\n" + "\n".join(errors))
+    return errors, warnings
+
+
 def load_workflow_from_json(
     json_path: str,
     model_override: Optional[str] = None,
@@ -2952,6 +3276,8 @@ def load_workflow_from_json(
                     # extended model, the canonical schema stays bound and
                     # behavior is exactly pre-P6.
                     schema_cls = ExtendedReviewVerdict
+                elif node_cfg.output_schema == "CriticVerdict" and ExtendedCriticVerdict is not None:
+                    schema_cls = ExtendedCriticVerdict
             if node_cfg.fork_from is not None:
                 if node_cfg.fork_from == node_id:
                     errors.append(f"Node {node_id}: fork_from names itself.")
@@ -3029,6 +3355,17 @@ def load_workflow_from_json(
                         f"Never let one finding's weakness dismiss its siblings, and never let one finding's "
                         f"strength confirm them. The top-level route/reason then summarize the overall outcome "
                         f"(confirmed if ANY finding is confirmed)."
+                    )
+                elif node_cfg.output_schema == "CriticVerdict" and schema_cls is ExtendedCriticVerdict:
+                    instruction = (
+                        f"{instruction}\n\n"
+                        f"PER-FINDING VERDICTS: Each finding returned by get_findings is an INDEPENDENT "
+                        f"vulnerability claim and deserves its own reachability/viability judgment. When more "
+                        f"than one finding is in scope, your verdict JSON MUST include a \"finding_verdicts\" "
+                        f"list with one entry per finding: {{\"finding_id\": <numeric id from get_findings>, "
+                        f"\"route\": \"viable\" | \"non_viable\", \"reason\": \"<one sentence for THIS finding>\"}}. "
+                        f"Never let one unreachable finding dismiss its viable siblings. The top-level "
+                        f"route/reason summarize the overall outcome (viable if ANY finding is viable)."
                     )
 
             harness_nodes.append({
@@ -3209,6 +3546,10 @@ def load_workflow_from_json(
                         f"Edge from classifier '{from_str}' to '{to_str}' is missing route condition ('on')."
                     )
                 elif isinstance(route, list):
+                    if DEFAULT_ROUTE in route:
+                        errors.append(
+                            f"Edge from classifier '{from_str}' to '{to_str}' cannot combine '{DEFAULT_ROUTE}' with other routes in a list."
+                        )
                     for r in route:
                         if r not in declared_routes:
                             errors.append(
@@ -3259,6 +3600,10 @@ def load_workflow_from_json(
             errors.append(
                 "Workflow must have at least one terminal sink node, but found none (cycle without sink)."
             )
+
+    _, topo_warnings = validate_workflow_topology(spec, strict_synthesis=False)
+    for w in topo_warnings:
+        print(f"[WORKFLOW WARNING] {w}", file=sys.stderr)
 
     if errors:
         raise ValueError("Graph validation failed:\n" + "\n".join(errors))

@@ -1951,6 +1951,12 @@ def record_patch(
         )
         if res is None:
             return f"Error: Finding {finding_id} not found in active campaign scope."
+        if res.get("rejected_unverified_diff"):
+            return (
+                f"ERROR: Finding {res['finding_id']} already has a VERIFIED_SECURE patch; "
+                f"unverified/bypassed diff was NOT stored "
+                f"(patch_status={res['patch_status']}, status={res['status']})."
+            )
         return (
             f"SUCCESS: Recorded patch for finding {res['finding_id']} "
             f"(patch_status={res['patch_status']}, status={res['status']})."

@@ -104,6 +104,11 @@ class RunContext:
     # True on multi-campaign runs so per-campaign reporter defers to the single
     # post-run consolidated report pass.
     defer_reporter: bool = False
+    # Finding IDs explicitly promoted by the most recent per-finding classifier
+    # stage in this campaign/pass (None = no classifier has narrowed the cohort yet).
+    promoted_finding_ids: Optional[set[int]] = None
+    # Count of synthesized Fallback: verdict turns observed in this campaign.
+    verdict_fallbacks: int = 0
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

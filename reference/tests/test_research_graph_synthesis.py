@@ -444,17 +444,24 @@ class TestResearchGraphSynthesis(unittest.TestCase):
         bad_choice.message.content = '{"name": "broken_workflow", "nodes": []}'
         bad_response.choices = [bad_choice]
 
-        # Attempt 2 returns valid workflow JSON
+        # Attempt 2 returns valid workflow JSON (including promotion gate)
         good_workflow = {
             "name": "corrected_workflow",
             "config": {"sandbox": {"type": "static-only"}},
             "nodes": [
                 {"id": "researcher", "type": "agent", "skill": "mantis-researcher", "tools": ["read_file", "report_findings"]},
+                {"id": "reviewer", "type": "agent", "skill": "mantis-review", "tools": ["get_findings", "read_file"], "output_schema": "ReviewVerdict", "output_key": "verdict"},
+                {"id": "review_decision", "type": "classifier", "routes": ["confirmed"], "max_visits": 1},
+                {"id": "calibrator", "type": "agent", "skill": "mantis-calibrate", "tools": ["get_findings", "calibrate_finding", "score_risk"]},
                 {"id": "reporter", "type": "agent", "skill": "mantis-report", "tools": ["get_findings", "generate_report"]},
             ],
             "edges": [
                 {"from": "START", "to": "researcher"},
-                {"from": "researcher", "to": "reporter"},
+                {"from": "researcher", "to": "reviewer"},
+                {"from": "reviewer", "to": "review_decision"},
+                {"from": "review_decision", "to": "calibrator", "on": "confirmed"},
+                {"from": "review_decision", "to": "reporter", "on": "__DEFAULT__"},
+                {"from": "calibrator", "to": "reporter"},
             ],
         }
         good_response = MagicMock()

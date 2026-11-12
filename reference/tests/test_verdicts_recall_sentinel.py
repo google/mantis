@@ -416,9 +416,9 @@ class TestClassifierPerFindingVerdicts(unittest.TestCase):
             ],
         })
 
-        self.assertEqual(_status_of(self.db, "a.py"), "reported",
-                         "The promoted finding's path must never be stamped "
-                         "by sibling dismissals.")
+        self.assertEqual(_status_of(self.db, "a.py"), "confirmed",
+                         "The promoted finding's path must be stamped "
+                         "confirmed and never dismissed by sibling dismissals.")
         self.assertEqual(_status_of(self.db, "b.py"), "false_positive",
                          "Dismissal must persist, lowercase.")
         self.assertEqual(_status_of(self.db, "c.py"), "non_viable",
@@ -454,9 +454,9 @@ class TestClassifierPerFindingVerdicts(unittest.TestCase):
             ).fetchall())
         finally:
             conn.close()
-        self.assertEqual(rows[id_a], "reported",
-                         "The promoted finding must never be touched by a "
-                         "sibling's dismissal.")
+        self.assertEqual(rows[id_a], "confirmed",
+                         "The promoted finding must be stamped confirmed and "
+                         "never touched by a sibling's dismissal.")
         self.assertEqual(rows[id_b], "false_positive",
                          "The dismissed finding must be stamped even when a "
                          "promoted sibling shares its path.")
@@ -652,7 +652,7 @@ class TestClassifierPerFindingVerdicts(unittest.TestCase):
         })
         event = self._run_classifier(raw)
 
-        self.assertEqual(_status_of(self.db, "s1.py"), "reported")
+        self.assertEqual(_status_of(self.db, "s1.py"), "confirmed")
         self.assertEqual(_status_of(self.db, "s2.py"), "false_positive")
         self.assertEqual(event.actions.route, "confirmed")
 

@@ -202,10 +202,12 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 # fire from after_agent_callback, which resolves the db and
                 # finding through current_run_context.
                 self.assertEqual(cfg.get("on_enter_status"), {})
-                # sandbox_executed models the reproducer having actually run
-                # its PoC: INV-1's gate refuses dynamic_confirmed stamps from
-                # runs that never touched a sandbox.
-                ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file=target_file, run_id=run_id, sandbox_executed=True)
+                # sandbox_executed models reached-sink proof from the
+                # reproducer's PoC: INV-1's gate refuses dynamic_confirmed
+                # stamps without it. Only the successful-repro script carries
+                # that proof; a failed repro must stay static_confirmed.
+                ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file=target_file, run_id=run_id,
+                                 sandbox_executed=(expected_status == "dynamic_confirmed"))
                 tok = current_run_context.set(ctx)
                 msg = types.Content(parts=[types.Part.from_text(text="Evaluate file.py")], role="user")
                 executed_nodes = []
@@ -3465,6 +3467,12 @@ Parses JWT claims.
                 "patch_status": "applied",
                 "patch_diff": "--- a/src/auth.py\n+++ b/src/auth.py\n@@ -10,2 +10,2 @@\n- hdr = req.header\n+ hdr = sanitize(req.header)\n",
             }], run_id="run-1")
+            # write_findings never takes a model's word for VERIFIED_SECURE
+            # (INV-1); model a row whose patch the verifier actually re-attacked.
+            conn = sqlite3.connect(db_path)
+            conn.execute("UPDATE findings SET patch_status = 'VERIFIED_SECURE' WHERE title = 'Unsanitized Token Header'")
+            conn.commit()
+            conn.close()
 
             guidance = query_security_guidance(db_path, filepath="src/auth.py")
             summary = guidance["guidance_summary"]

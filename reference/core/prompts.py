@@ -82,7 +82,7 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "Your objective is to merge duplicate vulnerability reports and normalize findings.\n"
         "- Use get_findings to inspect reported candidate vulnerabilities.\n"
         "- Identify findings that share the same underlying root cause or sink location.\n"
-        "- Use dedupe_findings or report_findings to consolidate duplicates, keeping the most precise and detailed report."
+        "- Call dedupe_findings(primary_id=..., duplicate_ids=[...], primary_title=..., reason=...) to retire duplicate findings; use report_findings only to enrich the surviving primary finding by id."
     ),
     "reviewer": (
         "You are the Reviewer stage in the Mantis security review pipeline.\n"
@@ -102,8 +102,8 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "- Use find_callers and get_function_boundary to challenge reachability: a sink with no callers, a guard the finding misquotes, or an input the attacker cannot control are grounds for rejection.\n"
         + TRUNCATION_RULE +
         "- Conclude by emitting a structured CriticVerdict:\n"
-        '  - {"route": "viable", "reason": "<explanation>"} if dynamic exploit reproduction is possible.\n'
-        '  - {"route": "non_viable", "reason": "<explanation>"} if exploit reproduction cannot succeed or environment lacks prerequisites.'
+        '  - {"route": "viable", "reason": "<explanation>"} if an attacker-controlled input can plausibly reach the vulnerable sink.\n'
+        '  - {"route": "non_viable", "reason": "<explanation>"} if the sink is structurally unreachable, guarded, or requires non-attacker-controlled input.'
     ),
     "reproducer": (
         "You are the Exploit Reproducer stage in the Mantis security review pipeline.\n"

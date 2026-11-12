@@ -239,7 +239,12 @@ try:
         # route can therefore route conservatively but can never be learned.
         model_config = _PydanticConfigDict(extra="ignore")
         finding_id: int = Field(description="The numeric finding id exactly as returned by get_findings.")
-        route: str = Field(description="'confirmed' or 'false_positive' for THIS finding only.")
+        route: str = Field(
+            description=(
+                "'confirmed'/'false_positive' (reviewer) or 'viable'/'non_viable' (critic) "
+                "for THIS finding only."
+            )
+        )
         reason: str = Field(default="", description="One sentence justifying this finding's verdict.")
 
     class ExtendedReviewVerdict(_PydanticBaseModel):
@@ -259,9 +264,24 @@ try:
                 "Empty list = the top-level verdict applies to the whole campaign."
             ),
         )
+
+    class ExtendedCriticVerdict(_PydanticBaseModel):
+        """Structured critic verdict with optional per-finding verdicts."""
+
+        model_config = _PydanticConfigDict(extra="forbid")
+        route: _Literal["viable", "non_viable"]
+        reason: str = Field(description="One sentence justifying the verdict.")
+        finding_verdicts: list[FindingVerdict] = Field(
+            default_factory=list,
+            description=(
+                "One verdict per finding id from get_findings ('viable' or 'non_viable'). "
+                "Empty list = the top-level verdict applies to the promoted campaign findings."
+            ),
+        )
 except Exception:  # pragma: no cover - only when pydantic itself is absent
     FindingVerdict = None
     ExtendedReviewVerdict = None
+    ExtendedCriticVerdict = None
 
 DEFAULT_MODEL = "vertex_ai/gemini-3.8-flash"
 SUPPORTED_SANDBOXES = ("static-only", "static", "gvisor", "microsandbox", "gce", "remote")
@@ -2466,8 +2486,14 @@ class ResilientLiteLlm(LiteLlm):
                     '-- include one finding_verdicts entry PER finding id when multiple findings exist; '
                     'omit or leave the list empty only when there is a single finding or none'
                 )
-            elif schema_name == "CriticVerdict":
-                hint = '{"route": "viable" | "non_viable", "reason": "<explanation>"}'
+            elif schema_name in ("CriticVerdict", "ExtendedCriticVerdict"):
+                hint = (
+                    '{"route": "viable" | "non_viable", "reason": "<explanation>", '
+                    '"finding_verdicts": [{"finding_id": <id from get_findings>, '
+                    '"route": "viable" | "non_viable", "reason": "<one sentence>"}, ...]} '
+                    '-- include one finding_verdicts entry PER finding id when multiple findings exist; '
+                    'omit or leave the list empty only when there is a single finding or none'
+                )
             else:
                 hint = '{"route": "...", "reason": "..."}'
 
@@ -2622,10 +2648,16 @@ class ResilientLiteLlm(LiteLlm):
                 if not getattr(p, "thought", False)
             )
 
-        # Check if the text is valid JSON according to schema_cls
+        from google.genai import types
+        is_safety_block = getattr(response, "finish_reason", None) in (types.FinishReason.SAFETY, "SAFETY") or getattr(response, "error_code", None) == "SAFETY"
+
+        # Check if the text (or fenced/embedded JSON inside it) validates against schema_cls.
         is_valid = False
-        clean_text = text.strip()
-        if clean_text:
+        salvaged_json: Optional[str] = None
+        raw_stripped = text.strip()
+        if raw_stripped and not is_safety_block and not getattr(response, "error_code", None):
+            candidates: list[str] = [raw_stripped]
+            clean_text = raw_stripped
             if clean_text.startswith("```json"):
                 clean_text = clean_text[7:]
             elif clean_text.startswith("```"):
@@ -2633,26 +2665,65 @@ class ResilientLiteLlm(LiteLlm):
             if clean_text.endswith("```"):
                 clean_text = clean_text[:-3]
             clean_text = clean_text.strip()
+            if clean_text and clean_text not in candidates:
+                candidates.append(clean_text)
 
-            try:
-                if hasattr(schema_cls, "model_validate_json"):
-                    schema_cls.model_validate_json(clean_text)
-                    is_valid = True
-                elif hasattr(schema_cls, "validate_json"):
-                    schema_cls.validate_json(clean_text)
-                    is_valid = True
-            except Exception:
-                is_valid = False
+            for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE):
+                cand_fenced = m.group(1).strip()
+                if cand_fenced and cand_fenced not in candidates:
+                    candidates.append(cand_fenced)
 
-        from google.genai import types
-        is_safety_block = getattr(response, "finish_reason", None) in (types.FinishReason.SAFETY, "SAFETY") or getattr(response, "error_code", None) == "SAFETY"
+            decoder = json.JSONDecoder()
+            search_pos = 0
+            while True:
+                brace_idx = text.find("{", search_pos)
+                if brace_idx == -1:
+                    break
+                try:
+                    _obj, end_idx = decoder.raw_decode(text, brace_idx)
+                    if isinstance(_obj, dict):
+                        cand_obj = text[brace_idx:end_idx].strip()
+                        if cand_obj and cand_obj not in candidates:
+                            candidates.append(cand_obj)
+                    search_pos = end_idx
+                except Exception:
+                    search_pos = brace_idx + 1
+
+            for cand in candidates:
+                try:
+                    if hasattr(schema_cls, "model_validate_json"):
+                        validated = schema_cls.model_validate_json(cand)
+                        is_valid = True
+                        salvaged_json = (
+                            validated.model_dump_json()
+                            if cand != raw_stripped and hasattr(validated, "model_dump_json")
+                            else (cand if cand != raw_stripped else None)
+                        )
+                        break
+                    elif hasattr(schema_cls, "validate_json"):
+                        schema_cls.validate_json(cand)
+                        is_valid = True
+                        salvaged_json = cand if cand != raw_stripped else None
+                        break
+                except Exception:
+                    continue
+
         if is_safety_block:
             is_valid = False
+
+        if is_valid and salvaged_json is not None:
+            thought_parts = [p for p in (parts or []) if getattr(p, "thought", False)]
+            new_parts = thought_parts + [types.Part.from_text(text=salvaged_json)]
+            if getattr(response, "content", None) is None:
+                response.content = types.Content(role="model", parts=new_parts)
+            else:
+                response.content.parts = new_parts
+            return response
 
         if not is_valid:
             schema_name = getattr(schema_cls, "__name__", str(schema_cls))
             model_fields = getattr(schema_cls, "model_fields", None) or {}
-            if schema_name not in ("ReproVerdict", "ReviewVerdict", "ExtendedReviewVerdict", "CriticVerdict") and "route" not in model_fields:
+            if schema_name not in ("ReproVerdict", "ReviewVerdict", "ExtendedReviewVerdict", "CriticVerdict", "ExtendedCriticVerdict") and "route" not in model_fields:
                 # Non-verdict schemas (FindingCalibration, AuditPlan) have dedicated
                 # prose/JSON fallback parsers in their callers; replacing their text
                 # with a ReproVerdict payload would clobber those fallbacks.
@@ -2695,16 +2766,26 @@ class ResilientLiteLlm(LiteLlm):
                     # schema, so adding the key there would turn the
                     # fail-safe itself into a validation error.
                     fallback_payload["finding_verdicts"] = []
-            elif schema_name == "CriticVerdict":
+            elif schema_name in ("CriticVerdict", "ExtendedCriticVerdict"):
                 fallback_payload = {
                     "route": "non_viable",
                     "reason": f"Fallback: {clean_snippet}",
                 }
+                if schema_name == "ExtendedCriticVerdict":
+                    fallback_payload["finding_verdicts"] = []
             else:
                 fallback_payload = {
                     "route": "failed_repro",
                     "reason": f"Fallback: {clean_snippet}",
                 }
+
+            try:
+                from core.context import current_run_context
+                _rc = current_run_context.get()
+                if _rc is not None:
+                    _rc.verdict_fallbacks = int(getattr(_rc, "verdict_fallbacks", 0) or 0) + 1
+            except Exception:
+                pass
 
             fallback_json = json.dumps(fallback_payload)
             if getattr(response, "content", None) is None:
@@ -2777,11 +2858,13 @@ class ResilientLiteLlm(LiteLlm):
         attempt = 0
         empty_turns = 0
         auth_refreshed = False
+        schema_error_retried = False
         current_stream = stream
         while True:
             streamed_content = False  # per attempt: has this turn yielded an answer yet
             yielded_any = False       # per attempt: did upstream yield any LlmResponse at all
             pending_empty = None      # a final with no answer, held until the stream shows what follows
+            retry_schema_turn = False
             try:
                 from google.genai import types as genai_types
                 async for response in super().generate_content_async(llm_request, stream=current_stream):
@@ -2813,10 +2896,30 @@ class ResilientLiteLlm(LiteLlm):
                         # ends the turn, and only the stream's end says.
                         pending_empty = response
                         continue
+                    if (
+                        schema_cls is not None
+                        and not getattr(response, "partial", False)
+                        and not schema_error_retried
+                        and not streamed_content
+                        and (
+                            (
+                                getattr(response, "error_code", None)
+                                and str(getattr(response, "error_code", "")) not in ("SAFETY", "MAX_TOKENS")
+                            )
+                            or str(getattr(response, "finish_reason", "")).endswith("MALFORMED_FUNCTION_CALL")
+                        )
+                    ):
+                        meter_response_usage(response)
+                        schema_error_retried = True
+                        retry_schema_turn = True
+                        current_stream = False
+                        break
                     if response_has_meaningful_content(response):
                         streamed_content = True
                     yielded_any = True
                     yield self._sanitize_structured_response(response, schema_cls)
+                if retry_schema_turn:
+                    continue
                 if pending_empty is not None:
                     # The turn ended on it: an empty turn. Billed, so charged,
                     # before it is thrown away. A budget ceiling crossed here

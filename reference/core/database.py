@@ -106,26 +106,35 @@ def connect(db_path: str, timeout: Optional[float] = None,
             pass  # read-only media or a filesystem without shared-memory support
     return conn
 
-ACTIVE_STATUSES = (
-    "reported",
-    "static_confirmed",
-    "confirmed",
-    "viable",
-    "reproduced",
-    "dynamic_confirmed",
-    "patch_verified",
-)
 FALSE_POSITIVE_STATUSES = (
     "false_positive",
     "non_viable",
     "sample_or_test",
 )
+UNTRIAGED_STATUSES = ("reported",)
+CLOSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "mitigated", "archived")
+CONFIRMED_LIVE_STATUSES = (
+    "confirmed",
+    "viable",
+    "static_confirmed",
+    "reproduced",
+    "dynamic_confirmed",
+    "patch_verified",
+)
+OPEN_CONFIRMED_STATUSES = (
+    "confirmed",
+    "viable",
+    "static_confirmed",
+    "reproduced",
+    "dynamic_confirmed",
+)
+OPEN_FINDING_STATUSES = UNTRIAGED_STATUSES + OPEN_CONFIRMED_STATUSES
+ACTIVE_STATUSES = UNTRIAGED_STATUSES + CONFIRMED_LIVE_STATUSES
 ALL_STATUSES = ACTIVE_STATUSES + FALSE_POSITIVE_STATUSES
 
-# Statuses meaning "looked at and set aside". One definition, because the cost of
-# these drifting apart is silent: a finding counted as live in one place and dead in
-# another.
-SUPPRESSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "reported", "archived")
+# Statuses meaning "looked at and set aside" (closed verdicts, merges, mitigations,
+# archived code shifts) plus untriaged defaults that must never ship as confirmed alerts.
+SUPPRESSED_STATUSES = CLOSED_STATUSES + UNTRIAGED_STATUSES
 
 # A finding whose lines the code moved out from under it, and which a rescan
 # of that file, with the finding in front of it, did not report again. Not a
@@ -147,6 +156,11 @@ MONOTONIC_TERMINAL_STATUSES = frozenset({
 })
 
 
+def is_untriaged(status: Any) -> bool:
+    """True when a status represents an unreviewed initial candidate claim."""
+    return str(status or "").strip().lower() in UNTRIAGED_STATUSES
+
+
 def is_suppressed(status: Any) -> bool:
     """True when a status means the finding should not be presented as live.
 
@@ -161,6 +175,10 @@ def is_suppressed(status: Any) -> bool:
     any row written by an older build mismatched.
     """
     return str(status or "").strip().lower() in SUPPRESSED_STATUSES
+
+
+_migrated_additive_dbs: set = set()
+
 
 @contextmanager
 def _db(db_path: str, check_version: bool = True):
@@ -183,8 +201,18 @@ def _db(db_path: str, check_version: bool = True):
                         f"Database schema version mismatch in '{db_path}' (found version {v}, expected {CURRENT_SCHEMA_VERSION}). "
                         f"Schema changed: please delete '{db_path}' before running."
                     )
+                if db_path == ":memory:" or db_path not in _migrated_additive_dbs:
+                    _ensure_findings_additive_schema(cursor)
+                    if db_path != ":memory:":
+                        _migrated_additive_dbs.add(db_path)
         yield conn
         conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
@@ -352,10 +380,124 @@ def _drop_artifact_uniqueness(cursor) -> None:
     cursor.execute("ALTER TABLE campaign_artifacts__rebuilt RENAME TO campaign_artifacts")
 
 
+def _widen_findings_uniqueness_for_passes(cursor) -> None:
+    """Rebuilds findings when its composite UNIQUE index omits pass_index."""
+    try:
+        idx_rows = cursor.execute("PRAGMA index_list(findings)").fetchall()
+    except sqlite3.Error:
+        return
+    needs_rebuild = False
+    for row in idx_rows:
+        if row[2] == 1 and row[3] != "pk":
+            idx_name = str(row[1]).replace('"', '""')
+            cols = [r[2] for r in cursor.execute(f'PRAGMA index_info("{idx_name}")').fetchall()]
+            if "filepath" in cols and "run_id" in cols and "pass_index" not in cols:
+                needs_rebuild = True
+                break
+    if not needs_rebuild:
+        return
+    cursor.execute("DROP TABLE IF EXISTS findings__rebuilt")
+    cursor.execute("""
+        CREATE TABLE findings__rebuilt (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            filepath TEXT,
+            title TEXT,
+            severity TEXT,
+            description TEXT,
+            line_numbers TEXT NOT NULL DEFAULT '[]',
+            remediation TEXT,
+            status TEXT NOT NULL DEFAULT 'reported',
+            mantis_risk_score REAL,
+            impact_score INTEGER,
+            likelihood_score INTEGER,
+            priority TEXT,
+            signature TEXT,
+            lineage_id TEXT,
+            cwe TEXT,
+            triage_reasoning TEXT,
+            patch_diff TEXT,
+            patch_status TEXT,
+            rca_summary TEXT,
+            embedding BLOB,
+            code_paths TEXT NOT NULL DEFAULT '[]',
+            campaign TEXT,
+            pass_index INTEGER NOT NULL DEFAULT 1,
+            merged_into_id INTEGER DEFAULT NULL,
+            target_symbol TEXT DEFAULT NULL,
+            symbol_source TEXT DEFAULT NULL,
+            prose_signature TEXT DEFAULT NULL,
+            UNIQUE(filepath, title, description, line_numbers, run_id, pass_index)
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO findings__rebuilt (
+            id, run_id, timestamp, filepath, title, severity, description, line_numbers,
+            remediation, status, mantis_risk_score, impact_score, likelihood_score,
+            priority, signature, lineage_id, cwe, triage_reasoning, patch_diff,
+            patch_status, rca_summary, embedding, code_paths, campaign,
+            pass_index, merged_into_id, target_symbol, symbol_source, prose_signature
+        )
+        SELECT
+            id, run_id, timestamp, filepath, title, severity, description,
+            COALESCE(line_numbers, '[]'),
+            remediation, COALESCE(status, 'reported'), mantis_risk_score, impact_score, likelihood_score,
+            priority, signature, lineage_id, cwe, triage_reasoning, patch_diff,
+            patch_status, rca_summary, embedding, COALESCE(code_paths, '[]'), campaign,
+            COALESCE(pass_index, 1), merged_into_id, target_symbol, symbol_source, prose_signature
+        FROM findings
+    """)
+    cursor.execute("DROP TABLE findings")
+    cursor.execute("ALTER TABLE findings__rebuilt RENAME TO findings")
+
+
+def _ensure_findings_additive_schema(cursor) -> None:
+    """Idempotently reconciles additive columns and pass-scoped uniqueness on findings."""
+    try:
+        cursor.execute("PRAGMA table_info(findings)")
+        existing_cols = {col[1] for col in cursor.fetchall()}
+    except sqlite3.Error:
+        return
+    if not existing_cols:
+        return
+    if "rca_summary" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN rca_summary TEXT")
+    if "embedding" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN embedding BLOB")
+    if "code_paths" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN code_paths TEXT DEFAULT '[]'")
+    if "campaign" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN campaign TEXT")
+    if "pass_index" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN pass_index INTEGER NOT NULL DEFAULT 1")
+    if "merged_into_id" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN merged_into_id INTEGER DEFAULT NULL")
+    if "target_symbol" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN target_symbol TEXT DEFAULT NULL")
+    if "symbol_source" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN symbol_source TEXT DEFAULT NULL")
+    if "prose_signature" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN prose_signature TEXT DEFAULT NULL")
+    _widen_findings_uniqueness_for_passes(cursor)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_filepath ON findings(filepath)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_lineage ON findings(lineage_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_signature ON findings(signature)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_run_pass ON findings(run_id, pass_index)")
+
+
 def init_db(db_path: str):
     """Initialize the SQLite database with tables, unique indexes, and enforce schema versioning."""
+    # Open from the raw path: _db is the single chokepoint that anchors and
+    # symlink-checks every knowledge-database path (INV-4), so init_db must
+    # not resolve it a second time and mask that check.
     with _db(db_path, check_version=False) as conn:
         cursor = conn.cursor()
+        db_row = cursor.execute("PRAGMA database_list").fetchone()
+        resolved_target_db = str(db_row[2]) if db_row and db_row[2] else ":memory:"
+        if not conn.in_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='findings'")
         has_findings = cursor.fetchone() is not None
 
@@ -364,8 +506,8 @@ def init_db(db_path: str):
         v = row[0] if row else 0
         if has_findings and v != CURRENT_SCHEMA_VERSION:
             raise RuntimeError(
-                f"Database schema version mismatch in '{db_path}' (found version {v}, expected {CURRENT_SCHEMA_VERSION}). "
-                f"Schema changed: please delete '{db_path}' before running."
+                f"Database schema version mismatch in '{resolved_target_db}' (found version {v}, expected {CURRENT_SCHEMA_VERSION}). "
+                f"Schema changed: please delete '{resolved_target_db}' before running."
             )
 
         cursor.execute("""
@@ -394,20 +536,17 @@ def init_db(db_path: str):
                 embedding BLOB,
                 code_paths TEXT NOT NULL DEFAULT '[]',
                 campaign TEXT,
-                UNIQUE(filepath, title, description, line_numbers, run_id)
+                pass_index INTEGER NOT NULL DEFAULT 1,
+                merged_into_id INTEGER DEFAULT NULL,
+                target_symbol TEXT DEFAULT NULL,
+                symbol_source TEXT DEFAULT NULL,
+                prose_signature TEXT DEFAULT NULL,
+                UNIQUE(filepath, title, description, line_numbers, run_id, pass_index)
             )
         """)
-        if has_findings:
-            cursor.execute("PRAGMA table_info(findings)")
-            existing_cols = {col[1] for col in cursor.fetchall()}
-            if "rca_summary" not in existing_cols:
-                cursor.execute("ALTER TABLE findings ADD COLUMN rca_summary TEXT")
-            if "embedding" not in existing_cols:
-                cursor.execute("ALTER TABLE findings ADD COLUMN embedding BLOB")
-            if "code_paths" not in existing_cols:
-                cursor.execute("ALTER TABLE findings ADD COLUMN code_paths TEXT DEFAULT '[]'")
-            if "campaign" not in existing_cols:
-                cursor.execute("ALTER TABLE findings ADD COLUMN campaign TEXT")
+        _ensure_findings_additive_schema(cursor)
+        if resolved_target_db != ":memory:":
+            _migrated_additive_dbs.add(resolved_target_db)
 
         # Which model a run used. Every record the pipeline writes already
         # carries its run id, so provenance is a join away without touching
@@ -1121,7 +1260,9 @@ def run_belongs_to_active_target(
 
 def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = "",
                    verified_evidence: Optional[bool] = None,
-                   finding_evidence: Optional[Dict[str, dict]] = None):
+                   finding_evidence: Optional[Dict[str, dict]] = None,
+                   pass_index: Optional[int] = None,
+                   trusted_identity: bool = True):
     """Write structured findings to the database contextually associated with their canonical filepaths, stable signatures, lineages, and RCA summaries.
 
     `verified_evidence` is the harness's own record of whether this run has
@@ -1137,8 +1278,24 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
     without reaching the sink; a finding with no record of its own is
     VERIFICATION_INCOMPLETE however the campaign as a whole fared.
     """
+    eff_pass_index = 1
+    if pass_index is not None:
+        try:
+            eff_pass_index = max(1, int(pass_index))
+        except (TypeError, ValueError):
+            eff_pass_index = 1
+    else:
+        try:
+            from core.context import current_run_context
+            _ctx = current_run_context.get()
+            if _ctx is not None:
+                eff_pass_index = max(1, int(getattr(_ctx, "pass_index", 1) or 1))
+        except Exception:
+            eff_pass_index = 1
+
     with _db(db_path) as conn:
         cursor = conn.cursor()
+        _ensure_findings_additive_schema(cursor)
         _ensure_run_target_root(conn, run_id, active_target_root(filepath))
         # Which campaign is reporting: `filepath` is the campaign's target
         # (the tools pass RunContext.target_file). Recorded on every row the
@@ -1211,13 +1368,13 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 # are not this campaign's to rewrite.
                 if id_own_clause:
                     cursor.execute(
-                        f"SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? AND {id_own_clause} LIMIT 1",
-                        (explicit_id, run_id, *id_own_params),
+                        f"SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? AND COALESCE(pass_index, 1) = ? AND {id_own_clause} LIMIT 1",
+                        (explicit_id, run_id, eff_pass_index, *id_own_params),
                     )
                 else:
                     cursor.execute(
-                        "SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
-                        (explicit_id, run_id),
+                        "SELECT id, filepath FROM findings WHERE id = ? AND run_id = ? AND COALESCE(pass_index, 1) = ? LIMIT 1",
+                        (explicit_id, run_id, eff_pass_index),
                     )
                 matched_id_row = cursor.fetchone()
 
@@ -1245,7 +1402,8 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             raw_desc = str(finding.get("description") or "")
             raw_cwe = str(finding.get("cwe") or "")
             canonical_cwe = extract_canonical_cwe(raw_cwe, raw_title, raw_desc)
-            target_symbol = extract_target_symbol(raw_title, raw_desc, finding.get("code_paths"))
+            prose_symbol = extract_target_symbol(raw_title, raw_desc, finding.get("code_paths"))
+            target_symbol = prose_symbol
             # Ground the lineage symbol in the structural catalog where one
             # exists: the enclosing function at filepath:line is invariant to
             # prose, so a retitled re-report of the same defect keeps its
@@ -1253,9 +1411,17 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             grounded_symbol = ground_symbol_in_catalog(db_path, finding_filepath, line_numbers)
             if grounded_symbol:
                 target_symbol = grounded_symbol
+            symbol_source = "catalog" if grounded_symbol else ("prose" if target_symbol else None)
+            prose_signature = compute_stable_signature(
+                filepath=finding_filepath,
+                title=raw_title,
+                cwe=canonical_cwe,
+                symbol=prose_symbol,
+                description=raw_desc,
+            )
 
             # Compute or extract deterministic stable content signature
-            signature = str(finding.get("signature") or "").strip()
+            signature = str(finding.get("signature") or "").strip() if trusted_identity else ""
             if not signature:
                 signature = compute_stable_signature(
                     filepath=finding_filepath,
@@ -1322,17 +1488,19 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
 
             # Monotonic status protection during re-report (C3)
             cursor.execute(
-                "SELECT id, status FROM findings WHERE run_id = ? AND (signature = ? OR lineage_id = ?) LIMIT 1",
-                (run_id, signature, lineage_id),
+                "SELECT id, status FROM findings WHERE run_id = ? AND COALESCE(pass_index, 1) = ? AND (signature = ? OR lineage_id = ?) ORDER BY id DESC LIMIT 1",
+                (run_id, eff_pass_index, signature, lineage_id),
             )
             existing_row = cursor.fetchone()
             if existing_row:
                 # Case-folded: a legacy row dismissed as FALSE_POSITIVE must not be
                 # resurrected to `reported` just because its case predates the fold.
                 existing_status = (existing_row[1] or "").strip().lower()
-                if existing_status in ("dynamic_confirmed", "patch_verified") and finding_status in ("reported", "static_confirmed"):
+                if existing_status in ("dynamic_confirmed", "patch_verified") and finding_status in ("reported", "confirmed", "viable", "static_confirmed"):
                     finding_status = existing_status
-                elif existing_status in ("false_positive", "duplicate_merged", "non_viable", "sample_or_test") and finding_status in ("reported", "static_confirmed"):
+                elif existing_status in ("false_positive", "duplicate_merged", "non_viable", "sample_or_test") and finding_status in ("reported", "confirmed", "viable", "static_confirmed"):
+                    finding_status = existing_status
+                elif existing_status in ("confirmed", "viable", "static_confirmed") and finding_status == "reported":
                     finding_status = existing_status
 
             # ... and, when the harness attributed evidence to findings, this
@@ -1358,9 +1526,10 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     """
                     SELECT id FROM findings
                     WHERE run_id = ? AND filepath = ? AND title = ? AND description = ? AND line_numbers = ?
+                      AND COALESCE(pass_index, 1) = ?
                     LIMIT 1
                     """,
-                    (run_id, finding_filepath, raw_title, raw_desc, line_numbers),
+                    (run_id, finding_filepath, raw_title, raw_desc, line_numbers, eff_pass_index),
                 )
                 match_row = cursor.fetchone()
                 if match_row:
@@ -1378,17 +1547,24 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 # restatement; a dismissal is undone only by a stamp from a
                 # sandbox-backed node, never by a report.
                 cursor.execute(
-                    "SELECT status, patch_status, patch_diff FROM findings WHERE id = ?",
+                    "SELECT status, patch_status, patch_diff, triage_reasoning FROM findings WHERE id = ?",
                     (target_id,),
                 )
                 prev = cursor.fetchone()
                 prev_status = str((prev[0] if prev else "") or "").strip().lower()
                 if prev_status in MONOTONIC_TERMINAL_STATUSES and finding_status != prev_status:
                     finding_status = prev_status
+                elif (
+                    prev_status in ("confirmed", "viable", "static_confirmed")
+                    and finding_status == "reported"
+                ):
+                    finding_status = prev_status
                 if prev and not patch_status:
                     patch_status = str(prev[1] or "")
                 if prev and not patch_diff:
                     patch_diff = str(prev[2] or "")
+                if prev and not triage_reasoning:
+                    triage_reasoning = str(prev[3] or "")
                 raw_risk_score = (
                     finding.get("mantis_risk_score")
                     if finding.get("mantis_risk_score") is not None
@@ -1401,7 +1577,8 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                         remediation = ?, status = ?, mantis_risk_score = COALESCE(?, mantis_risk_score), impact_score = ?, likelihood_score = ?,
                         priority = ?, signature = ?, lineage_id = ?, cwe = ?, triage_reasoning = ?, patch_diff = ?,
                         patch_status = ?, rca_summary = ?, code_paths = ?,
-                        campaign = COALESCE(NULLIF(campaign, ''), ?)
+                        campaign = COALESCE(NULLIF(campaign, ''), ?),
+                        target_symbol = ?, symbol_source = ?, prose_signature = ?
                     WHERE id = ?
                 """, (
                     finding_filepath,
@@ -1424,6 +1601,9 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     rca_summary,
                     code_paths_str,
                     owner or None,
+                    target_symbol or None,
+                    symbol_source,
+                    prose_signature,
                     target_id,
                 ))
             else:
@@ -1438,9 +1618,10 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                         run_id, filepath, title, severity, description, line_numbers,
                         remediation, status, mantis_risk_score, impact_score, likelihood_score,
                         priority, signature, lineage_id, cwe, triage_reasoning, patch_diff, patch_status,
-                        rca_summary, embedding, code_paths, campaign
+                        rca_summary, embedding, code_paths, campaign, pass_index,
+                        target_symbol, symbol_source, prose_signature
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     run_id,
                     finding_filepath,
@@ -1464,6 +1645,10 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     None,
                     code_paths_str,
                     owner or None,
+                    eff_pass_index,
+                    target_symbol or None,
+                    symbol_source,
+                    prose_signature,
                 ))
 
 def update_finding_calibration(
@@ -1501,7 +1686,7 @@ def _terminal_clause_for(status: str) -> str:
     higher-assurance or terminal status. Shared by update_status and
     update_finding_status_by_id so the two can never drift apart.
     """
-    if status in ("reported", "static_confirmed"):
+    if status in ("reported", "confirmed", "viable", "static_confirmed"):
         return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'dynamic_confirmed', 'patch_verified')"
     if status in ("dynamic_confirmed", "patch_verified"):
         return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'patch_verified')"
@@ -1575,7 +1760,9 @@ def archive_finding(db_path: str, lineage_id: str, note: str = "") -> int:
 
 def update_status(db_path: str, filepath: str, run_id: str, status: str,
                   finding_ids: Optional[Sequence[int]] = None,
-                  campaign: Optional[str] = None):
+                  campaign: Optional[str] = None,
+                  pass_index: Optional[int] = None,
+                  note: str = ""):
     """Update status for active candidate findings under `filepath` in a given run
     (preserving terminal/suppressed statuses and preventing downgrades).
 
@@ -1611,6 +1798,10 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str,
             return
         id_clause = f" AND id IN ({','.join('?' * len(ids))})"
         id_params = ids
+    if pass_index is not None:
+        id_clause += " AND COALESCE(pass_index, 1) = ?"
+        id_params.append(int(pass_index))
+    clean_note = str(note or "").strip()[:2000]
     with _db(db_path) as conn:
         cursor = conn.cursor()
         norm_fp = canonical_filepath(filepath, target_file=filepath)
@@ -1625,6 +1816,14 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str,
             # the laundering this function no longer performs.
             if not (filepath or "").strip():
                 return
+            if clean_note:
+                cursor.execute(f"""
+                    UPDATE findings
+                    SET triage_reasoning = TRIM(COALESCE(triage_reasoning, '') || CHAR(10) || ?)
+                    WHERE run_id = ?
+                      {id_clause}
+                      {terminal_clause}
+                """, (clean_note, run_id, *id_params))
             cursor.execute(f"""
                 UPDATE findings
                 SET status = ?
@@ -1637,6 +1836,15 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str,
         scope_clause, scope_params = _ownership_clause(filepath, campaign)
         if not scope_clause:
             scope_clause, scope_params = _campaign_scope_clause(norm_fp)
+        if clean_note:
+            cursor.execute(f"""
+                UPDATE findings
+                SET triage_reasoning = TRIM(COALESCE(triage_reasoning, '') || CHAR(10) || ?)
+                WHERE run_id = ?
+                  AND {scope_clause}
+                  {id_clause}
+                  {terminal_clause}
+            """, (clean_note, run_id, *scope_params, *id_params))
         cursor.execute(f"""
             UPDATE findings
             SET status = ?
@@ -1690,6 +1898,8 @@ def update_finding_status_by_id(
     status: str,
     scope_path: Optional[str] = None,
     campaign: Optional[str] = None,
+    pass_index: Optional[int] = None,
+    note: str = "",
 ):
     """Update one finding's status by primary key, with the same monotonic
     guard as update_status.
@@ -1706,15 +1916,27 @@ def update_finding_status_by_id(
         return
     own_clause, own_params = _ownership_clause(scope_path, campaign)
     own_sql = f" AND {own_clause}" if own_clause else ""
+    pass_sql = " AND COALESCE(pass_index, 1) = ?" if pass_index is not None else ""
+    pass_params = [int(pass_index)] if pass_index is not None else []
+    clean_note = str(note or "").strip()[:2000]
     with _db(db_path) as conn:
         cursor = conn.cursor()
         terminal_clause = _terminal_clause_for(status)
-        cursor.execute(f"""
-            UPDATE findings
-            SET status = ?
-            WHERE id = ? AND run_id = ?{own_sql}
-              {terminal_clause}
-        """, (status, fid, run_id, *own_params))
+        if clean_note:
+            cursor.execute(f"""
+                UPDATE findings
+                SET status = ?,
+                    triage_reasoning = TRIM(COALESCE(triage_reasoning, '') || CHAR(10) || ?)
+                WHERE id = ? AND run_id = ?{own_sql}{pass_sql}
+                  {terminal_clause}
+            """, (status, clean_note, fid, run_id, *own_params, *pass_params))
+        else:
+            cursor.execute(f"""
+                UPDATE findings
+                SET status = ?
+                WHERE id = ? AND run_id = ?{own_sql}{pass_sql}
+                  {terminal_clause}
+            """, (status, fid, run_id, *own_params, *pass_params))
 
 
 def record_finding_patch(
@@ -1777,12 +1999,14 @@ def record_finding_patch(
             and ev_verified
         )
 
+        rejected_unverified_diff = False
         if is_verified:
             computed_patch_status = "VERIFIED_SECURE"
         elif prev_patch_status.upper() == "VERIFIED_SECURE":
             computed_patch_status = "VERIFIED_SECURE"
-            if not clean_diff.strip():
-                clean_diff = prev_patch_diff
+            if clean_diff.strip() and clean_diff.strip() != prev_patch_diff.strip():
+                rejected_unverified_diff = True
+            clean_diff = prev_patch_diff
         elif norm_reattack == "bypassed" or (
             isinstance(own_ev, dict) and own_ev.get("reattacked") and own_ev.get("reattack_present")
         ):
@@ -1848,18 +2072,20 @@ def record_finding_patch(
             (fid, run_id),
         )
         updated = cursor.fetchone()
-        return {
+        result_payload: Dict[str, Any] = {
             "finding_id": fid,
             "status": str(updated[0] or "") if updated else "",
             "patch_status": str(updated[1] or "") if updated else computed_patch_status,
         }
+        if rejected_unverified_diff:
+            result_payload["rejected_unverified_diff"] = True
+        return result_payload
 
 
 # --- Regression checks: what a later run decided about an earlier finding ---------
 
 REGRESSION_OUTCOMES = ("still_present", "fixed", "inconclusive")
 REGRESSION_EVIDENCE = ("dynamic", "static", "lineage", "none")
-OPEN_FINDING_STATUSES = ("reported", "static_confirmed", "dynamic_confirmed", "confirmed", "viable", "reproduced")
 
 
 def _ensure_regression_table(conn: sqlite3.Connection) -> None:
@@ -2030,6 +2256,7 @@ def read_findings(
     status: Optional[str] = None,
     scope_path: Optional[str] = None,
     campaign: Optional[str] = None,
+    pass_index: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Read findings from the database, optionally filtered by filepath, run_id, or status.
 
@@ -2064,6 +2291,9 @@ def read_findings(
         if status:
             query += " AND status = ?"
             params.append(status)
+        if pass_index is not None:
+            query += " AND COALESCE(pass_index, 1) = ?"
+            params.append(int(pass_index))
         query += " ORDER BY id ASC"
         cursor.execute(query, params)
         rows = []
@@ -2872,6 +3102,7 @@ def merge_findings(
     duplicate_ids: Optional[List[int]] = None,
     scope_path: Optional[str] = None,
     campaign: Optional[str] = None,
+    pass_index: Optional[int] = None,
 ) -> int:
     """Marks duplicate findings as suppressed/merged in the database, safely protecting the primary finding.
 
@@ -2893,6 +3124,9 @@ def merge_findings(
     own_clause, own_params = _ownership_clause(scope_path, campaign)
     scope_clause = f"{run_clause} AND {own_clause}" if own_clause else run_clause
     scope_params: List[Any] = [*run_params, *own_params]
+    if pass_index is not None:
+        scope_clause = f"{scope_clause} AND COALESCE(pass_index, 1) = ?"
+        scope_params.append(int(pass_index))
     terminal = _terminal_clause_for("duplicate_merged")
 
     with _db(db_path) as conn:
@@ -3346,14 +3580,14 @@ def query_security_guidance(
             query_confirmed = """
                 SELECT * FROM findings
                 WHERE filepath = ?
-                  AND status IN ('confirmed', 'viable', 'reproduced', 'dynamic_confirmed', 'static_confirmed', 'reported', 'patch_verified')
+                  AND LOWER(status) IN ('confirmed', 'viable', 'reproduced', 'dynamic_confirmed', 'static_confirmed', 'reported', 'patch_verified')
                 ORDER BY timestamp DESC, id DESC
             """
             cursor.execute(query_confirmed, (norm_fp,))
         else:
             query_confirmed = """
                 SELECT * FROM findings
-                WHERE status IN ('confirmed', 'viable', 'reproduced', 'dynamic_confirmed', 'static_confirmed', 'reported', 'patch_verified')
+                WHERE LOWER(status) IN ('confirmed', 'viable', 'reproduced', 'dynamic_confirmed', 'static_confirmed', 'reported', 'patch_verified')
                 ORDER BY timestamp DESC, id DESC
             """
             cursor.execute(query_confirmed)
@@ -3547,12 +3781,17 @@ def query_security_guidance(
                     guidance_lines.append(f"  - **Patch Status**: `{safe_markdown_span(c.get('patch_status'))}`")
                 if c.get("patch_diff"):
                     diff_content = c.get("patch_diff", "").strip()
+                    patch_label = (
+                        "Verified Patch Diff (Few-Shot Pattern)"
+                        if str(c.get("patch_status") or "").strip().upper() == "VERIFIED_SECURE"
+                        else "Candidate Patch Diff (Unverified)"
+                    )
                     if not full and diff_content.count("\n") > 12:
                         diff_lines = diff_content.splitlines()[:12]
                         diff_truncated = "\n".join(diff_lines) + "\n... (truncated; use --full to view entire patch diff)"
-                        guidance_lines.append(f"  - **Verified Patch Diff (Few-Shot Pattern)**:\n{safe_markdown_fence(diff_truncated, lang='diff')}")
+                        guidance_lines.append(f"  - **{patch_label}**:\n{safe_markdown_fence(diff_truncated, lang='diff')}")
                     else:
-                        guidance_lines.append(f"  - **Verified Patch Diff (Few-Shot Pattern)**:\n{safe_markdown_fence(diff_content, lang='diff')}")
+                        guidance_lines.append(f"  - **{patch_label}**:\n{safe_markdown_fence(diff_content, lang='diff')}")
         elif not pattern_concepts:
             guidance_lines.append("No historical vulnerabilities recorded for this file.")
 

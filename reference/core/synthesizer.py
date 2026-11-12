@@ -54,6 +54,7 @@ from core.graph_loader import (
     GlobalConfig,
     SandboxConfig,
     WorkflowSpec,
+    validate_workflow_topology,
 )
 from tools import TOOLS
 
@@ -157,6 +158,7 @@ A valid workflow JSON has the following top-level structure:
 - Sandbox & Dynamic Execution Tools:
   * "run_sandbox": Run bash commands inside isolated container/VM sandbox.
   * "apply_patch": Apply unified diff patch inside sandbox.
+  * "record_patch": Persist verified remediation patch diff and re-attack verification status.
   * "run_sandbox_with_evidence": Execute exploit PoC and verify reached-sink sentinel or crash trace.
 - Structural Navigation Tools (deterministic, backed by the tree-sitter catalog; degrade to a baseline-tools pointer when the index is absent):
   * "find_symbol": Locate symbol definitions by name across the target.
@@ -176,8 +178,9 @@ A valid workflow JSON has the following top-level structure:
    - Every route in the classifier's "routes" list MUST have an outgoing edge: {"from": "<classifier_id>", "to": "<target>", "on": "<route>"}.
    - Every classifier MUST have an "on": "__DEFAULT__" fallback edge to handle unexpected verdicts or exit paths.
 4. Connectivity: Every declared node must be connected. No orphan nodes.
-5. Terminal Sink: The graph MUST contain at least one terminal sink node (a node with no outgoing edges, e.g. "reporter" or "reflector").
-6. Cyclic Loops: For concurrency / race condition stress-testing or iterative refinement, route the classifier's success/retry edge back to the analyzer/reproducer, set max_visits between 2 and 5, and route "__DEFAULT__" to the downstream calibrator/reporter to guarantee loop termination.
+5. Terminal Sink: The graph MUST converge onto a SINGLE terminal sink node (e.g. "reporter").
+6. Cyclic Loops: For concurrency / race condition stress-testing or iterative refinement, route the classifier's retry edge back to the analyzer/reproducer, set max_visits between 2 and 5, and route "__DEFAULT__" to a distinct downstream stage (never to the same node as a named route) to guarantee loop termination.
+7. Finding Promotion Gate: Every workflow whose discovery node uses "report_findings" MUST include a promotion gate (a "ReviewVerdict" or "CriticVerdict" agent followed by a classifier node, and/or a "mantis-reproduce" stage) so confirmed findings are promoted out of "reported".
 
 ### FEW-SHOT REFERENCE EXAMPLES:
 
@@ -202,7 +205,7 @@ Example 1: Static CI/CD & Configuration Audit (Linear Pipeline)
     {"from": "cicd_analyzer", "to": "reviewer"},
     {"from": "reviewer", "to": "review_decision"},
     {"from": "review_decision", "to": "calibrator", "on": "confirmed"},
-    {"from": "review_decision", "to": "calibrator", "on": "__DEFAULT__"},
+    {"from": "review_decision", "to": "reporter", "on": "__DEFAULT__"},
     {"from": "calibrator", "to": "reporter"}
   ]
 }
@@ -218,18 +221,24 @@ Example 2: Concurrency & TOCTOU Race Condition Audit (Bounded Cyclic Loop)
   "nodes": [
     {"id": "threat_model", "type": "agent", "skill": "mantis-threat-model", "tools": ["read_file", "list_files", "record_threat_model"]},
     {"id": "race_analyzer", "type": "agent", "system_prompt": "Audit file descriptor operations and shared memory for TOCTOU race windows.", "tools": ["read_file", "list_files", "report_findings", "get_findings"]},
+    {"id": "reviewer", "type": "agent", "skill": "mantis-review", "tools": ["get_findings", "read_file"], "output_schema": "ReviewVerdict", "output_key": "verdict"},
+    {"id": "review_decision", "type": "classifier", "routes": ["confirmed"], "max_visits": 1},
     {"id": "race_reproducer", "type": "agent", "skill": "mantis-reproduce", "tools": ["run_sandbox_with_evidence", "read_file", "write_file", "get_findings"], "output_schema": "ReproVerdict", "output_key": "verdict"},
-    {"id": "repro_decision", "type": "classifier", "routes": ["success"], "max_visits": 3},
-    {"id": "patcher", "type": "agent", "skill": "mantis-patch", "tools": ["apply_patch", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"]},
+    {"id": "repro_decision", "type": "classifier", "routes": ["success", "retry"], "max_visits": 3},
+    {"id": "patcher", "type": "agent", "skill": "mantis-patch", "tools": ["apply_patch", "record_patch", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"]},
     {"id": "calibrator", "type": "agent", "skill": "mantis-calibrate", "tools": ["get_findings", "calibrate_finding", "score_risk", "read_file"]},
     {"id": "reporter", "type": "agent", "skill": "mantis-report", "tools": ["get_findings", "generate_report", "read_file"]}
   ],
   "edges": [
     {"from": "START", "to": "threat_model"},
     {"from": "threat_model", "to": "race_analyzer"},
-    {"from": "race_analyzer", "to": "race_reproducer"},
+    {"from": "race_analyzer", "to": "reviewer"},
+    {"from": "reviewer", "to": "review_decision"},
+    {"from": "review_decision", "to": "race_reproducer", "on": "confirmed"},
+    {"from": "review_decision", "to": "calibrator", "on": "__DEFAULT__"},
     {"from": "race_reproducer", "to": "repro_decision"},
     {"from": "repro_decision", "to": "patcher", "on": "success"},
+    {"from": "repro_decision", "to": "race_reproducer", "on": "retry"},
     {"from": "repro_decision", "to": "calibrator", "on": "__DEFAULT__"},
     {"from": "patcher", "to": "calibrator"},
     {"from": "calibrator", "to": "reporter"}
@@ -288,21 +297,21 @@ DOMAIN_ARCHETYPES: Dict[str, Dict[str, Any]] = {
         "keywords": ["kernel", "ioctl", "driver", "syscall", "kasan", "ebpf", "memory corruption"],
         "researcher_tools": ["read_file", "list_files", "report_findings", "get_findings", "get_threat_model", "record_threat_model"],
         "reproducer_tools": ["run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"],
-        "patcher_tools": ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
+        "patcher_tools": ["apply_patch", "record_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
         "sandbox_type": "gvisor",
     },
     "cloud_iam": {
         "keywords": ["cloud", "iam", "aws", "gcp", "azure", "privilege escalation", "permission", "rbac", "policy"],
         "researcher_tools": ["read_file", "list_files", "report_findings", "get_findings", "get_threat_model", "record_threat_model", "get_security_guidance"],
         "reproducer_tools": ["run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"],
-        "patcher_tools": ["apply_patch", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
+        "patcher_tools": ["apply_patch", "record_patch", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
         "sandbox_type": "static-only",
     },
     "web_api": {
         "keywords": ["web", "api", "rest", "graphql", "jwt", "sqli", "xss", "ssrf", "auth", "endpoint"],
         "researcher_tools": ["read_file", "list_files", "report_findings", "get_findings", "get_threat_model", "record_threat_model"],
         "reproducer_tools": ["run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"],
-        "patcher_tools": ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
+        "patcher_tools": ["apply_patch", "record_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
         "sandbox_type": "microsandbox",
     },
 }
@@ -536,12 +545,14 @@ class ResearchGraphSynthesizer:
         ))
         reproducer_tools = list(cfg_archetype.get(
             "reproducer_tools",
-            ["run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"],
+            ["run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_threat_model", "get_function_boundary", "find_callers"],
         ))
         patcher_tools = list(cfg_archetype.get(
             "patcher_tools",
-            ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
+            ["apply_patch", "record_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
         ))
+        if "record_patch" in VALID_TOOLS and "record_patch" not in patcher_tools:
+            patcher_tools.insert(1 if "apply_patch" in patcher_tools else 0, "record_patch")
         # Sandbox selection, per section 5.4. An explicit operator choice is honoured
         # unchanged. Otherwise the archetype's preferred backend is a REQUEST, and what
         # it is clamped against depends on where the archetype came from:
@@ -636,11 +647,24 @@ class ResearchGraphSynthesizer:
             ]
             researcher_edges = [
                 {"from": "threat_model", "to": "researcher"},
-                {"from": "researcher", "to": "dedupe"},
+                {"from": "researcher", "to": "findings_gate"},
+                {"from": "findings_gate", "to": "reporter", "on": "clean"},
+                {"from": "findings_gate", "to": "dedupe", "on": "__DEFAULT__"},
             ]
+
+        structural_review_tools = [
+            t for t in ("find_symbol", "find_callers", "find_callees", "get_function_boundary")
+            if t in VALID_TOOLS
+        ]
 
         # Build declarative nodes
         nodes: List[Dict[str, Any]] = [
+            {
+                "id": "structural_index",
+                "type": "agent",
+                "skill": "mantis-structural-index",
+                "tools": ["read_file", "write_file", "list_files"],
+            },
             {
                 "id": "threat_model",
                 "type": "agent",
@@ -648,6 +672,12 @@ class ResearchGraphSynthesizer:
                 "tools": ["read_file", "list_files", "record_threat_model", "get_threat_model"],
             },
             *researcher_nodes,
+            {
+                "id": "findings_gate",
+                "type": "classifier",
+                "routes": ["clean"],
+                "max_visits": 1,
+            },
             {
                 "id": "dedupe",
                 "type": "agent",
@@ -658,20 +688,26 @@ class ResearchGraphSynthesizer:
                 "id": "reviewer",
                 "type": "agent",
                 "skill": "mantis-review",
-                "tools": ["get_findings", "read_file", "write_file"],
+                "tools": ["get_findings", "get_threat_model", "read_file", "write_file", *structural_review_tools],
                 "output_schema": "ReviewVerdict",
                 "output_key": "verdict",
+            },
+            {
+                "id": "reviewer_decision",
+                "type": "classifier",
+                "routes": ["confirmed"],
+                "max_visits": 1,
             },
             {
                 "id": "critic",
                 "type": "agent",
                 "skill": "mantis-critic",
-                "tools": ["get_findings", "read_file"],
+                "tools": ["get_findings", "get_threat_model", "read_file", *structural_review_tools],
                 "output_schema": "CriticVerdict",
                 "output_key": "verdict",
             },
             {
-                "id": "review_decision",
+                "id": "critic_decision",
                 "type": "classifier",
                 "routes": ["viable"],
                 "max_visits": 1,
@@ -702,13 +738,7 @@ class ResearchGraphSynthesizer:
                 "id": "calibrator",
                 "type": "agent",
                 "skill": "mantis-calibrate",
-                "tools": ["get_findings", "calibrate_finding", "score_risk", "read_file"],
-            },
-            {
-                "id": "reporter",
-                "type": "agent",
-                "skill": "mantis-report",
-                "tools": ["get_findings", "generate_report", "read_file"],
+                "tools": ["get_findings", "get_threat_model", "calibrate_finding", "score_risk", "read_file"],
             },
             {
                 "id": "reflector",
@@ -716,23 +746,42 @@ class ResearchGraphSynthesizer:
                 "skill": "mantis-reflect",
                 "tools": ["get_findings", "record_learning"],
             },
+            {
+                "id": "reporter",
+                "type": "agent",
+                "skill": "mantis-report",
+                "tools": ["get_findings", "generate_report", "read_file", "write_file"],
+            },
         ]
+
+        post_dedupe_edges: List[Dict[str, Any]] = (
+            [
+                {"from": "dedupe", "to": "findings_gate"},
+                {"from": "findings_gate", "to": "reporter", "on": "clean"},
+                {"from": "findings_gate", "to": "reviewer", "on": "__DEFAULT__"},
+            ]
+            if parallel_researchers
+            else [{"from": "dedupe", "to": "reviewer"}]
+        )
 
         # Connect the edges
         edges: List[Dict[str, Any]] = [
-            {"from": "START", "to": "threat_model"},
+            {"from": "START", "to": "structural_index"},
+            {"from": "structural_index", "to": "threat_model"},
             *researcher_edges,
-            {"from": "dedupe", "to": "reviewer"},
-            {"from": "reviewer", "to": "critic"},
-            {"from": "critic", "to": "review_decision"},
-            {"from": "review_decision", "to": "reproducer", "on": "viable"},
-            {"from": "review_decision", "to": "calibrator", "on": "__DEFAULT__"},
+            *post_dedupe_edges,
+            {"from": "reviewer", "to": "reviewer_decision"},
+            {"from": "reviewer_decision", "to": "critic", "on": "confirmed"},
+            {"from": "reviewer_decision", "to": "calibrator", "on": "__DEFAULT__"},
+            {"from": "critic", "to": "critic_decision"},
+            {"from": "critic_decision", "to": "reproducer", "on": "viable"},
+            {"from": "critic_decision", "to": "calibrator", "on": "__DEFAULT__"},
             {"from": "reproducer", "to": "repro_decision"},
             {"from": "repro_decision", "to": "patcher", "on": "success"},
             {"from": "repro_decision", "to": "calibrator", "on": "__DEFAULT__"},
             {"from": "patcher", "to": "calibrator"},
-            {"from": "calibrator", "to": "reporter"},
-            {"from": "reporter", "to": "reflector"},
+            {"from": "calibrator", "to": "reflector"},
+            {"from": "reflector", "to": "reporter"},
         ]
 
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -764,7 +813,9 @@ class ResearchGraphSynthesizer:
             "budget": budget_dict,
         }
 
-        return WorkflowSpec.model_validate(spec_dict)
+        spec_obj = WorkflowSpec.model_validate(spec_dict)
+        validate_workflow_topology(spec_obj, strict_synthesis=True)
+        return spec_obj
 
     def sanitize_and_validate_spec(
         self,
@@ -774,6 +825,7 @@ class ResearchGraphSynthesizer:
         target_root: str = ".",
         sandbox_type: Optional[str] = None,
         default_model: Optional[str] = None,
+        strict_synthesis: bool = False,
     ) -> WorkflowSpec:
         """Applies deterministic compiler safety gates to sanitize and compile LLM output.
         
@@ -985,6 +1037,8 @@ class ResearchGraphSynthesizer:
                 if any(k in clean_id for k in ("review", "critic", "dedupe", "repro", "patch", "calibrat", "report", "reflect")):
                     if "get_findings" not in clean_tools:
                         clean_tools.append("get_findings")
+                if "apply_patch" in clean_tools and "record_patch" in VALID_TOOLS and "record_patch" not in clean_tools:
+                    clean_tools.append("record_patch")
 
                 # Gate 5: Structured Output Schema Mapping
                 output_schema = n.get("output_schema")
@@ -1086,12 +1140,70 @@ class ResearchGraphSynthesizer:
                         seen_edge_pairs.add(key)
                         sanitized_edges.append({"from": from_id, "to": to_id})
                 elif from_node["type"] == "classifier":
-                    if route is None:
+                    if isinstance(route, list):
+                        route = [str(r) for r in route if str(r) != "__DEFAULT__"] or "__DEFAULT__"
+                        if isinstance(route, list) and len(route) == 1:
+                            route = route[0]
+                    elif route is None:
                         route = "__DEFAULT__"
                     key = (from_id, to_id)
                     if key not in seen_edge_pairs:
                         seen_edge_pairs.add(key)
                         sanitized_edges.append({"from": from_id, "to": to_id, "on": route})
+                    elif route != "__DEFAULT__":
+                        for prev_e in sanitized_edges:
+                            if prev_e["from"] == from_id and prev_e["to"] == to_id and prev_e.get("on") != "__DEFAULT__":
+                                prev_on = prev_e.get("on")
+                                merged_on = list(prev_on) if isinstance(prev_on, list) else ([prev_on] if prev_on else [])
+                                for r_item in (route if isinstance(route, list) else [route]):
+                                    if r_item not in merged_on and r_item != "__DEFAULT__":
+                                        merged_on.append(r_item)
+                                prev_e["on"] = merged_on if len(merged_on) > 1 else (merged_on[0] if merged_on else route)
+                                break
+
+        # Auto-insert a classifier node when an LLM emits a ReviewVerdict or
+        # CriticVerdict agent connected directly to a non-classifier agent.
+        _verdict_route_map = {"ReviewVerdict": "confirmed", "CriticVerdict": "viable"}
+        for v_node in list(sanitized_nodes):
+            v_schema = v_node.get("output_schema") if v_node.get("type") == "agent" else None
+            if v_schema not in _verdict_route_map:
+                continue
+            v_id = v_node["id"]
+            direct_agent_edges = [
+                e for e in sanitized_edges
+                if e["from"] == v_id and node_dict.get(e["to"], {}).get("type") == "agent"
+            ]
+            if not direct_agent_edges:
+                continue
+            promo_route = _verdict_route_map[v_schema]
+            cls_base = f"{v_id}_decision"
+            cls_id = cls_base
+            c_num = 1
+            while cls_id in node_dict:
+                cls_id = f"{cls_base}_{c_num}"
+                c_num += 1
+            cls_dict = {
+                "id": cls_id,
+                "type": "classifier",
+                "routes": [promo_route],
+                "max_visits": 1,
+            }
+            v_idx = next(i for i, item in enumerate(sanitized_nodes) if item["id"] == v_id)
+            sanitized_nodes.insert(v_idx + 1, cls_dict)
+            node_dict[cls_id] = cls_dict
+
+            first_target = direct_agent_edges[0]["to"]
+            for old_e in direct_agent_edges:
+                sanitized_edges.remove(old_e)
+                seen_edge_pairs.discard((old_e["from"], old_e["to"]))
+            sanitized_edges.append({"from": v_id, "to": cls_id})
+            seen_edge_pairs.add((v_id, cls_id))
+            sanitized_edges.append({"from": cls_id, "to": first_target, "on": promo_route})
+            seen_edge_pairs.add((cls_id, first_target))
+            sink_cand = sanitized_nodes[-1]["id"]
+            if sink_cand != first_target and sink_cand != cls_id:
+                sanitized_edges.append({"from": cls_id, "to": sink_cand, "on": "__DEFAULT__"})
+                seen_edge_pairs.add((cls_id, sink_cand))
 
         # Ensure START edge exists
         has_start = any(e["from"] == "START" for e in sanitized_edges)
@@ -1101,7 +1213,8 @@ class ResearchGraphSynthesizer:
             seen_edge_pairs.add(("START", first_id))
 
         # Ensure all classifier routes have outgoing edges + __DEFAULT__ fallback
-        for n in sanitized_nodes:
+        # (never combining __DEFAULT__ into a route list, per ADK 2.14 Edge rules).
+        for n in list(sanitized_nodes):
             if n["type"] == "classifier":
                 c_id = n["id"]
                 routes = n["routes"]
@@ -1127,21 +1240,49 @@ class ResearchGraphSynthesizer:
                             sanitized_edges.append({"from": c_id, "to": default_target, "on": r})
                             seen_edge_pairs.add((c_id, default_target))
                             existing_out_routes.add(r)
+                        else:
+                            for e in sanitized_edges:
+                                if e["from"] == c_id and e["to"] == default_target and e.get("on") != "__DEFAULT__":
+                                    cur_on = e.get("on")
+                                    e["on"] = (cur_on + [r]) if isinstance(cur_on, list) else [cur_on, r]
+                                    existing_out_routes.add(r)
+                                    break
 
                 if "__DEFAULT__" not in existing_out_routes:
-                    sink_id = sanitized_nodes[-1]["id"]
-                    fallback_target = sink_id if sink_id != c_id else default_target
-                    if (c_id, fallback_target) in seen_edge_pairs:
-                        for e in sanitized_edges:
-                            if e["from"] == c_id and e["to"] == fallback_target:
-                                if isinstance(e.get("on"), list):
-                                    e["on"].append("__DEFAULT__")
-                                elif isinstance(e.get("on"), str):
-                                    e["on"] = [e["on"], "__DEFAULT__"]
-                                break
-                    else:
+                    cand_targets = [
+                        node["id"]
+                        for idx_n, node in enumerate(sanitized_nodes)
+                        if node["id"] != c_id and (c_id, node["id"]) not in seen_edge_pairs and idx_n > c_idx
+                    ]
+                    if not cand_targets:
+                        cand_targets = [
+                            node["id"]
+                            for node in reversed(sanitized_nodes)
+                            if node["id"] != c_id and (c_id, node["id"]) not in seen_edge_pairs
+                        ]
+                    if cand_targets:
+                        fallback_target = cand_targets[-1]
                         sanitized_edges.append({"from": c_id, "to": fallback_target, "on": "__DEFAULT__"})
                         seen_edge_pairs.add((c_id, fallback_target))
+                    else:
+                        # Only one downstream node exists and already holds a named route;
+                        # insert a pass-through calibrator before the terminal sink so
+                        # named routes and __DEFAULT__ have distinct targets.
+                        pt_id = "calibrator" if "calibrator" not in node_dict else f"calibrator_{len(sanitized_nodes)}"
+                        pt_node = {
+                            "id": pt_id,
+                            "type": "agent",
+                            "skill": "mantis-calibrate",
+                            "tools": ["get_findings", "calibrate_finding", "score_risk", "read_file"],
+                        }
+                        sink_id = sanitized_nodes[-1]["id"]
+                        sanitized_nodes.insert(max(0, len(sanitized_nodes) - 1), pt_node)
+                        node_dict[pt_id] = pt_node
+                        if (pt_id, sink_id) not in seen_edge_pairs and pt_id != sink_id:
+                            sanitized_edges.append({"from": pt_id, "to": sink_id})
+                            seen_edge_pairs.add((pt_id, sink_id))
+                        sanitized_edges.append({"from": c_id, "to": pt_id, "on": "__DEFAULT__"})
+                        seen_edge_pairs.add((c_id, pt_id))
 
         # Connect any orphan nodes
         referenced_nodes = {e["from"] for e in sanitized_edges if e["from"] != "START"} | {
@@ -1192,7 +1333,9 @@ class ResearchGraphSynthesizer:
             "budget": budget_dict,
         }
 
-        return WorkflowSpec.model_validate(spec_dict)
+        spec_obj = WorkflowSpec.model_validate(spec_dict)
+        validate_workflow_topology(spec_obj, strict_synthesis=strict_synthesis)
+        return spec_obj
 
     def synthesize_with_llm(
         self,
@@ -1262,6 +1405,7 @@ class ResearchGraphSynthesizer:
                         target_root=target_root,
                         sandbox_type=sandbox_type,
                         default_model=chosen_model,
+                        strict_synthesis=True,
                     )
                     return spec
                 except Exception as compile_err:

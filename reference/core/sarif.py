@@ -205,6 +205,7 @@ def _message_text(finding: Dict[str, Any]) -> str:
     # sanitize_egress_text strips terminal control sequences and scrubs
     # credentials the model quoted; the bracket rewrite keeps a description
     # from forging the verification note that follows it.
+    from core.database import is_untriaged
     from core.llm_gateway import sanitize_egress_text
 
     title = sanitize_egress_text(str(finding.get("title") or "Unnamed finding")).strip()
@@ -213,16 +214,23 @@ def _message_text(finding: Dict[str, Any]) -> str:
     description = _MANTIS_NOTE_LOOKALIKE.sub("(", description)
 
     status = str(finding.get("status") or "").strip()
+    status_low = status.lower()
     patch_status = str(finding.get("patch_status") or "").strip().upper()
 
     # patch_status is trusted here because write_findings keeps
     # VERIFIED_SECURE only when the harness itself recorded reached-sink
     # evidence for the run (verified_evidence); the export adds no gate.
-    note = _VERIFICATION_NOTE.get(patch_status)
-    if note is None:
-        # No patch verification ran. Say so rather than staying silent: silence
-        # reads as confidence, and this is the most common case.
-        note = "unverified: no reproduction or patch verification is recorded"
+    if is_untriaged(status):
+        note = "untriaged: review did not complete; requires manual review"
+    else:
+        note = _VERIFICATION_NOTE.get(patch_status)
+        if note is None:
+            if status_low in ("dynamic_confirmed", "reproduced"):
+                note = "reproduced: reached-sink evidence recorded; no verified patch recorded"
+            else:
+                # No patch verification ran. Say so rather than staying silent: silence
+                # reads as confidence, and this is the most common case.
+                note = "unverified: no reproduction or patch verification is recorded"
 
     parts = [title]
     if description:
@@ -268,7 +276,7 @@ def build_sarif(
     results: List[Dict[str, Any]] = []
     skipped: List[str] = []
 
-    from core.database import is_suppressed
+    from core.database import is_suppressed, is_untriaged
 
     for finding in findings or []:
         status = str(finding.get("status") or "")
@@ -287,6 +295,8 @@ def build_sarif(
         severity = str(finding.get("severity") or "").strip().upper()
         level, fallback_score = _SEVERITY_MAP.get(severity, _DEFAULT_SEVERITY)
         score = _security_severity(finding, fallback_score)
+        untriaged_entry = bool(include_suppressed and is_untriaged(status))
+        result_level = "note" if untriaged_entry else level
 
         rid = _rule_id(finding)
         if rid not in rule_index:
@@ -307,10 +317,18 @@ def build_sarif(
                 "properties": {"security-severity": score, "tags": tags},
             })
 
+        props: Dict[str, Any] = {
+            "security-severity": score,
+            "mantis-status": status or "unknown",
+            "mantis-patch-status": str(finding.get("patch_status") or "") or "none",
+        }
+        if untriaged_entry:
+            props["mantis/triage"] = "untriaged"
+
         result: Dict[str, Any] = {
             "ruleId": rid,
             "ruleIndex": rule_index[rid],
-            "level": level,
+            "level": result_level,
             "message": {"text": _message_text(finding)},
             "locations": [{
                 "physicalLocation": {
@@ -318,11 +336,7 @@ def build_sarif(
                     "region": {"startLine": _first_line(finding.get("line_numbers"))},
                 }
             }],
-            "properties": {
-                "security-severity": score,
-                "mantis-status": status or "unknown",
-                "mantis-patch-status": str(finding.get("patch_status") or "") or "none",
-            },
+            "properties": props,
         }
         fingerprints = _fingerprint(finding)
         if fingerprints:
