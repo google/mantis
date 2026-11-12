@@ -32,7 +32,16 @@ from google.genai import types
 from core.prompts import get_stage_prompt, STAGE_PROMPTS
 
 
-from core.config import get_llm_kwargs, resolve_model_id, DEFAULT_MODEL, ResilientLiteLlm, DeferredEnvLiteLlm, ExtendedReviewVerdict, ExtendedCriticVerdict
+from core.config import (
+    DEFAULT_MODEL,
+    DEFAULT_VERTEX_FAST_MODEL,
+    DeferredEnvLiteLlm,
+    ExtendedCriticVerdict,
+    ExtendedReviewVerdict,
+    ResilientLiteLlm,
+    get_llm_kwargs,
+    resolve_model_id,
+)
 from core.config import context_editing_keeps as _context_editing_keeps
 
 LiteLlm = ResilientLiteLlm
@@ -142,6 +151,7 @@ class GlobalConfig(_Base):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
     db_path: str = "knowledge.db"
     default_model: str = DEFAULT_MODEL
+    fast_model: Optional[str] = None
     api_base: Optional[str] = None
     timeout: Optional[float] = Field(default=None, gt=0)
     reasoning_effort: Optional[str] = None
@@ -3058,6 +3068,7 @@ def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> t
                         for top_k in (
                             "sandbox",
                             "default_model",
+                            "fast_model",
                             "api_base",
                             "timeout",
                             "reasoning_effort",
@@ -3235,6 +3246,34 @@ def validate_workflow_topology(
     return errors, warnings
 
 
+# Low-effort mechanical stages that route to `config.fast_model` when the
+# operator configures one and the node does not pin its own `model`. On the
+# default Vertex Gemini route (with `fast_model` unset and no custom API base
+# or global model override), they default to `DEFAULT_VERTEX_FAST_MODEL`
+# (`vertex_ai/gemini-3.5-flash-lite`), preserving campaign cost and harness
+# fingerprints while still allowing non-Vertex `default_model` configurations
+# to run with zero Vertex dependencies.
+_FAST_TIER_NODE_IDS = frozenset({"history", "deduplicator"})
+
+
+def _resolve_fast_tier_default(
+    default_model: str,
+    fast_model: Optional[str],
+    model_override: Optional[str],
+    api_base: Optional[str],
+) -> str:
+    if fast_model:
+        return fast_model
+    if model_override or (os.environ.get("MANTIS_MODEL") or os.environ.get("MODEL_ID") or "").strip():
+        return default_model
+    if api_base or (os.environ.get("LLM_API_BASE") or "").strip():
+        return default_model
+    resolved_default = resolve_model_id(None, default_model, model_override)
+    if resolved_default.startswith("vertex_ai/gemini-"):
+        return DEFAULT_VERTEX_FAST_MODEL
+    return default_model
+
+
 def load_workflow_from_json(
     json_path: str,
     model_override: Optional[str] = None,
@@ -3323,6 +3362,7 @@ def load_workflow_from_json(
     # final instruction. Gathered here because this loop is the only place
     # the final instruction text exists.
     harness_nodes: list[dict] = []
+    resolved_node_models: list[str] = []
 
     for node_cfg in spec.nodes:
         node_id = node_cfg.id
@@ -3363,13 +3403,25 @@ def load_workflow_from_json(
                 harness_nodes.append({"id": node_id})
                 continue
             node_has_error = False
+            node_default_model = (
+                _resolve_fast_tier_default(
+                    spec.config.default_model,
+                    spec.config.fast_model,
+                    model_override,
+                    node_cfg.api_base or spec.config.api_base,
+                )
+                if (not node_cfg.model and node_id in _FAST_TIER_NODE_IDS)
+                else spec.config.default_model
+            )
             # What this node will call, as the identity the fingerprint
             # stamps: resolved through the same precedence get_llm_kwargs
             # applies, and available whether or not the credentials it goes
             # on to need are present.
             node_model_id = resolve_model_id(
-                node_cfg.model, spec.config.default_model, model_override
+                node_cfg.model, node_default_model, model_override
             )
+            if node_model_id not in resolved_node_models:
+                resolved_node_models.append(node_model_id)
             # The exact call graph build used to make eagerly, frozen as a
             # zero-argument resolver so it can run either here (normal path)
             # or inside DeferredEnvLiteLlm at first LLM call (hermetic path).
@@ -3378,7 +3430,7 @@ def load_workflow_from_json(
             llm_kwargs_resolver = functools.partial(
                 get_llm_kwargs,
                 node_cfg.model,
-                spec.config.default_model,
+                node_default_model,
                 api_base=node_cfg.api_base,
                 default_api_base=spec.config.api_base,
                 timeout=node_cfg.timeout,
@@ -3800,6 +3852,7 @@ def load_workflow_from_json(
     # so the map it receives must be empty. The key itself stays present
     # because it is part of the config contract main.py reads unconditionally.
     cfg["on_enter_status"] = {}
+    cfg["resolved_node_models"] = list(resolved_node_models)
     if spec.budget:
         cfg["budget"] = spec.budget
     elif "budget" in raw_json and isinstance(raw_json["budget"], dict):

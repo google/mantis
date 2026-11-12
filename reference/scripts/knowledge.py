@@ -87,7 +87,12 @@ def main(argv=None) -> int:
         from core.exclusions import normalize_exclude_patterns
         from main import discover_files
 
-        files = discover_files(Path(repo), args.db, exclude=normalize_exclude_patterns(args.exclude))
+        files = discover_files(
+            Path(repo),
+            args.db,
+            exclude=normalize_exclude_patterns(args.exclude),
+            path_root=Path(repo),
+        )
         summary = backfill_coverage(args.db, repo, files, at=args.at or None,
                                     assume_unchanged=args.assume_unchanged, dry_run=args.dry_run)
         verb = "Would record" if args.dry_run else "Recorded"

@@ -284,6 +284,7 @@ except Exception:  # pragma: no cover - only when pydantic itself is absent
     ExtendedCriticVerdict = None
 
 DEFAULT_MODEL = "vertex_ai/gemini-3.8-flash"
+DEFAULT_VERTEX_FAST_MODEL = "vertex_ai/gemini-3.5-flash-lite"
 SUPPORTED_SANDBOXES = ("static-only", "static", "gvisor", "microsandbox", "gce", "remote")
 RECOMMENDED_MODELS = (
     "gemini-3.8-flash",
@@ -1968,6 +1969,20 @@ def _chunk_has_finish(chunk: Any) -> bool:
     return any(getattr(choice, "finish_reason", None) for choice in (getattr(chunk, "choices", None) or []))
 
 
+def _strip_empty_injection_points(kwargs: dict[str, Any]) -> None:
+    """Removes falsy `cache_control_injection_points` before LiteLLM wire dispatch.
+
+    ADK's LiteLlm wrapper inspects `cache_control_injection_points: []` at agent
+    construction time so it does not synthesize Anthropic `cache_control` blocks
+    on non-Anthropic routes, then forwards the key into `LiteLLMClient`. Several
+    OpenAI-compatible providers (including Vertex AI MaaS OpenAI endpoints and
+    LiteLLM Proxy pass-through routes) forward unknown kwargs into the JSON body
+    and reject empty `cache_control_injection_points` with HTTP 400.
+    """
+    if "cache_control_injection_points" in kwargs and not kwargs["cache_control_injection_points"]:
+        kwargs.pop("cache_control_injection_points", None)
+
+
 class ResilientLiteLLMClient(LiteLLMClient):
     """LiteLLMClient with full jitter exponential backoff (min offset 5s, 1h patience) on 429/quota exhaustion.
 
@@ -1993,6 +2008,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
         # itself (its caller is the loop that does). Popped before LiteLLM
         # sees the kwargs.
         no_continue = bool(kwargs.pop("_mantis_no_continue", False))
+        _strip_empty_injection_points(kwargs)
 
         # Before the retry loop, not inside it: an oversized request is deterministic, so
         # every pass through the loop would upload the same doomed payload again.
@@ -2231,6 +2247,8 @@ class ResilientLiteLLMClient(LiteLLMClient):
         **kwargs: Any,
     ) -> Any:
         import litellm
+
+        _strip_empty_injection_points(kwargs)
 
         # Both dispatch paths are guarded: a control that only covers the async path is a
         # control that a single synchronous caller silently disables.

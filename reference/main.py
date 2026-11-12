@@ -38,6 +38,12 @@ from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.apps.compaction import EventsCompactionConfig
 from google.adk.agents.context_cache_config import ContextCacheConfig
 
+# Ensure the `reference/` package root is on sys.path even when Python runs
+# under isolated import policy (`PYTHONSAFEPATH=1` / `-P`).
+_REF_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REF_ROOT not in sys.path:
+    sys.path.insert(0, _REF_ROOT)
+
 from core.budget import (
     BudgetConfig,
     BudgetController,
@@ -995,12 +1001,32 @@ TOOL_STATE_DIR = ".mantis"
 
 
 def is_binary_file(path: Path, block_size: int = 1024) -> bool:
-    """Returns True if the file contains null bytes in its initial block."""
+    """Returns True if the file contains binary null bytes in its initial block.
+
+    UTF-16 and UTF-32 source files carrying a valid BOM are recognized as text.
+    """
     try:
         with open(path, "rb") as f:
-            return b"\x00" in f.read(block_size)
+            chunk = f.read(block_size)
     except OSError:
         return True
+    if not chunk:
+        return False
+    if chunk.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")) and len(chunk) >= 4:
+        aligned = chunk[: len(chunk) - (len(chunk) % 4)]
+        try:
+            aligned.decode("utf-32")
+            return False
+        except UnicodeDecodeError:
+            pass
+    if chunk.startswith((b"\xff\xfe", b"\xfe\xff")) and len(chunk) >= 2:
+        aligned = chunk[: len(chunk) - (len(chunk) % 2)]
+        try:
+            aligned.decode("utf-16")
+            return False
+        except UnicodeDecodeError:
+            pass
+    return b"\x00" in chunk
 
 def _is_safe_discovered_file(path: Path, target: Path, target_real: Path, db_path: str = "") -> bool:
     """True when `path` is a regular, singly-linked, non-credential file strictly inside
@@ -1040,7 +1066,102 @@ def _is_safe_discovered_file(path: Path, target: Path, target_real: Path, db_pat
     return not is_binary_file(path)
 
 
-def discover_files(target: Path, db_path: str = "", exclude: tuple = ()) -> list[str]:
+_WALK_SKIP_DIRS = frozenset({
+    "node_modules",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+})
+_WALK_SKIP_MARKER_FILES = ("pyvenv.cfg", "CACHEDIR.TAG")
+
+
+def _walk_safe_files(start_dir: Path, target: Path, target_real: Path, db_path: str = "") -> list[str]:
+    """Walks `start_dir` without following symlinks, skipping VCS/cache/venv trees."""
+    from core.environments.static_env import PROTECTED_VCS_DIRS
+
+    walked: list[str] = []
+    for root, dirs, filenames in os.walk(str(start_dir), followlinks=False):
+        root_p = Path(root)
+        kept_dirs: list[str] = []
+        for d in dirs:
+            if d.startswith(".") or d.lower() in PROTECTED_VCS_DIRS or d in _WALK_SKIP_DIRS:
+                continue
+            cand_dir = root_p / d
+            if cand_dir.is_symlink():
+                continue
+            if any((cand_dir / marker).is_file() for marker in _WALK_SKIP_MARKER_FILES):
+                continue
+            kept_dirs.append(d)
+        dirs[:] = sorted(kept_dirs)
+        for fn in sorted(filenames):
+            if fn.startswith("."):
+                continue
+            cand = root_p / fn
+            if _is_safe_discovered_file(cand, target, target_real, db_path=db_path):
+                walked.append(str(cand))
+    return walked
+
+
+def _find_enclosing_git_root(target: Path, target_real: Path, path_root: Optional[Path] = None) -> tuple[Optional[Path], str]:
+    """Locates the git repository root for `target` (either `target` itself or an ancestor)."""
+    import tempfile as _tempfile
+
+    if (target / ".git").exists() and not (target / ".git").is_symlink():
+        return target, ""
+    if (target_real / ".git").exists() and not (target_real / ".git").is_symlink():
+        return target_real, ""
+
+    try:
+        target_dev = os.stat(target_real).st_dev
+    except OSError:
+        return None, ""
+
+    ceiling_real: Optional[Path] = None
+    if path_root is not None:
+        ceiling_real = Path(os.path.realpath(str(path_root)))
+    tmp_real = Path(os.path.realpath(_tempfile.gettempdir()))
+    target_in_tmp = target_real == tmp_real or tmp_real in target_real.parents
+
+    anc = target_real.parent
+    while anc != anc.parent:
+        if target_in_tmp and anc == tmp_real:
+            break
+        if ceiling_real is not None:
+            try:
+                anc.relative_to(ceiling_real)
+            except ValueError:
+                break
+        try:
+            if os.stat(anc).st_dev != target_dev:
+                break
+        except OSError:
+            break
+        git_entry = anc / ".git"
+        if git_entry.exists() and not git_entry.is_symlink():
+            rel_sub = os.path.relpath(str(target_real), str(anc))
+            if not rel_sub.startswith(".."):
+                curr = anc
+                has_symlink = False
+                for part in Path(rel_sub).parts:
+                    curr = curr / part
+                    if curr.is_symlink():
+                        has_symlink = True
+                        break
+                if not has_symlink:
+                    return anc, rel_sub
+            break
+        anc = anc.parent
+    return None, ""
+
+
+def discover_files(
+    target: Path,
+    db_path: str = "",
+    exclude: tuple = (),
+    path_root: Optional[Path] = None,
+) -> list[str]:
     """Source files under `target`. Uses git's own view when available —
     a repo already declares what isn't source. Excludes binary files, and
     anything matching the operator's `exclude` patterns (core.exclusions)."""
@@ -1062,44 +1183,72 @@ def discover_files(target: Path, db_path: str = "", exclude: tuple = ()) -> list
     target_real = Path(os.path.realpath(str(target)))
     found: Optional[list[str]] = None
     try:
-        from tools.research_tools import _run_safe_git_command, _validate_git_jail
+        from tools.research_tools import MAX_GIT_TIMEOUT, _run_safe_git_bytes, _validate_git_jail
 
-        valid_git, _ = _validate_git_jail(target, target)
-        if valid_git:
-            out, ok = _run_safe_git_command(
-                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                target,
-                ceiling_dir="",
-            )
-            if ok and out:
-                raw_entries = [p for p in out.split("\0") if p]
-                if raw_entries:
-                    found = [
-                        str(target / p)
-                        for p in sorted(raw_entries)
-                        if _is_safe_discovered_file(target / p, target, target_real, db_path=db_path)
-                    ]
+        git_root, rel_sub = _find_enclosing_git_root(target, target_real, path_root=path_root)
+        if git_root is not None:
+            valid_git, _ = _validate_git_jail(git_root, git_root)
+            if valid_git:
+                ls_cmd = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+                if rel_sub not in ("", "."):
+                    ls_cmd.extend(["--", rel_sub])
+                raw_out, ok = _run_safe_git_bytes(
+                    ls_cmd,
+                    git_root,
+                    ceiling_dir=str(git_root),
+                    timeout=MAX_GIT_TIMEOUT,
+                )
+                use_git_view = ok
+                if ok and not raw_out and rel_sub not in ("", ".") and path_root is None:
+                    _, sub_ignored = _run_safe_git_bytes(
+                        ["check-ignore", "-q", "--", rel_sub],
+                        git_root,
+                        ceiling_dir=str(git_root),
+                        timeout=MAX_GIT_TIMEOUT,
+                    )
+                    if sub_ignored:
+                        use_git_view = False
+                if use_git_view:
+                    entries: list[str] = []
+                    non_utf8_skipped = 0
+                    for raw_entry in raw_out.split(b"\x00"):
+                        if not raw_entry:
+                            continue
+                        try:
+                            entries.append(raw_entry.decode("utf-8", errors="strict"))
+                        except UnicodeDecodeError:
+                            non_utf8_skipped += 1
+                    if non_utf8_skipped:
+                        print(
+                            f"[DISCOVERY WARNING] Skipped {non_utf8_skipped} non-UTF-8 path(s) under {target}.",
+                            file=sys.stderr,
+                        )
+                    collected: list[str] = []
+                    for p in sorted(entries):
+                        abs_entry = git_root / p
+                        if rel_sub in ("", "."):
+                            rel_to_target = p
+                        else:
+                            try:
+                                rel_to_target = os.path.relpath(str(abs_entry), str(target_real))
+                            except ValueError:
+                                continue
+                        if rel_to_target in ("", ".") or rel_to_target.startswith(".."):
+                            if rel_to_target in ("", ".") and abs_entry.is_dir() and not abs_entry.is_symlink():
+                                collected.extend(_walk_safe_files(target, target, target_real, db_path=db_path))
+                            continue
+                        cand_path = target / rel_to_target
+                        if cand_path.is_symlink():
+                            continue
+                        if cand_path.is_dir():
+                            collected.extend(_walk_safe_files(cand_path, target, target_real, db_path=db_path))
+                        elif _is_safe_discovered_file(cand_path, target, target_real, db_path=db_path):
+                            collected.append(str(cand_path))
+                    found = sorted(set(collected))
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     if found is None:
-        from core.environments.static_env import PROTECTED_VCS_DIRS
-
-        walked: list[str] = []
-        for root, dirs, filenames in os.walk(str(target), followlinks=False):
-            dirs[:] = sorted(
-                d
-                for d in dirs
-                if not d.startswith(".")
-                and d.lower() not in PROTECTED_VCS_DIRS
-                and not (Path(root) / d).is_symlink()
-            )
-            for fn in sorted(filenames):
-                if fn.startswith("."):
-                    continue
-                cand = Path(root) / fn
-                if _is_safe_discovered_file(cand, target, target_real, db_path=db_path):
-                    walked.append(str(cand))
-        found = sorted(walked)
+        found = sorted(_walk_safe_files(target, target, target_real, db_path=db_path))
     # Tool state is never source. git's view includes a committed
     # .mantis/knowledge; the dot-prefix rule above already drops it on the
     # other path.
@@ -3046,7 +3195,13 @@ async def pipeline(
     if exclude:
         config = {**config, "exclude": list(exclude)}
 
-    discovered_files = discover_files(target_path, db_path, exclude=exclude)
+    _disc_path_root: Optional[Path] = None
+    if path_root:
+        _cand_root = os.path.realpath(os.path.expanduser(path_root))
+        _tgt_real = os.path.realpath(str(target_path))
+        if os.path.isdir(_cand_root) and (_tgt_real == _cand_root or _tgt_real.startswith(_cand_root + os.sep)):
+            _disc_path_root = Path(_cand_root)
+    discovered_files = discover_files(target_path, db_path, exclude=exclude, path_root=_disc_path_root)
     if not discovered_files:
         print(f"Error: No source files found in target: {target_path}"
               + (" after exclusions" if exclude else ""), file=sys.stderr)

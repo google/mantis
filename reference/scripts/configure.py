@@ -41,12 +41,15 @@ if _REF_ROOT not in sys.path:
 
 from core.config import (
     DEFAULT_MODEL,
+    DEFAULT_VERTEX_FAST_MODEL,
     PLACEHOLDER_STRINGS,
     RECOMMENDED_MODELS,
     SUPPORTED_SANDBOXES,
+    _strip_empty_injection_points,
     get_llm_kwargs,
     is_placeholder,
     normalize_model_id,
+    resolve_model_id,
 )
 
 # Guest images the microsandbox tier can run. The first is the operator-built
@@ -179,6 +182,7 @@ def load_workflow_dict(workflow_path: str, load_local: bool = True) -> dict:
                         for top_k in (
                             "sandbox",
                             "default_model",
+                            "fast_model",
                             "api_base",
                             "timeout",
                             "reasoning_effort",
@@ -422,7 +426,52 @@ def detect_capabilities() -> dict:
     return caps
 
 
-def is_default_or_unconfigured(config: dict) -> Tuple[bool, List[str]]:
+def _distinct_configured_models(config: dict, nodes: Optional[List[dict]] = None) -> List[str]:
+    """Returns deduplicated model IDs active across default_model, fast_model, and agent nodes."""
+    default_m = config.get("default_model", DEFAULT_MODEL)
+    candidates: List[str] = []
+    if default_m is not None:
+        candidates.append(str(default_m))
+    fast_m = config.get("fast_model")
+    if fast_m:
+        candidates.append(str(fast_m))
+    resolved_list = config.get("resolved_node_models")
+    if isinstance(resolved_list, list):
+        for rm in resolved_list:
+            if rm:
+                candidates.append(str(rm))
+    if isinstance(nodes, list):
+        has_unpinned_fast_tier = False
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("type") != "agent" or node.get("id") == "structural_index":
+                continue
+            if node.get("model"):
+                candidates.append(str(node["model"]))
+            elif node.get("id") in ("history", "deduplicator"):
+                has_unpinned_fast_tier = True
+        if (
+            has_unpinned_fast_tier
+            and not fast_m
+            and not config.get("api_base")
+            and not (os.environ.get("LLM_API_BASE") or "").strip()
+            and not (os.environ.get("MANTIS_MODEL") or os.environ.get("MODEL_ID") or "").strip()
+            and not is_placeholder(default_m)
+            and resolve_model_id(None, str(default_m or DEFAULT_MODEL)).startswith("vertex_ai/gemini-")
+        ):
+            candidates.append(DEFAULT_VERTEX_FAST_MODEL)
+    if not candidates:
+        candidates.append(DEFAULT_MODEL)
+    seen_resolved: set[str] = set()
+    ordered: List[str] = []
+    for raw_m in candidates:
+        norm_key = raw_m if is_placeholder(raw_m) else resolve_model_id(raw_m, str(default_m or DEFAULT_MODEL))
+        if norm_key not in seen_resolved:
+            seen_resolved.add(norm_key)
+            ordered.append(raw_m)
+    return ordered
+
+
+def is_default_or_unconfigured(config: dict, nodes: Optional[List[dict]] = None) -> Tuple[bool, List[str]]:
     """Evaluates if workflow config contains default placeholders or unconfigured settings."""
     issues = []
     if not isinstance(config, dict):
@@ -466,24 +515,27 @@ def is_default_or_unconfigured(config: dict) -> Tuple[bool, List[str]]:
                 "Remote sandbox requires 'options.container', 'options.host', or 'options.exec_argv' in workflow.local.json."
             )
 
-    # Model checks
-    model = config.get("default_model", DEFAULT_MODEL)
-    if is_placeholder(model):
-        issues.append(f"Model '{model}' contains placeholder string.")
-
-    if str(model).startswith("vertex_ai/"):
-        proj = (
-            sb_opts.get("project")
-            or os.environ.get("VERTEXAI_PROJECT")
-            or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or config.get("project")
-        )
-        if is_placeholder(proj):
-            caps = detect_capabilities()
-            if not caps.get("gcp_project") and not caps.get("vertex_project"):
-                issues.append(
-                    f"Vertex AI Model '{model}' requires VERTEXAI_PROJECT / GOOGLE_CLOUD_PROJECT or active gcloud project."
-                )
+    # Model checks across all active stage models
+    caps_cache: Optional[dict] = None
+    for model in _distinct_configured_models(config, nodes=nodes):
+        if is_placeholder(model):
+            issues.append(f"Model '{model}' contains placeholder string.")
+            continue
+        resolved_m = resolve_model_id(model, config.get("default_model", DEFAULT_MODEL))
+        if str(resolved_m).startswith("vertex_ai/"):
+            proj = (
+                sb_opts.get("project")
+                or os.environ.get("VERTEXAI_PROJECT")
+                or os.environ.get("GOOGLE_CLOUD_PROJECT")
+                or config.get("project")
+            )
+            if is_placeholder(proj):
+                if caps_cache is None:
+                    caps_cache = detect_capabilities()
+                if not caps_cache.get("gcp_project") and not caps_cache.get("vertex_project"):
+                    issues.append(
+                        f"Vertex AI Model '{resolved_m}' requires VERTEXAI_PROJECT / GOOGLE_CLOUD_PROJECT or active gcloud project."
+                    )
 
     return bool(issues), issues
 
@@ -621,6 +673,7 @@ def _probe_llm_reachability(
     call_kwargs["max_tokens"] = max_tokens
     call_kwargs["timeout"] = timeout
     call_kwargs["model"] = resolved_model
+    _strip_empty_injection_points(call_kwargs)
 
     max_probe_attempts = 3
     for attempt in range(max_probe_attempts):
@@ -665,13 +718,12 @@ def _probe_llm_reachability(
     return False, f"LLM reachability probe failed after {max_probe_attempts} attempts."
 
 
-def _check_llm_preflight(config: dict, probe: bool = False) -> Tuple[bool, str]:
-    """Fast validation of LLM configuration and credentials in ~1s.
-    
-    If probe is True (or MANTIS_PROBE_LLM=1), actively tests model reachability
-    and client dependencies by sending a test prompt with max_tokens=256.
-    """
-    model = config.get("default_model", DEFAULT_MODEL)
+def _check_single_llm_preflight(
+    model: str,
+    config: dict,
+    *,
+    probe: bool = False,
+) -> Tuple[bool, str]:
     api_base = config.get("api_base")
     timeout = config.get("timeout")
     effort = config.get("reasoning_effort")
@@ -679,6 +731,7 @@ def _check_llm_preflight(config: dict, probe: bool = False) -> Tuple[bool, str]:
     try:
         resolved_model, kwargs = get_llm_kwargs(
             model_id=model,
+            default_model=config.get("default_model", DEFAULT_MODEL),
             api_base=api_base,
             timeout=timeout,
             reasoning_effort=effort,
@@ -733,6 +786,26 @@ def _check_llm_preflight(config: dict, probe: bool = False) -> Tuple[bool, str]:
         return True, f"{static_msg} [Live probe: OK]"
 
     return True, static_msg
+
+
+def _check_llm_preflight(
+    config: dict,
+    probe: bool = False,
+    nodes: Optional[List[dict]] = None,
+) -> Tuple[bool, str]:
+    """Fast validation of LLM configuration and credentials across all distinct stage models.
+
+    If probe is True (or MANTIS_PROBE_LLM=1), actively tests model reachability
+    and client dependencies by sending a test prompt with max_tokens=256.
+    """
+    distinct_models = _distinct_configured_models(config, nodes=nodes)
+    checked_msgs: List[str] = []
+    for cand_model in distinct_models:
+        ok, msg = _check_single_llm_preflight(cand_model, config, probe=probe)
+        if not ok:
+            return False, msg
+        checked_msgs.append(msg)
+    return True, "; ".join(checked_msgs)
 
 
 _PINNED_RUNTIME_PACKAGES = ("google-adk", "litellm")
@@ -792,6 +865,7 @@ async def run_preflight_checks_async(
     test_sandbox: bool = True,
     target_path: str = "",
     probe_llm: bool = False,
+    nodes: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str]]:
     """Runs combined LLM and Sandbox preflight testing asynchronously in ~1-2s."""
     messages = []
@@ -802,7 +876,7 @@ async def run_preflight_checks_async(
     messages.append(f"[DEPENDENCY PREFLIGHT] {'✅ PASSED' if pins_ok else '⚠️ WARNING'}: {pins_msg}")
 
     if test_llm:
-        ok, msg = _check_llm_preflight(config, probe=probe_llm)
+        ok, msg = _check_llm_preflight(config, probe=probe_llm, nodes=nodes)
         messages.append(f"[LLM PREFLIGHT] {'✅ PASSED' if ok else '❌ FAILED'}: {msg}")
         if not ok:
             all_ok = False
@@ -823,6 +897,7 @@ def run_preflight_checks(
     test_sandbox: bool = True,
     target_path: str = "",
     probe_llm: bool = False,
+    nodes: Optional[List[dict]] = None,
 ) -> Tuple[bool, List[str]]:
     """Runs combined LLM and Sandbox preflight testing safely in sync contexts."""
     try:
@@ -841,6 +916,7 @@ def run_preflight_checks(
                     test_sandbox=test_sandbox,
                     target_path=target_path,
                     probe_llm=probe_llm,
+                    nodes=nodes,
                 ),
             ).result()
     else:
@@ -851,6 +927,7 @@ def run_preflight_checks(
                 test_sandbox=test_sandbox,
                 target_path=target_path,
                 probe_llm=probe_llm,
+                nodes=nodes,
             )
         )
 
@@ -873,6 +950,8 @@ def update_workflow_config(
 
     if "default_model" in updates:
         cfg["default_model"] = updates["default_model"]
+    if "fast_model" in updates:
+        cfg["fast_model"] = updates["fast_model"]
     if "api_base" in updates:
         cfg["api_base"] = updates["api_base"]
     if "timeout" in updates:
@@ -1034,7 +1113,8 @@ async def ensure_configured_async(
         )
         cfg = wf_data.get("config", {})
 
-    is_unconf, issues = is_default_or_unconfigured(cfg)
+    wf_nodes = wf_data.get("nodes") if isinstance(wf_data, dict) else None
+    is_unconf, issues = is_default_or_unconfigured(cfg, nodes=wf_nodes)
     caps = detect_capabilities()
 
     sb_type = cfg.get("sandbox", {}).get("type", "static-only")
@@ -1065,7 +1145,7 @@ async def ensure_configured_async(
     preflight_msgs: List[str] = []
     if not is_unconf and not overrides and sb_available and not promote_to_microsandbox:
         preflight_ran = True
-        ok, preflight_msgs = await run_preflight_checks_async(cfg, probe_llm=probe_llm)
+        ok, preflight_msgs = await run_preflight_checks_async(cfg, probe_llm=probe_llm, nodes=wf_nodes)
         if ok:
             if sb_type in ("static-only", "static"):
                 _print_static_floor_hint(caps)
@@ -1362,7 +1442,7 @@ def run_interactive_wizard(workflow_path: str) -> dict:
 
     print("\nRunning preflight checks on configured settings...")
     preview_wf = update_workflow_config(workflow_path, updates, save=False)
-    ok, messages = run_preflight_checks(preview_wf.get("config", {}))
+    ok, messages = run_preflight_checks(preview_wf.get("config", {}), nodes=preview_wf.get("nodes"))
     for m in messages:
         print(f"  {m}")
 
@@ -1384,14 +1464,15 @@ def print_status(
 ) -> None:
     """Prints current configuration and preflight test status."""
     target_wf = find_workflow_json(workflow_path)
+    wf_data = load_workflow_dict(target_wf, load_local=True)
+    wf_nodes = wf_data.get("nodes") if isinstance(wf_data, dict) else None
     if config_override is not None:
         cfg = config_override
     else:
-        wf_data = load_workflow_dict(target_wf, load_local=True)
         cfg = wf_data.get("config", {})
     caps = detect_capabilities()
-    ok, messages = run_preflight_checks(cfg, probe_llm=probe_llm)
-    is_unconf, issues = is_default_or_unconfigured(cfg)
+    ok, messages = run_preflight_checks(cfg, probe_llm=probe_llm, nodes=wf_nodes)
+    is_unconf, issues = is_default_or_unconfigured(cfg, nodes=wf_nodes)
 
     local_path = get_local_workflow_path(target_wf)
     has_local = os.path.exists(local_path)
@@ -1610,7 +1691,11 @@ def main() -> int:
             dest = target_wf if save_tracked else get_local_workflow_path(target_wf)
             print(f"✅ {action} {dest}")
         if args.test or args.probe_llm:
-            ok, msgs = run_preflight_checks(updated_data.get("config", {}), probe_llm=args.probe_llm)
+            ok, msgs = run_preflight_checks(
+                updated_data.get("config", {}),
+                probe_llm=args.probe_llm,
+                nodes=updated_data.get("nodes"),
+            )
             if args.json:
                 print(json.dumps({"preflight_passed": ok, "messages": msgs}, indent=2))
             else:
@@ -1623,7 +1708,11 @@ def main() -> int:
     # 5. Preflight Test Only
     if args.test or args.probe_llm:
         wf_data = load_workflow_dict(target_wf, load_local=True)
-        ok, msgs = run_preflight_checks(wf_data.get("config", {}), probe_llm=args.probe_llm)
+        ok, msgs = run_preflight_checks(
+            wf_data.get("config", {}),
+            probe_llm=args.probe_llm,
+            nodes=wf_data.get("nodes"),
+        )
         if args.json:
             print(json.dumps({"preflight_passed": ok, "messages": msgs}, indent=2))
         else:
