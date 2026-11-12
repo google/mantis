@@ -457,12 +457,37 @@ class GceEnvironment(BaseEnvironment):
     async def initialize(self) -> None:
         await self._ensure()
 
+    @staticmethod
+    def _is_gce_ssh_transport_error(returncode: int, stderr_text: str) -> bool:
+        low = (stderr_text or "").lower()
+        if any(
+            m in low
+            for m in (
+                "error: (gcloud.compute.ssh)",
+                "ssh: connect to host",
+                "kex_exchange_identification",
+                "connection timed out",
+                "connection closed by remote host",
+                "connection reset by peer",
+                "instance not found",
+                "was not found",
+                "failed to connect to backend",
+                "iap tunnel",
+            )
+        ):
+            return True
+        return returncode == 255 and ("ssh:" in low or "gcloud" in low)
+
     async def execute(self, command: str, *, timeout: Optional[float] = None) -> ExecutionResult:
         """Executes a command inside the hardened GCE VM workspace via IAP SSH tunnel."""
         await self._ensure()
         t = timeout or self.timeout
+        from .base import format_posix_exports
 
-        guest_cmd = f"cd {shlex.quote(str(self._workdir))} && {command}"
+        exec_env = self._consume_exec_env() if hasattr(self, "_consume_exec_env") else None
+        effective_cmd = format_posix_exports(exec_env) + command if exec_env else command
+
+        guest_cmd = f"cd {shlex.quote(str(self._workdir))} && {effective_cmd}"
         ssh_args = self._ssh_args() + ["--command", guest_cmd]
 
         def _exec():
@@ -483,13 +508,16 @@ class GceEnvironment(BaseEnvironment):
                         exit_code=124,
                         timed_out=True,
                     )
+                stderr_formatted = format_bounded_output(
+                    res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
+                )
+                if res.returncode != 0 and self._is_gce_ssh_transport_error(res.returncode, stderr_formatted):
+                    stderr_formatted = f"SANDBOX-ERROR: GCE SSH transport failed: {stderr_formatted}"
                 return ExecutionResult(
                     stdout=format_bounded_output(
                         res.stdout, res.stdout_total_bytes, MAX_OUTPUT, what="sandbox stdout"
                     ),
-                    stderr=format_bounded_output(
-                        res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
-                    ),
+                    stderr=stderr_formatted,
                     exit_code=res.returncode,
                     timed_out=False,
                 )
@@ -545,9 +573,7 @@ class GceEnvironment(BaseEnvironment):
         logger.info(f"[GCE] Remapping out-of-workdir path '{path}' -> '{fallback_target}'")
         return fallback_target
 
-    async def read_file(self, path: Union[Path, str]) -> bytes:
-        """Reads a file from the guest VM workspace without output truncation."""
-        await self._ensure()
+    async def _read_started_vm_file(self, path: Union[Path, str]) -> bytes:
         resolved_path = self._resolve_guest_path(path)
         guest_cmd = f"base64 -w 0 {shlex.quote(str(resolved_path))}"
         ssh_args = self._ssh_args() + ["--command", guest_cmd]
@@ -586,6 +612,19 @@ class GceEnvironment(BaseEnvironment):
             return decoded
 
         return await asyncio.to_thread(_read)
+
+    async def read_guest_file(self, path: Union[Path, str]) -> bytes:
+        """Dynamic-plane sentinel/scaffold reader: never boots a VM or touches host files."""
+        if not getattr(self, "_started", False):
+            raise FileNotFoundError(
+                f"GCE VM not started; guest file unavailable: {path}"
+            )
+        return await self._read_started_vm_file(path)
+
+    async def read_file(self, path: Union[Path, str]) -> bytes:
+        """Reads a file from the guest VM workspace without output truncation."""
+        await self._ensure()
+        return await self._read_started_vm_file(path)
 
     async def write_file(self, path: Union[Path, str], content: Union[str, bytes]) -> None:
         """Writes content to a file inside the guest VM workspace via stdin streaming without argv limits."""

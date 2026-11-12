@@ -75,6 +75,7 @@ _PRUNED_ANYWHERE = (
 )
 
 _WRAPPER_EXTS = ("py", "sh", "c", "js", "txt")
+_SIDECAR_SENTINEL_RE = re.compile(r"^(?:\.mantis_reached_sentinel|sentinel[_-]\d+(?:\.\w+)?)$")
 
 
 def find_new_files_command(limit: int = 4 * MAX_SCAFFOLD_FILES) -> str:
@@ -165,6 +166,8 @@ async def capture_poc_scaffold(
     for rel in rels:
         if len(stored) >= MAX_SCAFFOLD_FILES or total >= MAX_SCAFFOLD_TOTAL_BYTES:
             break
+        if _SIDECAR_SENTINEL_RE.match(posixpath.basename(rel)):
+            continue  # sidecar proof file from this run, never a reusable scaffold
         if host_root and _host_has(host_root, rel):
             continue  # a target file the PoC edited: a patch, not a scaffold
         try:

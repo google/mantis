@@ -371,8 +371,8 @@ class EvidenceCheckerTruncationTest(unittest.TestCase):
         self.assertNotIn(EVIDENCE_TRUNCATED_PREFIX, reason)
 
     def test_sentinel_that_survived_the_cut_still_counts(self):
-        out = _cut(f"start\n{MANTIS_SENTINEL_TOKEN}\n" + "noise\n" * 100)
-        present, reason = check_reached_sink_evidence(out, exit_code=0)
+        out = _cut("==1==ERROR: AddressSanitizer: heap-buffer-overflow\n" + "noise\n" * 100)
+        present, reason = check_reached_sink_evidence(out, exit_code=1)
         self.assertTrue(present, reason)
         self.assertIn("EVIDENCE_PRESENT", reason)
 
@@ -416,13 +416,15 @@ class EvidenceCheckerTruncationTest(unittest.TestCase):
 
 
 class _FakeSandbox:
-    def __init__(self, stdout: str, stderr: str = "", exit_code: int = 0, files=None):
+    def __init__(self, stdout: str, stderr: str = "", exit_code: int = 0, files=None, post_files=None):
         from google.adk.environment import ExecutionResult
         self._res = ExecutionResult(stdout=stdout, stderr=stderr, exit_code=exit_code, timed_out=False)
         self.files = dict(files or {})   # guest path -> bytes
+        self._post_files = dict(post_files or {})
         self.writes = []
 
     async def execute(self, command):
+        self.files.update(self._post_files)
         return self._res
 
     async def read_file(self, path):
@@ -471,7 +473,7 @@ class StaleSentinelTest(unittest.IsolatedAsyncioTestCase):
         self._ctx(sb)
         res = await sandbox_tools.run_sandbox_with_evidence("python3 poc.py", sentinel_path="sentinel_9", sink_symbol="sink")
         self.assertEqual(sb.writes, [])
-        self.assertTrue(res["evidence_present"], "the token in the trace still counts")
+        self.assertFalse(res["evidence_present"], "stdout token without sidecar file must not forge proof")
 
 
 class RunSandboxWithEvidenceTruncationTest(unittest.IsolatedAsyncioTestCase):
@@ -496,8 +498,13 @@ class RunSandboxWithEvidenceTruncationTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_truncation_marker_present(res["raw"]))
 
     async def test_cut_trace_with_sentinel_in_the_kept_part_is_verified(self):
-        cut = truncate_with_marker(f"{MANTIS_SENTINEL_TOKEN}\n" + "poc running\n" * 2000, 16000, what="sandbox stdout")
-        ctx = self._ctx(_FakeSandbox(stdout=cut))
+        cut = truncate_with_marker("poc running\n" * 2000, 16000, what="sandbox stdout")
+        ctx = self._ctx(
+            _FakeSandbox(
+                stdout=cut,
+                post_files={".mantis_reached_sentinel": f"{MANTIS_SENTINEL_TOKEN}\n".encode("utf-8")},
+            )
+        )
         res = await sandbox_tools.run_sandbox_with_evidence("python3 poc.py", sink_symbol="sink")
         self.assertTrue(res["evidence_present"], res["evidence_reason"])
         self.assertTrue(ctx.sandbox_executed)

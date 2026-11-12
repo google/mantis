@@ -57,8 +57,10 @@ class _Guest:
     is_initialized = True
 
     def __init__(self, files: dict | None = None, created: list | None = None,
-                 stdout: str = "", exit_code: int = 0, target_path: str = ""):
+                 stdout: str = "", exit_code: int = 0, target_path: str = "",
+                 post_files: dict | None = None):
         self.files = dict(files or {})
+        self.post_files = dict(post_files or {})
         self.created = list(created or [])
         self.stdout, self.exit_code = stdout, exit_code
         self.commands: list = []
@@ -71,6 +73,7 @@ class _Guest:
                 return ExecutionResult(stdout="", stderr="", exit_code=1, timed_out=False)
             return ExecutionResult(stdout="".join(f"./{p}\n" for p in self.created), stderr="",
                                    exit_code=0, timed_out=False)
+        self.files.update(self.post_files)
         return ExecutionResult(stdout=self.stdout, stderr="", exit_code=self.exit_code, timed_out=False)
 
     async def read_file(self, p):
@@ -230,10 +233,12 @@ class EvidenceKeepsTheScaffoldTest(_DbBase):
     """run_sandbox_with_evidence stores the PoC's in-tree files when the
     evidence lands -- and only then, and not in the patcher."""
 
-    def _guest(self, stdout=TOKEN + "\n"):
+    def _guest(self, stdout="ok\n", sentinel: str = TOKEN + "\n"):
+        post = {"sentinel_12": sentinel} if sentinel else {}
         return _Guest(files={STAGING_MARKER: "", "pkg/repro12_test.go": "package pkg\n",
                              "pkg/mod1.py": "edited\n"},
-                      created=["pkg/repro12_test.go", "pkg/mod1.py"], stdout=stdout, target_path=self.target)
+                      created=["pkg/repro12_test.go", "pkg/mod1.py", "sentinel_12"],
+                      stdout=stdout, target_path=self.target, post_files=post)
 
     async def test_evidence_present_persists_new_tree_files_under_the_finding(self):
         Path(self.target, "pkg", "mod1.py").write_text("original\n")
@@ -245,10 +250,12 @@ class EvidenceKeepsTheScaffoldTest(_DbBase):
         self.assertEqual(art, "package pkg\n")
         self.assertIsNone(read_artifact(self.db, filepath=scaffold_artifact_path(12, "pkg/mod1.py"), run_id=NEW),
                           "a host file the PoC edited is a patch, not a scaffold")
+        self.assertIsNone(read_artifact(self.db, filepath=scaffold_artifact_path(12, "sentinel_12"), run_id=NEW),
+                          "sidecar sentinel must never be captured as a reusable PoC scaffold")
         self.assertTrue(ctx.finding_evidence["12"]["reproduced"])
 
     async def test_evidence_absent_keeps_nothing(self):
-        self._ctx(self._guest(stdout="nothing\n"))
+        self._ctx(self._guest(stdout=TOKEN + "\n", sentinel=""))
         res = await run_sandbox_with_evidence("python3 workspace/repro_12.py", finding_id=12)
         self.assertFalse(res["evidence_present"])
         self.assertEqual(res["scaffold_files_kept"], [])
@@ -275,7 +282,8 @@ class EvidenceKeepsTheScaffoldTest(_DbBase):
         # a harness into the package (guest only), then the evidence landed.
         record_artifact(self.db, OLD, "workspace_file", f"workspace/repro_{fid}.py", "# wrapper\n")
         self._ctx(_Guest(files={STAGING_MARKER: "", f"pkg/repro{fid}_test.go": "package pkg // harness\n"},
-                         created=[f"pkg/repro{fid}_test.go"], stdout=TOKEN + "\n", target_path=self.target),
+                         created=[f"pkg/repro{fid}_test.go"], stdout="ok\n", target_path=self.target,
+                         post_files={f"sentinel_{fid}": TOKEN + "\n"}),
                   run_id=OLD)
         await run_sandbox_with_evidence("go test ./pkg/", finding_id=fid)
         current_run_context.reset(self.token)

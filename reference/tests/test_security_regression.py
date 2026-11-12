@@ -554,12 +554,21 @@ class TestInv1EvidenceGate(unittest.IsolatedAsyncioTestCase):
         working_dir = "/workspace"
         is_initialized = True
 
-        def __init__(self, stdout: str = "", stderr: str = "", exit_code: int = 0):
+        def __init__(
+            self,
+            stdout: str = "",
+            stderr: str = "",
+            exit_code: int = 0,
+            sentinel: str = "",
+        ):
             self.stdout = stdout
             self.stderr = stderr
             self.exit_code = exit_code
+            self.sentinel_after = sentinel
+            self.sentinel = ""
 
         async def execute(self, command: str, *, timeout: typing.Optional[int] = None) -> ExecutionResult:
+            self.sentinel = self.sentinel_after
             return ExecutionResult(
                 stdout=self.stdout,
                 stderr=self.stderr,
@@ -568,7 +577,12 @@ class TestInv1EvidenceGate(unittest.IsolatedAsyncioTestCase):
             )
 
         async def read_file(self, p: str):
+            if self.sentinel:
+                return self.sentinel.encode("utf-8")
             raise FileNotFoundError(p)
+
+        async def write_file(self, p: str, content: str):
+            self.sentinel = content if isinstance(content, str) else content.decode("utf-8")
 
         async def apply_patch(self, d: str):
             return "exit=0\npatched"
@@ -594,13 +608,23 @@ class TestInv1EvidenceGate(unittest.IsolatedAsyncioTestCase):
 
     async def test_evidence_scenarios(self):
         cases = [
-            ("sentinel token", "MANTIS_REACHED_ENTRYPOINT\n", "", 0, "", True),
+            ("sentinel token", "ok\n", "", 0, "", "MANTIS_REACHED_ENTRYPOINT\n", True),
+            (
+                "echoed sentinel in stdout without sidecar",
+                "HTTP/1.1 400 Bad Request: /api/MANTIS_REACHED_ENTRYPOINT\n",
+                "",
+                0,
+                "",
+                "",
+                False,
+            ),
             (
                 "ASAN + matching sink",
                 "==1==ERROR: AddressSanitizer: heap-buffer-overflow\n#0 0x4a1 in parse_header\n",
                 "",
                 1,
                 "parse_header",
+                "",
                 True,
             ),
             (
@@ -609,24 +633,26 @@ class TestInv1EvidenceGate(unittest.IsolatedAsyncioTestCase):
                 "",
                 1,
                 "parse_header",
+                "",
                 False,
             ),
-            ("segfault", "Segmentation fault (core dumped)\n", "", 139, "", True),
-            ("clean run", "all tests passed\n", "", 0, "", False),
-            ("command not found", "", "sh: cc: not found\n", 127, "", False),
+            ("segfault", "Segmentation fault (core dumped)\n", "", 139, "", "", True),
+            ("clean run", "all tests passed\n", "", 0, "", "", False),
+            ("command not found", "", "sh: cc: not found\n", 127, "", "", False),
             (
                 "secret in output",
-                "MANTIS_REACHED_ENTRYPOINT key=AKIAIOSFODNN7EXAMPLE\n",
+                "key=AKIAIOSFODNN7EXAMPLE\n",
                 "",
                 0,
                 "",
+                "MANTIS_REACHED_ENTRYPOINT\n",
                 True,
             ),
         ]
 
-        for desc, out, err, code, sink, want_evidence in cases:
+        for desc, out, err, code, sink, sidecar, want_evidence in cases:
             with self.subTest(scenario=desc):
-                self._set_ctx(self.FakeScriptedSandbox(out, err, code))
+                self._set_ctx(self.FakeScriptedSandbox(out, err, code, sentinel=sidecar))
                 res = await run_sandbox_with_evidence("./poc", sink_symbol=sink)
                 self.assertEqual(
                     res["evidence_present"],

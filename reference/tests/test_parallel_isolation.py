@@ -135,7 +135,7 @@ class SandboxLifecycleTest(unittest.TestCase):
         res = asyncio.run(env.execute("sleep 100"))
         self.assertTrue(res.timed_out)
         self.assertEqual(res.exit_code, 124)
-        self.assertIn("SANDBOX-ERROR", res.stderr)
+        self.assertIn("SANDBOX-TIMEOUT", res.stderr)
 
     def test_close_kills_and_destroys_when_stop_fails(self):
         import asyncio

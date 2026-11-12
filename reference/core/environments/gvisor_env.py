@@ -29,6 +29,7 @@ from .base import (
     BaseEnvironment,
     MAX_GUEST_FILE_BYTES,
     format_bounded_output,
+    format_posix_exports,
     run_bounded_subprocess,
 )
 from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
@@ -96,7 +97,9 @@ class GvisorEnvironment(BaseEnvironment):
             )
         self.tool = tool
         self.container_name = f"mantis-gv-{uuid.uuid4().hex[:12]}"
+        self._created = False
         self._started = False
+        self._stage_error: Optional[Exception] = None
         self._lock = asyncio.Lock()
 
     @property
@@ -128,6 +131,9 @@ class GvisorEnvironment(BaseEnvironment):
         async with self._lock:
             if self._started:
                 return
+            stage_err = getattr(self, "_stage_error", None)
+            if stage_err is not None:
+                raise stage_err
 
             def _init():
                 # 1. Create container with runsc runtime, no network, dropped capabilities, and strict resource ceilings
@@ -150,27 +156,32 @@ class GvisorEnvironment(BaseEnvironment):
                 rc, out = self._run_cmd(create_cmd)
                 if rc != 0:
                     raise RuntimeError(f"Failed to create gVisor container '{self.container_name}': {out}")
+                self._created = True
 
-                # 2. Start container
-                rc, out = self._run_cmd([self.tool, "start", self.container_name])
-                if rc != 0:
+                try:
+                    # 2. Start container
+                    rc, out = self._run_cmd([self.tool, "start", self.container_name])
+                    if rc != 0:
+                        raise RuntimeError(f"Failed to start gVisor container '{self.container_name}': {out}")
+
+                    # 3. Stage target file or directory using canonical fail-closed staging helper
+                    if self.target_path and os.path.exists(self.target_path):
+                        from .staging import stage_to_directory
+                        with tempfile.TemporaryDirectory() as stage_dir:
+                            count = stage_to_directory(self.target_path, stage_dir)
+                            if count > 0:
+                                rc, out = self._run_cmd([
+                                    self.tool, "cp",
+                                    f"{stage_dir}/.",
+                                    f"{self.container_name}:{self._workdir}/",
+                                ])
+                                if rc != 0:
+                                    raise RuntimeError(f"Failed to stage files into gVisor container: {out}")
+                except Exception as e:
+                    self._stage_error = e
                     self._run_cmd([self.tool, "rm", "-f", self.container_name])
-                    raise RuntimeError(f"Failed to start gVisor container '{self.container_name}': {out}")
-
-                # 3. Stage target file or directory using canonical fail-closed staging helper
-                if self.target_path and os.path.exists(self.target_path):
-                    from .staging import stage_to_directory
-                    with tempfile.TemporaryDirectory() as stage_dir:
-                        count = stage_to_directory(self.target_path, stage_dir)
-                        if count > 0:
-                            rc, out = self._run_cmd([
-                                self.tool, "cp",
-                                f"{stage_dir}/.",
-                                f"{self.container_name}:{self._workdir}/",
-                            ])
-                            if rc != 0:
-                                self._run_cmd([self.tool, "rm", "-f", self.container_name])
-                                raise RuntimeError(f"Failed to stage files into gVisor container: {out}")
+                    self._created = False
+                    raise
 
             await asyncio.to_thread(_init)
             self._started = True
@@ -186,9 +197,27 @@ class GvisorEnvironment(BaseEnvironment):
     async def initialize(self) -> None:
         await self._ensure()
 
+    @staticmethod
+    def _is_container_infra_error(returncode: int, stderr_text: str) -> bool:
+        if returncode == 125:
+            return True
+        low = (stderr_text or "").lower()
+        return any(
+            m in low
+            for m in (
+                "no such container",
+                "is not running",
+                "cannot connect to the docker daemon",
+                "cannot connect to podman",
+                "container state improper",
+            )
+        )
+
     async def execute(self, command: str, *, timeout: Optional[float] = None) -> ExecutionResult:
         await self._ensure()
         t = int(timeout) if timeout is not None else self.timeout
+        exec_env = self._consume_exec_env() if hasattr(self, "_consume_exec_env") else None
+        effective_cmd = format_posix_exports(exec_env) + command if exec_env else command
 
         def _exec():
             try:
@@ -196,27 +225,31 @@ class GvisorEnvironment(BaseEnvironment):
                     [
                         self.tool, "exec",
                         self.container_name,
-                        "/bin/sh", "-c", command,
+                        "/bin/sh", "-c", effective_cmd,
                     ],
                     timeout=t,
                     max_stdout_bytes=_MAX_EXEC_CAPTURE_BYTES,
                     max_stderr_bytes=_MAX_EXEC_CAPTURE_BYTES,
                     mock_text=True,
                 )
+                stdout_formatted = format_bounded_output(
+                    res.stdout, res.stdout_total_bytes, MAX_OUTPUT, what="sandbox stdout"
+                )
                 if res.timed_out:
                     return ExecutionResult(
-                        stdout="",
+                        stdout=stdout_formatted,
                         stderr=f"SANDBOX-TIMEOUT: command exceeded {t}s.",
-                        exit_code=-1,
+                        exit_code=124,
                         timed_out=True,
                     )
+                stderr_formatted = format_bounded_output(
+                    res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
+                )
+                if res.returncode != 0 and self._is_container_infra_error(res.returncode, stderr_formatted):
+                    stderr_formatted = f"SANDBOX-ERROR: gVisor container execution failed: {stderr_formatted}"
                 return ExecutionResult(
-                    stdout=format_bounded_output(
-                        res.stdout, res.stdout_total_bytes, MAX_OUTPUT, what="sandbox stdout"
-                    ),
-                    stderr=format_bounded_output(
-                        res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
-                    ),
+                    stdout=stdout_formatted,
+                    stderr=stderr_formatted,
                     exit_code=res.returncode,
                     timed_out=False,
                 )
@@ -270,8 +303,7 @@ class GvisorEnvironment(BaseEnvironment):
                         pass
         return self._confine_to_workdir(self._workdir / p.name, path)
 
-    async def read_file(self, path: Union[Path, str]) -> bytes:
-        await self._ensure()
+    async def _read_started_container_file(self, path: Union[Path, str]) -> bytes:
         resolved_path = self._resolve_guest_path(path)
 
         def _read():
@@ -290,12 +322,29 @@ class GvisorEnvironment(BaseEnvironment):
                     f"File '{path}' exceeds maximum sandbox read size ({MAX_GUEST_FILE_BYTES} bytes)."
                 )
             if res.returncode != 0:
+                err_txt = res.stderr.decode("utf-8", errors="replace")
+                if self._is_container_infra_error(res.returncode, err_txt):
+                    raise RuntimeError(
+                        f"gVisor container '{self.container_name}' unavailable while reading {path}: {err_txt}"
+                    )
                 raise FileNotFoundError(
-                    f"File not found in gVisor container: {path} ({res.stderr.decode('utf-8', errors='replace')})"
+                    f"File not found in gVisor container: {path} ({err_txt})"
                 )
             return res.stdout
 
         return await asyncio.to_thread(_read)
+
+    async def read_guest_file(self, path: Union[Path, str]) -> bytes:
+        """Dynamic-plane sentinel/scaffold reader: never boots a container or touches host files."""
+        if not getattr(self, "_started", False):
+            raise FileNotFoundError(
+                f"gVisor container not started; guest file unavailable: {path}"
+            )
+        return await self._read_started_container_file(path)
+
+    async def read_file(self, path: Union[Path, str]) -> bytes:
+        await self._ensure()
+        return await self._read_started_container_file(path)
 
     async def write_file(self, path: Union[Path, str], content: Union[str, bytes]) -> None:
         await self._ensure()
@@ -426,9 +475,10 @@ class GvisorEnvironment(BaseEnvironment):
         await asyncio.to_thread(_check)
 
     async def close(self) -> None:
-        if self._started:
+        if getattr(self, "_started", False) or getattr(self, "_created", False):
             def _cleanup():
                 self._run_cmd([self.tool, "rm", "-f", self.container_name])
             await asyncio.to_thread(_cleanup)
+            self._created = False
             self._started = False
             self.is_initialized = False

@@ -93,11 +93,18 @@ class TestADKInvariants(unittest.IsolatedAsyncioTestCase):
     # INV-1 & INV-2: Reached-Sink Evidence & Re-Attack Validation Tests
     # -------------------------------------------------------------------------
     def test_evidence_gate_with_sentinel_token(self):
-        """Channel A: Verifies evidence is present when MANTIS_REACHED_ENTRYPOINT is emitted."""
+        """Channel A: Stdout sentinel alone is rejected; guest sidecar sentinel is required."""
         output = f"Running test harness...\n{MANTIS_SENTINEL_TOKEN}\nExecuting sink..."
-        present, reason = check_reached_sink_evidence(output=output, exit_code=0)
-        self.assertTrue(present)
-        self.assertIn("EVIDENCE_PRESENT", reason)
+        present_stdout, reason_stdout = check_reached_sink_evidence(output=output, exit_code=0)
+        self.assertFalse(present_stdout)
+        self.assertIn("EVIDENCE_ABSENT", reason_stdout)
+        present_sidecar, reason_sidecar = check_reached_sink_evidence(
+            output="Running test harness...\nExecuting sink...",
+            exit_code=0,
+            sentinel_content=MANTIS_SENTINEL_TOKEN,
+        )
+        self.assertTrue(present_sidecar)
+        self.assertIn("EVIDENCE_PRESENT", reason_sidecar)
 
     def test_evidence_gate_with_sidecar_file(self):
         """Channel A: Verifies evidence is present when sentinel file contains token."""

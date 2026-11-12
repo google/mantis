@@ -323,13 +323,18 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
                 "function's exact extent instead of the whole file.]"
             )
         return result
-    except (PermissionError, FileNotFoundError) as e:
+    except (PermissionError, FileNotFoundError, ValueError) as e:
         return f"Error: {e}"
     except Exception as e:
-        if ctx.sandbox is not None:
+        if ctx.sandbox is not None and type(ctx.sandbox).__name__ not in (
+            "StaticOnlyEnvironment",
+            "StaticOnlySandbox",
+        ):
             # SECURITY: When a dynamic sandbox is configured, never fall back to the host
-            # filesystem. An in-guest induced error (e.g. FIFO timeout) would
-            # otherwise silently convert sandboxed reads into host reads.
+            # filesystem, and surface guest boot/staging/transport failures as SANDBOX-ERROR
+            # so broken sandboxes fail closed instead of completing campaigns as clean.
+            return f"SANDBOX-ERROR: sandbox read failed for '{filepath}': {type(e).__name__}: {e}"
+        if ctx.sandbox is not None:
             return f"Error: sandbox read failed for '{filepath}': {type(e).__name__}: {e}"
         return f"Error reading file '{filepath}': {e}"
 
@@ -1581,6 +1586,9 @@ async def write_file(filepath: str, content: str) -> str:
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "write_file"):
         try:
             await ctx.sandbox.write_file(Path(filepath), content)
+            from tools.sandbox_tools import invalidate_patch_reattack_state
+
+            invalidate_patch_reattack_state(ctx)
             if hasattr(ctx.sandbox, "run_rebuild") and getattr(ctx.sandbox, "rebuild_cmd", None):
                 rb_rc, rb_out = await ctx.sandbox.run_rebuild()
                 if rb_rc != 0:
@@ -1766,6 +1774,8 @@ async def list_files(directory: str = "") -> str:
         except FileNotFoundError as fe:
             return f"Error: {fe}"
         except Exception as e:
+            if type(ctx.sandbox).__name__ not in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
+                return f"SANDBOX-ERROR: sandbox list_files failed: {type(e).__name__}: {e}"
             return f"Error listing files in sandbox: {e}"
 
     jail = os.path.realpath(ctx.jail_dir)

@@ -43,6 +43,7 @@ from .base import (
     BaseEnvironment,
     MAX_GUEST_FILE_BYTES,
     format_bounded_output,
+    format_posix_exports,
     run_bounded_subprocess,
 )
 from .static_env import StaticOnlyEnvironment
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 MAX_OUTPUT = 16000
 _MAX_EXEC_CAPTURE_BYTES = MAX_OUTPUT * 4 + 4096
-_MAX_TELEMETRY_CHARS = 4000
+_MAX_TELEMETRY_CHARS = 12000
 _MAX_B64_GUEST_FILE_BYTES = ((MAX_GUEST_FILE_BYTES + 2) // 3) * 4 + 64
 
 ALLOWED_TRANSPORTS = frozenset({"container", "ssh", "exec"})
@@ -110,6 +111,7 @@ class RemoteTargetEnvironment(BaseEnvironment):
         reset_argv: Optional[Sequence[str]] = None,
         rebuild_cmd: Optional[str] = None,
         log_cmd: Optional[str] = None,
+        log_file: Optional[str] = None,
         **_: object,
     ):
         super().__init__()
@@ -237,6 +239,13 @@ class RemoteTargetEnvironment(BaseEnvironment):
             self.reset_argv = None
         self.rebuild_cmd = str(rebuild_cmd).strip() if rebuild_cmd else None
         self.log_cmd = str(log_cmd).strip() if log_cmd else None
+        if log_file is not None and str(log_file).strip():
+            lf = str(log_file).strip()
+            if "\x00" in lf or "\n" in lf or "\r" in lf:
+                raise ValueError("Invalid remote sandbox 'log_file'.")
+            self.log_file: Optional[str] = lf
+        else:
+            self.log_file = None
 
         self._started = False
         self.is_initialized = False
@@ -564,14 +573,80 @@ class RemoteTargetEnvironment(BaseEnvironment):
 
         await asyncio.to_thread(_write)
 
+    @staticmethod
+    def _clip_newest_telemetry(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return (
+            f"[remote target telemetry clipped to newest {limit} of {len(text)} chars]\n"
+            + text[-limit:]
+        )
+
+    @staticmethod
+    def _is_remote_transport_failure(transport: str, returncode: int, stderr_text: str) -> bool:
+        low = (stderr_text or "").lower()
+        if transport == "container":
+            if returncode == 125:
+                return True
+            return any(
+                m in low
+                for m in (
+                    "no such container",
+                    "is not running",
+                    "cannot connect to the docker daemon",
+                    "cannot connect to podman",
+                    "container state improper",
+                )
+            )
+        if transport == "ssh" and returncode == 255:
+            return any(
+                m in low
+                for m in (
+                    "ssh:",
+                    "kex_exchange_identification",
+                    "connection timed out",
+                    "connection refused",
+                    "connection closed",
+                    "connection reset",
+                    "broken pipe",
+                    "no route to host",
+                    "host key verification failed",
+                    "permission denied (publickey",
+                )
+            )
+        return False
+
     async def execute(self, command: str, *, timeout: Optional[float] = None) -> ExecutionResult:
         """Executes ``command`` inside the remote target workdir and collects optional telemetry."""
         await self._ensure()
         t = float(timeout) if timeout is not None else float(self.timeout)
-        argv = self._build_transport_argv(command, with_stdin=False)
+        exec_env = self._consume_exec_env() if hasattr(self, "_consume_exec_env") else None
+        effective_cmd = format_posix_exports(exec_env) + command if exec_env else command
+        argv = self._build_transport_argv(effective_cmd, with_stdin=False)
 
         def _exec() -> ExecutionResult:
             try:
+                pre_log_bytes = 0
+                if self.log_file:
+                    qlog = shlex.quote(self.log_file)
+                    pre_res = run_bounded_subprocess(
+                        self._build_transport_argv(
+                            f"if [ -f {qlog} ]; then wc -c < {qlog} 2>/dev/null || echo 0; else echo 0; fi",
+                            with_stdin=False,
+                        ),
+                        timeout=min(t, 10.0),
+                        max_stdout_bytes=4096,
+                        max_stderr_bytes=4096,
+                        mock_text=True,
+                    )
+                    try:
+                        pre_log_bytes = max(
+                            0,
+                            int(pre_res.stdout.decode("utf-8", errors="replace").strip() or "0"),
+                        )
+                    except ValueError:
+                        pre_log_bytes = 0
+
                 res = run_bounded_subprocess(
                     argv,
                     timeout=t,
@@ -579,7 +654,29 @@ class RemoteTargetEnvironment(BaseEnvironment):
                     max_stderr_bytes=_MAX_EXEC_CAPTURE_BYTES,
                     mock_text=True,
                 )
-                telemetry_block = ""
+                telemetry_blocks: List[str] = []
+                if self.log_file:
+                    qlog = shlex.quote(self.log_file)
+                    delta_cmd = (
+                        f"if [ -f {qlog} ]; then "
+                        f"cur=$(wc -c < {qlog} 2>/dev/null || echo 0); "
+                        f"start={pre_log_bytes + 1}; "
+                        f"if [ \"$cur\" -lt \"{pre_log_bytes}\" ]; then start=1; fi; "
+                        f"if [ \"$cur\" -ge \"$start\" ]; then tail -c +\"$start\" {qlog}; fi; "
+                        f"fi"
+                    )
+                    delta_res = run_bounded_subprocess(
+                        self._build_transport_argv(delta_cmd, with_stdin=False),
+                        timeout=min(t, 10.0),
+                        max_stdout_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                        max_stderr_bytes=65536,
+                        mock_text=True,
+                    )
+                    delta_txt = delta_res.stdout.decode("utf-8", errors="replace").strip()
+                    if delta_txt:
+                        bounded_delta = self._clip_newest_telemetry(delta_txt, _MAX_TELEMETRY_CHARS)
+                        telemetry_blocks.append(f"\n[REMOTE TARGET DELTA TELEMETRY]\n{bounded_delta}")
+
                 if self.log_cmd:
                     log_res = run_bounded_subprocess(
                         self._build_transport_argv(self.log_cmd, with_stdin=False),
@@ -590,16 +687,18 @@ class RemoteTargetEnvironment(BaseEnvironment):
                     )
                     log_txt = log_res.stdout.decode("utf-8", errors="replace").strip()
                     if log_txt:
-                        bounded_log = truncate_with_marker(
-                            log_txt, _MAX_TELEMETRY_CHARS, what="remote target telemetry"
+                        bounded_log = self._clip_newest_telemetry(log_txt, _MAX_TELEMETRY_CHARS)
+                        telemetry_blocks.append(
+                            f"\n[REMOTE TARGET TELEMETRY]\n{bounded_log}\n[/REMOTE TARGET TELEMETRY]"
                         )
-                        telemetry_block = f"\n[REMOTE TARGET TELEMETRY]\n{bounded_log}"
 
                 stdout_formatted = format_bounded_output(
                     res.stdout, res.stdout_total_bytes, MAX_OUTPUT, what="sandbox stdout"
                 )
-                if telemetry_block:
-                    stdout_formatted = f"{stdout_formatted}{telemetry_block}" if stdout_formatted else telemetry_block.lstrip("\n")
+                for block in telemetry_blocks:
+                    stdout_formatted = (
+                        f"{stdout_formatted}{block}" if stdout_formatted else block.lstrip("\n")
+                    )
 
                 if res.timed_out:
                     return ExecutionResult(
@@ -608,11 +707,19 @@ class RemoteTargetEnvironment(BaseEnvironment):
                         exit_code=124,
                         timed_out=True,
                     )
+                stderr_formatted = format_bounded_output(
+                    res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
+                )
+                if res.returncode != 0 and self._is_remote_transport_failure(
+                    self.transport, res.returncode, stderr_formatted
+                ):
+                    stderr_formatted = (
+                        f"SANDBOX-ERROR: Remote {self.transport} transport failed "
+                        f"(exit={res.returncode}): {stderr_formatted}"
+                    )
                 return ExecutionResult(
                     stdout=stdout_formatted,
-                    stderr=format_bounded_output(
-                        res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
-                    ),
+                    stderr=stderr_formatted,
                     exit_code=res.returncode,
                     timed_out=False,
                 )

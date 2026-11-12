@@ -1044,12 +1044,13 @@ class TestDynamicEvidenceFlagDiscipline(unittest.TestCase):
     def test_sentinel_in_output_sets_flag(self):
         ctx = self._fake_ctx()
         st._note_dynamic_evidence(ctx, f"prefix {MANTIS_SENTINEL_TOKEN} suffix", 0)
+        self.assertFalse(ctx.sandbox_executed, "stdout-only sentinel text must not set flag")
+        st._note_dynamic_evidence(ctx, "ok", 0, sentinel_content=MANTIS_SENTINEL_TOKEN)
         self.assertTrue(ctx.sandbox_executed)
 
     def test_exit_127_with_sentinel_text_stays_false(self):
         """Fail-closed ORDERING: exit 127 (command not found) is checked
-        before the sentinel channel, so sentinel-looking text in a
-        command-not-found transcript proves nothing."""
+        before the crash channel, and sentinel-looking text in stdout proves nothing."""
         ctx = self._fake_ctx()
         st._note_dynamic_evidence(ctx, f"sh: {MANTIS_SENTINEL_TOKEN}: not found", 127)
         self.assertFalse(ctx.sandbox_executed,
@@ -1060,7 +1061,7 @@ class TestDynamicEvidenceFlagDiscipline(unittest.TestCase):
         command; clearing would let a flake (or an attacker) erase real
         evidence by running one broken command afterwards."""
         ctx = self._fake_ctx()
-        st._note_dynamic_evidence(ctx, MANTIS_SENTINEL_TOKEN, 0)
+        st._note_dynamic_evidence(ctx, "", 0, sentinel_content=MANTIS_SENTINEL_TOKEN)
         self.assertTrue(ctx.sandbox_executed)
         st._note_dynamic_evidence(ctx, "sh: cc: not found", 127)
         self.assertTrue(ctx.sandbox_executed,
@@ -1131,7 +1132,7 @@ class TestDynamicEvidenceFlagDiscipline(unittest.TestCase):
 
     def test_string_transport_parseable_exit_with_sentinel_sets_flag(self):
         rc, _out = self._run_sandbox_with_string_result(
-            f"exit=0\n{MANTIS_SENTINEL_TOKEN}"
+            "exit=1\n==1==ERROR: AddressSanitizer: heap-buffer-overflow"
         )
         self.assertTrue(rc.sandbox_executed,
                         "The string-transport branch dropped reached-sink "

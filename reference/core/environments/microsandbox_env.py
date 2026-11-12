@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import base64
 import os
 import shlex
@@ -23,7 +24,7 @@ from google.adk.environment import ExecutionResult
 from microsandbox import Sandbox as MsbSandbox, PullPolicy
 from microsandbox.types import Network
 
-from .base import BaseEnvironment, MAX_GUEST_FILE_BYTES
+from .base import BaseEnvironment, MAX_GUEST_FILE_BYTES, format_posix_exports
 from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 from core.truncation import truncate_with_marker
 
@@ -94,58 +95,68 @@ class MicrosandboxEnvironment(BaseEnvironment):
         self._sb: Optional[MsbSandbox] = None
         self._name: Optional[str] = None
         self._stage_error: Optional[Exception] = None
+        self._lock = asyncio.Lock()
 
     @property
     def working_dir(self) -> Path:
         return self._workdir
 
     async def _ensure(self) -> MsbSandbox:
-        if self._stage_error is not None:
-            raise self._stage_error
-        if self._sb is None:
-            verify_network_none_policy()
-            name = f"mantis-msb-{uuid.uuid4().hex[:12]}"
-            sizing = {}
-            if self.memory:
-                sizing["memory"] = self.memory
-            if self.cpus:
-                sizing["cpus"] = self.cpus
-            sb = await MsbSandbox.create(
-                name=name,
-                image=self.image,
-                network=Network.none(),
-                pull_policy=PullPolicy.NEVER,
-                replace=True,
-                # A guest outlives no campaign: whatever close() misses, the
-                # runtime reaps. Longer than any campaign, shorter than a
-                # forgotten weekend.
-                max_duration=float(MAX_GUEST_LIFETIME_SECONDS),
-                **sizing,
-            )
-            await sb.fs.mkdir(str(self._workdir))
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lock = lock
+        fresh = False
+        async with lock:
+            if self._stage_error is not None:
+                raise self._stage_error
+            if self._sb is None:
+                verify_network_none_policy()
+                name = f"mantis-msb-{uuid.uuid4().hex[:12]}"
+                sizing = {}
+                if self.memory:
+                    sizing["memory"] = self.memory
+                if self.cpus:
+                    sizing["cpus"] = self.cpus
+                sb = await MsbSandbox.create(
+                    name=name,
+                    image=self.image,
+                    network=Network.none(),
+                    pull_policy=PullPolicy.NEVER,
+                    replace=True,
+                    # A guest outlives no campaign: whatever close() misses, the
+                    # runtime reaps. Longer than any campaign, shorter than a
+                    # forgotten weekend.
+                    max_duration=float(MAX_GUEST_LIFETIME_SECONDS),
+                    **sizing,
+                )
+                await sb.fs.mkdir(str(self._workdir))
 
-            if self.target_path and os.path.exists(self.target_path):
-                from .staging import enforce_staging_budget, get_vetted_staging_files
-                try:
-                    vetted_files = get_vetted_staging_files(self.target_path)
-                    enforce_staging_budget(vetted_files)
-                    for src_file, rel_file in vetted_files:
-                        dest_file = f"{self._workdir}/{rel_file}"
-                        dest_dir = os.path.dirname(dest_file)
-                        if dest_dir != str(self._workdir):
-                            await sb.fs.mkdir(dest_dir)
-                        await sb.fs.copy_from_host(str(src_file), dest_file)
-                except Exception as e:
-                    self._stage_error = e
-                    self._sb = sb
-                    self._name = name
-                    raise e
+                if self.target_path and os.path.exists(self.target_path):
+                    from .staging import enforce_staging_budget, get_vetted_staging_files
+                    try:
+                        vetted_files = get_vetted_staging_files(self.target_path)
+                        enforce_staging_budget(vetted_files)
+                        for src_file, rel_file in vetted_files:
+                            dest_file = f"{self._workdir}/{rel_file}"
+                            dest_dir = os.path.dirname(dest_file)
+                            if dest_dir != str(self._workdir):
+                                await sb.fs.mkdir(dest_dir)
+                            await sb.fs.copy_from_host(str(src_file), dest_file)
+                    except Exception as e:
+                        self._stage_error = e
+                        self._sb = sb
+                        self._name = name
+                        raise e
 
-            self._name = name
-            self._sb = sb
-            self.is_initialized = True
+                self._name = name
+                self._sb = sb
+                self.is_initialized = True
+                fresh = True
+        if fresh:
             # Staging is done: anything newer than this was made by the
-            # campaign (see core.poc_scaffold).
+            # campaign (see core.poc_scaffold). Outside the lock: write_file
+            # re-enters _ensure.
             from core.poc_scaffold import mark_staged
             await mark_staged(self.write_file)
         return self._sb
@@ -155,9 +166,11 @@ class MicrosandboxEnvironment(BaseEnvironment):
 
     async def execute(self, command: str, *, timeout: Optional[float] = None) -> ExecutionResult:
         t = timeout or self.timeout
+        exec_env = self._consume_exec_env() if hasattr(self, "_consume_exec_env") else None
+        effective_cmd = format_posix_exports(exec_env) + command if exec_env else command
         try:
             sb = await self._ensure()
-            out = await sb.shell(command, cwd=str(self._workdir), timeout=t)
+            out = await sb.shell(effective_cmd, cwd=str(self._workdir), timeout=t)
             stdout_text = out.stdout_text or ""
             stderr_text = getattr(out, "stderr_text", "") or ""
             return ExecutionResult(
@@ -176,9 +189,10 @@ class MicrosandboxEnvironment(BaseEnvironment):
                 "timeout" in text or "timed out" in text
                 or type(e).__name__.lower().endswith("timeouterror")
             )
+            prefix = "SANDBOX-TIMEOUT" if timed_out else "SANDBOX-ERROR"
             return ExecutionResult(
                 stdout="",
-                stderr=f"SANDBOX-ERROR: {type(e).__name__}: {e}",
+                stderr=f"{prefix}: {type(e).__name__}: {e}",
                 exit_code=124 if timed_out else 1,
                 timed_out=timed_out,
             )

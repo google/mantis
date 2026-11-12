@@ -15,22 +15,33 @@
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import re
+import secrets
+import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.context import current_run_context
 from core.llm_gateway import SecretScrubber, wrap_untrusted_content
+from core.poc_scaffold import _host_has
 from core.truncation import is_truncation_marker_present
 from google.adk.environment import ExecutionResult
 
 MANTIS_SENTINEL_TOKEN = "MANTIS_REACHED_ENTRYPOINT"
+DEFAULT_UNATTRIBUTED_SENTINEL_PATH = ".mantis_reached_sentinel"
 
 # Reason prefix for "the output was cut before the sentinel could be
 # confirmed". Deliberately distinct from EVIDENCE_ABSENT: absent means the
 # whole trace was seen and carried no proof; truncated means the trace was
 # not whole, so its silence proves nothing either way. Both are not-verified.
 EVIDENCE_TRUNCATED_PREFIX = "EVIDENCE_TRUNCATED"
+
+_UNSCOPED_REMOTE_TELEMETRY_RE = re.compile(
+    r"\n?\[REMOTE TARGET TELEMETRY\]\n.*?(?:\n\[/REMOTE TARGET TELEMETRY\]|(?=\n<<<UNTRUSTED_SOURCE_CODE_DATA_END>>>)|\Z)",
+    re.S,
+)
 
 _SANITIZER_SIGNALS = [
     re.compile(r"==\d+==ERROR:\s+(?:AddressSanitizer|UndefinedBehaviorSanitizer|MemorySanitizer|ThreadSanitizer|LeakSanitizer)", re.IGNORECASE),
@@ -53,11 +64,192 @@ _FRAME_SYMBOL_RES = [
     re.compile(r"^\s*at\s+([A-Za-z_][\w.$]*)\s*\(", re.M),                       # JVM / Node
 ]
 
+_GO_PANIC_HEADER_RE = re.compile(r"^panic:\s+", re.M)
+_GO_GOROUTINE_RE = re.compile(r"^goroutine\s+\d+\s+\[", re.M)
+_GO_FRAME_RE = re.compile(
+    r"^(?:[A-Za-z0-9_./()-]+/)?([A-Za-z_][\w()*]*\.[A-Za-z_]\w*)\([^\n]*\)\r?\n\t[^\n]+\.go:\d+",
+    re.M,
+)
 
-def _frame_symbols(output: str) -> set:
+_RUST_PANIC_HEADER_RE = re.compile(r"^thread\s+'[^']+'\s+panicked\s+at\s+\S+:\d+:\d+:", re.M)
+_RUST_BACKTRACE_HDR_RE = re.compile(r"^stack backtrace:\s*$", re.M)
+_RUST_FRAME_RE = re.compile(
+    r"^\s*\d+:\s+(?:0x[0-9a-fA-F]+\s+-\s+)?([A-Za-z_][\w:$<>]*?)(?:::h[0-9a-fA-F]{16})?\s*$",
+    re.M,
+)
+
+_SHELL_LAUNCHER_FAIL_RE = re.compile(
+    r"(?:^|\n)(?:(?:/usr)?/bin/)?(?:ba|da|z|k)?sh:\s*(?:line\s+\d+:\s*)?(?:\d+:\s*)?"
+    r"(?:[^:\n]+:\s*){1,4}"
+    r"(?:command not found|not found|No such file or directory|Permission denied|can't cd to\b)",
+    re.I,
+)
+_ENV_LAUNCHER_FAIL_RE = re.compile(
+    r"(?:^|\n)env:\s*['\"]?[^'\":\n]+['\"]?:\s*No such file or directory\b",
+    re.I,
+)
+_CLI_MISSING_SCRIPT_RE = re.compile(
+    r"(?:can't open file\s+['\"]?[^'\"]+['\"]?:\s*\[Errno 2\]\s*No such file or directory|"
+    r"Error:\s*Cannot find module\s+['\"][^'\"]+['\"]|"
+    r"(?:^|\n)(?:go:\s*)?(?:stat|open|lstat)\s+[^\n:]+:\s*no such file or directory)",
+    re.I,
+)
+_PY_IMPORT_SYNTAX_EXC_RE = re.compile(
+    r"(?:^|\n)\s*(?:ModuleNotFoundError|ImportError|SyntaxError)\s*(?::|$)"
+)
+_PY_TRACEBACK_FILE_RE = re.compile(r'^\s*File\s+"([^"]+)",\s+line\s+\d+', re.M)
+_SHELL_SEP_RE = re.compile(r"(?:&&|\|\||[;|])")
+
+
+def _strip_unscoped_remote_telemetry(output: str) -> str:
+    if not output or "[REMOTE TARGET TELEMETRY]" not in output:
+        return output or ""
+    return _UNSCOPED_REMOTE_TELEMETRY_RE.sub("", output)
+
+
+def _has_go_panic_trace(output: str) -> bool:
+    return bool(
+        output
+        and _GO_PANIC_HEADER_RE.search(output)
+        and _GO_GOROUTINE_RE.search(output)
+        and _GO_FRAME_RE.search(output)
+    )
+
+
+def _has_rust_panic_trace(output: str, exit_code: int) -> bool:
+    try:
+        code = int(exit_code)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        code == 101
+        and output
+        and _RUST_PANIC_HEADER_RE.search(output)
+        and _RUST_BACKTRACE_HDR_RE.search(output)
+        and _RUST_FRAME_RE.search(output)
+    )
+
+
+def _invoked_script_relpaths(command: str, workdir: str, jail_root: str) -> set[str]:
+    out: set[str] = set()
+    if not command:
+        return out
+    wd = (workdir or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for raw_tok in tokens:
+        for tok in _SHELL_SEP_RE.split(raw_tok):
+            t = tok.strip().strip("'\"")
+            if not t or t.startswith("-") or ("=" in t and not t.startswith(("/", "."))):
+                continue
+            t = t.replace("\\", "/")
+            if t.startswith(wd + "/"):
+                rel = posixpath.normpath(t[len(wd) + 1:])
+            elif jail_root and t.startswith(jail_root + "/"):
+                rel = posixpath.normpath(t[len(jail_root) + 1:])
+            elif not t.startswith("/"):
+                rel = posixpath.normpath(t.removeprefix("./"))
+            else:
+                continue
+            if rel and rel not in (".", "..") and not rel.startswith("../"):
+                out.add(rel)
+    return out
+
+
+def _has_target_traceback_frame(
+    text: str,
+    *,
+    command: str = "",
+    jail_dir: str = "",
+    workdir: str = "",
+) -> bool:
+    """True only when a Python traceback names a real staged file in the target
+    repository (verified via ``_host_has``) that is not the invoked PoC script."""
+    ctx = current_run_context.get()
+    eff_jail = jail_dir or (str(getattr(ctx, "jail_dir", "") or "") if ctx is not None else "")
+    if not eff_jail:
+        return False
+    try:
+        jail_root = os.path.realpath(eff_jail)
+        if os.path.isfile(jail_root):
+            jail_root = os.path.dirname(jail_root)
+        if not os.path.isdir(jail_root):
+            return False
+    except OSError:
+        return False
+
+    eff_workdir = workdir or (
+        str(getattr(getattr(ctx, "sandbox", None), "working_dir", "") or "/workspace")
+        if ctx is not None
+        else "/workspace"
+    )
+    wd = (eff_workdir or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+    invoked = _invoked_script_relpaths(command, wd, jail_root)
+
+    for match in _PY_TRACEBACK_FILE_RE.finditer(text or ""):
+        fp = match.group(1).replace("\\", "/").strip()
+        if not fp or fp.startswith("<") or fp.startswith("/tmp/"):
+            continue
+        if fp.startswith(wd + "/"):
+            rel = posixpath.normpath(fp[len(wd) + 1:])
+        elif fp.startswith(jail_root + "/"):
+            rel = posixpath.normpath(fp[len(jail_root) + 1:])
+        elif not fp.startswith("/"):
+            rel = posixpath.normpath(fp.removeprefix("./"))
+        else:
+            continue
+        if (
+            not rel
+            or rel in (".", "..", "workspace")
+            or rel.startswith("../")
+            or rel.startswith("workspace/")
+            or any(part == ".." for part in rel.split("/"))
+        ):
+            continue
+        if rel in invoked:
+            continue
+        if _host_has(jail_root, rel) and os.path.isfile(os.path.join(jail_root, rel)):
+            return True
+    return False
+
+
+def _is_launcher_enoent(output: str, exit_code: int) -> bool:
+    if exit_code not in (1, 2, 127):
+        return False
+    if "no such file or directory" not in (output or "").lower():
+        return False
+    if _SHELL_LAUNCHER_FAIL_RE.search(output) or _ENV_LAUNCHER_FAIL_RE.search(output) or _CLI_MISSING_SCRIPT_RE.search(output):
+        return True
+    return not _has_target_traceback_frame(output)
+
+
+def _sentinel_verified(sentinel_content: str, expected_nonce: str = "") -> bool:
+    if not sentinel_content or MANTIS_SENTINEL_TOKEN not in sentinel_content:
+        return False
+    if expected_nonce:
+        tagged = f"{MANTIS_SENTINEL_TOKEN}:{expected_nonce}"
+        if tagged in sentinel_content:
+            return True
+        # Reject tokens carrying a different invocation's nonce, while keeping
+        # bare static MANTIS_REACHED_ENTRYPOINT instrumentation compatible on
+        # pre-cleared guest sidecar files.
+        for line in sentinel_content.splitlines():
+            if f"{MANTIS_SENTINEL_TOKEN}:" in line:
+                return False
+    return True
+
+
+def _frame_symbols(output: str, exit_code: int = 1) -> set:
     found: set = set()
+    text = output or ""
     for pat in _FRAME_SYMBOL_RES:
-        found.update(m.group(1) for m in pat.finditer(output or ""))
+        found.update(m.group(1) for m in pat.finditer(text))
+    if _has_go_panic_trace(text):
+        found.update(m.group(1) for m in _GO_FRAME_RE.finditer(text))
+    if _has_rust_panic_trace(text, exit_code):
+        found.update(m.group(1) for m in _RUST_FRAME_RE.finditer(text))
     return found
 
 
@@ -87,7 +279,7 @@ def _crash_corroborated(output: str, exit_code: int) -> bool:
         return True
     if code >= 128 or code < 0:
         return True
-    return code != 0 and bool(_frame_symbols(output))
+    return code != 0 and bool(_frame_symbols(output, code))
 
 
 def _no_evidence(output: str, detail: str) -> Tuple[bool, str]:
@@ -116,25 +308,33 @@ def check_reached_sink_evidence(
     exit_code: int,
     sink_symbol: str = "",
     sentinel_content: str = "",
+    expected_nonce: str = "",
+    timed_out: bool = False,
 ) -> Tuple[bool, str]:
     """Deterministically checks whether reached-sink evidence is present per INV-1 and INV-2 invariants.
 
     Returns:
         Tuple of (evidence_present: bool, reason: str)
     """
-    # Fail-closed checks: command not found or missing file is EVIDENCE ABSENT
-    if exit_code == 127:
-        return False, "EVIDENCE_ABSENT: exit code 127 (command not found)"
-    if "No such file or directory" in output and exit_code in (1, 2, 127):
-        return False, "EVIDENCE_ABSENT: target or harness file not found"
-    if "SANDBOX-UNAVAILABLE" in output:
+    clean_output = _strip_unscoped_remote_telemetry(output or "")
+    if "SANDBOX-UNAVAILABLE" in clean_output:
         return False, "EVIDENCE_ABSENT: sandbox environment unavailable"
 
-    # Channel A: Sidecar Sentinel File / explicit in-path flush token
-    if sentinel_content and MANTIS_SENTINEL_TOKEN in sentinel_content:
+    # Channel A: Guest Sidecar Sentinel File ONLY (sole Channel A authority per INV-1/INV-2).
+    # Evaluated ahead of post-sink child exit/ENOENT/timeout checks so a target that
+    # flushes the sidecar sentinel at the sink and then errors or hangs still counts.
+    if _sentinel_verified(sentinel_content, expected_nonce=expected_nonce):
         return True, "EVIDENCE_PRESENT: in-path sentinel marker MANTIS_REACHED_ENTRYPOINT verified"
-    if MANTIS_SENTINEL_TOKEN in output:
-        return True, "EVIDENCE_PRESENT: in-path sentinel marker emitted in execution trace"
+
+    # Fail-closed checks when sidecar sentinel was not written
+    if "SANDBOX-ERROR" in clean_output:
+        return False, "EVIDENCE_ABSENT: sandbox transport or runtime error"
+    if timed_out or "SANDBOX-TIMEOUT" in clean_output:
+        return False, "EVIDENCE_ABSENT: sandbox execution timed out"
+    if exit_code == 127:
+        return False, "EVIDENCE_ABSENT: exit code 127 (command not found)"
+    if _is_launcher_enoent(clean_output, exit_code):
+        return False, "EVIDENCE_ABSENT: target or harness file not found"
 
     # Channel B: Target-produced Sanitizer / Crash backtrace naming sink.
     # The crash must be real (see _crash_corroborated), and a sink symbol
@@ -142,19 +342,23 @@ def check_reached_sink_evidence(
     # Positive verdicts stand whether or not the trace was cut: proof that
     # survived the cut is still proof. Only the negatives go through
     # _no_evidence, which says whether the silence came from a whole trace.
-    has_sanitizer_or_crash = any(pat.search(output) for pat in _SANITIZER_SIGNALS)
+    has_sanitizer_or_crash = (
+        any(pat.search(clean_output) for pat in _SANITIZER_SIGNALS)
+        or _has_go_panic_trace(clean_output)
+        or _has_rust_panic_trace(clean_output, exit_code)
+    )
     if has_sanitizer_or_crash:
-        if not _crash_corroborated(output, exit_code):
-            return _no_evidence(output, (
+        if not _crash_corroborated(clean_output, exit_code):
+            return _no_evidence(clean_output, (
                 "crash-like text in output, but the process exited "
                 f"{exit_code} with no sanitizer report; text alone is not a crash"))
         if sink_symbol:
-            if _frame_names_sink(_frame_symbols(output), sink_symbol):
+            if _frame_names_sink(_frame_symbols(clean_output, exit_code), sink_symbol):
                 return True, f"EVIDENCE_PRESENT: crash backtrace explicitly confirms sink '{sink_symbol}'"
-            return _no_evidence(output, f"crash occurred but no backtrace frame names target sink '{sink_symbol}'")
+            return _no_evidence(clean_output, f"crash occurred but no backtrace frame names target sink '{sink_symbol}'")
         return True, "EVIDENCE_PRESENT: sanitizer/crash frame detected in execution output"
 
-    return _no_evidence(output, "no sentinel token or target-produced crash backtrace observed")
+    return _no_evidence(clean_output, "no sentinel token or target-produced crash backtrace observed")
 
 
 def _is_non_repro_node(ctx) -> bool:
@@ -269,6 +473,11 @@ def _record_finding_evidence(
             if evidence_present or ran is not False:
                 entry["reattacked"] = True
                 entry["reattack_present"] = bool(evidence_present)
+                entry["last_reattack_inconclusive"] = False
+            else:
+                # Never overwrite a prior reattack_present=True bypass on a
+                # timeout, transport failure, or PoC setup error (INV-1/INV-2).
+                entry["last_reattack_inconclusive"] = True
         elif evidence_present:
             entry["reproduced"] = True
         if sink_symbol:
@@ -305,19 +514,26 @@ def _record_finding_evidence(
         pass  # bookkeeping; never fails a run (and never sets anything on error)
 
 
-#: Output that means a PoC never got as far as attacking: a missing module
-#: or file, a shell that cannot find the interpreter, a syntax error, a Go
-#: or shell build that found no scaffold or no toolchain. An AssertionError
-#: or an application error is NOT in this list: those are the exploit
-#: failing, which is what a fix looks like from the PoC's side.
+def invalidate_patch_reattack_state(ctx: Any) -> None:
+    """Marks prior patcher re-attack verdicts stale after code edits in patcher."""
+    if ctx is None or getattr(ctx, "active_node", "") != "patcher":
+        return
+    entries = getattr(ctx, "finding_evidence", None)
+    if not isinstance(entries, dict):
+        return
+    for entry in entries.values():
+        if isinstance(entry, dict):
+            entry["reattacked"] = False
+            entry["reattack_present"] = False
+            entry["last_reattack_inconclusive"] = False
+
+
+#: Deterministic infrastructure, toolchain, or missing-scaffold substrings that
+#: unconditionally mean the PoC never got as far as attacking the target.
 POC_SETUP_FAILURE_MARKERS = (
-    "ModuleNotFoundError",
-    "ImportError",
-    "SyntaxError",
-    "No such file or directory",
-    "command not found",
     "SANDBOX-UNAVAILABLE",
     "SANDBOX-ERROR",
+    "SANDBOX-TIMEOUT",
     "no Go files in",
     "cannot find package",
     "cannot find module",
@@ -331,18 +547,41 @@ POC_SETUP_FAILURE_MARKERS = (
 )
 
 
-def poc_ran(output: str, exit_code: int, timed_out: bool = False) -> bool:
+def poc_ran(
+    output: str,
+    exit_code: int,
+    timed_out: bool = False,
+    *,
+    command: str = "",
+    jail_dir: str = "",
+    workdir: str = "",
+) -> bool:
     """Whether a PoC run got as far as attacking: not a missing interpreter
-    (126/127), not a timeout, none of the setup-failure markers in its
-    output. Absent evidence means a fix only when this is True."""
+    (126/127), not a timeout or sandbox transport error, and not a launcher or
+    PoC-harness startup failure. Absent evidence means a fix only when True."""
     try:
         code = int(exit_code)
     except (TypeError, ValueError):
         code = 1
-    if code in (126, 127) or timed_out:
+    if code in (126, 127) or code < 0 or timed_out:
         return False
-    text = str(output or "")
-    return not any(m in text for m in POC_SETUP_FAILURE_MARKERS)
+    text = _strip_unscoped_remote_telemetry(str(output or ""))
+    if any(m in text for m in POC_SETUP_FAILURE_MARKERS):
+        return False
+    if (
+        _SHELL_LAUNCHER_FAIL_RE.search(text)
+        or _ENV_LAUNCHER_FAIL_RE.search(text)
+        or _CLI_MISSING_SCRIPT_RE.search(text)
+    ):
+        return False
+    has_target_frame = _has_target_traceback_frame(
+        text, command=command, jail_dir=jail_dir, workdir=workdir
+    )
+    if "no such file or directory" in text.lower() and not has_target_frame:
+        return False
+    if _PY_IMPORT_SYNTAX_EXC_RE.search(text) and not has_target_frame:
+        return False
+    return True
 
 
 def _has_dynamic_sandbox(ctx: Any) -> bool:
@@ -364,11 +603,11 @@ def _guest_file_reader(sandbox: Any):
     return sandbox.read_file
 
 
-async def run_sandbox(command: str) -> str:
-    """Executes a command securely inside the configured sandbox. Use this to compile or run the reproduction script."""
+async def _run_sandbox_internal(command: str) -> Tuple[str, bool]:
+    """Internal runner returning ``(formatted_transcript, timed_out)``."""
     ctx = current_run_context.get()
     if ctx is None or ctx.sandbox is None:
-        return "exit=127\nSANDBOX-UNAVAILABLE: ERROR: No active sandbox environment (sandbox unavailable)."
+        return "exit=127\nSANDBOX-UNAVAILABLE: ERROR: No active sandbox environment (sandbox unavailable).", False
 
     try:
         sandbox_type = type(ctx.sandbox).__name__
@@ -386,12 +625,12 @@ async def run_sandbox(command: str) -> str:
                         f"(e.g. set_model_response(route='failed_repro', reason='Dynamic execution disabled in static-only mode')) "
                         f"or as structured JSON text (e.g. {{\"route\": \"failed_repro\", \"reason\": \"Dynamic execution disabled in static-only mode\"}}) "
                         f"in your model response to conclude this stage."
-                    )
+                    ), False
                 return (
                     f"exit=127\n"
                     f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked in static-only mode (attempt {ctx.static_sandbox_attempts}). "
                     f"Dynamic execution is disabled. Do NOT call run_sandbox again."
-                )
+                ), False
             if not _is_non_repro_node(ctx):
                 return (
                     "exit=127\n"
@@ -401,12 +640,12 @@ async def run_sandbox(command: str) -> str:
                     "STOP calling tools immediately, and submit your stage verdict using the 'set_model_response' tool "
                     "or as structured JSON text (e.g. {\"route\": \"failed_repro\", \"reason\": \"Dynamic execution disabled in static-only mode\"}) "
                     "in your model response."
-                )
+                ), False
             return (
                 "exit=127\n"
                 "SANDBOX-UNAVAILABLE: static-only sandbox; dynamic execution is disabled.\n"
                 "Do NOT retry running sandbox commands."
-            )
+            ), False
 
         res = await ctx.sandbox.execute(command)
         if isinstance(res, ExecutionResult):
@@ -423,29 +662,20 @@ async def run_sandbox(command: str) -> str:
                             f"STOP calling tools immediately and submit your stage verdict using the 'set_model_response' tool "
                             f"or as structured JSON text (e.g. {{\"route\": \"failed_repro\", \"reason\": \"Sandbox unavailable\"}}) "
                             f"in your model response to conclude this stage."
-                        )
+                        ), False
                     return (
                         f"exit=127\n"
                         f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
-                    )
-            else:
-                # Evidence, not liveness: the flag is only set when THIS command's
-                # own trace carries reached-sink proof (sentinel token or a
-                # target-produced crash), via the chokepoint above. The old rule --
-                # any exit code but 127 -- certified "a shell existed", and the
-                # downstream status gate read that as "the exploit was dynamically
-                # verified". Callers going through run_sandbox_with_evidence also
-                # get the sidecar sentinel file considered; a bare run_sandbox call
-                # only has its output to speak for it, which is exactly as much as
-                # it proved.
+                    ), False
+            elif not _is_non_repro_node(ctx):
                 _note_dynamic_evidence(ctx, raw_output, res.exit_code)
 
             if not raw_output:
-                return f"exit={res.exit_code}"
+                return f"exit={res.exit_code}", bool(res.timed_out)
             scrubbed_output = SecretScrubber.scrub(raw_output)
             wrapped_output = wrap_untrusted_content(scrubbed_output, filename="sandbox_output")
-            return f"exit={res.exit_code}\n{wrapped_output}"
+            return f"exit={res.exit_code}\n{wrapped_output}", bool(res.timed_out)
         if isinstance(res, str):
             is_unavail = "SANDBOX-UNAVAILABLE" in res
             if is_unavail:
@@ -459,19 +689,13 @@ async def run_sandbox(command: str) -> str:
                             f"STOP calling tools immediately and submit your stage verdict using the 'set_model_response' tool "
                             f"or as structured JSON text (e.g. {{\"route\": \"failed_repro\", \"reason\": \"Sandbox unavailable\"}}) "
                             f"in your model response to conclude this stage."
-                        )
+                        ), False
                     return (
                         f"exit=127\n"
                         f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
-                    )
-            elif res.startswith("exit="):
-                # Same evidence standard as the ExecutionResult branch, applied to
-                # the stringified transport some sandbox backends use. The exit code
-                # is parsed out of the "exit=N" prefix so the checker sees the same
-                # two inputs either way; an unparseable prefix falls through with
-                # the flag untouched, because a malformed transcript is not proof
-                # of anything (fail-closed, INV-1).
+                    ), False
+            elif res.startswith("exit=") and not _is_non_repro_node(ctx):
                 head, _, body = res.partition("\n")
                 try:
                     parsed_exit = int(head.split("=", 1)[1].strip())
@@ -479,10 +703,16 @@ async def run_sandbox(command: str) -> str:
                     parsed_exit = None
                 if parsed_exit is not None:
                     _note_dynamic_evidence(ctx, body, parsed_exit)
-            return SecretScrubber.scrub(res)
-        return SecretScrubber.scrub(str(res))
+            return SecretScrubber.scrub(res), False
+        return SecretScrubber.scrub(str(res)), False
     except Exception as e:
-        return f"ERROR: Sandbox execution failed: {SecretScrubber.scrub(str(e))}"
+        return f"ERROR: Sandbox execution failed: {SecretScrubber.scrub(str(e))}", False
+
+
+async def run_sandbox(command: str) -> str:
+    """Executes a command securely inside the configured sandbox. Use this to compile or run the reproduction script."""
+    out, _timed_out = await _run_sandbox_internal(command)
+    return out
 
 
 async def run_sandbox_with_evidence(
@@ -504,6 +734,16 @@ async def run_sandbox_with_evidence(
             finding_id = int(finding_id)
         except (TypeError, ValueError):
             finding_id = finding_id_from_sentinel_path(sentinel_path)
+
+    if not sentinel_path:
+        sentinel_path = (
+            f"sentinel_{finding_id}"
+            if finding_id is not None
+            else DEFAULT_UNATTRIBUTED_SENTINEL_PATH
+        )
+
+    nonce = secrets.token_hex(16)
+    ctx_pre = current_run_context.get()
     if sentinel_path:
         # A sentinel left by an earlier attempt must not satisfy this one. But
         # sentinel_path is model-controlled: blanking whatever file it names
@@ -512,7 +752,6 @@ async def run_sandbox_with_evidence(
         # the PoC runs). So: read first, and clear ONLY a file that already
         # carries the sentinel token -- i.e. is a stale sentinel. Anything
         # else is left alone; a file without the token cannot be evidence.
-        ctx_pre = current_run_context.get()
         if _has_dynamic_sandbox(ctx_pre):
             try:
                 existing = await _guest_file_reader(ctx_pre.sandbox)(Path(sentinel_path))
@@ -521,7 +760,16 @@ async def run_sandbox_with_evidence(
             except Exception:
                 pass  # no file: nothing stale to clear
 
-    raw_res = await run_sandbox(command)
+    if _has_dynamic_sandbox(ctx_pre) and hasattr(ctx_pre.sandbox, "set_exec_env"):
+        ctx_pre.sandbox.set_exec_env(
+            {
+                "MANTIS_SENTINEL_FILE": str(sentinel_path),
+                "MANTIS_SENTINEL_NONCE": nonce,
+                "RUST_BACKTRACE": "1",
+            }
+        )
+
+    raw_res, timed_out = await _run_sandbox_internal(command)
     exit_code = 127
     output = raw_res
 
@@ -552,6 +800,8 @@ async def run_sandbox_with_evidence(
         exit_code=exit_code,
         sink_symbol=sink_symbol,
         sentinel_content=sentinel_content,
+        expected_nonce=nonce,
+        timed_out=timed_out,
     )
 
     # This wrapper sees a channel the inner run_sandbox cannot: the sidecar sentinel
@@ -573,9 +823,16 @@ async def run_sandbox_with_evidence(
     # recorded: an absent re-attack is what verifies a patch. Whether the
     # PoC ran at all travels with it: absent evidence from a PoC that never
     # attacked is not a fix.
-    _record_finding_evidence(current_run_context.get(), finding_id, evidence_present, reason,
-                             sink_symbol=sink_symbol,
-                             ran=True if evidence_present else poc_ran(output, exit_code))
+    _record_finding_evidence(
+        current_run_context.get(),
+        finding_id,
+        evidence_present,
+        reason,
+        sink_symbol=sink_symbol,
+        ran=True
+        if evidence_present
+        else poc_ran(output, exit_code, timed_out=timed_out, command=command),
+    )
     scaffold: List[str] = []
     if evidence_present and finding_id is not None:
         scaffold = await _keep_poc_scaffold(current_run_context.get(), int(finding_id))
@@ -643,6 +900,9 @@ async def apply_patch(diff_content: str) -> str:
         if sandbox_type in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
             return "ERROR: Patch application failed: dynamic sandbox is disabled in static-only mode."
         res = await ctx.sandbox.apply_patch(diff_content)
-        return SecretScrubber.scrub(str(res))
+        out_str = str(res)
+        if out_str.startswith("exit=0"):
+            invalidate_patch_reattack_state(ctx)
+        return SecretScrubber.scrub(out_str)
     except Exception as e:
         return f"ERROR: Patch application failed: {SecretScrubber.scrub(str(e))}"

@@ -854,11 +854,18 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             # standard this test originally asserted was removed on main.
             self.assertFalse(ctx.sandbox_executed)
 
-            # A sentinel-bearing trace IS reached-sink evidence.
+            # Stdout sentinel text without a guest sidecar file does NOT count,
+            # whereas a corroborated target sanitizer report DOES set sandbox_executed.
             from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN
             mock_sb.execute.return_value = f"exit=0\n{MANTIS_SENTINEL_TOKEN} hit"
+            res_echo = await run_sandbox("./poc")
+            self.assertIn(MANTIS_SENTINEL_TOKEN, res_echo)
+            self.assertFalse(ctx.sandbox_executed)
+
+            asan_header = "==1==ERROR: AddressSanitizer: heap-buffer-overflow"
+            mock_sb.execute.return_value = f"exit=1\n{asan_header}"
             res_evid = await run_sandbox("./poc")
-            self.assertIn(MANTIS_SENTINEL_TOKEN, res_evid)
+            self.assertIn("AddressSanitizer", res_evid)
             self.assertTrue(ctx.sandbox_executed)
 
             res_patch = await apply_patch("test_diff")

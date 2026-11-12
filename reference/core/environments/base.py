@@ -16,9 +16,11 @@ import abc
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import threading
-from typing import Optional, Union, List
+from typing import Dict, Optional, Union, List
 from google.adk.environment import BaseEnvironment as AdkBaseEnvironment, ExecutionResult
 
 from core.context import current_run_context
@@ -224,8 +226,41 @@ def run_bounded_subprocess(
     )
 
 
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def format_posix_exports(env: Optional[Dict[str, str]]) -> str:
+    """Formats validated environment bindings as a POSIX ``export ...; `` prefix."""
+    if not env:
+        return ""
+    pairs = []
+    for k, v in env.items():
+        key = str(k or "").strip()
+        if not _ENV_KEY_RE.match(key):
+            continue
+        val = str(v if v is not None else "").replace("\x00", "")
+        pairs.append(f"{key}={shlex.quote(val)}")
+    if not pairs:
+        return ""
+    return "export " + " ".join(pairs) + "; "
+
+
 class BaseEnvironment(AdkBaseEnvironment):
     """Abstract base class extending ADK BaseEnvironment with patch management, lifecycle, and filesystem listing helpers."""
+
+    def set_exec_env(self, env: Optional[Dict[str, str]]) -> None:
+        """Queues one-shot environment variables for the next ``execute(command)`` call.
+
+        Keeps ``execute(command)`` single-argument compatible across test stubs
+        while exporting per-invocation variables (such as sentinel path/nonce)
+        across the entire guest shell pipeline.
+        """
+        self._pending_exec_env = dict(env) if env else None
+
+    def _consume_exec_env(self) -> Optional[Dict[str, str]]:
+        env = getattr(self, "_pending_exec_env", None)
+        self._pending_exec_env = None
+        return env
 
     @abc.abstractmethod
     async def apply_patch(self, diff: str) -> str:
@@ -284,6 +319,11 @@ class ProxyEnvironment(BaseEnvironment):
         if ctx is not None and ctx.sandbox is not None and hasattr(ctx.sandbox, "is_initialized"):
             ctx.sandbox.is_initialized = value
 
+    def set_exec_env(self, env: Optional[Dict[str, str]]) -> None:
+        active = self._get_active_env()
+        if hasattr(active, "set_exec_env"):
+            active.set_exec_env(env)
+
     async def initialize(self) -> None:
         ctx = current_run_context.get()
         if ctx is not None and ctx.sandbox is not None and hasattr(ctx.sandbox, "initialize"):
@@ -300,6 +340,12 @@ class ProxyEnvironment(BaseEnvironment):
 
     async def read_file(self, path: Path) -> bytes:
         env = self._get_active_env()
+        return await env.read_file(path)
+
+    async def read_guest_file(self, path: Path) -> bytes:
+        env = self._get_active_env()
+        if getattr(type(env), "read_guest_file", None) is not None:
+            return await env.read_guest_file(path)
         return await env.read_file(path)
 
     async def write_file(self, path: Path, content: Union[str, bytes]) -> None:

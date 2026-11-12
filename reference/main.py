@@ -681,6 +681,8 @@ async def _drive_campaign(
     pending_node_errors: dict[str, str] = {}
     fatal_tool_errors: set[str] = set()
     stamped_nodes: set[str] = set()
+    pending_in_scope_reads: dict[str, str] = {}
+    pending_in_scope_by_name: dict[str, list[str]] = {}
     last_banner: tuple[str | None, str | None] = (None, None)
     current_active_node: str | None = None
     streamed_partial_text: bool = False
@@ -929,16 +931,25 @@ async def _drive_campaign(
                             pfx = f"[{camp_tag}] " if is_parallel and camp_tag else ""
                             cprint(f"\n{pfx}[TOOL CALL: {call_name}] args={call_args}", flush=True)
                             if budget_controller:
+                                was_in_scope = _is_in_scope_code_read(
+                                    current_run_context.get(), call_name, call_args
+                                )
+                                if was_in_scope:
+                                    call_id = str(getattr(call, "id", "") or "")
+                                    active_n = current_active_node or "unknown"
+                                    if call_id:
+                                        pending_in_scope_reads[call_id] = active_n
+                                    else:
+                                        pending_in_scope_by_name.setdefault(call_name, []).append(active_n)
                                 budget_controller.record_tool_call(
                                     current_active_node or "unknown",
                                     call_name,
-                                    in_scope=_is_in_scope_code_read(
-                                        current_run_context.get(), call_name, call_args
-                                    ),
+                                    in_scope=False,
                                 )
                         elif hasattr(part, 'function_response') and part.function_response:
                             fn_resp = part.function_response
                             fn_name = getattr(fn_resp, "name", "unknown_tool")
+                            fn_id = str(getattr(fn_resp, "id", "") or "")
                             raw_resp = getattr(fn_resp, "response", {})
                             if isinstance(raw_resp, dict):
                                 resp_text = str(raw_resp.get("response") or raw_resp.get("result") or raw_resp.get("output") or raw_resp)
@@ -964,6 +975,23 @@ async def _drive_campaign(
                                 )
                                 and "SANDBOX-UNAVAILABLE" not in resp_text
                             )
+                            matched_read_node = None
+                            if fn_id and fn_id in pending_in_scope_reads:
+                                matched_read_node = pending_in_scope_reads.pop(fn_id)
+                            elif fn_name in pending_in_scope_by_name and pending_in_scope_by_name[fn_name]:
+                                matched_read_node = pending_in_scope_by_name[fn_name].pop(0)
+                            if (
+                                budget_controller
+                                and matched_read_node is not None
+                                and not is_fatal
+                                and not is_validation_feedback
+                                and not resp_text.startswith(("NO_DATA:", "SANDBOX-UNAVAILABLE"))
+                            ):
+                                from core.budget import AUDIT_NODES, CODE_READ_TOOLS
+
+                                clean_n = matched_read_node.split("/")[-1].split("@")[0] if matched_read_node else "unknown"
+                                if clean_n in AUDIT_NODES and fn_name in CODE_READ_TOOLS:
+                                    budget_controller.audit_code_reads += 1
 
                             pfx = f"[{camp_tag}] " if is_parallel and camp_tag else ""
                             if is_fatal:

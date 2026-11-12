@@ -1622,8 +1622,14 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 if own_id is None and existing_row:
                     own_id = existing_row[0]
                 own = finding_evidence.get(str(own_id)) if own_id is not None else None
-                if not (own and own.get("reproduced") and own.get("reattacked")
-                        and not own.get("reattack_present")):
+                if not (
+                    own
+                    and own.get("reproduced")
+                    and own.get("reattacked")
+                    and not own.get("reattack_present")
+                    and own.get("ran") is not False
+                    and not own.get("last_reattack_inconclusive")
+                ):
                     patch_status = "VERIFICATION_INCOMPLETE"
 
             # Check if updating an existing record by explicit ID or exact composite key
@@ -2099,6 +2105,8 @@ def record_finding_patch(
             and own_ev.get("reproduced")
             and own_ev.get("reattacked")
             and not own_ev.get("reattack_present")
+            and own_ev.get("ran") is not False
+            and not own_ev.get("last_reattack_inconclusive")
         )
         is_verified = bool(
             clean_diff.strip()

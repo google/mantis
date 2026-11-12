@@ -115,7 +115,7 @@ class EvidenceIsRecordedPerFindingTest(_Base):
         self.assertIsNone(finding_id_from_sentinel_path(None))
 
     async def test_a_verdict_is_attributed_to_the_finding_id_given(self):
-        ctx = self._ctx(_ScriptedSandbox(stdout=TOKEN + "\n"))
+        ctx = self._ctx(_ScriptedSandbox(sentinel=TOKEN + "\n"))
         res = await run_sandbox_with_evidence("python3 poc.py", finding_id=3)
         self.assertTrue(res["evidence_present"])
         self.assertEqual(res["finding_id"], 3)
@@ -131,8 +131,9 @@ class EvidenceIsRecordedPerFindingTest(_Base):
         self.assertEqual(ctx.finding_evidence["5"]["sink_symbol"], "extract")
 
     async def test_an_absent_verdict_is_recorded_but_does_not_unreproduce(self):
-        ctx = self._ctx(_ScriptedSandbox(stdout=TOKEN + "\n"))
+        ctx = self._ctx(_ScriptedSandbox(sentinel=TOKEN + "\n"))
         await run_sandbox_with_evidence("python3 poc.py", finding_id=2)
+        ctx.sandbox.sentinel_after = ""
         ctx.sandbox.stdout = "nothing happened\n"
         res = await run_sandbox_with_evidence("python3 poc.py", finding_id=2)
         self.assertFalse(res["evidence_present"])
@@ -143,7 +144,7 @@ class EvidenceIsRecordedPerFindingTest(_Base):
         self.assertIn("EVIDENCE_ABSENT", ctx.finding_evidence["4"]["reason"])
 
     async def test_unattributed_evidence_moves_only_the_campaign_bit(self):
-        ctx = self._ctx(_ScriptedSandbox(stdout=TOKEN + "\n"))
+        ctx = self._ctx(_ScriptedSandbox(sentinel=TOKEN + "\n"))
         res = await run_sandbox_with_evidence("python3 poc.py")
         self.assertTrue(res["evidence_present"])
         self.assertIsNone(res["finding_id"])
@@ -151,12 +152,13 @@ class EvidenceIsRecordedPerFindingTest(_Base):
         self.assertEqual(ctx.finding_evidence, {})
 
     async def test_in_the_patcher_the_last_reattack_counts(self):
-        ctx = self._ctx(_ScriptedSandbox(stdout=TOKEN + "\n"), node="reproducer")
+        ctx = self._ctx(_ScriptedSandbox(sentinel=TOKEN + "\n"), node="reproducer")
         await run_sandbox_with_evidence("python3 poc.py", finding_id=1)
         ctx.active_node = "patcher"
         await run_sandbox_with_evidence("python3 poc.py", finding_id=1)  # still reaches: patch bypassed
         e = ctx.finding_evidence["1"]
         self.assertEqual((e["reproduced"], e["reattacked"], e["reattack_present"]), (True, True, True))
+        ctx.sandbox.sentinel_after = ""
         ctx.sandbox.stdout = "blocked\n"
         await run_sandbox_with_evidence("python3 poc.py", finding_id=1)  # fixed again, re-attacked again
         e = ctx.finding_evidence["1"]
@@ -382,11 +384,12 @@ class RecordPatchToolTest(_Base):
         from tools.research_tools import record_patch
 
         ids = self._seed(2)
-        sb = _ScriptedSandbox(stdout=TOKEN + "\n")
+        sb = _ScriptedSandbox(sentinel=TOKEN + "\n")
         ctx = self._ctx(sandbox=sb, node="reproducer")
         await run_sandbox_with_evidence("python3 poc.py", finding_id=ids[0])
 
         ctx.active_node = "patcher"
+        sb.sentinel_after = ""
         sb.stdout = "Attack blocked cleanly\n"
         await run_sandbox_with_evidence("python3 poc.py", finding_id=ids[0])
 
@@ -418,7 +421,7 @@ class RecordPatchToolTest(_Base):
         from tools.research_tools import record_patch
 
         ids = self._seed(1)
-        sb = _ScriptedSandbox(stdout=TOKEN + "\n")
+        sb = _ScriptedSandbox(sentinel=TOKEN + "\n")
         ctx = self._ctx(sandbox=sb, node="reproducer")
         await run_sandbox_with_evidence("python3 poc.py", finding_id=ids[0])
 
