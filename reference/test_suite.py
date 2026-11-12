@@ -93,7 +93,7 @@ from tools.sandbox_tools import run_sandbox, apply_patch
 class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
 
     async def test_shipped_graph_execution_covers_all_edges(self):
-        """Exercises all edges of the shipped workflow using ScriptedLlm across 3 scripts."""
+        """Exercises all edges of the shipped workflow using ScriptedLlm across 5 scripts."""
         workflow_path = os.path.join(os.path.dirname(__file__), "workflow.json")
 
         scripts = [
@@ -111,6 +111,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     json.dumps({"route": "success", "reason": "Exploit successfully reproduced vulnerability."}),
                     "Exploit chained.",
                     "Patch created and applied successfully.",
+                    "Score: 85",
                     "Learnings reflected.",
                     "Report generated.",
                 ],
@@ -120,9 +121,10 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
                     "chainer", "patcher", "calibrator", "reflector", "reporter"
                 ],
-                "dynamic_confirmed"
+                "dynamic_confirmed",
+                True,
             ),
-            # Script 2: False positive -> false_positive (suppressed from calibration)
+            # Script 2: False positive -> false_positive (suppressed from calibration & deterministic clean report)
             (
                 [
                     "History extracted.",
@@ -133,14 +135,14 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Findings deduplicated.",
                     json.dumps({"route": "false_positive", "reason": "Input is bounded."}),
                     "Learnings reflected.",
-                    "Report generated.",
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
                     "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "calibrator", "reflector", "reporter"
                 ],
-                "false_positive"
+                "false_positive",
+                True,
             ),
             # Script 3: Repro fails -> calibrator -> static_confirmed
             (
@@ -154,6 +156,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
                     json.dumps({"route": "viable", "reason": "Exploit is viable."}),
                     json.dumps({"route": "failed_repro", "reason": "Exploit attempt failed."}),
+                    "Score: 60",
                     "Learnings reflected.",
                     "Report generated.",
                 ],
@@ -163,37 +166,78 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
                     "calibrator", "reflector", "reporter"
                 ],
-                "static_confirmed"
+                "static_confirmed",
+                True,
+            ),
+            # Script 4: Critic marks non_viable -> critic_classifier -> calibrator -> non_viable
+            (
+                [
+                    "History extracted.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
+                    "Found candidate issue.",
+                    "Findings deduplicated.",
+                    json.dumps({"route": "confirmed", "reason": "Plausible statically."}),
+                    json.dumps({"route": "non_viable", "reason": "Unreachable in deployment."}),
+                    "Learnings reflected.",
+                ],
+                [
+                    "history", "structural_index", "architect", "threat_modeler",
+                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
+                    "critic", "critic_classifier", "calibrator", "reflector", "reporter"
+                ],
+                "non_viable",
+                True,
+            ),
+            # Script 5: Zero findings -> findings_gate -> reporter (clean edge; deterministic clean report)
+            (
+                [
+                    "History extracted.",
+                    "Architecture KB created.",
+                    "Threat model created.",
+                    "Plan created.",
+                    "No issues found.",
+                ],
+                [
+                    "history", "structural_index", "architect", "threat_modeler",
+                    "planner", "researcher", "findings_gate", "reporter"
+                ],
+                None,
+                False,
             ),
         ]
 
-        for script_replies, expected_node_order, expected_status in scripts:
+        for idx, (script_replies, expected_node_order, expected_status, seed_finding) in enumerate(scripts):
             queue = list(script_replies)
 
             class ScriptedLlm(BaseLlm):
                 async def generate_content_async(self, llm_request, stream: bool = False):
-                    text = queue.pop(0) if queue else "done"
+                    if not queue:
+                        raise AssertionError(f"ScriptedLlm reply queue exhausted on script {idx}")
+                    text = queue.pop(0)
                     yield LlmResponse(content=types.Content(parts=[types.Part.from_text(text=text)]))
 
             with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
                 with patch("core.graph_loader.LiteLlm", lambda **_: ScriptedLlm(model="scripted")):
-                    wf, cfg = load_workflow_from_json(workflow_path)
+                    wf, cfg = load_workflow_from_json(workflow_path, load_local=False)
 
             app = App(name=APP_NAME, root_agent=wf)
             ss = InMemorySessionService()
-            sess_id = f"sess_{expected_node_order[1]}"
-            run_id = f"run_{expected_node_order[1]}"
+            sess_id = f"sess_{idx}"
+            run_id = f"run_{idx}"
             target_file = "file.py"
 
             temp_dir = tempfile.mkdtemp()
             try:
                 db_path = os.path.join(temp_dir, "test.db")
                 init_db(db_path)
-                f = VulnerabilityFinding(
-                    title="Flaw", severity="High", description="desc", line_numbers=[1], remediation="rem"
-                )
-                write_findings(db_path, target_file, [f], run_id=run_id)
-                self.assertEqual(read_findings(db_path, target_file, run_id=run_id)[0]["status"], "reported")
+                if seed_finding:
+                    f = VulnerabilityFinding(
+                        title="Flaw", severity="High", description="desc", line_numbers=[1], remediation="rem"
+                    )
+                    write_findings(db_path, target_file, [f], run_id=run_id)
+                    self.assertEqual(read_findings(db_path, target_file, run_id=run_id)[0]["status"], "reported")
 
                 await ss.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=sess_id)
                 runner = Runner(app=app, session_service=ss)
@@ -222,10 +266,14 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 finally:
                     current_run_context.reset(tok)
                 self.assertEqual(executed_nodes, expected_node_order)
+                self.assertEqual(queue, [], f"Unconsumed ScriptedLlm replies on script {idx}: {queue}")
 
                 findings = read_findings(db_path, target_file, run_id=run_id)
-                self.assertEqual(len(findings), 1)
-                self.assertEqual(findings[0]["status"], expected_status)
+                if seed_finding:
+                    self.assertEqual(len(findings), 1)
+                    self.assertEqual(findings[0]["status"], expected_status)
+                else:
+                    self.assertEqual(findings, [])
             finally:
                 shutil.rmtree(temp_dir)
 
@@ -265,7 +313,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
                     json.dumps({"route": "viable", "reason": "Exploit viable."}),
                     json.dumps({"route": "failed_repro", "reason": "Exploit failed."}),
-                    json.dumps({"route": "failed_repro", "reason": "Exploit failed."}),
                     "Score: 20",
                     "Learnings reflected.",
                     "Report generated.",
@@ -282,9 +329,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Analysis done.",
                     "Findings deduplicated.",
                     json.dumps({"route": "false_positive", "reason": "Score: 0"}),
-                    "Score: 0",
                     "Learnings reflected.",
-                    "Report generated.",
                 ],
                 "false_positive",
                 False,
@@ -297,12 +342,14 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
 
                 class ScriptedLlm(BaseLlm):
                     async def generate_content_async(self, llm_request, stream: bool = False):
-                        text = queue.pop(0) if queue else "done"
+                        if not queue:
+                            raise AssertionError(f"ScriptedLlm reply queue exhausted for {expected_status}")
+                        text = queue.pop(0)
                         yield LlmResponse(content=types.Content(parts=[types.Part.from_text(text=text)]))
 
                 with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
                     with patch("core.graph_loader.LiteLlm", lambda **_: ScriptedLlm(model="scripted")):
-                        wf, cfg = load_workflow_from_json(workflow_path)
+                        wf, cfg = load_workflow_from_json(workflow_path, load_local=False)
 
                 app = App(name=APP_NAME, root_agent=wf)
                 ss = InMemorySessionService()
@@ -333,6 +380,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                             status_map=cfg.get("on_enter_status", {}),
                         )
                         self.assertFalse(err)
+                        self.assertEqual(queue, [], f"Unconsumed ScriptedLlm replies for {expected_status}: {queue}")
 
                         findings = read_findings(db_path, target_file, run_id=run_id)
                         self.assertEqual(len(findings), 1)
@@ -684,8 +732,8 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FileNotFoundError):
                 await dir_env.read_file(Path("missing.txt"))
 
-            # 4. Test read_file tool with active sandbox attached
-            ctx_sb = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file, sandbox=dir_env)
+            # 4. Test read_file tool with active directory sandbox attached
+            ctx_sb = RunContext(jail_dir=jail_dir, db_path="", target_file=jail_dir, sandbox=dir_env)
             tok = current_run_context.set(ctx_sb)
             try:
                 self.assertIn("content_inside", await read_file("inside.txt"))
@@ -695,8 +743,17 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             finally:
                 current_run_context.reset(tok)
 
-            # 5. Test read_file tool with direct host fallback (no sandbox)
-            ctx_host = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file, sandbox=None)
+            # 4b. Single-file target_file scopes read_file strictly to that file
+            ctx_single = RunContext(jail_dir=jail_dir, db_path="", target_file=inside_file, sandbox=dir_env)
+            tok = current_run_context.set(ctx_single)
+            try:
+                self.assertIn("content_inside", await read_file("inside.txt"))
+                self.assertIn("Single-file scans may only read", await read_file("missing.txt"))
+            finally:
+                current_run_context.reset(tok)
+
+            # 5. Test read_file tool with direct host fallback (no sandbox, directory scope)
+            ctx_host = RunContext(jail_dir=jail_dir, db_path="", target_file=jail_dir, sandbox=None)
             tok = current_run_context.set(ctx_host)
             try:
                 self.assertIn("content_inside", await read_file("inside.txt"))
@@ -752,8 +809,8 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(PermissionError):
                 await single_env.list_files("../outside")
 
-            # 4. list_files tool with active sandbox attached
-            ctx_sb = RunContext(jail_dir=jail_dir, db_path="", target_file=file_a, sandbox=dir_env)
+            # 4. list_files tool with active directory sandbox attached
+            ctx_sb = RunContext(jail_dir=jail_dir, db_path="", target_file=jail_dir, sandbox=dir_env)
             tok = current_run_context.set(ctx_sb)
             try:
                 res_json = await list_files()
@@ -764,7 +821,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 current_run_context.reset(tok)
 
             # 5. list_files tool with direct host fallback (no sandbox)
-            ctx_host = RunContext(jail_dir=jail_dir, db_path="", target_file=file_a, sandbox=None)
+            ctx_host = RunContext(jail_dir=jail_dir, db_path="", target_file=jail_dir, sandbox=None)
             tok = current_run_context.set(ctx_host)
             try:
                 res_host = await list_files()
@@ -2130,7 +2187,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
             with patch("core.graph_loader.LiteLlm", lambda **_: ScriptedLlm(model="scripted")):
-                wf, cfg = load_workflow_from_json(workflow_path)
+                wf, cfg = load_workflow_from_json(workflow_path, load_local=False)
 
         app = App(name=APP_NAME, root_agent=wf)
         ss = InMemorySessionService()
@@ -2462,12 +2519,24 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("SUCCESS: Saved 1 finding", res_rf2)
 
                 # 9. get_findings campaign scoping and explicit file filtering.
-                # Unscoped reads are scoped to the campaign target (app.py):
-                # in multi-target runs every campaign shares one run_id, and a
-                # run-wide read leaked other campaigns' findings.
+                # Findings reported by the active campaign (app.py) remain visible to
+                # it even when they cite adjacent files, whereas findings belonging to
+                # a sibling campaign under the same run_id do not leak in.
+                write_findings(
+                    db_path,
+                    "other_slice/worker.py",
+                    [VulnerabilityFinding(
+                        title="Sibling Campaign Leak",
+                        severity="High",
+                        description="recorded by another campaign",
+                        line_numbers=[5],
+                    )],
+                    run_id=run_id,
+                )
                 res_get = get_findings()
                 self.assertIn("SQL Injection A", res_get)
-                self.assertNotIn("Hardcoded Secret Key", res_get)
+                self.assertIn("Hardcoded Secret Key", res_get)
+                self.assertNotIn("Sibling Campaign Leak", res_get)
 
                 # Explicitly filtered queries for adjacent files
                 res_get_crypto = get_findings("src/crypto.py")
@@ -3869,7 +3938,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "auto-discovered-proj"}):
             with patch("scripts.configure.detect_capabilities", return_value={
                 "kvm": False, "docker": False, "podman": False, "container_tool": None,
-                "runsc": False, "gcloud": True, "gcp_auth": True, "gcp_account": "user@google.com",
+                "runsc": False, "gcloud": True, "gcp_auth": True, "gcp_account": "user@example.com",
                 "gcp_project": "auto-discovered-proj", "vertex_project": "auto-discovered-proj",
                 "gemini_api_key": False, "anthropic_api_key": False, "openai_api_key": False,
                 "llm_api_base": None, "recommended_sandbox": "gce",
@@ -3900,7 +3969,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             # 1. By default without MANTIS_ALLOW_SANDBOX_DOWNGRADE=1, ensure_configured fails closed
             with self.assertRaises(SystemExit) as cm:
                 ensure_configured(self.sample_wf_path, auto=True)
-            self.assertEqual(cm.exception.code, 2)
+            self.assertEqual(cm.exception.code, 1)
 
             # 2. When operator explicitly allows downgrade, it proceeds session-only
             with patch.dict(os.environ, {"MANTIS_ALLOW_SANDBOX_DOWNGRADE": "1"}):
@@ -3964,7 +4033,10 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             os.remove(local_path)
         test_args = ["--workflow", self.sample_wf_path, "--auto", "--dry-run"]
         with patch("sys.argv", ["configure.py"] + test_args):
-            with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
+            with patch.dict(
+                os.environ,
+                {"VERTEXAI_PROJECT": "test-project", "MANTIS_ALLOW_SANDBOX_DOWNGRADE": "1"},
+            ):
                 rc = configure_main()
                 self.assertEqual(rc, 0)
                 self.assertFalse(os.path.exists(local_path))
@@ -4301,16 +4373,12 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         # 2. Error classification helpers
         self.assertTrue(is_rate_limit_error(MockQuotaExhausted()))
         self.assertTrue(is_rate_limit_error(RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded")))
-        if hasattr(litellm, "RateLimitError"):
-            try:
-                rate_err = litellm.RateLimitError(
-                    message="Rate limit exceeded",
-                    model="anthropic-claude-opus-5",
-                    llm_provider="vertex_ai",
-                )
-                self.assertTrue(is_rate_limit_error(rate_err))
-            except Exception:
-                pass
+        rate_err = litellm.RateLimitError(
+            message="Rate limit exceeded",
+            model="anthropic-claude-opus-5",
+            llm_provider="vertex_ai",
+        )
+        self.assertTrue(is_rate_limit_error(rate_err))
         self.assertFalse(is_rate_limit_error(RuntimeError("401 Unauthorized")))
         self.assertFalse(is_rate_limit_error(ValueError("Invalid syntax")))
 
@@ -4847,8 +4915,9 @@ class ShipAuditPreflightTests(unittest.TestCase):
 
     def test_inject_active_findings_state_non_mutation_and_dedup(self):
         """Item 5: Verify _inject_active_findings_state does not mutate session dicts in place and dedups cleanly."""
+        from types import SimpleNamespace
         from google.genai import types
-        from core.config import ResilientLiteLlm
+        from core.config import FINDINGS_SNAPSHOT_HEADER, ResilientLiteLlm
 
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             init_db(tmp.name)
@@ -4870,23 +4939,27 @@ class ShipAuditPreflightTests(unittest.TestCase):
                 content = types.Content(role="user", parts=[fr_part])
 
                 class MockReq:
-                    contents = [content]
+                    def __init__(self):
+                        self.contents = [content]
+                        self.config = SimpleNamespace(system_instruction="Base stage prompt.")
 
                 req = MockReq()
                 ResilientLiteLlm._inject_active_findings_state(req)
 
-                # 1. Original response dict MUST NOT be mutated in place
+                # 1. Original tool-response dict MUST NOT be mutated (preserves prompt cache prefix)
                 self.assertEqual(orig_resp["output"], "original tool result")
+                self.assertEqual(req.contents[0].parts[0].function_response.response, {"output": "original tool result"})
 
-                # 2. Request part got state block with scrubbed title
-                new_resp = req.contents[0].parts[0].function_response.response
-                self.assertIn("[STATE STORE: RECORDED FINDINGS", str(new_resp))
-                self.assertNotIn("Multiline title\n", str(new_resp))
+                # 2. System instruction got the findings snapshot block with scrubbed single-line title
+                sys_inst = req.config.system_instruction
+                self.assertIn(FINDINGS_SNAPSHOT_HEADER, sys_inst)
+                self.assertIn("SQL Injection in Auth Multiline title", sys_inst)
+                self.assertNotIn("Multiline title\n", sys_inst)
 
                 # 3. Repeated dispatch dedup
                 ResilientLiteLlm._inject_active_findings_state(req)
-                count = str(req.contents[0].parts[0].function_response.response).count("[STATE STORE: RECORDED FINDINGS")
-                self.assertEqual(count, 1)
+                self.assertEqual(sys_inst, req.config.system_instruction)
+                self.assertEqual(req.config.system_instruction.count(FINDINGS_SNAPSHOT_HEADER), 1)
             finally:
                 current_run_context.reset(tok)
 

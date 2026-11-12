@@ -1158,8 +1158,14 @@ async def ensure_configured_async(
         return run_interactive_wizard(target_wf)
 
     if auto:
+        # A GCE preflight that failed only because the project is still the
+        # placeholder is exactly what auto-resolution below repairs; counting
+        # it as a sandbox failure made the auto-resolve branch unreachable.
+        placeholder_gce = sb_type == "gce" and is_placeholder(sb_opts.get("project", ""))
         sb_preflight_failed = preflight_ran and any(
-            m.startswith("[SANDBOX PREFLIGHT] ❌") for m in preflight_msgs
+            m.startswith("[SANDBOX PREFLIGHT] ❌")
+            and not (placeholder_gce and "placeholder" in m)
+            for m in preflight_msgs
         )
         if (
             not preflight_ran

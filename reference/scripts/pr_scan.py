@@ -134,6 +134,29 @@ SCAN_TIMED_OUT = "timed_out"
 SCAN_AUTH_REJECTED = "credentials_rejected"
 # Never launched: the run's token budget had nothing left for it.
 SCAN_OVER_BUDGET = "over_budget"
+# Never launched: benign protected metadata (.gitattributes, .pre-commit-config.yaml)
+# or non-source binary asset that the static source pipeline does not target.
+SCAN_NOT_APPLICABLE = "not_scannable"
+# Never launched: source-like file with embedded NUL bytes, symlink, or hardlink
+# refused by pipeline safety checks; treated as an unaudited coverage gap.
+SCAN_REFUSED = "refused_by_jail"
+_NOT_LAUNCHED_STATUSES = (SCAN_OVER_BUDGET, SCAN_NOT_APPLICABLE, SCAN_REFUSED)
+
+# Well-known non-code binary media, archive, font, and model/data asset suffixes.
+# Under INV-6 fail-closed, any NUL-containing file outside this allowlist (for
+# example `blob.py` or an extensionless script) is classified SCAN_REFUSED rather
+# than SCAN_NOT_APPLICABLE so disguised code never passes --fail-closed silently.
+_BENIGN_BINARY_ASSET_SUFFIXES = frozenset({
+    ".7z", ".ani", ".arrow", ".avi", ".avif", ".avro", ".bmp", ".bz2", ".cur",
+    ".db", ".dib", ".doc", ".docx", ".eot", ".feather", ".flac", ".gif", ".gz",
+    ".h5", ".hdf5", ".heic", ".heif", ".ico", ".jpeg", ".jpg", ".lz4", ".m4a",
+    ".m4v", ".mdb", ".mkv", ".mov", ".mp3", ".mp4", ".npy", ".npz", ".odp",
+    ".ods", ".odt", ".ogg", ".onnx", ".opus", ".orc", ".otf", ".parquet", ".pb",
+    ".pdf", ".png", ".ppt", ".pptx", ".pt", ".pth", ".rar", ".safetensors",
+    ".sqlite", ".sqlite3", ".tar", ".tbz2", ".tflite", ".tgz", ".tif", ".tiff",
+    ".ttf", ".txz", ".wasm", ".wav", ".webm", ".webp", ".woff", ".woff2",
+    ".xls", ".xlsx", ".xz", ".zip", ".zst",
+})
 
 # A scan is not launched with less than this many tokens to spend. Measured
 # at the default call cap, the smallest file costs about 250k: prompts and
@@ -561,27 +584,80 @@ class _scoped_environ:
         return False
 
 
-def select_scan_files(state: MantisState, changed: Dict[str, List[int]],
-                      max_files: int) -> tuple[List[str], List[str]]:
+def _classify_changed_path(repo: Path, repo_real: Path, rel: str) -> Optional[str]:
+    """Returns None when `rel` is a scannable source/text file, 'skip' when absent
+    or a directory/VCS entry, SCAN_NOT_APPLICABLE for benign protected metadata or
+    non-source binary assets, or SCAN_REFUSED for symlinks, hardlinks, and
+    NUL-containing code/config files."""
+    import fnmatch
+    import stat as _stat
+    from core.environments.static_env import PROTECTED_METADATA_FILES, PROTECTED_VCS_DIRS
+
+    parts = Path(rel).parts
+    if not parts or any(p in ("", "..") or p.lower() in PROTECTED_VCS_DIRS for p in parts):
+        return "skip"
+    curr = repo
+    for part in parts:
+        curr = curr / part
+        if curr.is_symlink():
+            return SCAN_REFUSED
+    probe = repo / rel
+    try:
+        st = os.lstat(probe)
+    except OSError:
+        return "skip"
+    if _stat.S_ISDIR(st.st_mode):
+        return "skip"
+    if not _stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        return SCAN_REFUSED
+    try:
+        Path(os.path.realpath(str(probe))).relative_to(repo_real)
+    except (OSError, ValueError):
+        return SCAN_REFUSED
+    name_lower = parts[-1].lower()
+    if name_lower in PROTECTED_METADATA_FILES or fnmatch.fnmatch(parts[-1], "gha-creds-*.json"):
+        return SCAN_NOT_APPLICABLE
+    try:
+        with open(probe, "rb") as fh:
+            has_nul = b"\x00" in fh.read(1024)
+    except OSError:
+        return SCAN_REFUSED
+    if has_nul:
+        suffix = Path(parts[-1]).suffix.lower()
+        if suffix in _BENIGN_BINARY_ASSET_SUFFIXES:
+            return SCAN_NOT_APPLICABLE
+        return SCAN_REFUSED
+    return None
+
+
+def select_scan_files(
+    state: MantisState,
+    changed: Dict[str, List[int]],
+    max_files: int,
+    *,
+    non_scannable_out: Optional[List[Tuple[str, str]]] = None,
+) -> tuple[List[str], List[str]]:
     """Repo-relative files to scan, and the ones over the cap.
 
-    Mirrors scan_change's admission rule: inside the repository after
-    resolving symlinks, and a regular file. Order is the diff's order
-    (git's: path-sorted), so the cap is deterministic for a given change.
+    Mirrors main.discover_files's admission rule so protected metadata,
+    non-source binary assets, symlinks, hardlinks, and NUL-in-source files are
+    classified upfront instead of spawning doomed pipeline subprocesses.
+    Order is the diff's order (git's: path-sorted), so the cap is deterministic
+    for a given change.
     """
     rels: List[str] = []
+    seen: set[str] = set()
+    repo_real = state.repo.resolve()
     for f in changed:
         r = state.rel(f)
-        if not r:
+        if not r or r in seen:
             continue
-        probe = state.repo / r
-        try:
-            probe.resolve().relative_to(state.repo)
-        except (OSError, ValueError):
-            continue
-        if probe.is_file():
+        seen.add(r)
+        verdict = _classify_changed_path(state.repo, repo_real, r)
+        if verdict is None:
             rels.append(r)
-    rels = list(dict.fromkeys(rels))
+        elif verdict in (SCAN_NOT_APPLICABLE, SCAN_REFUSED) and non_scannable_out is not None:
+            non_scannable_out.append((r, verdict))
     if max_files > 0 and len(rels) > max_files:
         return rels[:max_files], rels[max_files:]
     return rels, []
@@ -1399,6 +1475,11 @@ def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
             _gap(report, r["file"],
                  f"Scan of '{r['file']}' {r['status'].replace('_', ' ')}: its content is unaudited.",
                  "Check the scan log and re-run the workflow.")
+        elif r["status"] == SCAN_REFUSED:
+            _gap(report, r["file"],
+                 f"File '{r['file']}' was refused by pipeline safety checks "
+                 "(binary NUL byte in source file, symlink, or hardlink): its content is unaudited.",
+                 f"Inspect '{r['file']}' manually or remove binary/symlink indirection.")
         elif r["status"] == SCAN_PAUSED:
             # The pipeline stops cleanly at a ceiling with whatever it found
             # so far stored, but it records no coverage for a cut-off
@@ -1446,11 +1527,15 @@ def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
         report["coverage"]["status"] = COVERAGE_PARTIAL if audited_files else COVERAGE_NONE
         if report["verdict"] == VERDICT_PASS:
             report["verdict"] = VERDICT_REVIEW
+    not_scannable = [r["file"] for r in scan_results if r["status"] == SCAN_NOT_APPLICABLE]
+    refused = [r["file"] for r in scan_results if r["status"] == SCAN_REFUSED]
     report["scan"] = {
-        "files": [r["file"] for r in scan_results],
+        "files": [r["file"] for r in scan_results if r["status"] not in (SCAN_NOT_APPLICABLE, SCAN_REFUSED)],
         "results": scan_results,
         "skipped": skipped,
         "over_budget": over_budget,
+        "not_scannable": not_scannable,
+        "refused": refused,
         "log": str(log_path),
     }
     report["usage"] = usage_summary(scan_results, max_tokens, daily)
@@ -1476,7 +1561,7 @@ def usage_summary(scan_results: List[Dict[str, Any]], max_tokens: int,
     tokens = sum(int(r.get("tokens") or 0) for r in scan_results)
     calls: Optional[int] = 0
     for r in scan_results:
-        if r["status"] == SCAN_OVER_BUDGET:
+        if r["status"] in _NOT_LAUNCHED_STATUSES:
             continue
         c = r.get("llm_calls")
         if c is None:
@@ -1487,7 +1572,7 @@ def usage_summary(scan_results: List[Dict[str, Any]], max_tokens: int,
         "tokens": tokens,
         "llm_calls": calls,
         "max_tokens": int(max_tokens),
-        "files_scanned": sum(1 for r in scan_results if r["status"] != SCAN_OVER_BUDGET),
+        "files_scanned": sum(1 for r in scan_results if r["status"] not in _NOT_LAUNCHED_STATUSES),
         "files_over_budget": sum(1 for r in scan_results if r["status"] == SCAN_OVER_BUDGET),
     }
     if daily:
@@ -1593,6 +1678,12 @@ def render_annotations(report: Dict[str, Any]) -> List[str]:
             buckets["warning"].append(annotation(
                 "warning", f"Mantis scan of {r['file']} {r['status'].replace('_', ' ')}; "
                            f"see the scan log in the step summary.",
+                title="Mantis: unscanned"))
+        elif r.get("status") == SCAN_REFUSED:
+            buckets["warning"].append(annotation(
+                "warning", f"Mantis refused to scan {r['file']} (binary NUL byte in source file, "
+                           f"symlink, or hardlink); inspect manually.",
+                file=str(r.get("file") or ""),
                 title="Mantis: unscanned"))
     if scan.get("skipped"):
         buckets["warning"].append(annotation(
@@ -1735,6 +1826,10 @@ def render_summary(report: Dict[str, Any]) -> str:
         lines.append("")
         lines.append("Not scanned (token budget spent): "
                      + ", ".join(f"`{_md(s)}`" for s in scan["over_budget"]))
+    if scan.get("not_scannable"):
+        lines.append("")
+        lines.append("Skipped (protected metadata or non-source binary): "
+                     + ", ".join(f"`{_md(s)}`" for s in scan["not_scannable"]))
     if report.get("ignored"):
         lines.append("")
         lines.append("Ignored (not code): "
@@ -1928,6 +2023,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "commit it reflects, and archive known findings whose lines this change "
                         "rewrote and the rescan did not report again. For the refresh workflow on "
                         "trusted code; a pull-request scan must not set it.")
+    p.add_argument("--knowledge-rev", default="",
+                   help="Git revision to import `.mantis/knowledge` from instead of --base "
+                        "(HEAD or a commit SHA; valid only with --export-knowledge on trusted "
+                        "refresh runs where the export was committed after manifest.head).")
     return p.parse_args(argv)
 
 
@@ -1988,6 +2087,19 @@ def main(argv: Optional[List[str]] = None,
                     f"read: {exc}")
             run_budget = run_budget_for_today(max_tokens, daily_budget, used_today)
         changed_all, diff, moves = pr_changes(repo, args.base, args.head)
+        knowledge_rev = str(args.knowledge_rev or "").strip()
+        if knowledge_rev:
+            if not args.export_knowledge:
+                raise InfraError(
+                    "--knowledge-rev requires --export-knowledge (pull-request scans "
+                    "always read knowledge from --base)."
+                )
+            if not _valid_rev(knowledge_rev, allow_head=True):
+                raise InfraError(
+                    f"--knowledge-rev must be HEAD or a commit SHA, got {knowledge_rev[:40]!r}."
+                )
+            if not _commit_present(repo, knowledge_rev):
+                raise InfraError(f"Knowledge revision '{knowledge_rev}' is not in the checkout.")
         state_dir = fresh_state_dir(repo, args.state_dir)
     except InfraError as exc:
         return _not_run(args.summary, str(exc), fail_closed=args.fail_closed,
@@ -2004,7 +2116,8 @@ def main(argv: Optional[List[str]] = None,
     changed = {f: lines for f, lines in changed_all.items() if f not in ignored}
     if ignored:
         diff = filter_diff(diff, set(changed))
-    rels, skipped = select_scan_files(state, changed, args.max_files)
+    non_scannable: List[Tuple[str, str]] = []
+    rels, skipped = select_scan_files(state, changed, args.max_files, non_scannable_out=non_scannable)
     state.ensure_home()
     log_path = state.home / "pr_scan.log"
     # A radius of 1 adds the files of direct callers, after the changed files
@@ -2012,31 +2125,40 @@ def main(argv: Optional[List[str]] = None,
     radius_files: List[str] = []
     if args.radius > 0 and changed:
         radius_files = caller_files(state, changed, diff)
-        extra = [r for r in radius_files if r not in rels and r not in skipped]
+        non_scannable_paths = {p for p, _ in non_scannable}
+        extra = [r for r in radius_files if r not in rels and r not in skipped and r not in non_scannable_paths]
         room = (args.max_files - len(rels)) if args.max_files > 0 else len(extra)
         rels += extra[:max(0, room)]
         skipped += extra[max(0, room):]
 
-    # The repository's memory, as of the base commit. Imported into this
-    # run's database so the gate sees known findings and coverage, and handed
-    # to every scan so the model starts from the threat model and
-    # architecture. The pull request's own edits to it are a finding.
-    from core.knowledge import KNOWLEDGE_DIR, KnowledgeImportError, import_knowledge
+    # The repository's memory, as of the base commit (or --knowledge-rev on a
+    # trusted main-branch refresh where `.mantis/knowledge` landed after
+    # manifest.head). Imported into this run's database so the gate sees known
+    # findings and coverage, and handed to every scan so the model starts from
+    # the threat model and architecture. The pull request's own edits to it are
+    # a finding.
+    from core.knowledge import KNOWLEDGE_DIR, KnowledgeImportError, import_knowledge, read_head
 
+    kb_rev = knowledge_rev or args.base
     knowledge: Dict[str, Any] = {"dir": KNOWLEDGE_DIR, "source": None, "imported": None,
-                                 "error": "", "changed": knowledge_edits(repo, args.base, args.head)}
+                                 "error": "", "changed": knowledge_edits(repo, kb_rev, args.head)}
     knowledge_dir = ""
-    extracted, note = knowledge_from_base(repo, args.base, state_dir / "knowledge")
+    imported_manifest_head = ""
+    extracted, note = knowledge_from_base(repo, kb_rev, state_dir / "knowledge")
     if extracted is not None:
+        imported_manifest_head = read_head(str(extracted))
         try:
             knowledge["imported"] = import_knowledge(state.db_path, str(extracted), run_id="pr-scan",
                                                      repo_root=str(repo))
-            knowledge["source"] = f"base commit {args.base[:12]}"
+            knowledge["source"] = (f"commit {kb_rev[:12]}" if knowledge_rev
+                                   else f"base commit {args.base[:12]}")
             knowledge_dir = str(extracted)
         except KnowledgeImportError as exc:
             knowledge["error"] = str(exc)
     elif note:
         knowledge["error"] = note
+    if not imported_manifest_head and _valid_rev(args.base):
+        imported_manifest_head = args.base
     # What the base knew before this run wrote anything: the refresh's archive
     # rule compares the rescan against it. A pull-request scan never archives
     # (an imported finding on rewritten lines stays open and blocks: the
@@ -2073,7 +2195,25 @@ def main(argv: Optional[List[str]] = None,
                             knowledge_dir=knowledge_dir,
                             models=models,
                             one_process=args.one_process) if rels else []
-    rejected = next((r for r in results if r["status"] == SCAN_AUTH_REJECTED), None)
+        if changed and not rels and not index_is_repo_rooted(state):
+            try:
+                reindex(state)
+            except Exception:
+                pass
+    launched_results = list(results)
+    for ns_file, ns_status in non_scannable:
+        results.append({
+            "file": ns_file,
+            "returncode": None,
+            "status": ns_status,
+            "seconds": 0.0,
+            "tokens": 0,
+            "llm_calls": 0,
+            "granted": 0,
+            "pause_trigger": "",
+            "examined": False,
+        })
+    rejected = next((r for r in launched_results if r["status"] == SCAN_AUTH_REJECTED), None)
     if rejected:
         return _not_run(
             args.summary,
@@ -2081,7 +2221,7 @@ def main(argv: Optional[List[str]] = None,
             f"scanning '{rejected['file']}'. Check the credentials and model configured on "
             f"the workflow step; the provider's message is in the scan log: {log_path}",
             fail_closed=args.fail_closed, github_output=args.github_output)
-    if rels and all(r["status"] == SCAN_FAILED and r["returncode"] == -1 for r in results):
+    if rels and all(r["status"] == SCAN_FAILED and r["returncode"] == -1 for r in launched_results):
         return _not_run(args.summary, f"Every scan failed to launch; see the scan log: {log_path}",
                         fail_closed=args.fail_closed, github_output=args.github_output)
 
@@ -2090,6 +2230,10 @@ def main(argv: Optional[List[str]] = None,
     if args.export_knowledge:
         head_sha = _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
                         f"{args.head}^{{commit}}", check=False).stdout.strip()
+        all_delta_audited = (not skipped) and all(
+            r["status"] in (SCAN_DONE, SCAN_NOT_APPLICABLE) for r in results
+        )
+        export_head = head_sha if all_delta_audited else imported_manifest_head
         if prior_open:
             # A file counts as examined when its researcher pass completed,
             # even if the run paused afterwards: the pass's report is in.
@@ -2117,8 +2261,9 @@ def main(argv: Optional[List[str]] = None,
             from core.knowledge import export_knowledge
 
             knowledge["exported"] = export_knowledge(state.db_path, args.export_knowledge,
-                                                     repo_root=str(repo), head=head_sha)
+                                                     repo_root=str(repo), head=export_head)
             knowledge["exported"]["dir"] = args.export_knowledge
+            knowledge["exported"]["all_delta_audited"] = all_delta_audited
         except Exception as exc:
             knowledge["error"] = (knowledge.get("error") or "") + f" export failed: {exc}"
 

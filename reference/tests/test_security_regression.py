@@ -1006,7 +1006,7 @@ class TestInjectionGuardCoverage(unittest.TestCase):
 
         gl.adk.Agent = mock_agent
         try:
-            wf = gl.load_workflow_from_json(str(wf_path))
+            wf = gl.load_workflow_from_json(str(wf_path), load_local=False)
             guard = UNTRUSTED_CODE_AUDIT_GUARD.strip()
 
             for node_name, instr in captured.items():

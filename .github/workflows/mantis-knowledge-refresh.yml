@@ -144,15 +144,17 @@ jobs:
         run: |
           set +e
           python scripts/pr_scan.py --repo "$GITHUB_WORKSPACE" \
-            --base "$BASE" --head HEAD --models "$(echo "$MANTIS_MODELS" | tr -s ' ' ',')" \
+            --base "$BASE" --head HEAD --knowledge-rev HEAD \
+            --models "$(echo "$MANTIS_MODELS" | tr -s ' ' ',')" \
             --radius 1 --max-llm-calls 400 --max-tokens "$((20 * $(echo "$MANTIS_MODELS" | wc -w)))M" \
             --export-knowledge "$GITHUB_WORKSPACE/.mantis/knowledge" \
             --state-dir "$RUNNER_TEMP" --output-json "$RUNNER_TEMP/refresh.json" --no-annotations \
             --fail-closed
           rc=$?
-          # 0 and 1 are verdicts (the export is the product here); 3 is a setup
-          # failure and must be seen.
-          [ "$rc" -eq 3 ] && exit 3
+          # 0 and 1 are verdicts (the export is the product here, and head only
+          # advances when every delta file was audited); 3 or any unexpected
+          # crash exit status is a failure and must stop before opening a PR.
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ] || exit "$rc"
           exit 0
 
       - name: Sweep files no scan has covered
@@ -190,18 +192,19 @@ jobs:
           [ "$rc" -eq 4 ] && exit 4
           set -e
           python scripts/knowledge.py export --db "$RUNNER_TEMP/knowledge.db" \
-            --repo "$GITHUB_WORKSPACE"
+            --repo "$GITHUB_WORKSPACE" --preserve-head
 
       - name: Open a pull request if the knowledge changed
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.plan.outputs.mode }}
         run: |
           git add -A .mantis/knowledge
           if git diff --cached --quiet; then
             echo "Knowledge unchanged."; exit 0
           fi
-          branch="mantis/knowledge-$(date -u +%Y%m%d)"
+          branch="mantis/knowledge-${MODE:-refresh}-$(date -u +%Y%m%d)"
           stat=$(git diff --cached --stat | tail -1 | sed 's/^ *//')
           git config user.name "mantis-knowledge[bot]"
           git config user.email "mantis-knowledge[bot]@users.noreply.github.com"

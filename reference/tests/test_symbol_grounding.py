@@ -77,10 +77,11 @@ _VIEWS_SRC = (
 _LIB_QUERIES_SRC = "def list_things():\n    return []\n"
 
 
-@unittest.skipUnless(_HAS_PYTHON_GRAMMAR, "tree-sitter python grammar unavailable")
 class GroundSymbolInCatalogTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not _HAS_PYTHON_GRAMMAR:
+            raise AssertionError("tree-sitter python grammar unavailable in reference environment")
         cls._tmp = tempfile.TemporaryDirectory(prefix="mantis_grounding_")
         base = Path(cls._tmp.name)
         jail = base / "jail"

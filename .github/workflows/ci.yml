@@ -1,0 +1,108 @@
+# Runs offline lint, skill-integrity, unit-test, and neuter-matrix checks.
+# Requires zero cloud credentials and runs on all pull requests (including
+# dependency updates) as well as pushes to main.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-and-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install reference dependencies
+        shell: bash
+        working-directory: reference
+        env:
+          PYTHONSAFEPATH: "1"
+        run: python -P -m pip install --quiet --require-hashes -r requirements.txt
+
+      - name: Check skill integrity and test layout
+        shell: bash
+        env:
+          PYTHONSAFEPATH: "1"
+        run: python -P test_skills_integrity.py
+
+      - name: Run pre-commit hooks
+        shell: bash
+        run: pipx run pre-commit==4.2.0 run --all-files
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install reference dependencies
+        shell: bash
+        working-directory: reference
+        env:
+          PYTHONSAFEPATH: "1"
+        run: python -P -m pip install --quiet --require-hashes -r requirements.txt
+
+      - name: Run unit test suite
+        shell: bash
+        working-directory: reference
+        env:
+          MANTIS_CI_STRICT_DEPS: "1"
+          PYTHONSAFEPATH: "1"
+          NO_PROXY: "127.0.0.1,localhost"
+          no_proxy: "127.0.0.1,localhost"
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          LITELLM_MODE: PRODUCTION
+        run: python -P -m unittest discover -s . -p "test*.py"
+
+  neuter-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install reference dependencies
+        shell: bash
+        working-directory: reference
+        env:
+          PYTHONSAFEPATH: "1"
+        run: python -P -m pip install --quiet --require-hashes -r requirements.txt
+
+      - name: Run regression neuter matrix
+        shell: bash
+        working-directory: reference
+        env:
+          PYTHONSAFEPATH: "1"
+          NO_PROXY: "127.0.0.1,localhost"
+          no_proxy: "127.0.0.1,localhost"
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          LITELLM_MODE: PRODUCTION
+        run: python -P scripts/neuter_matrix.py --jobs 4

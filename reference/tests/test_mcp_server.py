@@ -675,13 +675,11 @@ class TestCheckCli(unittest.TestCase):
 
 
 class TestMcpProtocol(unittest.TestCase):
-    """Smoke test over the real SDK, skipped where it is not installed."""
+    """Smoke test over the pinned MCP SDK."""
 
     def test_tools_registered(self):
-        try:
-            import mcp  # noqa: F401
-        except ImportError:
-            self.skipTest("mcp SDK not installed")
+        import mcp  # noqa: F401
+
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         state = mcp_server.MantisState(str(make_repo(tmp)))

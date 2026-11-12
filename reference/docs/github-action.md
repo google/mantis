@@ -536,15 +536,18 @@ copy:
 
 - **Nightly, the delta.** The committed export records the commit it reflects
   (`head` in `manifest.json`). The refresh runs the same driver as the action
-  from that commit to `main`, with the committed knowledge imported, one hop of
-  callers added (`--radius 1`), and `--export-knowledge` pointed back at
-  `.mantis/knowledge/`. The run's database is the base's knowledge plus what it
-  just found, so the export is the merged result; coverage advances to `main`.
+  from that commit to `main`, importing the latest committed knowledge via
+  `--knowledge-rev HEAD`, adding one hop of callers (`--radius 1`), and pointing
+  `--export-knowledge` back at `.mantis/knowledge/`. The run's database is the
+  prior knowledge plus what it just found, so the export is the merged result;
+  `head` advances to `main` only when every changed source file in the delta was
+  audited in full.
 - **Weekly, a sweep.** `auto` mode over the repository with the knowledge
-  imported scans only files no recorded campaign has covered, under
-  `--max-tokens`; files it does not reach wait for next week. A repository can
-  start from an empty `.mantis/knowledge/` and fill in over a month without ever
-  paying for a full scan.
+  imported scans files no recorded campaign has covered, under `--max-tokens`,
+  and exports with `--preserve-head` so un-diffed weekday commits stay queued
+  for the nightly delta; files it does not reach wait for next week. Each mode
+  pushes its own `mantis/knowledge-<mode>-YYYYMMDD` branch so a Sunday sweep
+  never overwrites that morning's delta branch.
 - **If anything changed, a pull request.** The export is committed on a branch
   and a pull request opened, by the one step in the job that holds a token. The
   scanning steps get none: GitHub's tokens are stripped from the pipeline's
@@ -672,10 +675,14 @@ model credential. The design keeps those two facts apart:
   as its own memory.
 - **The change set does not depend on how git rendered a file.** Which files
   changed comes from `git diff --name-status -z`; the unified diff only adds
-  changed lines where it has them. A `.gitattributes` line marking a file
-  `-diff`, or a byte that trips binary detection, cannot remove the file from
-  the scan or the gate: it is scanned, and gated without line information, which
-  the gate treats as `direct`. Inside a hunk, a content line that reads
+  changed lines where it has them. A `.gitattributes` line marking a source file
+  `-diff` cannot remove the file from the scan or the gate: it is scanned and
+  gated without line information, which the gate treats as `direct`. Benign
+  protected metadata (such as `.gitattributes` or `.pre-commit-config.yaml`) and
+  non-source binary assets are noted as `not_scannable` while still checked
+  against known findings; source files carrying NUL bytes, symlinks, or
+  hardlinks are refused (`refused_by_jail`) and surface as `REVIEW` coverage
+  gaps (failing `fail-closed: true`). Inside a hunk, a content line that reads
   `+++ b/other.py` is content; headers are recognized only between hunks.
 - **Credential rejection is an exit status, not a log string.** The pipeline
   exits with a reserved status when the provider refuses the credentials, and

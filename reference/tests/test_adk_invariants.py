@@ -824,7 +824,7 @@ class TestADKInvariants(unittest.IsolatedAsyncioTestCase):
         pkg_workflow = Path(__file__).resolve().parent.parent / "workflow.json"
         if not pkg_workflow.exists():
             self.skipTest("workflow.json not found")
-        workflow, cfg = load_workflow_from_json(str(pkg_workflow))
+        workflow, cfg = load_workflow_from_json(str(pkg_workflow), load_local=False)
         self.assertIsNotNone(workflow)
         # Check researcher node
         researcher_edge = next(e for e in workflow.edges if getattr(e.to_node, "name", None) == "researcher")

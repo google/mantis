@@ -1414,39 +1414,54 @@ SCENARIOS = {
 
 
 
-def run_matrix(only_scenarios=None):
-    results = {}
-    selected = {k: v for k, v in SCENARIOS.items() if not only_scenarios or k in only_scenarios}
-    total = len(selected)
-    print(f"Running Neuter Matrix across {total} scenarios...")
+def _default_jobs() -> int:
+    return min(8, max(1, os.cpu_count() or 4))
 
-    for idx, (name, patches) in enumerate(selected.items(), 1):
-        work = Path(tempfile.mkdtemp(prefix=f"neuter_{name}_"))
-        dst = work / "reference"
+
+def _evaluate_scenario(item: tuple[int, int, str, list]) -> tuple[str, str, str]:
+    idx, total, name, patches = item
+    work = Path(tempfile.mkdtemp(prefix=f"neuter_{name}_"))
+    dst = work / "reference"
+    try:
         shutil.copytree(
             REF, dst, symlinks=True,
             ignore=shutil.ignore_patterns(".venv", "__pycache__", "workspace", "*.db", ".git"),
         )
-        ok_patch = True
         for rel, old, new in patches:
             p = dst / rel
             text = p.read_text(encoding="utf-8")
             if old not in text:
-                print(f"  [{idx}/{total}] !! {name}: pattern not found in {rel}")
-                ok_patch = False
-                break
+                return (
+                    name,
+                    "PATCH-FAILED",
+                    f"  [{idx}/{total}] !! {name}: pattern not found in {rel}",
+                )
             p.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-        if not ok_patch:
-            results[name] = "PATCH-FAILED"
-            shutil.rmtree(work, ignore_errors=True)
-            continue
 
         # The matrix measures control potency, not ranking quality, and it reruns the
         # whole suite once per scenario. The Surveyor's real-repository smoke test costs
         # ~65s against a chromium checkout, which would add half an hour to a full
         # matrix for a test that cannot be neutered by any scenario here.
-        matrix_env = dict(os.environ, MANTIS_NEUTER_MATRIX="1")
+        # Clear PYTHONSAFEPATH for the child unittest invocation and anchor PYTHONPATH
+        # exclusively to the isolated `dst` copy so `-m unittest tests.<mod>` imports
+        # the patched tree rather than failing module resolution with `ERROR: tests`.
+        matrix_env = dict(
+            os.environ,
+            MANTIS_NEUTER_MATRIX="1",
+            PYTHONPATH=str(dst),
+            LITELLM_LOCAL_MODEL_COST_MAP="True",
+            LITELLM_MODE="PRODUCTION",
+        )
+        matrix_env.pop("PYTHONSAFEPATH", None)
+        # Loopback test endpoints (127.0.0.1:9, local fake model servers) must
+        # never route through a host proxy: a proxied loopback call fails in
+        # every scenario and would masquerade as behavioural evidence.
+        for key in ("NO_PROXY", "no_proxy"):
+            parts = [p for p in (matrix_env.get(key) or "").split(",") if p]
+            for host in ("127.0.0.1", "localhost"):
+                if host not in parts:
+                    parts.append(host)
+            matrix_env[key] = ",".join(parts)
         proc = subprocess.run(
             [
                 PY, "-m", "unittest",
@@ -1463,6 +1478,12 @@ def run_matrix(only_scenarios=None):
             cwd=dst, capture_output=True, text=True, env=matrix_env,
         )
         combined = proc.stdout + proc.stderr
+        if "unittest.loader._FailedTest" in combined:
+            return (
+                name,
+                "IMPORT-ERROR (BAD): test loader failed inside patched copy",
+                f"  [{idx}/{total}] {name:35s} -> IMPORT-ERROR (BAD)",
+            )
         failed = re.findall(r"^(?:FAIL|ERROR): (\S+)", combined, re.M)
 
         # The matrix's own self-checks read the PATCHED tree, so they fail for every
@@ -1477,16 +1498,52 @@ def run_matrix(only_scenarios=None):
             and not f.endswith("test_every_neuter_produces_code_that_still_parses")
         })
         if proc.returncode != 0 and behavioural:
-            results[name] = "WENT RED: " + ", ".join(behavioural)
-            print(f"  [{idx}/{total}] {name:35s} -> WENT RED ({len(behavioural)} failure(s))")
-        elif proc.returncode != 0:
-            results[name] = "SELF-CHECK ONLY (BAD): no test depends on this code"
-            print(f"  [{idx}/{total}] {name:35s} -> SELF-CHECK ONLY (BAD)")
-        else:
-            results[name] = "STILL GREEN (BAD)"
-            print(f"  [{idx}/{total}] {name:35s} -> STILL GREEN (BAD)")
-
+            return (
+                name,
+                "WENT RED: " + ", ".join(behavioural),
+                f"  [{idx}/{total}] {name:35s} -> WENT RED ({len(behavioural)} failure(s))",
+            )
+        if proc.returncode != 0:
+            return (
+                name,
+                "SELF-CHECK ONLY (BAD): no test depends on this code",
+                f"  [{idx}/{total}] {name:35s} -> SELF-CHECK ONLY (BAD)",
+            )
+        return (
+            name,
+            "STILL GREEN (BAD)",
+            f"  [{idx}/{total}] {name:35s} -> STILL GREEN (BAD)",
+        )
+    finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def run_matrix(only_scenarios=None, *, jobs: int | None = None):
+    selected = {k: v for k, v in SCENARIOS.items() if not only_scenarios or k in only_scenarios}
+    total = len(selected)
+    workers = _default_jobs() if jobs is None else max(1, int(jobs))
+    workers = min(workers, max(1, total))
+    print(f"Running Neuter Matrix across {total} scenarios (jobs={workers})...")
+
+    tasks = [
+        (idx, total, name, patches)
+        for idx, (name, patches) in enumerate(selected.items(), 1)
+    ]
+    raw_outcomes: dict[str, tuple[str, str]] = {}
+    if workers <= 1 or total <= 1:
+        for task in tasks:
+            name, outcome, log_line = _evaluate_scenario(task)
+            print(log_line, flush=True)
+            raw_outcomes[name] = (outcome, log_line)
+    else:
+        import concurrent.futures
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            for name, outcome, log_line in pool.map(_evaluate_scenario, tasks):
+                print(log_line, flush=True)
+                raw_outcomes[name] = (outcome, log_line)
+
+    results = {name: raw_outcomes[name][0] for name in selected}
 
     print("\n" + "=" * 80)
     print(f" NEUTER MATRIX SUMMARY: {len(results)} SCENARIOS EVALUATED")
@@ -1495,6 +1552,7 @@ def run_matrix(only_scenarios=None):
     green_count = sum(1 for v in results.values() if "STILL GREEN" in v)
     stale_count = sum(1 for v in results.values() if "PATCH-FAILED" in v)
     selfonly_count = sum(1 for v in results.values() if "SELF-CHECK ONLY" in v)
+    import_err_count = sum(1 for v in results.values() if "IMPORT-ERROR" in v)
 
     for k, v in results.items():
         print(f"  {k:35s} {v}")
@@ -1504,6 +1562,7 @@ def run_matrix(only_scenarios=None):
         f" Total: {len(results)} | Potent (Went Red): {red_count} | "
         f"Inert (Still Green): {green_count} | Stale (Patch Failed): {stale_count} | "
         f"Self-check only: {selfonly_count}"
+        + (f" | Import errors: {import_err_count}" if import_err_count else "")
     )
 
     # Reported separately because they demand different fixes, and because a stale
@@ -1520,9 +1579,25 @@ def run_matrix(only_scenarios=None):
             if "PATCH-FAILED" in v:
                 print(f"   - {k}")
     print("=" * 80)
-    return (green_count + stale_count) == 0
+    return (green_count + stale_count + selfonly_count + import_err_count) == 0
+
+
+def _parse_args(argv: list[str] | None = None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-j", "--jobs", type=int, default=_default_jobs(),
+        help="parallel worker processes (default: min(8, cpu_count))",
+    )
+    parser.add_argument(
+        "scenarios", nargs="*",
+        help="optional subset of scenario names to evaluate",
+    )
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    success = run_matrix(sys.argv[1:])
+    cli_args = _parse_args()
+    success = run_matrix(cli_args.scenarios or None, jobs=cli_args.jobs)
     sys.exit(0 if success else 1)

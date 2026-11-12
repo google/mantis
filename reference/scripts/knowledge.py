@@ -44,6 +44,7 @@ from core.knowledge import (  # noqa: E402
     describe,
     export_knowledge,
     import_knowledge,
+    read_head,
 )
 
 
@@ -54,6 +55,12 @@ def main(argv=None) -> int:
     ex.add_argument("--db", default="knowledge.db", help="knowledge database (default: knowledge.db)")
     ex.add_argument("--repo", required=True, help="repository root the scan targeted; paths are made relative to it")
     ex.add_argument("--out", default="", help=f"output directory (default: <repo>/{KNOWLEDGE_DIR})")
+    ex.add_argument("--head", default="", help="commit SHA to record as manifest `head` (default: repository HEAD)")
+    ex.add_argument(
+        "--preserve-head",
+        action="store_true",
+        help="keep the existing manifest.json `head` commit when present instead of advancing it to HEAD",
+    )
     im = sub.add_parser("import", help="read a knowledge export into a database")
     im.add_argument("--db", default="knowledge.db")
     im.add_argument("--repo", required=True, help="repository root the paths are relative to")
@@ -114,8 +121,13 @@ def main(argv=None) -> int:
         if not os.path.exists(args.db):
             print(f"error: no database at {args.db}", file=sys.stderr)
             return 2
+        export_head = args.head.strip() or None
+        if export_head is None and args.preserve_head:
+            existing_head = read_head(out)
+            if existing_head:
+                export_head = existing_head
         try:
-            counts = export_knowledge(args.db, out, repo_root=repo)
+            counts = export_knowledge(args.db, out, repo_root=repo, head=export_head)
         except (OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2

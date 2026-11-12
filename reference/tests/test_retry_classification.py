@@ -69,10 +69,8 @@ class AdkNodeRetryPatchTest(unittest.TestCase):
     the exception itself and for a wrapped __cause__."""
 
     def setUp(self):
-        try:
-            import google.adk.workflow.utils._retry_utils as adk_retry
-        except Exception:
-            self.skipTest("google.adk retry utils not importable here")
+        import google.adk.workflow.utils._retry_utils as adk_retry
+
         self.should_retry = adk_retry._should_retry_node
 
     def _exc(self, name: str) -> BaseException:

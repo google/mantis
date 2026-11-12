@@ -22,9 +22,15 @@ def ensure_reference_deps():
     there is nothing meaningful to test, so a missing environment is an
     error -- never a skip, never a pass.
     """
+    import os
+
     try:
         import pydantic  # noqa: F401
         import google.adk  # noqa: F401
+        if os.environ.get("MANTIS_CI_STRICT_DEPS") == "1":
+            import litellm  # noqa: F401
+            import mcp  # noqa: F401
+            import tree_sitter  # noqa: F401
     except ImportError as exc:
         raise ImportError(
             "The Mantis reference test suites require the reference "

@@ -265,11 +265,9 @@ class ListFilesHintTest(unittest.IsolatedAsyncioTestCase):
 
 class FunctionBoundaryMarkerTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        import tree_sitter  # noqa: F401
         from core.structural_index import build_structural_index, state_dir_for_db
-        try:
-            import tree_sitter  # noqa: F401
-        except Exception:  # pragma: no cover - environment without parsers
-            self.skipTest("tree-sitter unavailable")
+
         self._tmp = tempfile.TemporaryDirectory(prefix="mantis_trunc_boundary_")
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(os.path.realpath(self._tmp.name))
@@ -288,8 +286,8 @@ class FunctionBoundaryMarkerTest(unittest.IsolatedAsyncioTestCase):
     async def test_boundary_cut_is_announced_outside_the_fence(self):
         import tools.structural_tools as st
         full = await st.get_function_boundary("big.py", 5)
-        if "Structural index unavailable" in full or "No indexed function" in full:
-            self.skipTest("structural index did not index the fixture")
+        self.assertNotIn("Structural index unavailable", full)
+        self.assertNotIn("No indexed function", full)
         self.assertFalse(is_truncation_marker_present(full))
         with patch.object(st, "MAX_SNIPPET_BYTES", 200):
             out = await st.get_function_boundary("big.py", 5)

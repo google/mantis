@@ -2188,5 +2188,249 @@ class TestSarifExport(DriverCase):
         self.assertEqual(self.report()["sarif"]["results"], 0)
 
 
+class TestNonPipelineChangedFiles(DriverCase):
+    """ci-pr-scan-6: protected metadata and benign binary assets are
+    SCAN_NOT_APPLICABLE (coverage complete under --fail-closed), while
+    NUL-in-source, symlinks, and hardlinks are SCAN_REFUSED (REVIEW + fail
+    --fail-closed without spawning doomed pipeline subprocesses)."""
+
+    def test_protected_metadata_and_benign_binary_do_not_break_fail_closed(self):
+        launched = []
+
+        def tracking_scan(state, target, max_llm_calls, model):
+            launched.append(target)
+            return fake_scan()(state, target, max_llm_calls, model)
+
+        (self.repo / "assets").mkdir(parents=True, exist_ok=True)
+        (self.repo / "assets" / "banner.webp").write_bytes(b"RIFF\x00\x00\x00\x00WEBP")
+        self.commit_pr({
+            ".pre-commit-config.yaml": "repos: []\n",
+            ".gitattributes": "*.bin binary\n",
+        })
+        rc, out = self.run_main("--fail-closed", scan=tracking_scan)
+        rep = self.report()
+        by_file = {r["file"]: r["status"] for r in rep["scan"]["results"]}
+        self.assertEqual(by_file[".pre-commit-config.yaml"], pr_scan.SCAN_NOT_APPLICABLE)
+        self.assertEqual(by_file[".gitattributes"], pr_scan.SCAN_NOT_APPLICABLE)
+        self.assertEqual(by_file["assets/banner.webp"], pr_scan.SCAN_NOT_APPLICABLE)
+        self.assertEqual(by_file["app.py"], pr_scan.SCAN_DONE)
+        self.assertEqual(by_file["new.py"], pr_scan.SCAN_DONE)
+        self.assertEqual(len(launched), 2, "only the two scannable Python files launch subprocesses")
+        self.assertEqual(rep["coverage"]["unaudited"], [])
+        self.assertEqual(rep["coverage"]["status"], pr_scan.COVERAGE_COMPLETE)
+        self.assertEqual(rep["verdict"], "PASS", rep["reasons"])
+        self.assertEqual(rc, pr_scan.EXIT_OK, out)
+        self.assertIn("Skipped (protected metadata or non-source binary):", self.summary.read_text())
+
+    def test_metadata_only_pr_passes_fail_closed_with_repo_index(self):
+        # Reset checkout to base so ONLY .pre-commit-config.yaml differs from base.
+        _git(self.repo, "reset", "--hard", self.base)
+        (self.repo / ".pre-commit-config.yaml").write_text("repos: []\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "metadata only")
+
+        def must_not_launch(*a, **k):
+            raise AssertionError("no pipeline subprocess should launch for metadata-only PR")
+
+        rc, out = self.run_main("--fail-closed", scan=must_not_launch)
+        rep = self.report()
+        self.assertEqual(rep["scan"]["files"], [])
+        self.assertEqual(rep["scan"]["not_scannable"], [".pre-commit-config.yaml"])
+        self.assertEqual(rep["coverage"]["status"], pr_scan.COVERAGE_COMPLETE, rep["reasons"])
+        self.assertEqual(rep["verdict"], "PASS", rep["reasons"])
+        self.assertEqual(rc, pr_scan.EXIT_OK, out)
+
+    def test_nul_in_source_and_symlink_are_refused_and_fail_closed(self):
+        launched = []
+
+        def tracking_scan(state, target, max_llm_calls, model):
+            launched.append(target)
+            return fake_scan()(state, target, max_llm_calls, model)
+
+        (self.repo / "blob.py").write_bytes(b"x = 1\n\x00\nimport os\n")
+        os.symlink("app.py", self.repo / "linked.py")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "add disguised source and symlink")
+
+        rc, out = self.run_main("--fail-closed", scan=tracking_scan)
+        rep = self.report()
+        by_file = {r["file"]: r["status"] for r in rep["scan"]["results"]}
+        self.assertEqual(by_file["blob.py"], pr_scan.SCAN_REFUSED)
+        self.assertEqual(by_file["linked.py"], pr_scan.SCAN_REFUSED)
+        self.assertEqual(len(launched), 2, "blob.py and linked.py must not launch main.py")
+        unaudited_files = {u["file"] for u in rep["coverage"]["unaudited"]}
+        self.assertEqual(unaudited_files, {"blob.py", "linked.py"})
+        self.assertEqual(rep["coverage"]["status"], pr_scan.COVERAGE_PARTIAL)
+        self.assertEqual(rep["verdict"], "REVIEW")
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+        self.assertFalse(any("re-run the workflow" in a for a in rep["next_actions"]), rep["next_actions"])
+        self.assertIn("refused to scan blob.py", out)
+
+
+class TestMultiCommitKnowledgeRefreshChain(unittest.TestCase):
+    """ci-pr-scan-3 & ci-pr-scan-9: C0 -> C1 -> C2 -> C3 -> C4 refresh chain and
+    scripts/knowledge.py --preserve-head."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mantis_refresh_chain_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = Path(self.tmp, "repo")
+        self.repo.mkdir()
+        self.state_root = Path(self.tmp, "state")
+        for args in (
+            ("init", "-q", "-b", "main"),
+            ("config", "user.email", "t@example.com"),
+            ("config", "user.name", "t"),
+            ("config", "commit.gpgsign", "false"),
+        ):
+            _git(self.repo, *args)
+
+    def _run_refresh(self, base_sha: str, *extra: str, scan):
+        out_json = Path(self.tmp, "report.json")
+        summary = Path(self.tmp, "summary.md")
+        gh_out = Path(self.tmp, "gh_out.txt")
+        for p in (out_json, summary, gh_out):
+            p.unlink(missing_ok=True)
+        buf = io.StringIO()
+        argv = [
+            "--repo", str(self.repo),
+            "--base", base_sha,
+            "--head", "HEAD",
+            "--model", "gemini/gemini-3.8-flash",
+            "--daily-token-budget", "0",
+            "--state-dir", str(self.state_root),
+            "--output-json", str(out_json),
+            "--summary", str(summary),
+            "--github-output", str(gh_out),
+            "--export-knowledge", str(self.repo / ".mantis/knowledge"),
+            *extra,
+        ]
+        env = {**os.environ, "GEMINI_API_KEY": "test-key"}
+        with mock.patch.object(pr_scan, "_scan_cmd", scan), contextlib.redirect_stdout(buf):
+            rc = pr_scan.main(argv, env=env)
+        rep = json.loads(out_json.read_text(encoding="utf-8")) if out_json.exists() else None
+        return rc, buf.getvalue(), rep
+
+    def test_knowledge_rev_requires_export_knowledge(self):
+        (self.repo / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "c0")
+        c0 = _git(self.repo, "rev-parse", "HEAD")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = pr_scan.main(
+                [
+                    "--repo", str(self.repo),
+                    "--base", c0,
+                    "--head", "HEAD",
+                    "--knowledge-rev", "HEAD",
+                    "--model", "gemini/gemini-3.8-flash",
+                    "--daily-token-budget", "0",
+                    "--fail-closed",
+                ],
+                env={**os.environ, "GEMINI_API_KEY": "test-key"},
+            )
+        self.assertEqual(rc, pr_scan.EXIT_INFRA)
+        self.assertIn("--knowledge-rev requires --export-knowledge", buf.getvalue())
+
+    def test_c0_c1_c2_c3_delta_and_sweep_preserve_knowledge_and_head(self):
+        from core.cost import record_spend
+        from core.database import init_db, record_run, write_findings
+        from core.knowledge import export_knowledge, read_head
+        from scripts import knowledge as knowledge_cli
+
+        # C0: initial repository with two source files.
+        (self.repo / "keep.py").write_text("def vuln(q):\n    return q\n", encoding="utf-8")
+        (self.repo / "app.py").write_text("def clean(x):\n    return x\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "C0: initial code")
+        c0 = _git(self.repo, "rev-parse", "HEAD")
+
+        # Initial sweep exports 1 confirmed HIGH finding on keep.py with manifest.head == C0.
+        sweep_db = str(Path(self.tmp, "sweep.db"))
+        init_db(sweep_db)
+        record_run(sweep_db, "sweep-0", "gemini/gemini-3.8-flash")
+        write_findings(
+            sweep_db,
+            str(self.repo / "keep.py"),
+            [{
+                "title": "Stored SQLi in keep",
+                "filepath": "keep.py",
+                "severity": "HIGH",
+                "status": "confirmed",
+                "description": "sink",
+                "line_numbers": [2],
+                "remediation": "parameterize",
+            }],
+            run_id="sweep-0",
+            status="",
+        )
+        record_spend(sweep_db, "sweep-0", str(self.repo / "keep.py"), "file-by-file", tokens=100)
+        export_knowledge(sweep_db, str(self.repo / ".mantis/knowledge"), repo_root=str(self.repo), head=c0)
+
+        # C1: merge `.mantis/knowledge` onto main (manifest.head still points to C0!).
+        _git(self.repo, "add", ".mantis/knowledge")
+        _git(self.repo, "commit", "-q", "-m", "C1: commit initial knowledge export")
+        self.assertEqual(read_head(str(self.repo / ".mantis/knowledge")), c0)
+
+        # C2: edit app.py AND .pre-commit-config.yaml (benign protected metadata).
+        (self.repo / "app.py").write_text("def clean(x):\n    return x + 1\n", encoding="utf-8")
+        (self.repo / ".pre-commit-config.yaml").write_text("repos: []\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "C2: edit app.py and metadata")
+        c2 = _git(self.repo, "rev-parse", "HEAD")
+
+        # Nightly delta C0..HEAD with --knowledge-rev HEAD and --fail-closed:
+        # must import C1's finding on keep.py (NOT wipe it!) and advance manifest.head to C2
+        # even though .pre-commit-config.yaml was in the diff!
+        rc, out, rep = self._run_refresh(c0, "--knowledge-rev", "HEAD", "--fail-closed", scan=fake_scan())
+        self.assertEqual(rc, pr_scan.EXIT_OK, out)
+        self.assertTrue(rep["knowledge"]["exported"]["all_delta_audited"])
+        self.assertEqual(read_head(str(self.repo / ".mantis/knowledge")), c2)
+        exported_findings = [
+            json.loads(line)
+            for line in (self.repo / ".mantis/knowledge/findings.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(exported_findings), 1, "C0's finding on keep.py must survive C2 delta export")
+        self.assertEqual(exported_findings[0]["title"], "Stored SQLi in keep")
+
+        _git(self.repo, "add", ".mantis/knowledge")
+        _git(self.repo, "commit", "-q", "-m", "commit C2 knowledge refresh")
+
+        # C3: add two files, then run a partial/paused delta scan -- manifest.head MUST stay C2!
+        (self.repo / "more1.py").write_text("def m1():\n    return 1\n", encoding="utf-8")
+        (self.repo / "more2.py").write_text("def m2():\n    return 2\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "C3: two more files")
+        c3 = _git(self.repo, "rev-parse", "HEAD")
+        self.assertNotEqual(c2, c3)
+
+        paused = fake_scan(code=2, pause_trigger="token_budget", nodes=FULL_GRAPH[:4])
+        rc, _, rep = self._run_refresh(c2, "--knowledge-rev", "HEAD", "--fail-closed", scan=paused)
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE, "partial coverage fails --fail-closed")
+        self.assertFalse(rep["knowledge"]["exported"]["all_delta_audited"])
+        self.assertEqual(
+            read_head(str(self.repo / ".mantis/knowledge")),
+            c2,
+            "manifest.head must NOT advance past paused/unaudited C3 delta files",
+        )
+
+        # Weekly sweep runs `scripts/knowledge.py export --preserve-head` at C3:
+        # manifest.head must remain C2 so C3's un-diffed edits stay queued for nightly delta!
+        rc_cli = knowledge_cli.main([
+            "export",
+            "--db", sweep_db,
+            "--repo", str(self.repo),
+            "--preserve-head",
+        ])
+        self.assertEqual(rc_cli, 0)
+        self.assertEqual(
+            read_head(str(self.repo / ".mantis/knowledge")),
+            c2,
+            "knowledge.py export --preserve-head must keep C2 instead of stamping C3 HEAD",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
