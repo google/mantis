@@ -64,7 +64,7 @@ Follow these guidelines during the consultation:
     - **Custom Environment Integration**: Use Custom MCP servers for isolated
       testing (VMs) or hardware interaction.
 03. **Ensure Schema Consistency**: Advise the user to strictly adhere to the
-    inter-stage data contracts defined in [schema.json](../schema.json) when
+    inter-stage data contracts defined in [schema.json](../../schema.json) when
     building their harness.
 04. **Adaptive Design**: Help them draft the code/architecture tailored to their
     specific stack, rather than imposing a rigid template.
@@ -326,9 +326,9 @@ that `mantis-meta-agent` implements. To support *continue-after-edits* and
 *opt-in boundary sync* **without producing silent wrong results** (false
 `VERIFIED_SECURE`, false `failed_to_reproduce`, dropped regressions), the
 harness must implement the following harness-agnostic contract. This is the same
-contract recorded in [schema.json](../schema.json) under **Non-JSON Contracts**;
-the `Block A`–`Block G` and `SNAPSHOT_ID` references below name mechanisms each
-Mantis stage already carries in its own `SKILL.md`.
+contract recorded in [schema.json](../../schema.json) under **Non-JSON
+Contracts**; the `Block A`–`Block G` and `SNAPSHOT_ID` references below name
+mechanisms each Mantis stage already carries in its own `SKILL.md`.
 
 Mantis runs under multiple harnesses (various CLIs, ADK, custom deterministic
 pipelines), so the lifecycle must not live only in `mantis-meta-agent`. Any
@@ -393,12 +393,12 @@ The scenarios below expose nearly every issue in the snapshot model. They are
 handling each one in its own environment. The table is a quick-reference; prose
 detail follows for each scenario. The **State** column uses the 3-STATE RULE
 (MODE-OFF / HALT / PINNED, branched on `active_snapshot` presence — see the
-global backward-compat rule in [schema.json](../schema.json) and the advisory
+global backward-compat rule in [schema.json](../../schema.json) and the advisory
 notes above); `SNAPSHOT_ID` formats follow the ladder in the advisory notes
 above (e.g. `live:<ts>` signals an unpinned/HALT pass).
 
 **Invariant legend** (the labels below name safety properties enforced by the
-blocks and the global backward-compat rule in [schema.json](../schema.json)):
+blocks and the global backward-compat rule in [schema.json](../../schema.json)):
 
 | Label | Property                       | Enforced by                                   |
 | ----- | ------------------------------ | --------------------------------------------- |
