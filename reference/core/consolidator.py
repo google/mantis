@@ -135,26 +135,16 @@ def _tier1_exact_groups(
         if ra != rb:
             parent[rb] = ra
 
-    by_sig: Dict[str, int] = {}
-    by_lin: Dict[str, int] = {}
+    sigs_by_id: Dict[int, str] = {}
+    lins_by_id: Dict[int, str] = {}
     syms_by_id: Dict[int, Set[str]] = {}
     lines_by_id: Dict[int, Set[int]] = {}
     toks_by_id: Dict[int, Set[str]] = {}
 
     for f in findings:
         fid = int(f["id"])
-        sig = str(f.get("signature") or "").strip()
-        lin = str(f.get("lineage_id") or "").strip()
-        if sig:
-            if sig in by_sig:
-                union(by_sig[sig], fid)
-            else:
-                by_sig[sig] = fid
-        if lin:
-            if lin in by_lin:
-                union(by_lin[lin], fid)
-            else:
-                by_lin[lin] = fid
+        sigs_by_id[fid] = str(f.get("signature") or "").strip()
+        lins_by_id[fid] = str(f.get("lineage_id") or "").strip()
         syms = set(_symbols_from_code_paths(f.get("code_paths"))) | set(
             _enclosing_symbols_for_row(idx, f)
         )
@@ -168,23 +158,36 @@ def _tier1_exact_groups(
         idi = int(fi["id"])
         fpi = str(fi.get("filepath") or "").strip()
         cwei = _norm_cwe(fi)
+        li = lines_by_id[idi]
+        sigi = sigs_by_id[idi]
+        lini = lins_by_id[idi]
         for j in range(i + 1, n):
             fj = findings[j]
             idj = int(fj["id"])
             if find(idi) == find(idj):
                 continue
+            lj = lines_by_id[idj]
+            sim = _jaccard(toks_by_id[idi], toks_by_id[idj])
+            close_lines = _lines_close(li, lj)
+            both_have_lines = bool(li and lj)
+
+            if (sigi and sigi == sigs_by_id[idj]) or (lini and lini == lins_by_id[idj]):
+                if (not both_have_lines) or close_lines or sim >= 0.70:
+                    union(idi, idj)
+                    continue
+
             fpj = str(fj.get("filepath") or "").strip()
             if not fpi or fpi != fpj:
                 continue
             cwej = _norm_cwe(fj)
             if cwei and cwej and cwei != cwej:
                 continue
-            same_loc = _lines_close(lines_by_id[idi], lines_by_id[idj]) or bool(
-                syms_by_id[idi] and (syms_by_id[idi] & syms_by_id[idj])
+            same_loc = close_lines or (
+                not both_have_lines
+                and bool(syms_by_id[idi] and (syms_by_id[idi] & syms_by_id[idj]))
             )
             if not same_loc:
                 continue
-            sim = _jaccard(toks_by_id[idi], toks_by_id[idj])
             same_cwe_and_overlap = bool(cwei and cwei == cwej and sim >= 0.35)
             if sim >= 0.70 or same_cwe_and_overlap:
                 union(idi, idj)
@@ -342,6 +345,8 @@ async def _run_structured_one_shot(
     system_instruction: str,
     schema_cls: Any,
     config: Optional[dict],
+    *,
+    budget_controller: Any = None,
 ) -> Any:
     """Executes a single structured ADK `set_model_response` LLM call against `schema_cls`."""
     from core.config import ResilientLiteLlm, get_llm_kwargs, structured_llm_request
@@ -358,8 +363,16 @@ async def _run_structured_one_shot(
     resp_text = ""
     structured: Optional[Dict[str, Any]] = None
     async for resp in llm.generate_content_async(req):
+        if budget_controller is not None:
+            usage = getattr(resp, "usage_metadata", None)
+            total_tok = int(getattr(usage, "total_token_count", 0) or 0) if usage is not None else 0
+            cached_tok = int(getattr(usage, "cached_content_token_count", 0) or 0) if usage is not None else 0
+            if total_tok > 0 and hasattr(budget_controller, "record_tokens"):
+                budget_controller.record_tokens(total_tok, cached_count=cached_tok)
         content = getattr(resp, "content", None)
         for part in getattr(content, "parts", None) or []:
+            if getattr(part, "thought", False):
+                continue
             fc = getattr(part, "function_call", None)
             if fc is not None and getattr(fc, "name", "") == "set_model_response":
                 args = getattr(fc, "args", None)
@@ -380,12 +393,15 @@ async def consolidate_run_findings(
     run_id: str,
     config: Optional[dict] = None,
     llm_callable: Any = None,
+    *,
+    budget_controller: Any = None,
+    allow_llm: bool = True,
 ) -> Dict[str, Any]:
     """Consolidates duplicate open findings across campaigns in `run_id`.
 
     Runs Tier 1 deterministic consolidation unconditionally and Tier 2 structured
-    LLM semantic consolidation when candidate clusters exist and an LLM is
-    configured (or `llm_callable` is injected). Never raises (INV-6).
+    LLM semantic consolidation when candidate clusters exist, `allow_llm` is True,
+    and an LLM is configured (or `llm_callable` is injected). Never raises (INV-6).
     """
     summary = {"tier1_merged": 0, "tier2_merged": 0, "clusters_checked": 0}
     try:
@@ -402,6 +418,9 @@ async def consolidate_run_findings(
                 db_path, run_id, prim_id, dup_ids, reason=reason
             )
             summary["tier1_merged"] += count
+
+        if not allow_llm:
+            return summary
 
         # Refresh open findings after Tier 1
         active = [
@@ -462,8 +481,13 @@ async def consolidate_run_findings(
                         system_instruction=sys_inst,
                         schema_cls=SemanticDedupeBatchResult,
                         config=config,
+                        budget_controller=budget_controller,
                     )
             except Exception as exc:
+                from core.budget import BudgetExceededError
+
+                if isinstance(exc, BudgetExceededError):
+                    break
                 logger.debug("Semantic dedupe cluster skipped: %s", exc)
                 continue
 
@@ -551,19 +575,31 @@ async def synthesize_aggregate_report(
     run_id: str,
     active_findings: Sequence[Dict[str, Any]],
     config: Optional[dict] = None,
+    *,
+    budget_controller: Any = None,
+    allow_llm: bool = True,
 ) -> bool:
     """Synthesizes and persists a single post-run aggregate report for `run_id`.
 
     Zero-finding runs write a deterministic clean report with 0 LLM calls.
     Runs with active findings synthesize one executive summary via LLM when
-    reachable, degrading cleanly to `_deterministic_executive_report`.
+    reachable and `allow_llm` is True, degrading cleanly to `_deterministic_executive_report`.
     """
     if not db_path or not run_id:
         return False
     try:
+        crit_n = sum(1 for f in active_findings if str(f.get("severity") or "").upper() == "CRITICAL")
         rpt_obj, packet_md = _deterministic_executive_report(active_findings)
-        if active_findings and _can_call_llm(config):
+        if allow_llm and active_findings and _can_call_llm(config):
             try:
+                ordered_active = sorted(
+                    active_findings,
+                    key=lambda f: (
+                        -float(f.get("mantis_risk_score") or 0.0),
+                        -finding_assurance_rank(f.get("status")),
+                        int(f.get("id") or 0),
+                    ),
+                )
                 compact_items = [
                     {
                         "id": f.get("id"),
@@ -574,7 +610,7 @@ async def synthesize_aggregate_report(
                         "title": str(f.get("title") or "")[:180],
                         "remediation": str(f.get("remediation") or "")[:240],
                     }
-                    for f in active_findings[:60]
+                    for f in ordered_active[:60]
                 ]
                 arch = read_artifact(db_path, artifact_type="summary", run_id=run_id) or ""
                 prompt = (
@@ -598,7 +634,9 @@ async def synthesize_aggregate_report(
                     ),
                     schema_cls=ExecutiveReport,
                     config=config,
+                    budget_controller=budget_controller,
                 )
+                rpt_obj.critical_findings_count = crit_n
             except Exception as exc:
                 logger.debug("Aggregate LLM report degraded to deterministic summary: %s", exc)
 

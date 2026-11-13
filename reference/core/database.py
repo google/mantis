@@ -920,6 +920,9 @@ def generate_rca_summary(finding: Union[dict, Any], model: Optional[str] = None,
     )
 
 
+_GENERIC_HANDLER_STOPWORDS = frozenset({"get", "put", "run", "id", "do", "ok"})
+
+
 def resolve_ancestor_lineage(
     cursor: sqlite3.Cursor,
     filepath: str,
@@ -933,39 +936,91 @@ def resolve_ancestor_lineage(
     **kwargs: Any,
 ) -> str:
     """Resolves ancestor lineage_id using deterministic anchors:
-    1. Exact stable content signature (< 1ms, 0 tokens)
-    2. File + Normalized CWE + Target Symbol
+    1. Exact stable content signature (or prose_signature) within compatible target_root
+    2. File + Normalized CWE + Grounded/Whole-Identifier Target Symbol within compatible target_root
     3. Strict line proximity window (<= 3 lines) on exact canonical filepath
     4. Fail closed: mint fresh UUIDv4 to eliminate false merges without guessing via embeddings.
     """
     norm_fp = canonical_filepath(filepath, target_file=filepath)
     norm_cwe = extract_canonical_cwe(cwe, title, description)
     norm_sym = symbol.lower() if symbol else extract_target_symbol(title, description)
+    db_path = str(kwargs.get("db_path") or "")
+    active_root = str(kwargs.get("active_root") or "")
+    roots_map = kwargs.get("roots_map")
+    prose_sig = str(kwargs.get("prose_signature") or "").strip()
+    incoming_sym_source = str(kwargs.get("symbol_source") or "").strip()
+
+    def _same_target(cand_run_id: Any) -> bool:
+        if not active_root:
+            return True
+        return run_belongs_to_active_target(
+            db_path, cand_run_id, active_root=active_root, roots_map=roots_map
+        )
 
     # 1. Exact Stable Content Signature Match (< 1ms, 0 tokens)
-    if signature:
-        cursor.execute("""
-            SELECT lineage_id FROM findings
-            WHERE signature = ? AND lineage_id IS NOT NULL AND lineage_id != ''
-            ORDER BY id DESC LIMIT 1
-        """, (signature,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            return row[0]
+    if signature or prose_sig:
+        try:
+            cursor.execute("""
+                SELECT lineage_id, run_id FROM findings
+                WHERE (signature = ? OR (? != '' AND prose_signature = ?) OR (? != '' AND signature = ?))
+                  AND lineage_id IS NOT NULL AND lineage_id != ''
+                ORDER BY id DESC LIMIT 25
+            """, (signature, prose_sig, prose_sig, prose_sig, prose_sig))
+        except sqlite3.OperationalError:
+            cursor.execute("""
+                SELECT lineage_id, run_id FROM findings
+                WHERE signature = ? AND lineage_id IS NOT NULL AND lineage_id != ''
+                ORDER BY id DESC LIMIT 25
+            """, (signature,))
+        for row in cursor.fetchall():
+            if row and row[0] and _same_target(row[1]):
+                return str(row[0])
 
-    # 2. File + Normalized CWE + Exact Target Symbol Match
+    # 2. File + Normalized CWE + Grounded or Whole-Identifier Target Symbol Match
     if norm_sym and norm_fp:
-        cursor.execute("""
-            SELECT lineage_id FROM findings
-            WHERE filepath = ?
-              AND (cwe = ? OR cwe = '')
-              AND (title LIKE ? OR description LIKE ? OR signature LIKE ?)
-              AND lineage_id IS NOT NULL AND lineage_id != ''
-            ORDER BY id DESC LIMIT 1
-        """, (norm_fp, norm_cwe, f"%{norm_sym}%", f"%{norm_sym}%", f"%{norm_sym}%"))
-        row = cursor.fetchone()
-        if row and row[0]:
-            return row[0]
+        try:
+            cursor.execute("""
+                SELECT lineage_id, run_id, title, description, target_symbol, symbol_source
+                FROM findings
+                WHERE filepath = ?
+                  AND (cwe = ? OR cwe = '')
+                  AND lineage_id IS NOT NULL AND lineage_id != ''
+                ORDER BY id DESC LIMIT 50
+            """, (norm_fp, norm_cwe))
+            cand_rows = cursor.fetchall()
+            has_sym_cols = True
+        except sqlite3.OperationalError:
+            cursor.execute("""
+                SELECT lineage_id, run_id, title, description
+                FROM findings
+                WHERE filepath = ?
+                  AND (cwe = ? OR cwe = '')
+                  AND lineage_id IS NOT NULL AND lineage_id != ''
+                ORDER BY id DESC LIMIT 50
+            """, (norm_fp, norm_cwe))
+            cand_rows = cursor.fetchall()
+            has_sym_cols = False
+
+        ident_re = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(norm_sym)}(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        for cand in cand_rows:
+            if not cand or not cand[0] or not _same_target(cand[1]):
+                continue
+            cand_title = str(cand[2] or "")
+            cand_desc = str(cand[3] or "")
+            cand_sym = str(cand[4] or "").strip().lower() if has_sym_cols else ""
+            cand_src = str(cand[5] or "").strip() if has_sym_cols else ""
+
+            if incoming_sym_source == "catalog" and cand_src == "catalog":
+                if cand_sym and cand_sym == norm_sym:
+                    return str(cand[0])
+                continue
+            if cand_sym and cand_sym == norm_sym:
+                return str(cand[0])
+            if norm_sym not in _GENERIC_HANDLER_STOPWORDS and ident_re.search(f"{cand_title} {cand_desc}"):
+                return str(cand[0])
 
     # 3. Strict Line Proximity Match on exact filepath if and only if symbol is empty
     if not norm_sym and norm_fp and line_numbers and line_numbers != "[]":
@@ -973,7 +1028,7 @@ def resolve_ancestor_lineage(
             curr_lines = json.loads(line_numbers)
             if curr_lines:
                 cursor.execute("""
-                    SELECT id, line_numbers, lineage_id FROM findings
+                    SELECT id, line_numbers, lineage_id, run_id FROM findings
                     WHERE filepath = ?
                       AND cwe = ?
                       AND lineage_id IS NOT NULL AND lineage_id != ''
@@ -981,6 +1036,8 @@ def resolve_ancestor_lineage(
                 """, (norm_fp, norm_cwe))
                 candidate_rows = cursor.fetchall()
                 for cand in candidate_rows:
+                    if not _same_target(cand[3]):
+                        continue
                     cand_lines_raw = cand[1]
                     try:
                         cand_lines = json.loads(cand_lines_raw) if isinstance(cand_lines_raw, str) else cand_lines_raw
@@ -998,29 +1055,47 @@ def resolve_ancestor_lineage(
 _PRIOR_REF = re.compile(r"^\s*(?:prior|finding|earlier|id)?[\s\-_#:]*#?(\d+)\s*$", re.IGNORECASE)
 
 
-def _supplied_lineage(cursor, raw: Any) -> str:
+def _supplied_lineage(
+    cursor,
+    raw: Any,
+    *,
+    trusted_identity: bool = True,
+    db_path: str = "",
+    active_root: str = "",
+    roots_map: Optional[Dict[str, str]] = None,
+) -> str:
     """The lineage a reported finding carries, or "" to resolve from the
-    anchors. A lineage the table already has is kept, as is an explicit id a
-    caller minted (an import, a seed). A model told that a re-report
-    "carries the prior's lineage" writes the prior in words ("prior-103",
-    "#103"); that names a finding, not a lineage, and the finding's lineage
-    is what it meant -- stored verbatim it broke the join regression
-    settlement makes. A reference to no finding resolves from the anchors."""
+    anchors. When `trusted_identity=False` (LLM tool boundary), only existing
+    lineages or prior-finding `#id` references belonging to `active_root` are
+    honoured; arbitrary model-invented strings fall back to `""`."""
     text = str(raw or "").strip()
     if not text:
         return ""
+
+    def _ok_run(cand_run_id: Any) -> bool:
+        if not active_root:
+            return True
+        return run_belongs_to_active_target(
+            db_path, cand_run_id, active_root=active_root, roots_map=roots_map
+        )
+
     try:
-        cursor.execute("SELECT 1 FROM findings WHERE lineage_id = ? LIMIT 1", (text,))
-        if cursor.fetchone():
-            return text
+        cursor.execute("SELECT run_id FROM findings WHERE lineage_id = ? ORDER BY id DESC LIMIT 10", (text,))
+        existing = cursor.fetchall()
+        if existing:
+            if trusted_identity or any(_ok_run(r[0]) for r in existing):
+                return text
+            return ""
         m = _PRIOR_REF.match(text)
         if m:
-            cursor.execute("SELECT lineage_id FROM findings WHERE id = ?", (int(m.group(1)),))
+            cursor.execute("SELECT lineage_id, run_id FROM findings WHERE id = ?", (int(m.group(1)),))
             row = cursor.fetchone()
-            return str(row[0]) if row and row[0] else ""
+            if row and row[0] and (trusted_identity or _ok_run(row[1])):
+                return str(row[0])
+            return ""
     except Exception:
-        return text
-    return text
+        return text if trusted_identity else ""
+    return text if trusted_identity else ""
 
 
 def campaign_key(target: Any) -> str:
@@ -1296,7 +1371,20 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
     with _db(db_path) as conn:
         cursor = conn.cursor()
         _ensure_findings_additive_schema(cursor)
-        _ensure_run_target_root(conn, run_id, active_target_root(filepath))
+        eff_target_root = active_target_root(filepath)
+        _ensure_run_target_root(conn, run_id, eff_target_root)
+        roots_map: Dict[str, str] = {}
+        if eff_target_root:
+            try:
+                for _r in cursor.execute("SELECT run_id, metadata_json FROM runs").fetchall():
+                    _rid = str(_r[0] or "")
+                    if not _rid:
+                        continue
+                    _m = json.loads(_r[1] or "{}")
+                    if isinstance(_m, dict) and _m.get("target_root"):
+                        roots_map[_rid] = str(_m["target_root"])
+            except Exception:
+                roots_map = {}
         # Which campaign is reporting: `filepath` is the campaign's target
         # (the tools pass RunContext.target_file). Recorded on every row the
         # campaign writes and kept on a re-report by another campaign; see
@@ -1395,6 +1483,10 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                         )
                     ):
                         finding_filepath = prev_fp
+                    elif canonical_filepath(prev_fp) != finding_filepath:
+                        # Explicit-id collision across distinct source files:
+                        # refuse to overwrite another file's finding row.
+                        matched_id_row = None
             raw_sev = finding.get("severity") or "MEDIUM"
             normalized_severity = str(raw_sev).upper()
 
@@ -1446,7 +1538,14 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 })
 
             # Compute or inherit cross-pass lineage identifier via deterministic anchors
-            lineage_id = _supplied_lineage(cursor, finding.get("lineage_id"))
+            lineage_id = _supplied_lineage(
+                cursor,
+                finding.get("lineage_id"),
+                trusted_identity=trusted_identity,
+                db_path=db_path,
+                active_root=eff_target_root,
+                roots_map=roots_map,
+            )
             if not lineage_id:
                 lineage_id = resolve_ancestor_lineage(
                     cursor=cursor,
@@ -1458,6 +1557,11 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     description=raw_desc,
                     line_numbers=line_numbers,
                     rca_summary=rca_summary,
+                    db_path=db_path,
+                    active_root=eff_target_root,
+                    roots_map=roots_map,
+                    prose_signature=prose_signature,
+                    symbol_source=symbol_source,
                 )
 
             triage_reasoning = str(finding.get("reasoning") or finding.get("triage_reasoning") or finding.get("critic_reasoning") or "")
@@ -1488,7 +1592,9 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
 
             # Monotonic status protection during re-report (C3)
             cursor.execute(
-                "SELECT id, status FROM findings WHERE run_id = ? AND COALESCE(pass_index, 1) = ? AND (signature = ? OR lineage_id = ?) ORDER BY id DESC LIMIT 1",
+                "SELECT id, status FROM findings WHERE run_id = ? AND COALESCE(pass_index, 1) = ? "
+                "AND (signature = ? OR lineage_id = ?) "
+                "ORDER BY CASE WHEN LOWER(COALESCE(status, '')) = 'duplicate_merged' THEN 1 ELSE 0 END ASC, id DESC LIMIT 1",
                 (run_id, eff_pass_index, signature, lineage_id),
             )
             existing_row = cursor.fetchone()
@@ -3133,59 +3239,68 @@ def merge_findings(
         cursor = conn.cursor()
         merged_count = 0
 
-        # 1. Resolve primary_id if not provided; a supplied one must be in scope.
+        # 1. Resolve primary_id and verify it is an open in-scope finding.
+        resolved_primary_title = primary_title
         if primary_id is not None:
-            cursor.execute(f"SELECT 1 FROM findings WHERE id = ? AND {scope_clause}",
-                           (primary_id, *scope_params))
-            if cursor.fetchone() is None:
-                primary_id = None
-        if primary_id is None and primary_title:
             cursor.execute(
-                f"SELECT id FROM findings WHERE title = ? AND {scope_clause} ORDER BY id ASC LIMIT 1",
-                (primary_title, *scope_params),
+                f"SELECT id, status, title FROM findings WHERE id = ? AND {scope_clause}",
+                (primary_id, *scope_params),
             )
-            row = cursor.fetchone()
-            if row:
-                primary_id = row[0]
+            prim_row = cursor.fetchone()
+            if prim_row is None:
+                return 0
+            if str(prim_row[1] or "").strip().lower() in CLOSED_STATUSES:
+                return 0
+            if not resolved_primary_title:
+                resolved_primary_title = str(prim_row[2] or f"#{primary_id}")
+        elif primary_title:
+            closed_placeholders = ",".join("?" * len(CLOSED_STATUSES))
+            cursor.execute(
+                f"SELECT id, status, title FROM findings WHERE title = ? AND {scope_clause} "
+                f"AND LOWER(COALESCE(status, '')) NOT IN ({closed_placeholders}) ORDER BY id ASC LIMIT 1",
+                (primary_title, *scope_params, *CLOSED_STATUSES),
+            )
+            prim_row = cursor.fetchone()
+            if prim_row is None:
+                return 0
+            primary_id = int(prim_row[0])
+        else:
+            return 0
 
         # 2. Merge by explicit duplicate_ids (strictly excluding primary_id)
         for d_id in dup_ids:
-            if primary_id is not None and d_id == primary_id:
+            if d_id == primary_id:
                 continue
             cursor.execute(f"""
                 UPDATE findings
                 SET status = 'duplicate_merged',
+                    merged_into_id = ?,
                     description = description || '\n[MERGED: Duplicate of ' || ? || ' - Reason: ' || ? || ']'
                 WHERE id = ? AND id != ? AND {scope_clause} {terminal}
-            """, (primary_title, reason, d_id, primary_id if primary_id is not None else -1,
+            """, (primary_id, resolved_primary_title, reason, d_id, primary_id,
                   *scope_params))
             merged_count += cursor.rowcount
 
-        # 3. Merge by duplicate_titles (strictly excluding primary_id)
+        # 3. Merge by duplicate_titles (strictly excluding primary_id and refusing ambiguous titles)
         for dup in dup_titles:
-            where_clauses = ["title = ?", scope_clause]
-            params: List[Any] = [primary_title, reason, dup, *scope_params]
-            if primary_id is not None:
-                where_clauses.append("id != ?")
-                params.append(primary_id)
-
+            cursor.execute(
+                f"SELECT id FROM findings WHERE title = ? AND id != ? AND {scope_clause}",
+                (dup, primary_id, *scope_params),
+            )
+            matching_dup_rows = cursor.fetchall()
+            if len(matching_dup_rows) > 1:
+                continue
+            where_clauses = ["title = ?", scope_clause, "id != ?"]
+            params: List[Any] = [primary_id, resolved_primary_title, reason, dup, *scope_params, primary_id]
             where_str = " AND ".join(where_clauses)
             cursor.execute(f"""
                 UPDATE findings
                 SET status = 'duplicate_merged',
+                    merged_into_id = ?,
                     description = description || '\n[MERGED: Duplicate of ' || ? || ' - Reason: ' || ? || ']'
                 WHERE {where_str} {terminal}
             """, tuple(params))
             merged_count += cursor.rowcount
-
-        # 4. Invariant assertion: primary finding must NEVER remain in duplicate_merged status
-        #    -- for the primary this call just established, in this campaign's scope.
-        if primary_id is not None:
-            cursor.execute(
-                f"UPDATE findings SET status = 'static_confirmed' "
-                f"WHERE id = ? AND status = 'duplicate_merged' AND {scope_clause}",
-                (primary_id, *scope_params),
-            )
 
         return merged_count
 

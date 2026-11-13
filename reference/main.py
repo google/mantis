@@ -1134,6 +1134,17 @@ _WORK_PLAN_DISCLOSURE: dict = {"focus": ""}
 _SPEND_REPORT: dict = {"controller": None}
 
 
+def _post_run_llm_kwargs(fallback_controller: Any, paused: bool) -> dict:
+    """Budget kwargs for the post-run consolidation and aggregate report:
+    meter them on the run's controller, and keep them off the LLM once the
+    run paused or its controller reached a ceiling."""
+    ctrl = _SPEND_REPORT.get("controller") or fallback_controller
+    return {
+        "budget_controller": ctrl,
+        "allow_llm": not paused and not bool(getattr(ctrl, "is_paused", False)),
+    }
+
+
 def _note_campaign_spend(scan_item: str, files: list, scope: Optional[BudgetController],
                          status: str, pause_trigger: str = "", elapsed_seconds: float = 0.0) -> None:
     """Records how one campaign ended, and what it spent, for --spend-report.
@@ -4347,7 +4358,7 @@ async def pipeline(
             from core.consolidator import consolidate_run_findings
 
             dedupe_stats = await consolidate_run_findings(
-                db_path, run_id, config=config
+                db_path, run_id, config=config, **_post_run_llm_kwargs(budget_ctrl, paused)
             )
             merged_total = int(dedupe_stats.get("tier1_merged", 0)) + int(
                 dedupe_stats.get("tier2_merged", 0)
@@ -4393,7 +4404,8 @@ async def pipeline(
             from core.consolidator import synthesize_aggregate_report
 
             await synthesize_aggregate_report(
-                db_path, run_id, active_findings, config=config
+                db_path, run_id, active_findings, config=config,
+                **_post_run_llm_kwargs(budget_ctrl, paused),
             )
         except Exception as exc:
             print(f"[AGGREGATE REPORT WARNING] {exc}", file=sys.stderr)

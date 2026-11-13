@@ -18,6 +18,7 @@ import logging
 import os
 import posixpath
 import re
+import sqlite3
 import stat
 import subprocess
 from typing import Any, Optional, Union
@@ -26,6 +27,7 @@ from core.schemas import VulnerabilityReport
 from core.database import (
     write_findings,
     read_findings,
+    merge_findings,
     record_calibration,
     record_artifact,
     read_artifact,
@@ -141,6 +143,14 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
     if ctx is None:
         return "Error: No active execution context."
 
+    if not isinstance(filepath, str) or not filepath.strip():
+        return "Error: filepath must be a non-empty string."
+    try:
+        start_line = int(start_line or 0)
+        end_line = int(end_line or 0)
+    except (TypeError, ValueError):
+        return "Error: start_line and end_line must be integers."
+
     clean_path = filepath.replace("\\", "/").removeprefix("./")
 
     # Handle non-source URL / endpoint locators
@@ -151,77 +161,80 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
     if clean_path.startswith("workspace/") or clean_path in ("mantis-summary.md", "workspace"):
         resolved_db = _resolve_context_db(ctx)
         if resolved_db and os.path.exists(resolved_db):
-            # Check campaign_artifacts by exact filepath first (returns documents written via write_file)
-            art = read_artifact(resolved_db, filepath=clean_path, run_id=ctx.run_id, resource=_own_resource(ctx))
-            if art is None and clean_path.startswith("workspace/"):
-                art = read_artifact(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id)
-            if art is None:
-                art = read_artifact(resolved_db, filepath=os.path.basename(clean_path), run_id=ctx.run_id)
+            try:
+                # Check campaign_artifacts by exact filepath first (returns documents written via write_file)
+                art = read_artifact(resolved_db, filepath=clean_path, run_id=ctx.run_id, resource=_own_resource(ctx))
+                if art is None and clean_path.startswith("workspace/"):
+                    art = read_artifact(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id)
+                if art is None:
+                    art = read_artifact(resolved_db, filepath=os.path.basename(clean_path), run_id=ctx.run_id)
 
-            # Fallback for structured harness artifacts if no document exists at this exact path
-            if art is None:
-                if clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md"):
-                    art = read_artifact(resolved_db, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))
-                elif clean_path in ("mantis-summary.md", "workspace/mantis-summary.md"):
-                    art = read_artifact(resolved_db, artifact_type="summary", run_id=ctx.run_id, resource=_own_resource(ctx))
-                elif clean_path in ("workspace/plan.json", "plan.json"):
-                    art = read_artifact(resolved_db, artifact_type="plan", run_id=ctx.run_id, resource=_own_resource(ctx))
-                elif clean_path.startswith("workspace/report/review_packet") or clean_path in ("workspace/review_packet.md", "review_packet-latest.md"):
-                    art = read_artifact(resolved_db, artifact_type="report", run_id=ctx.run_id, resource=_own_resource(ctx))
+                # Fallback for structured harness artifacts if no document exists at this exact path
+                if art is None:
+                    if clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md"):
+                        art = read_artifact(resolved_db, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))
+                    elif clean_path in ("mantis-summary.md", "workspace/mantis-summary.md"):
+                        art = read_artifact(resolved_db, artifact_type="summary", run_id=ctx.run_id, resource=_own_resource(ctx))
+                    elif clean_path in ("workspace/plan.json", "plan.json"):
+                        art = read_artifact(resolved_db, artifact_type="plan", run_id=ctx.run_id, resource=_own_resource(ctx))
+                    elif clean_path.startswith("workspace/report/review_packet") or clean_path in ("workspace/review_packet.md", "review_packet-latest.md"):
+                        art = read_artifact(resolved_db, artifact_type="report", run_id=ctx.run_id, resource=_own_resource(ctx))
 
-            if art is not None:
-                # The marker rides outside the untrusted fence (when one is
-                # applied): it is the harness's note about the cut, not part
-                # of the artifact.
-                art, cut_note = split_truncation(art, MAX_READ_SIZE, what=f"artifact '{clean_path}'")
-                # An artifact that came in with a knowledge import is a file
-                # from the repository, not this run's own notes: it is read
-                # the way any repository file is, fenced as untrusted.
-                from core.database import artifact_is_imported
-                if artifact_is_imported(resolved_db, filepath=clean_path, run_id=ctx.run_id, resource=_own_resource(ctx)) or \
-                        artifact_is_imported(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id) or \
-                        (clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md")
-                         and artifact_is_imported(resolved_db, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))):
-                    return wrap_untrusted_content(art, filename=clean_path) + cut_note
-                return art + cut_note
+                if art is not None:
+                    # The marker rides outside the untrusted fence (when one is
+                    # applied): it is the harness's note about the cut, not part
+                    # of the artifact.
+                    art, cut_note = split_truncation(art, MAX_READ_SIZE, what=f"artifact '{clean_path}'")
+                    # An artifact that came in with a knowledge import is a file
+                    # from the repository, not this run's own notes: it is read
+                    # the way any repository file is, fenced as untrusted.
+                    from core.database import artifact_is_imported
+                    if artifact_is_imported(resolved_db, filepath=clean_path, run_id=ctx.run_id, resource=_own_resource(ctx)) or \
+                            artifact_is_imported(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id) or \
+                            (clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md")
+                             and artifact_is_imported(resolved_db, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))):
+                        return wrap_untrusted_content(art, filename=clean_path) + cut_note
+                    return art + cut_note
 
-            # Check findings virtual paths
-            if clean_path.startswith("workspace/findings") or clean_path.startswith("findings"):
-                finding_target = clean_path.split("/")[-1].removesuffix(".json") if "/" in clean_path else ""
-                if finding_target in ("*", "findings", ""):
-                    return get_findings()
-                active_node = str(getattr(ctx, "active_node", "") or "")
-                own_scope = None if active_node in _RUN_WIDE_FINDINGS_NODES else (getattr(ctx, "target_file", "") or None)
-                findings = read_findings(
-                    resolved_db, run_id=ctx.run_id, scope_path=own_scope, campaign=own_scope
-                )
-                if findings:
-                    for f in findings:
-                        f_id = str(f.get("id"))
-                        f_lineage = str(f.get("lineage_id") or "")
-                        if finding_target in (f_id, f_lineage):
-                            raw_json = json.dumps(f, indent=2, default=str)
-                            bounded_json, cut_note = split_truncation(
-                                raw_json, MAX_READ_SIZE, what=f"finding '{finding_target}'"
-                            )
-                            return wrap_untrusted_content(bounded_json, filename=clean_path) + cut_note
-                    return get_findings()
+                # Check findings virtual paths
+                if clean_path.startswith("workspace/findings") or clean_path.startswith("findings"):
+                    finding_target = clean_path.split("/")[-1].removesuffix(".json") if "/" in clean_path else ""
+                    if finding_target in ("*", "findings", ""):
+                        return get_findings()
+                    active_node = str(getattr(ctx, "active_node", "") or "")
+                    own_scope = None if active_node in _RUN_WIDE_FINDINGS_NODES else (getattr(ctx, "target_file", "") or None)
+                    findings = read_findings(
+                        resolved_db, run_id=ctx.run_id, scope_path=own_scope, campaign=own_scope
+                    )
+                    if findings:
+                        for f in findings:
+                            f_id = str(f.get("id"))
+                            f_lineage = str(f.get("lineage_id") or "")
+                            if finding_target in (f_id, f_lineage):
+                                raw_json = json.dumps(f, indent=2, default=str)
+                                bounded_json, cut_note = split_truncation(
+                                    raw_json, MAX_READ_SIZE, what=f"finding '{finding_target}'"
+                                )
+                                return wrap_untrusted_content(bounded_json, filename=clean_path) + cut_note
+                        return get_findings()
 
-            # Check learnings virtual JSONL
-            if clean_path in ("workspace/learnings.jsonl", "learnings.jsonl"):
-                try:
-                    with _db(resolved_db) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT category, learning, tags, timestamp FROM learnings WHERE run_id = ?", (ctx.run_id,))
-                        rows = cursor.fetchall()
-                        if rows:
-                            lines = [json.dumps({"category": r[0], "learning": r[1], "tags": json.loads(r[2]) if r[2] else [], "timestamp": r[3]}) for r in rows]
-                            return "\n".join(lines)
+                # Check learnings virtual JSONL
+                if clean_path in ("workspace/learnings.jsonl", "learnings.jsonl"):
+                    try:
+                        with _db(resolved_db) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT category, learning, tags, timestamp FROM learnings WHERE run_id = ?", (ctx.run_id,))
+                            rows = cursor.fetchall()
+                            if rows:
+                                lines = [json.dumps({"category": r[0], "learning": r[1], "tags": json.loads(r[2]) if r[2] else [], "timestamp": r[3]}) for r in rows]
+                                return "\n".join(lines)
+                            return ""
+                    except Exception:
                         return ""
-                except Exception:
-                    return ""
 
-            return f"NO_DATA: File not found in workspace: {filepath}"
+                return f"NO_DATA: File not found in workspace: {filepath}"
+            except (sqlite3.Error, RuntimeError, OSError) as e:
+                return f"ERROR READING ARTIFACT: {e}"
 
     # A finding stored under --path-root carries the repo-relative spelling
     # ("routes/login.ts") while this jail resolves against the scan target
@@ -978,6 +991,79 @@ def report_findings(report: VulnerabilityReport) -> str:
         elif isinstance(report, list):
             report_obj = VulnerabilityReport(findings=report)
             findings = report_obj.findings
+        else:
+            return "Error: report must be a VulnerabilityReport, dict, or list."
+
+        active_node = str(getattr(ctx, "active_node", "") or "").strip().lower()
+        is_dedupe_node = active_node in ("deduplicator", "dedupe") or "dedupe" in active_node
+        sanitized_findings = []
+        merged_via_report = 0
+        skipped_duplicates = 0
+        for f in findings:
+            raw_st = str(
+                (getattr(f, "status", None) if hasattr(f, "status") else (f.get("status") if isinstance(f, dict) else ""))
+                or ""
+            ).strip().upper()
+            raw_id = str(
+                (getattr(f, "id", None) if hasattr(f, "id") else (f.get("id") if isinstance(f, dict) else ""))
+                or ""
+            ).strip()
+            raw_dup_of = str(
+                (getattr(f, "duplicate_of", None) if hasattr(f, "duplicate_of") else (f.get("duplicate_of") if isinstance(f, dict) else ""))
+                or ""
+            ).strip().lstrip("#")
+
+            if raw_st == "DUPLICATE":
+                if is_dedupe_node and raw_id.isdigit() and int(raw_id) > 0 and raw_dup_of.isdigit() and int(raw_dup_of) > 0:
+                    scope = getattr(ctx, "target_file", None) or None
+                    merged_via_report += merge_findings(
+                        ctx.db_path,
+                        primary_title="",
+                        primary_id=int(raw_dup_of),
+                        duplicate_ids=[int(raw_id)],
+                        reason="Marked duplicate via report_findings",
+                        run_id=ctx.run_id,
+                        scope_path=scope,
+                        campaign=scope,
+                        pass_index=int(getattr(ctx, "pass_index", 1) or 1),
+                    )
+                    continue
+                # Skip only this item: one stray DUPLICATE must not discard
+                # every sibling finding in the batch.
+                skipped_duplicates += 1
+                continue
+
+            if hasattr(f, "status"):
+                f.status = None
+            elif isinstance(f, dict):
+                f.pop("status", None)
+
+            if not is_dedupe_node:
+                if hasattr(f, "id"):
+                    f.id = ""
+                elif isinstance(f, dict):
+                    f.pop("id", None)
+            elif not raw_id or raw_id == "0" or (raw_id.lstrip("-").isdigit() and int(raw_id) <= 0):
+                if hasattr(f, "id"):
+                    f.id = ""
+                elif isinstance(f, dict):
+                    f.pop("id", None)
+
+            sanitized_findings.append(f)
+
+        findings = sanitized_findings
+        dup_note = (
+            f" Skipped {skipped_duplicates} item(s) with status='DUPLICATE': call "
+            "dedupe_findings(primary_id=..., duplicate_ids=[...], primary_title=..., "
+            "reason=...) to merge duplicates."
+            if skipped_duplicates
+            else ""
+        )
+        if not findings:
+            if merged_via_report > 0:
+                return f"SUCCESS: Deduplicated {merged_via_report} finding(s) in database.{dup_note}"
+            if skipped_duplicates:
+                return f"Error: No findings saved.{dup_note}"
 
         sb = getattr(ctx, "sandbox", None)
         workdir = (
@@ -1129,11 +1215,12 @@ def report_findings(report: VulnerabilityReport) -> str:
                 elif isinstance(f, dict):
                     f["filepath"] = single_target_rel
 
-        write_findings(ctx.db_path, ctx.target_file, findings, run_id=ctx.run_id,
+        write_findings(ctx.db_path, ctx.target_file, findings, status="reported", run_id=ctx.run_id,
                        verified_evidence=bool(getattr(ctx, "sandbox_executed", False)),
-                       finding_evidence=dict(getattr(ctx, "finding_evidence", None) or {}))
+                       finding_evidence=dict(getattr(ctx, "finding_evidence", None) or {}),
+                       trusted_identity=False)
         ctx.reported_in_pass = True
-        return f"SUCCESS: Saved {len(findings)} finding(s) to database."
+        return f"SUCCESS: Saved {len(findings)} finding(s) to database.{dup_note}"
     except Exception as e:
         from pydantic import ValidationError
 
@@ -1342,6 +1429,12 @@ async def write_file(filepath: str, content: str) -> str:
     ctx = current_run_context.get()
     if ctx is None:
         return "Error: No active execution context."
+    if not isinstance(filepath, str) or not filepath.strip():
+        return "Error: filepath must be a non-empty string."
+    if isinstance(content, (dict, list)):
+        content = json.dumps(content, indent=2, ensure_ascii=False)
+    elif not isinstance(content, str):
+        return "Error: content must be a string."
 
     clean_fp = filepath.replace("\\", "/").removeprefix("./")
     if clean_fp.startswith("workspace/") or clean_fp in ("mantis-summary.md",):
@@ -1437,34 +1530,37 @@ async def write_file(filepath: str, content: str) -> str:
                     parsed_findings = items
                 except Exception:
                     parsed_findings = None
-            record_artifact(ctx.db_path, ctx.run_id, "workspace_file", clean_fp, content, metadata=meta)
-            # Sync any per-finding calibration updates into the findings table
-            if parsed_findings:
-                from core.schemas import normalize_mantis_risk_score
+            try:
+                record_artifact(ctx.db_path, ctx.run_id, "workspace_file", clean_fp, content, metadata=meta)
+                # Sync any per-finding calibration updates into the findings table
+                if parsed_findings:
+                    from core.schemas import normalize_mantis_risk_score
 
-                for item in parsed_findings:
-                    if not isinstance(item, dict):
-                        continue
-                    f_id = item.get("id")
-                    if f_id is not None and "mantis_risk_score" in item:
-                        try:
-                            val = normalize_mantis_risk_score(item["mantis_risk_score"], min_score=0.1)
-                            if val is None:
-                                continue
-                            scope = getattr(ctx, "target_file", None) or None
-                            update_finding_calibration(
-                                ctx.db_path,
-                                int(f_id),
-                                val,
-                                impact_score=int(item["impact_score"]) if "impact_score" in item else None,
-                                likelihood_score=int(item["likelihood_score"]) if "likelihood_score" in item else None,
-                                priority=str(item.get("priority")),
-                                run_id=ctx.run_id or "",
-                                scope_path=scope,
-                                campaign=scope,
-                            )
-                        except (ValueError, TypeError):
-                            pass
+                    for item in parsed_findings:
+                        if not isinstance(item, dict):
+                            continue
+                        f_id = item.get("id")
+                        if f_id is not None and "mantis_risk_score" in item:
+                            try:
+                                val = normalize_mantis_risk_score(item["mantis_risk_score"], min_score=0.1)
+                                if val is None:
+                                    continue
+                                scope = getattr(ctx, "target_file", None) or None
+                                update_finding_calibration(
+                                    ctx.db_path,
+                                    int(f_id),
+                                    val,
+                                    impact_score=int(item["impact_score"]) if "impact_score" in item else None,
+                                    likelihood_score=int(item["likelihood_score"]) if "likelihood_score" in item else None,
+                                    priority=str(item.get("priority")),
+                                    run_id=ctx.run_id or "",
+                                    scope_path=scope,
+                                    campaign=scope,
+                                )
+                            except (ValueError, TypeError):
+                                pass
+            except (sqlite3.Error, RuntimeError, OSError) as e:
+                return f"ERROR SAVING ARTIFACT: {e}"
         # If dynamic sandbox is active, also sync artifact into guest workspace filesystem
         if ctx.sandbox is not None and hasattr(ctx.sandbox, "write_file") and type(ctx.sandbox).__name__ != "StaticOnlyEnvironment":
             try:
@@ -1564,6 +1660,10 @@ async def list_files(directory: str = "") -> str:
     ctx = current_run_context.get()
     if ctx is None:
         return "Error: No active execution context."
+    if directory is None:
+        directory = ""
+    if not isinstance(directory, str):
+        return "Error: directory must be a string."
 
     if directory and _is_protected_rel_path(directory):
         return "Error: Permission denied. Refusing to list version-control metadata or credential files."
@@ -1594,16 +1694,18 @@ async def list_files(directory: str = "") -> str:
                             continue
                         if clean_dir == "workspace" or fp_norm.startswith(clean_dir):
                             items.add(fp_norm)
+
+                findings = read_findings(resolved_db, run_id=ctx.run_id)
+                if clean_dir in ("workspace/findings", "findings", "workspace"):
+                    for f in findings:
+                        items.add(f"workspace/findings/{f['id']}.json")
+                if clean_dir == "workspace" and not items:
+                    items.add("workspace/plan.json")
+                    items.add("workspace/kb/THREAT_MODEL.md")
+            except (sqlite3.Error, RuntimeError, OSError) as e:
+                return f"Error listing workspace artifacts: {e}"
             except Exception:
                 pass
-
-            findings = read_findings(resolved_db, run_id=ctx.run_id)
-            if clean_dir in ("workspace/findings", "findings", "workspace"):
-                for f in findings:
-                    items.add(f"workspace/findings/{f['id']}.json")
-            if clean_dir == "workspace" and not items:
-                items.add("workspace/plan.json")
-                items.add("workspace/kb/THREAT_MODEL.md")
         return _bounded_listing(sorted(items), clean_dir)
 
     # A single-file campaign sees its own directory, once, and no further:
@@ -1738,13 +1840,16 @@ def get_plan() -> str:
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
-    art = read_artifact(ctx.db_path, artifact_type="plan", run_id=ctx.run_id, resource=_own_resource(ctx))
-    if not art:
-        art = read_artifact(ctx.db_path, filepath="workspace/plan.json", run_id=ctx.run_id, resource=_own_resource(ctx))
-    if art:
-        # Model-written after reading the target: fenced like get_findings.
-        return wrap_untrusted_content(art, filename="recorded_plan")
-    return "NO_DATA: No review plan recorded in database."
+    try:
+        art = read_artifact(ctx.db_path, artifact_type="plan", run_id=ctx.run_id, resource=_own_resource(ctx))
+        if not art:
+            art = read_artifact(ctx.db_path, filepath="workspace/plan.json", run_id=ctx.run_id, resource=_own_resource(ctx))
+        if art:
+            # Model-written after reading the target: fenced like get_findings.
+            return wrap_untrusted_content(art, filename="recorded_plan")
+        return "NO_DATA: No review plan recorded in database."
+    except (sqlite3.Error, RuntimeError, OSError) as e:
+        return f"ERROR READING ARTIFACT: {e}"
 
 
 def record_threat_model(threat_model: dict) -> str:
@@ -1787,12 +1892,15 @@ def get_threat_model() -> str:
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
-    art = read_artifact(ctx.db_path, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))
-    if not art:
-        art = read_artifact(ctx.db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=ctx.run_id, resource=_own_resource(ctx))
-    if art:
-        return wrap_untrusted_content(art, filename="recorded_threat_model")
-    return "NO_DATA: No threat model recorded in database."
+    try:
+        art = read_artifact(ctx.db_path, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))
+        if not art:
+            art = read_artifact(ctx.db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=ctx.run_id, resource=_own_resource(ctx))
+        if art:
+            return wrap_untrusted_content(art, filename="recorded_threat_model")
+        return "NO_DATA: No threat model recorded in database."
+    except (sqlite3.Error, RuntimeError, OSError) as e:
+        return f"ERROR READING ARTIFACT: {e}"
 
 
 def record_summary(summary: dict) -> str:
@@ -1821,32 +1929,35 @@ def get_summary() -> str:
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
-    art = read_artifact(ctx.db_path, artifact_type="summary", run_id=ctx.run_id, resource=_own_resource(ctx))
-    if not art:
-        art = read_artifact(ctx.db_path, filepath="mantis-summary.md", run_id=ctx.run_id, resource=_own_resource(ctx))
+    try:
+        art = read_artifact(ctx.db_path, artifact_type="summary", run_id=ctx.run_id, resource=_own_resource(ctx))
+        if not art:
+            art = read_artifact(ctx.db_path, filepath="mantis-summary.md", run_id=ctx.run_id, resource=_own_resource(ctx))
 
-    is_empty_summary = False
-    if art:
-        try:
-            parsed = json.loads(art)
-            if isinstance(parsed, dict) and not parsed.get("overview") and not parsed.get("key_modules"):
-                is_empty_summary = True
-        except Exception:
-            if not art.strip():
-                is_empty_summary = True
+        is_empty_summary = False
+        if art:
+            try:
+                parsed = json.loads(art)
+                if isinstance(parsed, dict) and not parsed.get("overview") and not parsed.get("key_modules"):
+                    is_empty_summary = True
+            except Exception:
+                if not art.strip():
+                    is_empty_summary = True
 
-    if not art or is_empty_summary:
-        kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/architecture.md", run_id=ctx.run_id, resource=_own_resource(ctx))
-        if not kb_arch:
-            kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/index.md", run_id=ctx.run_id, resource=_own_resource(ctx))
-        if kb_arch:
-            return wrap_untrusted_content(kb_arch, filename="recorded_summary")
+        if not art or is_empty_summary:
+            kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/architecture.md", run_id=ctx.run_id, resource=_own_resource(ctx))
+            if not kb_arch:
+                kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/index.md", run_id=ctx.run_id, resource=_own_resource(ctx))
+            if kb_arch:
+                return wrap_untrusted_content(kb_arch, filename="recorded_summary")
+            if art and not is_empty_summary:
+                return wrap_untrusted_content(art, filename="recorded_summary")
+
         if art and not is_empty_summary:
             return wrap_untrusted_content(art, filename="recorded_summary")
-
-    if art and not is_empty_summary:
-        return wrap_untrusted_content(art, filename="recorded_summary")
-    return "NO_DATA: No codebase summary recorded in database."
+        return "NO_DATA: No codebase summary recorded in database."
+    except (sqlite3.Error, RuntimeError, OSError) as e:
+        return f"ERROR READING ARTIFACT: {e}"
 
 
 def record_exploit_chain(chain: dict) -> str:
@@ -1888,22 +1999,86 @@ def dedupe_findings(
     duplicate_ids: Optional[list[int]] = None,
 ) -> str:
     """Merges and suppresses duplicate findings in the state store, safely protecting the primary finding."""
-    from core.database import merge_findings as db_merge_findings
+    from core.database import (
+        CLOSED_STATUSES,
+        _ownership_clause,
+        merge_findings as db_merge_findings,
+    )
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
     try:
         scope = getattr(ctx, "target_file", None) or None
+        pass_idx = int(getattr(ctx, "pass_index", 1) or 1)
+        clauses: list[str] = ["COALESCE(pass_index, 1) = ?"]
+        params: list[Any] = [pass_idx]
+        if ctx.run_id:
+            clauses.append("run_id = ?")
+            params.append(ctx.run_id)
+        if scope:
+            sc_sql, sc_params = _ownership_clause(scope, scope)
+            if sc_sql:
+                clauses.append(sc_sql)
+                params.extend(sc_params)
+        where_sql = " AND ".join(clauses)
+        with _db(ctx.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT id, title, status FROM findings WHERE {where_sql} ORDER BY id ASC",
+                tuple(params),
+            )
+            scoped_rows = cur.fetchall()
+
+        if primary_id is not None:
+            pid_int = int(primary_id)
+            primary_matches = [r for r in scoped_rows if int(r[0]) == pid_int]
+            if not primary_matches or str(primary_matches[0][2] or "").strip().lower() in CLOSED_STATUSES:
+                return (
+                    f"ERROR DEDUPLICATING FINDINGS: primary_id {primary_id} does not refer to "
+                    "an active in-scope finding."
+                )
+            resolved_primary_id = pid_int
+        else:
+            title_matches = [
+                r
+                for r in scoped_rows
+                if r[1] == primary_title
+                and str(r[2] or "").strip().lower() not in CLOSED_STATUSES
+            ]
+            if not title_matches:
+                return (
+                    f"ERROR DEDUPLICATING FINDINGS: primary_title '{primary_title}' did not match "
+                    "any active in-scope finding; pass explicit primary_id from get_findings()."
+                )
+            resolved_primary_id = int(title_matches[0][0])
+
+        for dt in duplicate_titles or []:
+            if dt == primary_title:
+                continue
+            dt_matches = [
+                r
+                for r in scoped_rows
+                if r[1] == dt
+                and int(r[0]) != resolved_primary_id
+                and str(r[2] or "").strip().lower() != "duplicate_merged"
+            ]
+            if len(dt_matches) > 1:
+                return (
+                    f"ERROR DEDUPLICATING FINDINGS: duplicate title '{dt}' matches multiple "
+                    f"findings ({[int(r[0]) for r in dt_matches]}); pass explicit primary_id and duplicate_ids."
+                )
+
         count = db_merge_findings(
             ctx.db_path,
             primary_title=primary_title,
             duplicate_titles=duplicate_titles or [],
             reason=reason,
             run_id=ctx.run_id,
-            primary_id=primary_id,
+            primary_id=resolved_primary_id,
             duplicate_ids=duplicate_ids,
             scope_path=scope,
             campaign=scope,
+            pass_index=pass_idx,
         )
         return f"SUCCESS: Deduplicated {count} finding(s) under primary title '{primary_title}'."
     except Exception as e:
@@ -2926,6 +3101,14 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
     jail_dir, target_path = _resolve_jail_and_target()
     if jail_dir is None:
         return "Error: No active execution context."
+    if path is None:
+        path = ""
+    if not isinstance(path, str):
+        return "Error: path must be a string."
+    try:
+        limit = min(max(1, int(max_commits)), 100)
+    except (TypeError, ValueError):
+        return "Error: max_commits must be an integer."
 
     repo_dir = jail_dir if jail_dir.is_dir() else jail_dir.parent
 
@@ -2938,8 +3121,6 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
     valid, err = _validate_git_jail(repo_dir, jail_dir)
     if not valid:
         return _vcs_unavailable_message(err)
-
-    limit = min(max(1, int(max_commits)), 100)
 
     git_args = [
         "log",
@@ -2983,6 +3164,12 @@ async def get_git_diff(commit_hash: str = "", path: str = "") -> str:
     jail_dir, target_path = _resolve_jail_and_target()
     if jail_dir is None:
         return "Error: No active execution context."
+    if commit_hash is None:
+        commit_hash = ""
+    if path is None:
+        path = ""
+    if not isinstance(commit_hash, str) or not isinstance(path, str):
+        return "Error: commit_hash and path must be strings."
 
     repo_dir = jail_dir if jail_dir.is_dir() else jail_dir.parent
 

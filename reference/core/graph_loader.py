@@ -676,6 +676,75 @@ def apply_completion_stamp(rc, new_status: str, node_id: str = "") -> Optional[l
     return ids
 
 
+def _is_end_of_agent(ev: Any) -> bool:
+    """ADK carries the end-of-agent marker on ``Event.actions.end_of_agent``."""
+    actions = getattr(ev, "actions", None)
+    return bool(getattr(actions, "end_of_agent", False) or getattr(ev, "end_of_agent", False))
+
+
+def _invocation_aborted_or_dangling(callback_context: Any, node_id: str) -> bool:
+    """Returns True when ADK paused/aborted the node with an error_code or unanswered FunctionCall.
+
+    Under ResumabilityConfig (ResumeAction.PAUSE) or mid-turn model/tool aborts,
+    base_agent.run_async can still enter _handle_after_agent_callback when the
+    generator exits cleanly without raising. Checking negatively for explicit
+    abort markers preserves normal model-less test agents and bare callback
+    contexts while blocking premature coverage stamps on incomplete turns.
+    """
+    inv_ctx = getattr(callback_context, "_invocation_context", None)
+    sess = getattr(inv_ctx, "session", None)
+    if inv_ctx is None or sess is None:
+        return False
+    events = getattr(sess, "events", None)
+    if not isinstance(events, (list, tuple)) or not events:
+        return False
+    inv_id = getattr(inv_ctx, "invocation_id", None)
+    inv_branch = getattr(inv_ctx, "branch", None)
+
+    def _matches_node(ev: Any) -> bool:
+        if inv_id and getattr(ev, "invocation_id", None) != inv_id:
+            return False
+        if getattr(ev, "author", None) == node_id:
+            return True
+        ev_branch = str(getattr(ev, "branch", "") or "")
+        if inv_branch and ev_branch == str(inv_branch):
+            return True
+        tail = ev_branch.split(".")[-1].split("/")[-1].split("@")[0]
+        return tail == node_id
+
+    node_events = [ev for ev in events if _matches_node(ev)]
+    if not node_events:
+        return False
+
+    real_evs = [ev for ev in node_events if not _is_end_of_agent(ev)]
+    if real_evs and getattr(real_evs[-1], "error_code", None):
+        return True
+
+    unanswered_fcs: set[str] = set()
+    unanswered_names: list[str] = []
+    for ev in real_evs:
+        content = getattr(ev, "content", None)
+        parts = getattr(content, "parts", None) or ()
+        for part in parts:
+            fc = getattr(part, "function_call", None)
+            if fc is not None:
+                fc_id = getattr(fc, "id", None)
+                if fc_id:
+                    unanswered_fcs.add(str(fc_id))
+                else:
+                    unanswered_names.append(str(getattr(fc, "name", "") or "call"))
+            fr = getattr(part, "function_response", None)
+            if fr is not None:
+                fr_id = getattr(fr, "id", None)
+                if fr_id and str(fr_id) in unanswered_fcs:
+                    unanswered_fcs.discard(str(fr_id))
+                else:
+                    fr_name = str(getattr(fr, "name", "") or "call")
+                    if fr_name in unanswered_names:
+                        unanswered_names.remove(fr_name)
+    return bool(unanswered_fcs or unanswered_names)
+
+
 def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
     """Builds an after-agent callback that stamps coverage on SUCCESS only.
 
@@ -710,6 +779,8 @@ def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
                 return None
         except Exception:
             pass
+        if _invocation_aborted_or_dangling(callback_context, node_id):
+            return None
         try:
             from core.context import current_run_context
             rc = current_run_context.get()
@@ -1000,6 +1071,46 @@ def compute_harness_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _make_on_tool_error_callback(node_id: str):
+    """Converts unhandled tool runtime exceptions into structured FunctionResponse dicts.
+
+    Control-plane exceptions (BudgetExceededError, MantisAuthError,
+    NodeContextExhausted, asyncio.CancelledError) always re-raise untouched so
+    budget enforcement, auth fail-fast, node ceiling handoffs, and task
+    cancellation are never swallowed.
+    """
+
+    def _on_tool_error(
+        tool: Any = None,
+        args: Optional[dict[str, Any]] = None,
+        tool_context: Any = None,
+        error: Optional[Exception] = None,
+        **kwargs: Any,
+    ) -> Optional[dict[str, Any]]:
+        import asyncio
+        from core.budget import BudgetExceededError
+        from core.config import MantisAuthError
+        from core.llm_gateway import sanitize_egress_text
+
+        err = error if error is not None else kwargs.get("error")
+        if isinstance(
+            err,
+            (BudgetExceededError, MantisAuthError, NodeContextExhausted, asyncio.CancelledError),
+        ):
+            raise err
+        tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", None) or "tool"
+        raw_msg = str(err) if err is not None else "unknown tool error"
+        clean_msg = sanitize_egress_text(raw_msg)[:500]
+        err_type = type(err).__name__ if err is not None else "Error"
+        print(
+            f"[{node_id}] Tool '{tool_name}' raised {err_type}: {clean_msg}",
+            file=sys.stderr,
+        )
+        return {"error": f"Tool '{tool_name}' failed ({err_type}): {clean_msg}"}
+
+    return _on_tool_error
+
+
 class LiteralInstruction:
     """An ADK ``InstructionProvider`` that returns fixed text.
 
@@ -1146,18 +1257,28 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
         tool_context: Any,
         tool_response: Any,
     ) -> Any:
-        tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", "")
-        tool_response, changed = _bounded(str(tool_name or ""), tool_response)
-        if changed and "[CONTEXT NOTICE]" not in str(tool_response):
-            print(
-                f"[{node_id}] {tool_name} response exceeded the per-response cap for this "
-                f"model ({_cap():,} chars); cut with a marker.",
-                file=sys.stderr, flush=True,
-            )
-        steered = _steer(tool_name, args, tool_response)
-        if steered is not None:
-            return steered
-        return tool_response if changed else None
+        import asyncio
+        from core.budget import BudgetExceededError
+        from core.config import MantisAuthError
+
+        try:
+            tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", "")
+            tool_response, changed = _bounded(str(tool_name or ""), tool_response)
+            if changed and "[CONTEXT NOTICE]" not in str(tool_response):
+                print(
+                    f"[{node_id}] {tool_name} response exceeded the per-response cap for this "
+                    f"model ({_cap():,} chars); cut with a marker.",
+                    file=sys.stderr, flush=True,
+                )
+            steered = _steer(tool_name, args, tool_response)
+            if steered is not None:
+                return steered
+            return tool_response if changed else None
+        except (BudgetExceededError, MantisAuthError, NodeContextExhausted, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            print(f"[{node_id}] after_tool_callback ignored error: {exc}", file=sys.stderr)
+            return None
 
     def _steer(tool_name: Any, args: Any, tool_response: Any) -> Any:
         if not has_structural_nav:
@@ -3450,6 +3571,9 @@ def load_workflow_from_json(
             # whole-file reads toward it.
             agent_kwargs["after_tool_callback"] = _make_after_tool_guard_callback(
                 node_id, node_cfg.tools, model=node_model_id
+            )
+            agent_kwargs["on_tool_error_callback"] = _make_on_tool_error_callback(
+                node_id
             )
 
             agent_kwargs["before_model_callback"] = [

@@ -143,6 +143,8 @@ def _resolve_unique(
 
 def find_symbol(name: str, offset: int = 0) -> str:
     """Looks up where a function, method, or class is defined, by name or qualified name."""
+    if not isinstance(name, str) or not name.strip():
+        return "Error: symbol name must be a non-empty string."
     try:
         idx, err = _load_index()
         if idx is None:
@@ -168,6 +170,12 @@ def find_symbol(name: str, offset: int = 0) -> str:
 
 def find_callers(symbol: str, filepath: str = "", offset: int = 0) -> str:
     """Lists call sites that invoke the given function or method."""
+    if not isinstance(symbol, str) or not symbol.strip():
+        return "Error: symbol must be a non-empty string."
+    if filepath is None:
+        filepath = ""
+    if not isinstance(filepath, str):
+        return "Error: filepath must be a string."
     try:
         idx, err = _load_index()
         if idx is None:
@@ -207,6 +215,12 @@ def find_callers(symbol: str, filepath: str = "", offset: int = 0) -> str:
 
 def find_callees(symbol: str, filepath: str = "", offset: int = 0) -> str:
     """Lists the functions a given function or method calls."""
+    if not isinstance(symbol, str) or not symbol.strip():
+        return "Error: symbol must be a non-empty string."
+    if filepath is None:
+        filepath = ""
+    if not isinstance(filepath, str):
+        return "Error: filepath must be a string."
     try:
         idx, err = _load_index()
         if idx is None:
@@ -244,6 +258,8 @@ def find_callees(symbol: str, filepath: str = "", offset: int = 0) -> str:
 
 async def get_function_boundary(filepath: str, line: int) -> str:
     """Returns the innermost function enclosing file:line, with its source."""
+    if not isinstance(filepath, str) or not filepath.strip():
+        return "Error: filepath must be a non-empty string."
     try:
         idx, err = _load_index()
         if idx is None:
