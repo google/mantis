@@ -35,9 +35,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from core.environments.staging import get_vetted_staging_files
 from core.llm_gateway import wrap_untrusted_content
 from core.paths import resolve_db_path
-from core.structural_index import state_dir_for_db
+from core.structural_index import resolve_state_dir_for_target, state_dir_for_db
 
 MAX_CHECKLIST_SINKS = 35
+MAX_SINKS_PER_FILE = 5
 MAX_CHECKLIST_ENTRYPOINTS = 20
 MAX_CHECKLIST_CHARS = 3600
 MAX_FALLBACK_FILES = 40
@@ -53,14 +54,14 @@ _SINK_TAXONOMY: Tuple[Tuple[str, int, frozenset[str]], ...] = (
             "Popen", "check_output", "check_call", "create_subprocess_shell",
             "create_subprocess_exec", "execSync", "execFile", "execFileSync",
             "spawn", "spawnSync", "shell_exec", "passthru", "proc_open",
-            "ProcessBuilder", "Command",
+            "ProcessBuilder", "Command", "CommandContext",
         }),
     ),
     (
         "code_eval_deser",
         2,
         frozenset({
-            "eval", "exec", "compile", "unsafe_load", "Unpickler", "loads",
+            "eval", "exec", "unsafe_load", "Unpickler",
             "readObject", "readUnshared", "fromXML", "unserialize",
             "deserialize", "runInNewContext", "runInContext", "runInThisContext",
         }),
@@ -125,6 +126,38 @@ for _cat, _rank, _names in _SINK_TAXONOMY:
     for _n in _names:
         _CALLEE_TO_CATEGORY.setdefault(_n, (_cat, _rank))
 
+_UNSAFE_DESER_QUALIFIERS = frozenset({
+    "pickle", "cpickle", "_pickle", "dill", "cloudpickle", "marshal",
+    "yaml", "ruamel", "shelve", "jsonpickle",
+})
+_BENIGN_SYSTEM_QUALIFIERS = frozenset({"platform"})
+_QUALIFIED_ONLY_CALLEES = frozenset({"run", "call", "loads", "load", "decode", "compile"})
+
+
+def _classify_edge_sink(callee: str, qualifier: str) -> Optional[Tuple[str, int]]:
+    """Classifies `(callee, qualifier)` to `(category, tier_rank)` or `None` when benign."""
+    q_low = (qualifier or "").strip().lower()
+    if callee in ("run", "call"):
+        if q_low == "subprocess":
+            return ("command_exec", 1)
+        return None
+    if callee in ("loads", "load"):
+        if q_low in _UNSAFE_DESER_QUALIFIERS:
+            return ("code_eval_deser", 2)
+        return None
+    if callee == "decode":
+        if q_low == "jsonpickle":
+            return ("code_eval_deser", 2)
+        return None
+    if callee == "compile":
+        if q_low in ("", "builtins"):
+            return ("code_eval_deser", 2)
+        return None
+    if callee == "system" and q_low in _BENIGN_SYSTEM_QUALIFIERS:
+        return None
+    return _CALLEE_TO_CATEGORY.get(callee)
+
+
 _ENTRYPOINT_NAME_RE = re.compile(
     r"(?:^(?:handle|serve|route|on_|api_|rpc_|do(?:get|post|put|delete))|"
     r"(?:handler|controller|endpoint|view|servlet|webhook|callback|middleware|graphql)$)",
@@ -132,7 +165,9 @@ _ENTRYPOINT_NAME_RE = re.compile(
 )
 _ENTRYPOINT_SIG_RE = re.compile(
     r"(?:@(?:app|router|bp|blueprint|api)\.(?:route|get|post|put|delete|patch|websocket)|"
-    r"@(?:RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping)|"
+    r"@(?:RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|Get|Post|Put|Delete|Patch|All|Controller)\b|"
+    r"#\[(?:get|post|put|delete|patch|route)\s*\(|"
+    r"\[(?:HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch|Route)\b|"
     r"\b(?:http\.ResponseWriter|gin\.Context|echo\.Context|express\.Request|FastAPI|APIRouter)\b)",
 )
 
@@ -142,6 +177,7 @@ _FALLBACK_SINK_RES: Tuple[Tuple[str, int, re.Pattern[str]], ...] = (
         1,
         re.compile(
             r"\b(os\.system|os\.popen|subprocess\.(?:Popen|run|call|check_output|check_call)|"
+            r"exec\.Command(?:Context)?|"
             r"child_process\.(?:exec|execSync|spawn|execFile)|shell_exec|passthru|proc_open)\s*\("
         ),
     ),
@@ -218,6 +254,24 @@ def _path_in_prefixes(rel_path: str, prefixes: Sequence[str], is_whole: bool) ->
     return False
 
 
+def _cap_per_file_sinks(
+    sinks: Sequence[Tuple[int, str, int, str, str, str]],
+) -> List[Tuple[int, str, int, str, str, str]]:
+    """Caps sink bullets per file at `MAX_SINKS_PER_FILE` (highest-severity first)
+    so a single noisy file cannot flood the slice checklist."""
+    ordered = sorted(sinks, key=lambda item: (item[0], item[1], item[2], item[4]))
+    counts: Dict[str, int] = {}
+    kept: List[Tuple[int, str, int, str, str, str]] = []
+    for item in ordered:
+        fp = item[1]
+        cur = counts.get(fp, 0)
+        if cur >= MAX_SINKS_PER_FILE:
+            continue
+        counts[fp] = cur + 1
+        kept.append(item)
+    return kept
+
+
 def _query_catalog_checklist(
     catalog_path: Path, prefixes: Sequence[str], is_whole: bool
 ) -> Tuple[List[Tuple[int, str, int, str, str, str]], List[Tuple[str, int, str, str]]]:
@@ -227,28 +281,37 @@ def _query_catalog_checklist(
     if not catalog_path.exists():
         return sinks, entrypoints
 
-    callee_names = sorted(_CALLEE_TO_CATEGORY)
+    callee_names = sorted(set(_CALLEE_TO_CATEGORY) | _QUALIFIED_ONLY_CALLEES)
     placeholders = ",".join("?" for _ in callee_names)
     conn = sqlite3.connect(f"file:{catalog_path}?mode=ro", uri=True)
     try:
+        cols = {
+            str(r[1])
+            for r in conn.execute("PRAGMA table_info(call_edges)").fetchall()
+        }
+        qual_expr = "COALESCE(e.qualifier, '')" if "qualifier" in cols else "''"
         edge_rows = conn.execute(
-            f"SELECT e.file_path, e.line, e.callee_name, COALESCE(s.qualified_name, '<module>')"
+            f"SELECT e.file_path, e.line, e.callee_name, COALESCE(s.qualified_name, '<module>'), {qual_expr}"
             f" FROM call_edges e LEFT JOIN symbols s ON s.symbol_id = e.caller_id"
             f" WHERE e.callee_name IN ({placeholders})"
             f" ORDER BY e.file_path ASC, e.line ASC, e.callee_name ASC",
             tuple(callee_names),
         ).fetchall()
         seen_sinks: set[Tuple[str, int, str]] = set()
-        for fp, line, callee, caller in edge_rows:
+        for fp, line, callee, caller, qual in edge_rows:
             fp_s = str(fp or "")
             if not _path_in_prefixes(fp_s, prefixes, is_whole):
                 continue
-            key = (fp_s, int(line or 0), str(callee or ""))
+            callee_s = str(callee or "")
+            classified = _classify_edge_sink(callee_s, str(qual or ""))
+            if classified is None:
+                continue
+            key = (fp_s, int(line or 0), callee_s)
             if key in seen_sinks:
                 continue
             seen_sinks.add(key)
-            cat, rank = _CALLEE_TO_CATEGORY[str(callee)]
-            sinks.append((rank, fp_s, int(line or 0), cat, str(callee), str(caller or "<module>")))
+            cat, rank = classified
+            sinks.append((rank, fp_s, int(line or 0), cat, callee_s, str(caller or "<module>")))
 
         sym_rows = conn.execute(
             "SELECT file_path, start_line, name, qualified_name, COALESCE(signature, '')"
@@ -266,7 +329,7 @@ def _query_catalog_checklist(
     finally:
         conn.close()
 
-    sinks.sort(key=lambda item: (item[0], item[1], item[2], item[4]))
+    sinks = _cap_per_file_sinks(sinks)
     entrypoints.sort(key=lambda item: (item[0], item[1], item[2]))
     return sinks, entrypoints
 
@@ -304,8 +367,7 @@ def _fallback_lexical_checklist(
                     if key not in seen:
                         seen.add(key)
                         sinks.append((rank, rel_p, lineno, cat, callee, "<lexical>"))
-    sinks.sort(key=lambda item: (item[0], item[1], item[2], item[4]))
-    return sinks
+    return _cap_per_file_sinks(sinks)
 
 
 def build_slice_audit_checklist(ctx: Any) -> str:
@@ -328,6 +390,9 @@ def build_slice_audit_checklist(ctx: Any) -> str:
             return ""
         if os.path.isfile(code_root):
             code_root = os.path.dirname(code_root)
+        import tempfile as _tempfile
+        if os.path.realpath(code_root) == os.path.realpath(_tempfile.gettempdir()):
+            return ""
 
         prefixes, is_whole = _scope_rel_prefixes(
             code_root, target_file, getattr(ctx, "group_targets", ()) or ()
@@ -338,10 +403,16 @@ def build_slice_audit_checklist(ctx: Any) -> str:
         db_path = str(getattr(ctx, "db_path", "") or "").strip()
         if db_path:
             try:
-                state_dir = Path(state_dir_for_db(resolve_db_path(db_path)))
-                sinks, entrypoints = _query_catalog_checklist(
-                    state_dir / "catalog.sqlite", prefixes, is_whole
+                resolved_db = resolve_db_path(db_path)
+                matched_state = resolve_state_dir_for_target(
+                    resolved_db,
+                    code_root,
+                    snapshot_id=str(getattr(ctx, "snapshot_id", "") or ""),
                 )
+                if matched_state:
+                    sinks, entrypoints = _query_catalog_checklist(
+                        Path(matched_state) / "catalog.sqlite", prefixes, is_whole
+                    )
             except Exception:
                 sinks, entrypoints = [], []
 

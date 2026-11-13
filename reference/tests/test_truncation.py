@@ -188,18 +188,21 @@ class ReadFileMarkerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cut_is_announced_outside_the_untrusted_fence(self):
         limit = 500
+        numbered_body = "".join(
+            f"{i}: line {i:05d}: int guard = x < len;\n" for i in range(1, 400)
+        )
         with patch.object(self.rt, "MAX_READ_SIZE", limit):
             out = await self.rt.read_file("big.c")
         self.assertTrue(is_truncation_marker_present(out))
-        self.assertIn(f"file 'big.c' cut by the harness after {limit} of {len(self.body)} chars", out)
+        self.assertIn(f"file 'big.c' cut by the harness after {limit} of {len(numbered_body)} chars", out)
         self.assertNotIn("[TRUNCATED", out)
         # Harness bookkeeping sits after the fence, like the range header and
         # the large-read note: a hostile file cannot forge its position.
         self.assertGreater(out.index(TRUNCATION_MARKER_PREFIX), out.index(UNTRUSTED_DATA_END))
-        # Exactly `limit` chars of the file survive inside the fence.
+        # Exactly `limit` chars of the numbered source survive inside the fence.
         inside = out[out.index(UNTRUSTED_DATA_START):out.index(UNTRUSTED_DATA_END)]
         inside_body = inside.split("\n", 1)[1].rstrip("\n")
-        self.assertEqual(inside_body, self.body[:limit])
+        self.assertEqual(inside_body, numbered_body[:limit])
 
     async def test_ranged_read_is_cut_by_the_same_rule(self):
         with patch.object(self.rt, "MAX_READ_SIZE", 40):

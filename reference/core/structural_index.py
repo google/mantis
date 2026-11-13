@@ -44,8 +44,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -62,15 +64,80 @@ from core.environments.staging import get_vetted_staging_files
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
+_EXTRACTOR_SCHEMA_VERSION = 2
 EXTRACTOR_NAME = "tree-sitter"
 STATE_DIRNAME = "structural_index"
 
-# Bounds. Deterministic: files are processed in sorted relative-path order,
-# so truncation always drops the same tail.
-MAX_UNITS = 10000
+# Bounds. Deterministic: files are processed in tiered (first-party -> tests ->
+# vendor/generated) sorted relative-path order, so truncation always drops the
+# lowest-priority tail first.
+MAX_INDEX_FILES = 10000
+MAX_UNITS = MAX_INDEX_FILES
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_SOURCE_BYTES = 200 * 1024 * 1024
 MAX_TOTAL_SYMBOLS = 250000
+
+_TIER3_VENDOR_GENERATED_DIRS = frozenset({
+    "vendor", "third_party", "third-party", "3rdparty", "external",
+    "node_modules", "bower_components", "pods", "dist", "build", "out",
+    "target", "gen", "generated", "__generated__", ".venv", "venv",
+    "site-packages", "cmakefiles",
+})
+_TIER2_TEST_EXAMPLE_DIRS = frozenset({
+    "test", "tests", "testing", "testdata", "test_data", "__tests__",
+    "__mocks__", "unittest", "unittests", "spec", "specs", "fixture",
+    "fixtures", "mock", "mocks", "example", "examples", "sample", "samples",
+    "demo", "demos", "benchmark", "benchmarks", "doc", "docs",
+})
+_TIER3_GENERATED_SUFFIXES = (
+    ".pb.go", ".pb.cc", ".pb.h", "_pb2.py", "_pb2_grpc.py",
+    ".g.dart", ".generated.ts", ".generated.cs", ".min.js",
+)
+_TIER2_TEST_SUFFIXES = (
+    "_test.py", "_test.go", "_test.rs", ".test.ts", ".test.tsx",
+    ".test.js", ".test.jsx", ".spec.ts", ".spec.tsx", ".spec.js",
+    "test.java", "tests.java", "tests.cs",
+)
+_UNSUPPORTED_CODE_EXTS = frozenset({
+    ".scala", ".swift", ".sol", ".zig", ".ex", ".exs", ".lua",
+    ".sh", ".bash", ".pl", ".m", ".mm", ".dart", ".groovy",
+    ".clj", ".erl", ".hs", ".ml", ".vue", ".svelte",
+})
+
+
+def _source_file_tier(rel_path: str) -> int:
+    """Classifies `rel_path` into Tier 1 (first-party source), Tier 2 (tests/examples),
+    or Tier 3 (vendor/third_party/generated) for deterministic priority indexing."""
+    norm = str(rel_path or "").replace("\\", "/").strip("/")
+    parts_low = [p.lower() for p in norm.split("/") if p]
+    if not parts_low:
+        return 1
+    dir_parts = parts_low[:-1]
+    fname = parts_low[-1]
+    if any(d in _TIER3_VENDOR_GENERATED_DIRS for d in dir_parts) or fname.endswith(_TIER3_GENERATED_SUFFIXES):
+        return 3
+    if (
+        any(d in _TIER2_TEST_EXAMPLE_DIRS for d in dir_parts)
+        or fname.startswith("test_")
+        or fname.endswith(_TIER2_TEST_SUFFIXES)
+    ):
+        return 2
+    return 1
+
+
+def _resolve_index_file_cap() -> int:
+    """Returns max indexed file count honoring env and module-constant overrides."""
+    raw = os.environ.get("MANTIS_MAX_INDEX_FILES", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    if MAX_INDEX_FILES != 10000:
+        return MAX_INDEX_FILES
+    return MAX_UNITS
 
 
 def _resolve_index_limits() -> Tuple[int, int]:
@@ -198,12 +265,37 @@ def _language_for(rel_path: str) -> Optional[str]:
     return _EXT_LANGUAGES.get(Path(rel_path).suffix.lower())
 
 
+_FAILED_PARSERS: Dict[str, str] = {}
+_FAILED_PARSER_MOD_IDS: Dict[str, int] = {}
+_FAILED_PARSERS_LOCK = threading.Lock()
+
+
 def _load_parser(language: str):
-    """Returns a parser or None. Import failure is a degradation, not an error."""
+    """Returns a parser or None. Logs a concise warning once per failed language."""
+    mod = sys.modules.get("tree_sitter_language_pack")
+    mod_id = id(mod) if mod is not None else 0
+    with _FAILED_PARSERS_LOCK:
+        if language in _FAILED_PARSERS and _FAILED_PARSER_MOD_IDS.get(language) == mod_id and mod_id != 0:
+            return None
     try:
         from tree_sitter_language_pack import get_parser
-        return get_parser(language)
-    except Exception:
+
+        parser = get_parser(language)
+        with _FAILED_PARSERS_LOCK:
+            _FAILED_PARSERS.pop(language, None)
+            _FAILED_PARSER_MOD_IDS.pop(language, None)
+        return parser
+    except Exception as exc:
+        cur_mod = sys.modules.get("tree_sitter_language_pack")
+        cur_mod_id = id(cur_mod) if cur_mod is not None else 0
+        should_warn = False
+        with _FAILED_PARSERS_LOCK:
+            if language not in _FAILED_PARSERS or _FAILED_PARSER_MOD_IDS.get(language) != cur_mod_id:
+                should_warn = language not in _FAILED_PARSERS
+                _FAILED_PARSERS[language] = f"{type(exc).__name__}: {exc}"
+                _FAILED_PARSER_MOD_IDS[language] = cur_mod_id
+        if should_warn:
+            logger.warning("Tree-sitter parser for '%s' unavailable: %s", language, exc)
         return None
 
 
@@ -365,12 +457,86 @@ def _callee_name(call_node) -> str:
     return _callee_parts(call_node)[1]
 
 
+_DECORATOR_SIBLING_TYPES = frozenset({
+    "decorator", "attribute_item", "inner_attribute_item",
+    "attribute_list", "attribute_group",
+})
+_COMMENT_SIBLING_TYPES = frozenset({
+    "line_comment", "block_comment", "comment",
+})
+
+
 def _signature_of(node, source: bytes) -> str:
     # Bounded slice: a definition on a single multi-megabyte line would
     # otherwise be copied in full for every nested definition inside it.
     end = min(node.end_byte, node.start_byte + _MAX_SIGNATURE_SCAN_BYTES)
     first_line = source[node.start_byte:end].split(b"\n", 1)[0]
     return first_line.decode("utf-8", errors="replace").strip()[:200]
+
+
+def _span_and_signature(node, source: bytes) -> Tuple[int, str]:
+    """Returns `(start_line_1based, signature)` including enclosing/preceding
+    decorators and attributes (`@app.route`, `@Get`, `#[get]`, `[Authorize]`)."""
+    first_decor = None
+    parent = getattr(node, "parent", None)
+    if parent is not None and parent.type == "decorated_definition":
+        first_decor = parent
+    elif parent is not None and parent.type == "export_statement":
+        for ch in parent.named_children:
+            if ch == node:
+                break
+            if ch.type in _DECORATOR_SIBLING_TYPES:
+                first_decor = ch
+                break
+    if first_decor is None:
+        prev = getattr(node, "prev_named_sibling", None)
+        hops = 0
+        while prev is not None and hops < 32:
+            if prev.type in _DECORATOR_SIBLING_TYPES:
+                first_decor = prev
+            elif prev.type not in _COMMENT_SIBLING_TYPES:
+                break
+            prev = getattr(prev, "prev_named_sibling", None)
+            hops += 1
+
+    has_inline_leading_attrs = False
+    if first_decor is None:
+        for ch in node.named_children:
+            if ch.type in _DECORATOR_SIBLING_TYPES or ch.type == "modifiers":
+                if ch.start_point[0] < node.end_point[0]:
+                    raw_first = source[node.start_byte : min(node.end_byte, node.start_byte + 512)].split(b"\n", 1)[0]
+                    if b"\n" in source[ch.start_byte : min(node.end_byte, node.start_byte + _MAX_SIGNATURE_SCAN_BYTES)]:
+                        # Multi-line leading attribute/annotation child (C# / Java / PHP)
+                        body = node.child_by_field_name("body")
+                        hdr_stop = body.start_byte if body is not None else node.end_byte
+                        if raw_first.strip() and hdr_stop > node.start_byte + len(raw_first):
+                            has_inline_leading_attrs = True
+                break
+
+    start_byte = first_decor.start_byte if first_decor is not None else node.start_byte
+    start_line = (first_decor.start_point[0] if first_decor is not None else node.start_point[0]) + 1
+
+    if first_decor is None and not has_inline_leading_attrs:
+        return start_line, _signature_of(node, source)
+
+    body = node.child_by_field_name("body")
+    if body is not None and body.start_byte > start_byte:
+        hdr_end = min(body.start_byte, start_byte + _MAX_SIGNATURE_SCAN_BYTES)
+    else:
+        node_first_nl = source.find(b"\n", node.start_byte, min(node.end_byte, node.start_byte + _MAX_SIGNATURE_SCAN_BYTES))
+        hdr_end = node_first_nl if node_first_nl != -1 else min(node.end_byte, start_byte + _MAX_SIGNATURE_SCAN_BYTES)
+
+    raw_hdr = source[start_byte:hdr_end].decode("utf-8", errors="replace")
+    parts: List[str] = []
+    for ln in raw_hdr.split("\n"):
+        s = ln.strip()
+        if not s or s.startswith("//") or s.startswith("# "):
+            continue
+        parts.append(s)
+    joined = " ".join(parts).rstrip("{").strip()
+    if not joined:
+        return start_line, _signature_of(node, source)
+    return start_line, joined[:240]
 
 
 _MAX_SIGNATURE_SCAN_BYTES = 4096
@@ -435,15 +601,15 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
                 # costs linear memory, not quadratic.
                 prefix = [n for n, _ in enclosing[-MAX_NEST_DEPTH:]]
                 qualified = ".".join(prefix + [name])[-_MAX_QUALIFIED_CHARS:]
-                signature = _signature_of(node, source)
-                sid = _symbol_id(language, rel_path, qualified, node.start_point[0] + 1, signature)
+                span_start_line, signature = _span_and_signature(node, source)
+                sid = _symbol_id(language, rel_path, qualified, span_start_line, signature)
                 symbols.append({
                     "symbol_id": sid,
                     "name": name,
                     "qualified_name": qualified,
                     "language": language,
                     "file_path": rel_path,
-                    "start_line": node.start_point[0] + 1,
+                    "start_line": span_start_line,
                     "end_line": node.end_point[0] + 1,
                     "kind": kind,
                     "signature": signature,
@@ -571,6 +737,7 @@ CREATE TABLE IF NOT EXISTS call_edges (
     caller_id TEXT NOT NULL, callee_id TEXT, callee_name TEXT NOT NULL,
     file_path TEXT NOT NULL, line INTEGER NOT NULL,
     edge_kind TEXT NOT NULL CHECK (edge_kind IN ('direct','indirect','virtual','macro','unresolved')),
+    qualifier TEXT,
     FOREIGN KEY (caller_id) REFERENCES symbols(symbol_id),
     FOREIGN KEY (callee_id) REFERENCES symbols(symbol_id)
 );
@@ -595,9 +762,13 @@ CREATE INDEX IF NOT EXISTS idx_boundaries_file ON function_boundaries(file_path,
 """
 
 
+def _extractor_id() -> str:
+    return f"{SCHEMA_VERSION}|v{_EXTRACTOR_SCHEMA_VERSION}|{EXTRACTOR_NAME}@{_ts_version()}"
+
+
 def _unit_cache_key(language: str, content_sha: str) -> str:
     return hashlib.sha256(
-        f"{SCHEMA_VERSION}|{EXTRACTOR_NAME}@{_ts_version()}|{language}|{content_sha}".encode()
+        f"{_extractor_id()}|{language}|{content_sha}".encode()
     ).hexdigest()
 
 
@@ -735,7 +906,7 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
     # extractor, as in the unit cache key: the same commit indexed by an
     # older build is a different catalog.
     real_root = os.path.realpath(code_root)
-    extractor = f"{SCHEMA_VERSION}|{EXTRACTOR_NAME}@{_ts_version()}"
+    extractor = _extractor_id()
     existing = _read_manifest(state)
     if (
         existing is not None
@@ -752,9 +923,18 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
     (state / "tmp").mkdir(exist_ok=True)
 
     vetted = sorted(get_vetted_staging_files(code_root), key=lambda t: t[1])
-    sources = [(abs_p, rel) for abs_p, rel in vetted if _language_for(rel)]
-    truncated = len(sources) > MAX_UNITS
-    sources = sources[:MAX_UNITS]
+    unsupported_source_files = sum(
+        1
+        for _, rel in vetted
+        if not _language_for(rel) and Path(rel).suffix.lower() in _UNSUPPORTED_CODE_EXTS
+    )
+    sources = sorted(
+        [(abs_p, rel) for abs_p, rel in vetted if _language_for(rel)],
+        key=lambda t: (_source_file_tier(t[1]), t[1]),
+    )
+    max_files = _resolve_index_file_cap()
+    truncated = len(sources) > max_files
+    sources = sources[:max_files]
 
     parsers: Dict[str, Any] = {}
     units: List[Dict[str, Any]] = []
@@ -884,10 +1064,15 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
 
     _write_catalog(state, units, coverage_rows, snapshot_id)
 
+    with _FAILED_PARSERS_LOCK:
+        failed_grammars = dict(_FAILED_PARSERS)
+
     manifest = {
         "schema_version": SCHEMA_VERSION,
+        "extractor_schema_version": _EXTRACTOR_SCHEMA_VERSION,
         "snapshot_id": snapshot_id,
         "code_root": real_root,
+        "root_dir": real_root,
         "extractor": extractor,
         "root_fingerprint": fingerprint.hexdigest(),
         "status": status,
@@ -904,12 +1089,15 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
             "total_files": len(sources),
             "indexed_files": indexed,
             "failed_files": failed,
+            "unsupported_source_files": unsupported_source_files,
         },
+        "failed_grammars": failed_grammars,
         "truncated": truncated,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "build_duration_ms": int((time.time() - t0) * 1000),
     }
     _commit_manifest(state, manifest)
+    _mirror_target_scoped_state(state, real_root, manifest)
     return manifest
 
 
@@ -1053,10 +1241,11 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
             for edge in unit["edges"]:
                 callee_id = _resolve_callee_id(edge, syms_by_name, sym_by_id, lookup)
                 conn.execute(
-                    "INSERT INTO call_edges (caller_id, callee_id, callee_name, file_path, line, edge_kind)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO call_edges (caller_id, callee_id, callee_name, file_path, line, edge_kind, qualifier)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (edge["caller_id"], callee_id, edge["callee_name"], edge["file_path"],
-                     edge["line"], "direct" if callee_id else "unresolved"),
+                     edge["line"], "direct" if callee_id else "unresolved",
+                     edge.get("qualifier") or None),
                 )
 
         for file_path, indexed, cache_key, row_status in coverage_rows:
@@ -1131,24 +1320,52 @@ class StructuralIndex:
         finally:
             conn.close()
 
-    def resolve_symbol(self, name: str, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+    def resolve_symbol(
+        self,
+        name: str,
+        limit: int = 20,
+        offset: int = 0,
+        filepath: str = "",
+    ) -> Dict[str, Any]:
         if not self.available():
             return {"results": [], "total": 0, "ambiguous": False,
                     "coverage": {"partition_status": self.partition_status()}}
+        clean_fp = str(filepath or "").strip().replace("\\", "/").removeprefix("./").lstrip("/")
+        where = "(name = ? OR qualified_name = ?)"
+        params: List[Any] = [name, name]
+        order_sql = "ORDER BY file_path, start_line"
+        if clean_fp:
+            suffixes: List[str] = []
+            probe = clean_fp
+            while "/" in probe:
+                probe = probe.split("/", 1)[1]
+                if probe:
+                    suffixes.append(probe)
+            escaped = clean_fp.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            fp_clauses = ["file_path = ?", "file_path LIKE ? ESCAPE '\\'"]
+            fp_params: List[Any] = [clean_fp, f"%/{escaped}"]
+            if suffixes:
+                fp_clauses.append(f"file_path IN ({','.join('?' for _ in suffixes)})")
+                fp_params.extend(suffixes)
+            where += f" AND ({' OR '.join(fp_clauses)})"
+            params.extend(fp_params)
+            order_sql = "ORDER BY CASE WHEN file_path = ? THEN 0 ELSE 1 END, file_path, start_line"
+
         conn = self._connect()
         try:
             total = conn.execute(
-                "SELECT COUNT(*) FROM symbols WHERE name = ? OR qualified_name = ?",
-                (name, name),
+                f"SELECT COUNT(*) FROM symbols WHERE {where}",
+                tuple(params),
             ).fetchone()[0]
         finally:
             conn.close()
+        row_params = tuple(params + ([clean_fp] if clean_fp else []) + [limit, offset])
         rows = self._rows(
             "SELECT symbol_id, name, qualified_name, language, file_path, start_line,"
             " end_line, kind, signature, backend, precision FROM symbols"
-            " WHERE name = ? OR qualified_name = ?"
-            " ORDER BY file_path, start_line LIMIT ? OFFSET ?",
-            (name, name, limit, offset),
+            f" WHERE {where}"
+            f" {order_sql} LIMIT ? OFFSET ?",
+            row_params,
         )
         return {
             "results": rows,
@@ -1284,14 +1501,118 @@ class StructuralIndex:
         return rows[0] if rows else {"status": "not_enumerated"}
 
 
-def state_dir_for_db(db_path: str) -> str:
-    """The catalog lives next to the campaign database, keyed by its filename.
+def _target_hash(target_root: str) -> str:
+    real_t = os.path.realpath(str(target_root))
+    return hashlib.sha256(real_t.encode("utf-8")).hexdigest()[:12]
 
-    Keying by the database name (knowledge.db -> knowledge.structural_index/)
-    keeps two campaign databases that share a directory from silently serving
-    each other's catalogs with status "complete" (each build clobbered the
-    shared <dir>/structural_index). Cost: pre-existing unkeyed state dirs are
-    orphaned and rebuilt once on first use.
-    """
+
+def _mirror_target_scoped_state(state: Path, real_root: str, manifest: Dict[str, Any]) -> None:
+    """Mirrors a published catalog under `<db>.structural_index/<target_hash>/`
+    when building into the top-level `<db>.structural_index/` directory so
+    switching between repositories on a shared DB preserves each repo's catalog."""
+    try:
+        if not state.name.endswith(f".{STATE_DIRNAME}"):
+            return
+        src_cat = state / "catalog.sqlite"
+        if not src_cat.exists():
+            return
+        sub = state / _target_hash(real_root)
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / "tmp").mkdir(exist_ok=True)
+        dst_tmp = (sub / "tmp") / f"catalog.{os.getpid()}.{uuid.uuid4().hex}.sqlite.tmp"
+        shutil.copy2(src_cat, dst_tmp)
+        os.replace(dst_tmp, sub / "catalog.sqlite")
+        _commit_manifest(sub, manifest)
+    except Exception:
+        pass
+
+
+def _manifest_matches_target(
+    manifest: Optional[Dict[str, Any]],
+    active_real: str,
+    snapshot_id: str = "",
+) -> bool:
+    """True when `manifest` was built for `active_real` (or an enclosing root)
+    and does not contradict an explicit pinned `snapshot_id`."""
+    if not isinstance(manifest, dict):
+        return False
+    if manifest.get("status") not in ("complete", "partial"):
+        return False
+    m_root = str(manifest.get("code_root") or manifest.get("root_dir") or "").strip()
+    if m_root:
+        try:
+            m_real = os.path.realpath(m_root)
+            if os.path.commonpath([m_real, active_real]) != m_real:
+                return False
+        except ValueError:
+            return False
+    m_snap = str(manifest.get("snapshot_id") or "").strip()
+    c_snap = str(snapshot_id or "").strip()
+    if c_snap and c_snap != "unknown" and m_snap and m_snap != "unknown" and c_snap != m_snap:
+        return False
+    return True
+
+
+def state_dir_for_db(db_path: str, target_root: Optional[str] = None) -> str:
+    """The catalog lives next to the campaign database, keyed by its filename,
+    and optionally scoped under `<db>.structural_index/<target_hash>` when
+    `target_root` is provided."""
     db = Path(db_path).resolve()
-    return str(db.parent / f"{db.stem}.{STATE_DIRNAME}")
+    base = db.parent / f"{db.stem}.{STATE_DIRNAME}"
+    if target_root and str(target_root).strip():
+        return str(base / _target_hash(str(target_root)))
+    return str(base)
+
+
+def resolve_state_dir_for_target(
+    db_path: str,
+    target_root: str = "",
+    snapshot_id: str = "",
+) -> Optional[str]:
+    """Resolves a target-verified structural index directory for `(db_path, target_root)`,
+    returning `None` if no published catalog matches `target_root`."""
+    base = Path(state_dir_for_db(db_path))
+    raw_target = str(target_root or "").strip()
+    if not raw_target:
+        return str(base) if (base / "catalog.sqlite").exists() else None
+    active_real = os.path.realpath(raw_target)
+    if os.path.isfile(active_real):
+        active_real = os.path.dirname(active_real)
+
+    # 1. Exact target-scoped directory `<db>.structural_index/<target_hash>`
+    exact_sub = Path(state_dir_for_db(db_path, active_real))
+    if (exact_sub / "catalog.sqlite").exists() and _manifest_matches_target(
+        _read_manifest(exact_sub), active_real, snapshot_id=snapshot_id
+    ):
+        return str(exact_sub)
+
+    # 2. Top-level `<db>.structural_index` (legacy / 1-arg callers), strictly verified!
+    top_manifest = _read_manifest(base)
+    if (base / "catalog.sqlite").exists() and _manifest_matches_target(
+        top_manifest, active_real, snapshot_id=snapshot_id
+    ):
+        return str(base)
+
+    # 3. Enclosing repo-root directory under `<db>.structural_index/<parent_hash>`
+    #    (e.g. slice scan where `active_real` is a subdirectory of the indexed repo).
+    if base.is_dir():
+        best_dir: Optional[str] = None
+        best_len = -1
+        try:
+            for child in sorted(base.iterdir()):
+                if not child.is_dir() or child.name in ("units", "tmp", "shards", "native"):
+                    continue
+                if not (child / "catalog.sqlite").exists():
+                    continue
+                m = _read_manifest(child)
+                if _manifest_matches_target(m, active_real, snapshot_id=snapshot_id):
+                    m_root = str((m or {}).get("code_root") or "")
+                    if len(m_root) > best_len:
+                        best_len = len(m_root)
+                        best_dir = str(child)
+        except OSError:
+            pass
+        if best_dir is not None:
+            return best_dir
+
+    return None

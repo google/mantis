@@ -29,7 +29,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.context import current_run_context
 from core.llm_gateway import wrap_untrusted_content
-from core.structural_index import StructuralIndex, state_dir_for_db
+from core.structural_index import (
+    StructuralIndex,
+    resolve_state_dir_for_target,
+    state_dir_for_db,
+)
 from core.truncation import split_truncation
 
 logger = logging.getLogger(__name__)
@@ -61,23 +65,76 @@ def _degraded_note(status: str) -> str:
     )
 
 
-def _load_index() -> Tuple[Optional[StructuralIndex], Optional[str]]:
-    """The catalog for the active run, or (None, reason). Never raises."""
-    ctx = current_run_context.get()
+def _unavailable_message(ctx: Any) -> str:
+    """Context-aware fallback guidance when the structural index is unavailable."""
+    if ctx is not None:
+        tf = str(getattr(ctx, "target_file", "") or "").strip()
+        if tf and os.path.isfile(tf):
+            root = str(getattr(ctx, "path_root", "") or getattr(ctx, "jail_dir", "") or "").strip()
+            rel_target = os.path.basename(tf)
+            if root and os.path.isdir(root):
+                try:
+                    cand = os.path.relpath(os.path.realpath(tf), os.path.realpath(root)).replace(os.sep, "/")
+                    if not cand.startswith(".."):
+                        rel_target = cand
+                except ValueError:
+                    pass
+            return (
+                f"Structural index unavailable; in single-file mode only '{rel_target}' "
+                f"is readable directly — use read_file('{rel_target}') to inspect it."
+            )
+    return _UNAVAILABLE
+
+
+def _active_target_root(ctx: Any) -> str:
+    if ctx is None:
+        return ""
+    path_root = str(getattr(ctx, "path_root", "") or "").strip()
+    if path_root and os.path.exists(path_root):
+        return os.path.realpath(path_root)
+    jail_dir = str(getattr(ctx, "jail_dir", "") or "").strip()
+    if jail_dir and os.path.exists(jail_dir):
+        real_j = os.path.realpath(jail_dir)
+        return os.path.dirname(real_j) if os.path.isfile(real_j) else real_j
+    tf = str(getattr(ctx, "target_file", "") or "").strip()
+    if tf and os.path.exists(tf):
+        real_tf = os.path.realpath(tf)
+        return os.path.dirname(real_tf) if os.path.isfile(real_tf) else real_tf
+    return ""
+
+
+def _open_index(ctx: Optional[Any] = None) -> Tuple[Optional[StructuralIndex], Optional[str]]:
+    """Target-verified catalog for `ctx` (or active run context), or `(None, reason)`."""
+    if ctx is None:
+        ctx = current_run_context.get()
     if ctx is None:
         return None, "Error: No active execution context."
     if not getattr(ctx, "db_path", None):
-        return None, _UNAVAILABLE
+        return None, _unavailable_message(ctx)
     try:
         from core.paths import resolve_db_path
-        state_dir = state_dir_for_db(resolve_db_path(ctx.db_path))
+
+        resolved_db = resolve_db_path(ctx.db_path)
+        active_root = _active_target_root(ctx)
+        snap = str(getattr(ctx, "snapshot_id", "") or "")
+        if active_root:
+            state_dir = resolve_state_dir_for_target(resolved_db, active_root, snapshot_id=snap)
+        else:
+            state_dir = state_dir_for_db(resolved_db)
+        if not state_dir:
+            return None, _unavailable_message(ctx)
         idx = StructuralIndex(state_dir)
         if not idx.available():
-            return None, _UNAVAILABLE
+            return None, _unavailable_message(ctx)
         return idx, None
     except Exception:
         logger.warning("structural index load failed", exc_info=True)
-        return None, _UNAVAILABLE
+        return None, _unavailable_message(ctx)
+
+
+def _load_index() -> Tuple[Optional[StructuralIndex], Optional[str]]:
+    """The catalog for the active run, or (None, reason). Never raises."""
+    return _open_index()
 
 
 def _clean_path(filepath: str) -> str:
@@ -90,10 +147,17 @@ def _suffix_match(a: str, b: str) -> bool:
 
 
 def _footer(idx: StructuralIndex) -> str:
+    notes: List[str] = []
     status = idx.partition_status()
     if status != "complete":
-        return _degraded_note(status) + "\n" + _HINT
-    return _HINT
+        notes.append(_degraded_note(status))
+    unsupported = int(((idx.manifest or {}).get("coverage") or {}).get("unsupported_source_files") or 0)
+    if unsupported > 0:
+        notes.append(
+            f"NOTE: {unsupported} source file(s) in unsupported languages were not AST-indexed."
+        )
+    notes.append(_HINT)
+    return "\n".join(notes)
 
 
 def _symbol_line(row: Dict[str, Any]) -> str:
@@ -116,9 +180,9 @@ def _resolve_unique(
     than silently picking one: a caller graph for the wrong overload reads
     as evidence.
     """
-    resolved = idx.resolve_symbol(symbol)
-    rows = resolved["results"]
     want = _clean_path(filepath)
+    resolved = idx.resolve_symbol(symbol, limit=50 if want else _PAGE_SIZE, filepath=want)
+    rows = resolved["results"]
     if want:
         exact = [r for r in rows if r.get("file_path") == want]
         rows = exact or [
@@ -141,16 +205,21 @@ def _resolve_unique(
     return rows[0], None
 
 
-def find_symbol(name: str, offset: int = 0) -> str:
+def find_symbol(name: str, offset: int = 0, filepath: str = "") -> str:
     """Looks up where a function, method, or class is defined, by name or qualified name."""
     if not isinstance(name, str) or not name.strip():
         return "Error: symbol name must be a non-empty string."
+    if filepath is None:
+        filepath = ""
+    if not isinstance(filepath, str):
+        return "Error: filepath must be a string."
     try:
         idx, err = _load_index()
         if idx is None:
             return err
         offset = max(0, int(offset or 0))
-        res = idx.resolve_symbol(name, limit=_PAGE_SIZE, offset=offset)
+        want = _clean_path(filepath)
+        res = idx.resolve_symbol(name, limit=_PAGE_SIZE, offset=offset, filepath=want)
         if not res["results"]:
             return f"No definition of '{name}' in the structural index.\n" + _footer(idx)
         listing = "\n".join(_symbol_line(r) for r in res["results"])
@@ -334,8 +403,18 @@ async def get_function_boundary(filepath: str, line: int) -> str:
                 return f"Error: sandbox read failed for '{res['file_path']}': {type(e).__name__}: {e}"
             return f"Error reading file '{res['file_path']}': {e}"
         text = content_bytes.decode("utf-8", errors="replace")
-        selected = text.splitlines()[res["start_line"] - 1 : res["end_line"]]
-        snippet = "\n".join(selected)
+        if text:
+            raw_lines = text.split("\n")
+            if text.endswith("\n"):
+                raw_lines.pop()
+            all_lines = [ln[:-1] if ln.endswith("\r") else ln for ln in raw_lines]
+        else:
+            all_lines = []
+        start_ln = int(res["start_line"])
+        selected = all_lines[start_ln - 1 : int(res["end_line"])]
+        snippet = "\n".join(
+            f"{ln_no}: {ln}" for ln_no, ln in enumerate(selected, start=start_ln)
+        )
         snippet, cut_note = split_truncation(
             snippet, MAX_SNIPPET_BYTES,
             what=f"function body {res['file_path']}:{res['start_line']}-{res['end_line']}",

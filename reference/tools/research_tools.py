@@ -303,12 +303,15 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
 
     try:
         content_bytes = await sandbox.read_file(Path(clean_path))
-        text = content_bytes.decode("utf-8", errors="replace")
+        if content_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = content_bytes.decode("utf-16", errors="replace")
+        else:
+            text = content_bytes.decode("utf-8", errors="replace")
         full_len = len(text)
+        lines = _split_source_newlines(text)
+        total = len(lines)
         header = ""
         if start_line > 0 or end_line > 0:
-            lines = text.splitlines(keepends=True)
-            total = len(lines)
             lo = start_line if start_line > 0 else 1
             hi = end_line if end_line > 0 else total
             if lo > total:
@@ -316,14 +319,32 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
             if hi < lo:
                 return f"Error: end_line {hi} is before start_line {lo}."
             hi = min(hi, total)
-            text = "".join(lines[lo - 1:hi])
+            selected = lines[lo - 1 : hi]
             # The range header is harness bookkeeping, not file content, so it
             # stays outside the untrusted-content wrapper below.
             header = f"[{clean_path}: lines {lo}-{hi} of {total}]\n"
+        else:
+            lo = 1
+            hi = total
+            selected = lines
+
+        if selected:
+            numbered_parts = [
+                f"{ln_no}: {ln}\n"
+                for ln_no, ln in enumerate(selected[:-1], start=lo)
+            ]
+            last_nl = "\n" if (hi < total or text.endswith("\n")) else ""
+            numbered_parts.append(f"{lo + len(selected) - 1}: {selected[-1]}{last_nl}")
+            numbered_text = "".join(numbered_parts)
+        else:
+            numbered_text = ""
+
         # Cut inside the fence, announce outside it: the marker is harness
         # bookkeeping like the range header, not bytes from the file.
-        text, cut_note = split_truncation(text, MAX_READ_SIZE, what=f"file '{clean_path}'")
-        result = header + wrap_untrusted_content(text, filename=clean_path) + cut_note
+        numbered_text, cut_note = split_truncation(
+            numbered_text, MAX_READ_SIZE, what=f"file '{clean_path}'"
+        )
+        result = header + wrap_untrusted_content(numbered_text, filename=clean_path) + cut_note
         if not header and full_len > LARGE_READ_NOTE_BYTES:
             result += (
                 f"\n[NOTE: this file is {full_len} characters. For focused "
@@ -370,6 +391,98 @@ MAX_CITATION_PROBLEMS = 5
 MAX_CITATION_CHECK_BYTES = 8 * 1024 * 1024
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_LINE_ONLY_LOC_RE = re.compile(r"^[Ll]?(\d+)(?:\s*-\s*[Ll]?(\d+))?(?::\d+(?:\s*-\s*\d+)?)?$")
+_LINE_AND_SYM_LOC_RE = re.compile(r"^[Ll]?(\d+)(?:\s*-\s*[Ll]?(\d+))?(?::\d+)?\s*:\s*(.+)$")
+
+
+def _split_source_newlines(text: str) -> "list[str]":
+    """Splits `text` strictly on `\\n` (stripping a single trailing `\\r` per line)
+    so line numbers match tree-sitter's `\\n` row numbering 1-for-1 even when
+    form feeds (`\\x0c`) or Unicode line separators (`\\u2028`) appear in source."""
+    if not text:
+        return []
+    raw_lines = text.split("\n")
+    if text.endswith("\n"):
+        raw_lines.pop()
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in raw_lines]
+
+
+def _parse_code_path_entry(
+    entry: str,
+    jail_root: str = "",
+    base_rel: str = "",
+    single_target: str = "",
+    workdir: str = "/workspace",
+) -> "Optional[tuple[str, list[int], str, bool]]":
+    """Parses a `code_paths` entry (`path:line`, `path:L42`, `path:42-50`,
+    `path:42:col`, `path:Class::method`, `path:L42:Module.func`) into
+    `(path_part, cited_lines, symbol_locator, invalid_line_range)`, or `None`
+    when `entry` is prose / URL / non-checkable."""
+    clean = str(entry or "").strip()
+    if ":" not in clean or "://" in clean or " " in clean:
+        return None
+
+    single_colon_positions = [
+        i
+        for i, ch in enumerate(clean)
+        if ch == ":"
+        and not (i > 0 and clean[i - 1] == ":")
+        and not (i + 1 < len(clean) and clean[i + 1] == ":")
+    ]
+    if not single_colon_positions:
+        return None
+
+    chosen_path = ""
+    locator = ""
+    if jail_root and len(single_colon_positions) > 1:
+        for pos in reversed(single_colon_positions):
+            cand_p = clean[:pos].strip()
+            cand_loc = clean[pos + 1 :].strip()
+            if not cand_p or not cand_loc or _protected_citation(cand_p):
+                continue
+            host, _, amb = _resolve_citation_checked(
+                jail_root, cand_p, base_rel=base_rel, single_target=single_target, workdir=workdir
+            )
+            if host is not None or amb:
+                chosen_path, locator = cand_p, cand_loc
+                break
+
+    if not chosen_path:
+        pos0 = single_colon_positions[0]
+        chosen_path = clean[:pos0].strip()
+        locator = clean[pos0 + 1 :].strip()
+
+    if not locator or ("/" not in chosen_path and "." not in chosen_path):
+        return None
+
+    m_line = _LINE_ONLY_LOC_RE.match(locator)
+    if m_line:
+        ln1 = int(m_line.group(1))
+        if m_line.group(2) is not None:
+            ln2 = int(m_line.group(2))
+            return chosen_path, [ln1, ln2], "", (ln2 < ln1)
+        return chosen_path, [ln1], "", False
+
+    m_both = _LINE_AND_SYM_LOC_RE.match(locator)
+    if m_both:
+        ln1 = int(m_both.group(1))
+        sym = m_both.group(3).strip()
+        if m_both.group(2) is not None:
+            ln2 = int(m_both.group(2))
+            return chosen_path, [ln1, ln2], sym, (ln2 < ln1)
+        return chosen_path, [ln1], sym, False
+
+    return chosen_path, [], locator, False
+
+
+def _terminal_symbol_ident(symbol_token: str) -> str:
+    """Extracts the terminal identifier from `Class::method`, `Module.func`,
+    `Type#method`, `ptr->fn(...)`, or `Widget::~Widget`."""
+    core = str(symbol_token or "").split("(", 1)[0].split("<", 1)[0].strip()
+    if not core:
+        return ""
+    parts = [p.strip().lstrip("~") for p in re.split(r"::|->|[.#]", core) if p.strip()]
+    return parts[-1] if parts else ""
 
 
 def _jail_file(jail_root: str, rel_path: str) -> Optional[str]:
@@ -846,7 +959,7 @@ def _check_finding_citations(
                     f["filepath"] = repaired
             text = _citation_text(host)
             if text is not None:
-                total = len(text.splitlines())
+                total = len(_split_source_newlines(text))
                 bad = [
                     n for n in (f_dict.get("line_numbers") or [])
                     if isinstance(n, int) and not (1 <= n <= total)
@@ -861,20 +974,17 @@ def _check_finding_citations(
     cps_changed = False
     for cp_idx, cp in enumerate(raw_cps):
         entry = str(cp).strip()
-        if ":" not in entry or "://" in entry or " " in entry:
+        parsed_cp = _parse_code_path_entry(
+            entry,
+            jail_root=jail_root,
+            base_rel=base_rel,
+            single_target=single_target,
+            workdir=workdir,
+        )
+        if parsed_cp is None:
             continue  # prose or a URL, not a checkable path:line / path:symbol
-        path_part, token = entry.rsplit(":", 1)
-        path_part, token = path_part.strip(), token.strip()
-        line_token = ""
-        if ":" in path_part:
-            # Third circulating shape, 'path:42:symbol' (see correlator's
-            # _symbols_from_code_paths): peel the line off so the path
-            # resolves and BOTH the line and the symbol get verified.
-            maybe_path, maybe_line = path_part.rsplit(":", 1)
-            if maybe_line.strip().isdigit():
-                path_part, line_token = maybe_path.strip(), maybe_line.strip()
-        if not token or ("/" not in path_part and "." not in path_part):
-            continue
+        path_part, cited_lines, sym_token, bad_range = parsed_cp
+        locator_tail = entry[len(path_part) + 1 :] if entry.startswith(path_part + ":") else ""
         if _protected_citation(path_part):
             continue
         host, cp_repaired, cp_ambiguous = _resolve_citation_checked(
@@ -898,28 +1008,29 @@ def _check_finding_citations(
             continue
         if not _citation_readable(jail_root, host, single_target):
             continue
-        if cp_repaired and cp_repaired != path_part:
-            repaired_cps[cp_idx] = (
-                f"{cp_repaired}:{line_token}:{token}" if line_token else f"{cp_repaired}:{token}"
-            )
+        if cp_repaired and cp_repaired != path_part and locator_tail:
+            repaired_cps[cp_idx] = f"{cp_repaired}:{locator_tail}"
             cps_changed = True
         text = _citation_text(host)
         if text is None:
             continue
-        total = len(text.splitlines())
-        for cited_line in (int(t) for t in (token, line_token) if t.isdigit()):
-            if not (1 <= cited_line <= total):
-                problems.append(
-                    f"Finding '{title}': code_paths entry '{entry}' is past the end of the file ({total} lines)"
-                )
-                break
-        if not token.isdigit():
-            # 'path:Class.method' and 'path:func(...)' cite their last
-            # identifier; anything less identifier-like stays unchecked.
-            last = token.split(".")[-1].split("(")[0].strip()
+        total = len(_split_source_newlines(text))
+        if bad_range:
+            problems.append(
+                f"Finding '{title}': code_paths entry '{entry}' has an inverted line range"
+            )
+        else:
+            for cited_line in cited_lines:
+                if not (1 <= cited_line <= total):
+                    problems.append(
+                        f"Finding '{title}': code_paths entry '{entry}' is past the end of the file ({total} lines)"
+                    )
+                    break
+        if sym_token:
+            last = _terminal_symbol_ident(sym_token)
             if _IDENT_RE.fullmatch(last) and not re.search(rf"\b{re.escape(last)}\b", text):
                 problems.append(
-                    f"Finding '{title}': symbol '{token}' does not appear in '{path_part}'"
+                    f"Finding '{title}': symbol '{sym_token}' does not appear in '{path_part}'"
                 )
     if cps_changed:
         if hasattr(f, "code_paths"):
@@ -1124,7 +1235,9 @@ def report_findings(report: ReportedFindingsBatch) -> str:
             else ""
         )
 
-        # Validate and repair finding filepaths and line numbers
+        # Validate and repair finding filepaths and line numbers per item so a
+        # single malformed citation never discards sibling valid findings.
+        missing_fp_errors: "dict[int, str]" = {}
         for idx, f in enumerate(findings):
             f_dict = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
             raw_fp = (f_dict.get("filepath") or "").strip()
@@ -1149,22 +1262,17 @@ def report_findings(report: ReportedFindingsBatch) -> str:
                 extracted_lines = []
                 for cp in code_paths:
                     cp_clean = str(cp).strip()
-                    if ":" in cp_clean and "://" not in cp_clean:
-                        parts = cp_clean.rsplit(":", 1)
-                        cand_path = parts[0].strip()
-                        cand_line = parts[1].strip()
-                        if ":" in cand_path:
-                            maybe_p, maybe_line = cand_path.rsplit(":", 1)
-                            if maybe_line.strip().isdigit():
-                                cand_path = maybe_p.strip()
-                                if not cand_line.isdigit():
-                                    cand_line = maybe_line.strip()
+                    parsed_cp = _parse_code_path_entry(
+                        cp_clean, jail_root=jail_real_dir, workdir=workdir
+                    )
+                    if parsed_cp is not None:
+                        cand_path, cand_lines, _, bad_rng = parsed_cp
                         if cand_path and not cand_path.endswith(("/", "\\")):
                             if not extracted_fp:
                                 extracted_fp = cand_path
-                            if cand_line.isdigit():
-                                extracted_lines.append(int(cand_line))
-                    elif cp_clean and "://" not in cp_clean and not cp_clean.endswith(("/", "\\")):
+                            if cand_lines and not bad_rng:
+                                extracted_lines.extend(cand_lines)
+                    elif cp_clean and "://" not in cp_clean and ":" not in cp_clean and not cp_clean.endswith(("/", "\\")):
                         if not extracted_fp:
                             extracted_fp = cp_clean
 
@@ -1186,24 +1294,21 @@ def report_findings(report: ReportedFindingsBatch) -> str:
                         f["filepath"] = default_fp
                 else:
                     title = f_dict.get("title") or f"Finding #{idx + 1}"
-                    return (
-                        f"Error: Finding '{title}' has missing or invalid 'filepath' ('{raw_fp or '<empty>'}'). "
-                        f"Every finding must specify a concrete relative source file path (e.g. 'core/llm_gateway.py') "
-                        f"and line numbers where the flaw occurs (e.g. line_numbers=[149]). "
-                        f"Please specify the file path and resubmit via report_findings."
+                    missing_fp_errors[idx] = (
+                        f"Finding '{title}' has missing or invalid 'filepath' ('{raw_fp or '<empty>'}')"
                     )
 
         # Lexical single-file target check (zero sibling probing / no existence oracle):
         # a single-file campaign may only record findings against its scanned file.
-        single_problems: "list[str]" = []
         single_target_rel = ""
+        single_real = ""
+        effective_root = jail_real_dir
         if (
             jail_real_dir
             and ctx.target_file
             and os.path.isfile(ctx.target_file)
             and getattr(ctx, "active_node", "") not in _RUN_WIDE_FINDINGS_NODES
         ):
-            effective_root = jail_real_dir
             raw_path_root = getattr(ctx, "path_root", "") or ""
             if raw_path_root:
                 try:
@@ -1220,34 +1325,75 @@ def report_findings(report: ReportedFindingsBatch) -> str:
                 single_real = os.path.realpath(ctx.target_file)
                 if single_real.startswith(effective_root + os.sep):
                     single_target_rel = os.path.relpath(single_real, effective_root).replace("\\", "/")
-                    for idx, f in enumerate(findings):
-                        f_cur = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
-                        fp_cur = str(f_cur.get("filepath") or "").strip()
-                        title_cur = f_cur.get("title") or f"Finding #{idx + 1}"
-                        if not _names_single_target(fp_cur, effective_root, single_real, workdir=workdir):
-                            single_problems.append(
-                                f"Finding '{title_cur}': single-file scans may only report findings "
-                                f"on '{single_target_rel}' (got '{fp_cur}')"
-                            )
             except (OSError, ValueError):
                 single_target_rel = ""
 
-        # Deterministic citation gate, AFTER the repair pass so repaired
-        # paths are what gets verified. Fail-closed on provable falsehoods,
-        # fail-open on anything unverifiable -- see _citation_problems.
-        problems = list(dict.fromkeys(
-            single_problems
-            + _citation_problems(
-                findings,
-                ctx.jail_dir or "",
-                ctx.target_file or "",
-                getattr(ctx, "path_root", "") or "",
-                workdir=workdir,
-            )
-        ))
-        if problems:
-            shown = "; ".join(problems[:MAX_CITATION_PROBLEMS])
-            extra = len(problems) - MAX_CITATION_PROBLEMS
+        # Deterministic per-finding citation gate (partial-batch persistence):
+        # valid findings are saved immediately while provably false citations are
+        # returned with structured per-item errors so only rejected items need retry.
+        valid_findings = []
+        rejected_items: "list[dict[str, Any]]" = []
+        all_problems: "list[str]" = []
+        only_missing_fp = bool(missing_fp_errors)
+
+        for idx, f in enumerate(findings):
+            f_cur = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
+            fp_cur = str(f_cur.get("filepath") or "").strip()
+            title_cur = f_cur.get("title") or f"Finding #{idx + 1}"
+            item_problems: "list[str]" = []
+
+            if idx in missing_fp_errors:
+                item_problems.append(missing_fp_errors[idx])
+            else:
+                if single_target_rel and not _names_single_target(fp_cur, effective_root, single_real, workdir=workdir):
+                    only_missing_fp = False
+                    item_problems.append(
+                        f"Finding '{title_cur}': single-file scans may only report findings "
+                        f"on '{single_target_rel}' (got '{fp_cur}')"
+                    )
+                else:
+                    cit_probs = _citation_problems(
+                        [f],
+                        ctx.jail_dir or "",
+                        ctx.target_file or "",
+                        getattr(ctx, "path_root", "") or "",
+                        workdir=workdir,
+                    )
+                    if cit_probs:
+                        only_missing_fp = False
+                        item_problems.extend(cit_probs)
+
+            dedup_item_probs = list(dict.fromkeys(item_problems))
+            if dedup_item_probs:
+                rejected_items.append(
+                    {
+                        "index": idx,
+                        "title": title_cur,
+                        "filepath": fp_cur,
+                        "errors": dedup_item_probs,
+                    }
+                )
+                all_problems.extend(dedup_item_probs)
+            else:
+                if single_target_rel:
+                    if hasattr(f, "filepath"):
+                        f.filepath = single_target_rel
+                    elif isinstance(f, dict):
+                        f["filepath"] = single_target_rel
+                valid_findings.append(f)
+
+        all_problems = list(dict.fromkeys(all_problems))
+        if not valid_findings and all_problems:
+            if only_missing_fp and len(rejected_items) == 1:
+                bad0 = rejected_items[0]
+                return (
+                    f"Error: {bad0['errors'][0]}. "
+                    "Every finding must specify a concrete relative source file path (e.g. 'core/llm_gateway.py') "
+                    "and line numbers where the flaw occurs (e.g. line_numbers=[149]). "
+                    "Please specify the file path and resubmit via report_findings."
+                )
+            shown = "; ".join(all_problems[:MAX_CITATION_PROBLEMS])
+            extra = len(all_problems) - MAX_CITATION_PROBLEMS
             suffix = f" (+{extra} more)" if extra > 0 else ""
             return (
                 f"Error: citation verification failed and findings were NOT saved: {shown}{suffix}. "
@@ -1256,19 +1402,21 @@ def report_findings(report: ReportedFindingsBatch) -> str:
                 "report via report_findings."
             )
 
-        if single_target_rel:
-            for f in findings:
-                if hasattr(f, "filepath"):
-                    f.filepath = single_target_rel
-                elif isinstance(f, dict):
-                    f["filepath"] = single_target_rel
-
-        write_findings(ctx.db_path, ctx.target_file, findings, status="reported", run_id=ctx.run_id,
+        write_findings(ctx.db_path, ctx.target_file, valid_findings, status="reported", run_id=ctx.run_id,
                        verified_evidence=bool(getattr(ctx, "sandbox_executed", False)),
                        finding_evidence=dict(getattr(ctx, "finding_evidence", None) or {}),
                        trusted_identity=False)
         ctx.reported_in_pass = True
-        return f"SUCCESS: Saved {len(findings)} finding(s) to database.{dup_note}"
+        if rejected_items:
+            details_json = json.dumps(rejected_items, ensure_ascii=False)
+            return (
+                f"PARTIAL SUCCESS: Saved {len(valid_findings)} finding(s) to database; "
+                f"rejected {len(rejected_items)} finding(s) due to invalid citations.{dup_note} "
+                f"Rejected items: {details_json}. "
+                "Re-read the cited files with read_file or get_function_boundary and resubmit "
+                "ONLY the rejected finding(s) via report_findings (saved findings are already persisted)."
+            )
+        return f"SUCCESS: Saved {len(valid_findings)} finding(s) to database.{dup_note}"
     except Exception as e:
         from pydantic import ValidationError
 
@@ -1810,6 +1958,18 @@ async def list_files(directory: str = "") -> str:
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:
             files = await ctx.sandbox.list_files(directory)
+            if type(ctx.sandbox).__name__ in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
+                sb_target = str(getattr(ctx.sandbox, "target_path", "") or ctx.jail_dir or "")
+                if sb_target:
+                    real_sb = os.path.realpath(sb_target)
+                    if os.path.isdir(real_sb):
+                        search_sb = os.path.realpath(os.path.join(real_sb, directory)) if directory else real_sb
+                        files = _filter_gitignored_rel_files(
+                            files,
+                            Path(real_sb),
+                            Path(search_sb),
+                            path_root=str(getattr(ctx, "path_root", "") or ""),
+                        )
             files = [p for p in _without_excluded(ctx, files) if not _is_protected_rel_path(p)]
             return _bounded_listing(sorted(files), directory)
         except PermissionError as pe:
@@ -1821,6 +1981,8 @@ async def list_files(directory: str = "") -> str:
                 return f"SANDBOX-ERROR: sandbox list_files failed: {type(e).__name__}: {e}"
             return f"Error listing files in sandbox: {e}"
 
+    if ctx.jail_dir and os.path.islink(str(ctx.jail_dir).rstrip("/")):
+        return "Error: Permission denied. Refusing to list symlinked scan target."
     jail = os.path.realpath(ctx.jail_dir)
     base_dir = os.path.dirname(jail) if os.path.isfile(jail) else jail
     if directory:
@@ -1857,12 +2019,19 @@ async def list_files(directory: str = "") -> str:
             for fn in sorted(filenames):
                 if (
                     not fn.startswith(".")
+                    and not fn.endswith(".db")
                     and fn.lower() not in PROTECTED_METADATA_FILES
                     and fn.lower() not in PROTECTED_VCS_DIRS
                     and not os.path.islink(os.path.join(root, fn))
                 ):
                     rel = os.path.relpath(os.path.join(root, fn), base_dir)
                     files.append(rel)
+        files = _filter_gitignored_rel_files(
+            files,
+            Path(base_dir),
+            Path(target_dir),
+            path_root=str(getattr(ctx, "path_root", "") or ""),
+        )
         files = [p for p in _without_excluded(ctx, files) if not _is_protected_rel_path(p)]
         return _bounded_listing(sorted(files), directory)
     except Exception as e:
@@ -2660,14 +2829,24 @@ def _run_safe_git_command(
         res = subprocess.run(
             base_cmd + cmd_args,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=effective_timeout,
             env=git_env,
         )
+        stdout_raw = (
+            res.stdout
+            if isinstance(res.stdout, (bytes, bytearray))
+            else str(res.stdout or "").encode("utf-8", errors="replace")
+        )
+        stderr_raw = (
+            res.stderr
+            if isinstance(res.stderr, (bytes, bytearray))
+            else str(res.stderr or "").encode("utf-8", errors="replace")
+        )
         if res.returncode != 0:
-            err = res.stderr.strip() or "git command failed"
+            err = stderr_raw.decode("utf-8", errors="replace").strip() or "git command failed"
             return err, False
-        return res.stdout, True
+        return stdout_raw.decode("utf-8", errors="replace"), True
     except subprocess.TimeoutExpired:
         return f"Error: git command timed out after {effective_timeout:.0f}s.", False
     except (FileNotFoundError, OSError) as e:
@@ -3214,8 +3393,164 @@ def _assert_no_symlinks_under(base: Path, jail_real: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _resolve_enclosing_git_repo(
+    jail_dir: Path,
+    raw_jail: str = "",
+    path_root: str = "",
+) -> "tuple[Optional[Path], str, str]":
+    """Resolves `(git_root, rel_subdir, err)` for `jail_dir` (either `jail_dir`
+    itself or a vetted enclosing git repository root when `jail_dir` is a
+    subdirectory target). Rejects symlink escapes and validates git metadata."""
+    import tempfile as _tempfile
+    from core.paths import find_escaping_symlink_component
+
+    if raw_jail:
+        if os.path.islink(raw_jail.rstrip("/")):
+            return None, "", "Symlinked scan target is prohibited for security."
+        if find_escaping_symlink_component(raw_jail) is not None:
+            return None, "", "Scan target traverses an escaping symlink component."
+
+    repo_cand = jail_dir if jail_dir.is_dir() else jail_dir.parent
+    git_here = repo_cand / ".git"
+    if git_here.exists() or git_here.is_symlink():
+        valid, err = _validate_git_jail(repo_cand, jail_dir)
+        if not valid:
+            return None, "", err
+        return repo_cand, "", ""
+
+    repo_real = repo_cand.resolve()
+    try:
+        target_dev = os.stat(repo_real).st_dev
+    except OSError as exc:
+        return None, "", str(exc)
+
+    ceiling_real: Optional[Path] = None
+    if path_root and str(path_root).strip():
+        ceiling_real = Path(os.path.realpath(str(path_root)))
+    tmp_real = Path(os.path.realpath(_tempfile.gettempdir()))
+    target_in_tmp = repo_real == tmp_real or tmp_real in repo_real.parents
+
+    anc = repo_real.parent
+    while anc != anc.parent:
+        if target_in_tmp and anc == tmp_real:
+            break
+        if ceiling_real is not None:
+            try:
+                anc.relative_to(ceiling_real)
+            except ValueError:
+                break
+        try:
+            if os.stat(anc).st_dev != target_dev:
+                break
+        except OSError:
+            break
+        anc_git = anc / ".git"
+        if anc_git.is_symlink():
+            return None, "", "Symlinked .git is prohibited for security."
+        if anc_git.exists():
+            rel_sub = os.path.relpath(str(repo_real), str(anc)).replace(os.sep, "/")
+            if rel_sub.startswith(".."):
+                break
+            curr = anc
+            for part in Path(rel_sub).parts:
+                curr = curr / part
+                if curr.is_symlink():
+                    return None, "", f"Path component '{part}' is a symlink."
+            valid_anc, err_anc = _validate_git_jail(anc, anc)
+            if not valid_anc:
+                return None, "", err_anc
+            if rel_sub not in ("", "."):
+                tracked_sub, ok_tracked = _run_safe_git_bytes(
+                    ["ls-files", "-z", "--cached", "--", rel_sub],
+                    anc,
+                    ceiling_dir=str(anc),
+                    timeout=MAX_GIT_TIMEOUT,
+                )
+                if not ok_tracked or not tracked_sub.strip(b"\x00"):
+                    # Untracked directory sitting inside an enclosing checkout
+                    # (INV-4: never leak parent repo history into an unversioned folder).
+                    return None, "", "Not a git repository."
+            return anc, ("" if rel_sub == "." else rel_sub), ""
+        anc = anc.parent
+
+    return None, "", "Not a git repository."
+
+
+def _filter_gitignored_rel_files(
+    rel_files: "list[str]",
+    base_dir: Path,
+    search_dir: Path,
+    path_root: str = "",
+) -> "list[str]":
+    """Filters `rel_files` (relative to `base_dir`) against git's non-ignored
+    view when `base_dir` is inside a vetted git repository. Leaves `rel_files`
+    unchanged when outside git or when `search_dir` itself is gitignored."""
+    if not rel_files:
+        return rel_files
+    git_root, _, err = _resolve_enclosing_git_repo(base_dir, path_root=path_root)
+    if git_root is None or err:
+        return rel_files
+    try:
+        rel_search = os.path.relpath(str(search_dir.resolve()), str(git_root.resolve())).replace(os.sep, "/")
+    except ValueError:
+        return rel_files
+    if rel_search.startswith(".."):
+        return rel_files
+
+    ls_cmd = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    if rel_search not in ("", "."):
+        ls_cmd.extend(["--", rel_search])
+    raw_out, ok = _run_safe_git_bytes(
+        ls_cmd, git_root, ceiling_dir=str(git_root), timeout=MAX_GIT_TIMEOUT
+    )
+    if not ok:
+        return rel_files
+    if not raw_out and rel_search not in ("", ".") and not path_root:
+        _, sub_ignored = _run_safe_git_bytes(
+            ["check-ignore", "-q", "--", rel_search],
+            git_root,
+            ceiling_dir=str(git_root),
+            timeout=MAX_GIT_TIMEOUT,
+        )
+        if sub_ignored:
+            return rel_files
+
+    allowed_files: "set[str]" = set()
+    allowed_dirs: "set[str]" = set()
+    base_real = str(base_dir.resolve())
+    git_real = Path(os.path.realpath(str(git_root)))
+    for raw_entry in raw_out.split(b"\x00"):
+        if not raw_entry:
+            continue
+        try:
+            p = raw_entry.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+        abs_p = git_real / p
+        try:
+            rel_to_base = os.path.relpath(str(abs_p), base_real).replace(os.sep, "/")
+        except ValueError:
+            continue
+        if rel_to_base.startswith(".."):
+            continue
+        if rel_to_base in ("", "."):
+            return rel_files
+        if p.endswith("/") or abs_p.is_dir():
+            allowed_dirs.add(rel_to_base.rstrip("/"))
+        else:
+            allowed_files.add(rel_to_base)
+
+    out: "list[str]" = []
+    for rf in rel_files:
+        norm = rf.replace("\\", "/")
+        if norm in allowed_files or any(norm.startswith(d + "/") for d in allowed_dirs):
+            out.append(rf)
+    return out
+
+
 async def get_git_log(max_commits: int = 50, path: str = "") -> str:
     """Reads commit history and author/message metadata for the repository or a specific file."""
+    ctx = current_run_context.get()
     jail_dir, target_path = _resolve_jail_and_target()
     if jail_dir is None:
         return "Error: No active execution context."
@@ -3228,16 +3563,18 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
     except (TypeError, ValueError):
         return "Error: max_commits must be an integer."
 
-    repo_dir = jail_dir if jail_dir.is_dir() else jail_dir.parent
-
     target_p = None
     if path:
         target_p, err = _validate_safe_repo_path(path, jail_dir)
         if err:
             return err
 
-    valid, err = _validate_git_jail(repo_dir, jail_dir)
-    if not valid:
+    raw_jail = str(getattr(ctx, "jail_dir", "") or "") if ctx is not None else ""
+    path_root = str(getattr(ctx, "path_root", "") or "") if ctx is not None else ""
+    repo_dir, rel_sub, err = _resolve_enclosing_git_repo(
+        jail_dir, raw_jail=raw_jail, path_root=path_root
+    )
+    if repo_dir is None:
         return _vcs_unavailable_message(err)
 
     git_args = [
@@ -3251,8 +3588,10 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
     if path and target_p:
         rel_path = os.path.relpath(target_p, repo_dir)
         git_args += ["--", rel_path]
+    elif rel_sub not in ("", "."):
+        git_args += ["--", rel_sub]
 
-    out, ok = _run_safe_git_command(git_args, repo_dir)
+    out, ok = _run_safe_git_command(git_args, repo_dir, ceiling_dir=str(repo_dir))
     if not ok:
         if "not a git repository" in out.lower():
             return "INFO: Target repository is not a git repository or VCS metadata is unavailable."
@@ -3268,17 +3607,23 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
 _COMMIT_HASH_RE = re.compile(r"^[a-zA-Z0-9~^._-]+$")
 
 
-def _git_metadata_exclude_pathspecs() -> list[str]:
+def _git_metadata_exclude_pathspecs(rel_sub: str = "") -> list[str]:
     """Returns git pathspecs that exclude credential/metadata files at any depth."""
-    specs = ["."]
+    prefix = rel_sub.strip("/")
+    specs = [prefix if prefix else "."]
     for name in sorted(PROTECTED_METADATA_FILES):
-        specs.append(f":(exclude,icase){name}")
-        specs.append(f":(exclude,icase,glob)**/{name}")
+        if prefix:
+            specs.append(f":(exclude,icase){prefix}/{name}")
+            specs.append(f":(exclude,icase,glob){prefix}/**/{name}")
+        else:
+            specs.append(f":(exclude,icase){name}")
+            specs.append(f":(exclude,icase,glob)**/{name}")
     return specs
 
 
 async def get_git_diff(commit_hash: str = "", path: str = "") -> str:
     """Shows the diff and commit details for a specific commit, or the latest commit diff (HEAD~1..HEAD)."""
+    ctx = current_run_context.get()
     jail_dir, target_path = _resolve_jail_and_target()
     if jail_dir is None:
         return "Error: No active execution context."
@@ -3289,41 +3634,51 @@ async def get_git_diff(commit_hash: str = "", path: str = "") -> str:
     if not isinstance(commit_hash, str) or not isinstance(path, str):
         return "Error: commit_hash and path must be strings."
 
-    repo_dir = jail_dir if jail_dir.is_dir() else jail_dir.parent
+    target_p = None
+    if path:
+        target_p, err = _validate_safe_repo_path(path, jail_dir)
+        if err:
+            return err
 
+    commit_clean = ""
     if commit_hash:
         commit_clean = commit_hash.strip()
         if commit_clean.startswith("-") or not _COMMIT_HASH_RE.match(commit_clean) or len(commit_clean) > 64:
             return "Error: Invalid commit identifier."
-        git_args = ["show", "--no-show-signature", "--stat", "-p", "--no-ext-diff", "--no-textconv", "--submodule=short", commit_clean]
+
+    raw_jail = str(getattr(ctx, "jail_dir", "") or "") if ctx is not None else ""
+    path_root = str(getattr(ctx, "path_root", "") or "") if ctx is not None else ""
+    repo_dir, rel_sub, err = _resolve_enclosing_git_repo(
+        jail_dir, raw_jail=raw_jail, path_root=path_root
+    )
+    if repo_dir is None:
+        return _vcs_unavailable_message(err)
+
+    rel_flag = [f"--relative={rel_sub}"] if rel_sub not in ("", ".") else []
+    if commit_clean:
+        git_args = ["show", "--no-show-signature", "--stat", "-p", "--no-ext-diff", "--no-textconv", "--submodule=short", *rel_flag, commit_clean]
     else:
         # SECURITY TRIPWIRE (INV-4): Do NOT change "HEAD~1..HEAD" to unstaged working-tree
         # diff ("HEAD" or ""). Diffing against the working tree causes git to invoke clean filters
         # (filter.<driver>.clean via .gitattributes) on untrusted working tree files, which can
         # execute arbitrary code on the host outside the sandbox. Diffing HEAD~1..HEAD operates
         # strictly on immutable git object database blobs and bypasses working-tree clean filters.
-        git_args = ["diff", "--no-ext-diff", "--no-textconv", "--submodule=short", "HEAD~1..HEAD"]
+        git_args = ["diff", "--no-ext-diff", "--no-textconv", "--submodule=short", *rel_flag, "HEAD~1..HEAD"]
 
-    target_p = None
-    if path:
-        target_p, err = _validate_safe_repo_path(path, jail_dir)
-        if err:
-            return err
-        if target_p:
-            rel_path = os.path.relpath(target_p, repo_dir)
-            git_args += ["--", rel_path]
+    if path and target_p:
+        rel_path = os.path.relpath(target_p, repo_dir)
+        git_args += ["--", rel_path]
     else:
-        git_args += ["--", *_git_metadata_exclude_pathspecs()]
+        git_args += ["--", *_git_metadata_exclude_pathspecs(rel_sub)]
 
-    valid, err = _validate_git_jail(repo_dir, jail_dir)
-    if not valid:
-        return _vcs_unavailable_message(err)
-
-    out, ok = _run_safe_git_command(git_args, repo_dir)
+    out, ok = _run_safe_git_command(git_args, repo_dir, ceiling_dir=str(repo_dir))
     if not ok:
         if "not a git repository" in out.lower():
             return "INFO: Target repository is not a git repository or VCS metadata is unavailable."
         return f"Error querying git diff: {out}"
+
+    if commit_clean and rel_sub not in ("", ".") and "diff --git " not in out:
+        return "INFO: No diff found for the specified commit or path."
 
     if not out.strip():
         return "INFO: No diff found for the specified commit or path."
