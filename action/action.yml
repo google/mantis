@@ -51,13 +51,14 @@ inputs:
     default: "10M"
   daily-token-budget:
     description: >-
-      Tokens the Google Cloud project may be served in any 24 hours, read
-      from the platform's own meter (Cloud Monitoring) before the run
-      starts. The run's budget is cut to what is left of the day; when
-      nothing is left, nothing is launched and every file is reported
-      unscanned (REVIEW). Needs roles/monitoring.viewer on the service
-      account; a budget that cannot be checked is a setup error (exit 3).
-      0 disables the check.
+      Tokens the Google Cloud project may be served in any 24 hours on Vertex
+      AI (vertex_ai/*) routes, read from Cloud Monitoring before the run
+      starts. The run's budget is cut to what is left of the day; when nothing
+      is left, nothing is launched and every file is reported unscanned
+      (REVIEW). Needs roles/monitoring.viewer on the service account; a Vertex
+      budget that cannot be checked is a setup error (exit 3 under
+      fail-closed). Skipped automatically for non-Vertex providers (Gemini API
+      key, Anthropic, OpenAI). 0 disables the check.
     required: false
     default: "100M"
   max-input-tokens:
@@ -78,6 +79,19 @@ inputs:
     description: Seconds before one file's scan is abandoned (0 for none).
     required: false
     default: "1800"
+  max-run-minutes:
+    description: >-
+      Wall-clock deadline in minutes for the entire scan step (0 for none).
+      Defaults to 75 so the step flushes its summary, annotations, and JSON
+      report cleanly before a standard 90-minute GitHub Actions job timeout.
+    required: false
+    default: "75"
+  one-process:
+    description: >-
+      Scan all changed files in one pipeline process (per model) rather than
+      one process per file.
+    required: false
+    default: "false"
   ignore:
     description: >-
       Comma-separated fnmatch patterns of changed files to leave out of both
@@ -180,6 +194,8 @@ runs:
         MANTIS_ACTION_MAX_INPUT_TOKENS: ${{ inputs.max-input-tokens }}
         MANTIS_ACTION_MAX_FILES: ${{ inputs.max-files }}
         MANTIS_ACTION_PER_FILE_TIMEOUT: ${{ inputs.per-file-timeout }}
+        MANTIS_ACTION_MAX_RUN_MINUTES: ${{ inputs.max-run-minutes }}
+        MANTIS_ACTION_ONE_PROCESS: ${{ inputs.one-process }}
         MANTIS_ACTION_IGNORE: ${{ inputs.ignore }}
         MANTIS_ACTION_FAIL_ON: ${{ inputs.fail-on }}
         MANTIS_ACTION_FAIL_CLOSED: ${{ inputs.fail-closed }}
@@ -199,6 +215,12 @@ runs:
           --output-json "$report"
           --state-dir "$RUNNER_TEMP"
         )
+        if [ -n "${MANTIS_ACTION_MAX_RUN_MINUTES:-}" ] && [ "${MANTIS_ACTION_MAX_RUN_MINUTES:-0}" -gt 0 ] 2>/dev/null; then
+          args+=(--max-run-seconds "$((MANTIS_ACTION_MAX_RUN_MINUTES * 60))")
+        fi
+        case "${MANTIS_ACTION_ONE_PROCESS:-false}" in
+          true|True|TRUE|yes|1) args+=(--one-process) ;;
+        esac
         if [ -n "$MANTIS_ACTION_API_BASE" ]; then
           args+=(--api-base "$MANTIS_ACTION_API_BASE")
         fi

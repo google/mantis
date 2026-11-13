@@ -13,12 +13,22 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+import json
 import os
+from pathlib import Path
 import shutil
 import tempfile
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
-from core.config import ExtendedReviewVerdict, get_llm_kwargs, ResilientLiteLlm
+from core.config import (
+    DEFAULT_MODEL,
+    DeferredEnvLiteLlm,
+    ExtendedCriticVerdict,
+    ExtendedReviewVerdict,
+    ResilientLiteLlm,
+    get_llm_kwargs,
+    resolve_model_id,
+)
 from core.llm_gateway import UNTRUSTED_CODE_AUDIT_GUARD
 from core.prompts import get_stage_prompt
 
@@ -28,7 +38,7 @@ from tools import TOOLS
 
 STAGE_OUTPUT_SCHEMAS = {
     'reviewer': ExtendedReviewVerdict or ReviewVerdict,
-    'critic': CriticVerdict,
+    'critic': ExtendedCriticVerdict or CriticVerdict,
     'reproducer': ReproVerdict,
     'reporter': ExecutiveReport,
 }
@@ -115,9 +125,43 @@ STAGE_CONFIGS = {
     },
 }
 
-def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: str = None, tools_override: list = None,
-                      include_contents: str = None, before_model_callback: list = None, instruction_suffix: str = None,
-                      instruction_override: str = None):
+
+def _load_shipped_workflow_meta() -> tuple[dict, dict]:
+    """Returns `(config_dict, {node_id: node_dict})` from shipped `reference/workflow.json`."""
+    wf_path = Path(__file__).resolve().parent.parent / 'workflow.json'
+    try:
+        raw = json.loads(wf_path.read_text(encoding='utf-8'))
+        cfg = raw.get('config') if isinstance(raw.get('config'), dict) else {}
+        nodes = {
+            str(n.get('id')): n
+            for n in (raw.get('nodes') or [])
+            if isinstance(n, dict) and n.get('id')
+        }
+        return cfg, nodes
+    except Exception:
+        return {}, {}
+
+
+def _default_stage_reasoning_effort(stage_name: str) -> str:
+    cfg, nodes = _load_shipped_workflow_meta()
+    node = nodes.get(stage_name) or {}
+    return str(node.get('reasoning_effort') or cfg.get('reasoning_effort') or 'low')
+
+
+def build_stage_agent(
+    stage_name: str,
+    model_id: str = None,
+    reasoning_effort: str = None,
+    tools_override: list = None,
+    include_contents: str = None,
+    before_model_callback: list = None,
+    instruction_suffix: str = None,
+    instruction_override: str = None,
+    *,
+    include_production_callbacks: bool = True,
+    include_checklist: bool = True,
+    include_context_editing: bool = True,
+):
     """Builds one pipeline stage as a standalone ADK agent for benchmarking.
 
     ``tools_override`` replaces the stage's tool list for this build only
@@ -131,10 +175,32 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
     ``instruction_override`` replaces the stage's own instruction: a per-file
     campaign's planner must not be told to list and read the whole application.
     """
-    model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.8-flash')
-    reasoning_effort = reasoning_effort or os.environ.get('EVAL_REASONING_EFFORT', 'low')
+    import functools
 
-    _, llm_kwargs = get_llm_kwargs(model_id=model_id, reasoning_effort=reasoning_effort)
+    wf_cfg, _ = _load_shipped_workflow_meta()
+    model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.8-flash')
+    reasoning_effort = (
+        reasoning_effort
+        or os.environ.get('EVAL_REASONING_EFFORT')
+        or _default_stage_reasoning_effort(stage_name)
+    )
+
+    resolved_model = resolve_model_id(model_id, DEFAULT_MODEL)
+    llm_kwargs_resolver = functools.partial(
+        get_llm_kwargs,
+        model_id=model_id,
+        reasoning_effort=reasoning_effort,
+        config=wf_cfg or None,
+    )
+    deferred_env = False
+    llm_kwargs = {}
+    try:
+        resolved_model, llm_kwargs = llm_kwargs_resolver()
+    except ValueError as exc:
+        if 'VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT' in str(exc):
+            deferred_env = True
+        else:
+            raise
 
     cfg = STAGE_CONFIGS.get(
         stage_name,
@@ -157,7 +223,12 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
 
     output_schema = STAGE_OUTPUT_SCHEMAS.get(stage_name)
     if output_schema is not None:
-        schema_label = "ReviewVerdict" if stage_name == "reviewer" else output_schema.__name__
+        if stage_name == "reviewer":
+            schema_label = "ReviewVerdict"
+        elif stage_name == "critic":
+            schema_label = "CriticVerdict"
+        else:
+            schema_label = output_schema.__name__
         instruction = (
             f"{instruction.rstrip()}\n\n"
             f"CRITICAL TERMINATION CONTRACT: When your analysis for this stage is complete, "
@@ -180,23 +251,82 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
                 f"strength confirm them. The top-level route/reason then summarize the overall outcome "
                 f"(confirmed if ANY finding is confirmed)."
             )
+        elif stage_name == "critic" and output_schema is ExtendedCriticVerdict:
+            instruction = (
+                f"{instruction}\n\n"
+                f"PER-FINDING VERDICTS: Each finding returned by get_findings is an INDEPENDENT "
+                f"vulnerability claim and deserves its own reachability/viability judgment. When more "
+                f"than one finding is in scope, your verdict JSON MUST include a \"finding_verdicts\" "
+                f"list with one entry per finding: {{\"finding_id\": <numeric id from get_findings>, "
+                f"\"route\": \"viable\" | \"non_viable\", \"reason\": \"<one sentence for THIS finding>\"}}. "
+                f"Never let one unreachable finding dismiss its viable siblings. The top-level "
+                f"route/reason summarize the overall outcome (viable if ANY finding is viable)."
+            )
 
-    from core.graph_loader import LiteralInstruction, _make_after_tool_guard_callback
+    from core.graph_loader import (
+        GlobalConfig,
+        LiteralInstruction,
+        _context_editing_keeps,
+        _make_after_tool_guard_callback,
+        _make_campaign_directive_before_model_callback,
+        _make_client_context_editing_before_model_callback,
+        _make_node_context_ceiling_before_model_callback,
+        _make_on_tool_error_callback,
+        _make_stage_experience_before_model_callback,
+    )
 
-    after_tool_cb = _make_after_tool_guard_callback(stage_name, tool_names, model=model_id)
+    after_tool_cb = _make_after_tool_guard_callback(stage_name, tool_names, model=resolved_model)
+    on_tool_error_cb = _make_on_tool_error_callback(stage_name)
+
+    raw_max_cont = wf_cfg.get("max_node_continuations") if isinstance(wf_cfg, dict) else None
+    max_continuations = (
+        GlobalConfig().max_node_continuations if raw_max_cont is None else int(raw_max_cont)
+    )
+
+    callbacks: list = list(before_model_callback or [])
+    if include_production_callbacks:
+        prod_cbs = [
+            _make_stage_experience_before_model_callback(stage_name),
+            _make_campaign_directive_before_model_callback(stage_name) if include_checklist else None,
+            (
+                _make_client_context_editing_before_model_callback(
+                    stage_name, model=resolved_model, config=wf_cfg or {},
+                )
+                if include_context_editing
+                else None
+            ),
+            _make_node_context_ceiling_before_model_callback(
+                stage_name,
+                model=resolved_model,
+                has_schema=bool(output_schema is not None),
+                keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
+                llm_factory=(
+                    (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw)) if llm_kwargs else None
+                ),
+                max_continuations=max_continuations,
+            ),
+        ]
+        callbacks.extend(cb for cb in prod_cbs if cb is not None)
 
     extra = {}
     if include_contents is not None:
         extra['include_contents'] = include_contents
-    if before_model_callback:
-        extra['before_model_callback'] = list(before_model_callback)
+    if callbacks:
+        extra['before_model_callback'] = callbacks
+
+    model_inst = (
+        DeferredEnvLiteLlm(model=str(model_id or DEFAULT_MODEL), env_resolver=llm_kwargs_resolver)
+        if deferred_env
+        else LiteLlm(**llm_kwargs)
+    )
     return Agent(
         name=stage_name,
-        model=LiteLlm(**llm_kwargs),
+        model=model_inst,
         instruction=LiteralInstruction(instruction),
         tools=tools_list,
         output_schema=output_schema,
         after_tool_callback=after_tool_cb,
+        on_tool_error_callback=on_tool_error_cb,
         **extra,
     )
 

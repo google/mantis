@@ -174,13 +174,14 @@ jobs:
           # The pipeline runs without GitHub's runtime tokens, as it does
           # under the driver: scripts/pr_scan.py's subprocess_env is the one
           # list of what is stripped.
-          # One pass per model over the same database. `auto` mode sweeps the
-          # files THIS model has not covered, so each model works through the
-          # repository on its own schedule within its own budget.
+          # One pass per model over the same database. `uncovered` mode sweeps
+          # only the files THIS model has not covered (regardless of repository
+          # size), so each model works through the repository on its own
+          # schedule within its own budget without re-scanning small repos.
           rc=0
           for m in $MANTIS_MODELS; do
             env $(python -c 'import sys; sys.path.insert(0, "."); from scripts.pr_scan import _STRIPPED_ENV; print(" ".join("-u " + k for k in sorted(_STRIPPED_ENV)))') \
-              python main.py "$GITHUB_WORKSPACE" --scan-mode auto --yes --sandbox static-only \
+              python main.py "$GITHUB_WORKSPACE" --scan-mode uncovered --yes --sandbox static-only \
               --model "$m" --max-tokens 20M --cache-discount 1 \
               --exclude tests --db "$RUNNER_TEMP/knowledge.db" "${import_flag[@]}"
             this=$?

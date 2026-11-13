@@ -41,16 +41,19 @@ Design rules, in force everywhere in this file:
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _REF_ROOT = Path(__file__).resolve().parent.parent
 if str(_REF_ROOT) not in sys.path:
@@ -97,6 +100,7 @@ MCP_STATE_DIR_ENV = "MANTIS_MCP_STATE_DIR"
 MAX_SCAN_LLM_CALLS = 500
 MAX_SCAN_FILES = 50
 MAX_CONCURRENT_SCANS = 2
+MAX_SCAN_WALL_SECONDS = 3600.0
 
 VERDICT_PASS = "PASS"
 VERDICT_REVIEW = "REVIEW"
@@ -125,6 +129,7 @@ class MantisState:
         self.db_path = str(self.home / "knowledge.db")
         self.scans: Dict[str, Dict[str, Any]] = {}
         self._scan_events: Dict[str, threading.Event] = {}
+        self._scan_procs: Dict[str, Optional[subprocess.Popen]] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -250,10 +255,35 @@ def _resolve_symbol_rows(idx, name: str, filepath: str = "") -> List[Dict[str, A
     return rows
 
 
+def _unavailable_index_response(idx, *, for_function_at: bool = False) -> Dict[str, Any]:
+    if idx.is_legitimately_empty():
+        base: Dict[str, Any] = {
+            "available": True,
+            "empty_repo": True,
+            "hint": "Repository has no files in supported tree-sitter languages.",
+        }
+        if for_function_at:
+            base["found"] = False
+        else:
+            base["results"] = []
+        return base
+    if idx.failure_reason() == "degraded_empty":
+        hint = "Structural index degraded (0 files indexed despite supported source files). Call mantis_reindex."
+    else:
+        hint = "No structural index. Call mantis_reindex first."
+    out: Dict[str, Any] = {"available": False, "hint": hint}
+    if for_function_at:
+        out["found"] = False
+    return out
+
+
 def find_symbol(state: MantisState, name: str, offset: int = 0) -> Dict[str, Any]:
     idx = state.index()
     if not idx.available():
-        return {"available": False, "hint": "No structural index. Call mantis_reindex first."}
+        res = _unavailable_index_response(idx)
+        if res.get("empty_repo"):
+            res["total"] = 0
+        return res
     out = idx.resolve_symbol(name, limit=20, offset=offset)
     out["available"] = True
     return out
@@ -262,7 +292,10 @@ def find_symbol(state: MantisState, name: str, offset: int = 0) -> Dict[str, Any
 def find_callers(state: MantisState, symbol: str, filepath: str = "") -> Dict[str, Any]:
     idx = state.index()
     if not idx.available():
-        return {"available": False, "hint": "No structural index. Call mantis_reindex first."}
+        res = _unavailable_index_response(idx)
+        if res.get("empty_repo"):
+            res["resolved"] = False
+        return res
     rows = _resolve_symbol_rows(idx, symbol, filepath)
     if not rows:
         return {"available": True, "resolved": False,
@@ -282,7 +315,10 @@ def find_callers(state: MantisState, symbol: str, filepath: str = "") -> Dict[st
 def find_callees(state: MantisState, symbol: str, filepath: str = "") -> Dict[str, Any]:
     idx = state.index()
     if not idx.available():
-        return {"available": False, "hint": "No structural index. Call mantis_reindex first."}
+        res = _unavailable_index_response(idx)
+        if res.get("empty_repo"):
+            res["resolved"] = False
+        return res
     rows = _resolve_symbol_rows(idx, symbol, filepath)
     if not rows:
         return {"available": True, "resolved": False,
@@ -295,8 +331,7 @@ def find_callees(state: MantisState, symbol: str, filepath: str = "") -> Dict[st
 def function_at(state: MantisState, filepath: str, line: int) -> Dict[str, Any]:
     idx = state.index()
     if not idx.available():
-        return {"found": False, "available": False,
-                "hint": "No structural index. Call mantis_reindex first."}
+        return _unavailable_index_response(idx, for_function_at=True)
     out = idx.enclosing_symbol(state.rel(filepath), int(line))
     out["available"] = True
     return out
@@ -357,17 +392,41 @@ def security_guidance(state: MantisState, filepath: str, full: bool = False) -> 
 # (patch_verified, dynamic_confirmed) stay reserved for the verification
 # pipeline, and the database's monotonic guard still refuses a dismissal
 # over machine-verified evidence.
-RESOLUTION_STATUSES = ("mitigated", "false_positive")
+RESOLUTION_STATUSES = ("mitigated", "false_positive", "accepted_risk")
+_RESOLUTION_ALIASES = {
+    "mark_resolved": "mitigated",
+    "resolved": "mitigated",
+}
+_TERMINAL_CLOSED_STATUSES = frozenset({
+    "false_positive",
+    "mitigated",
+    "accepted_risk",
+    "duplicate_merged",
+    "non_viable",
+    "sample_or_test",
+    "patch_verified",
+})
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        if path.is_file():
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        pass
+    return ""
 
 
 def resolve_finding(state: MantisState, finding_id: int, resolution: str,
                     reason: str) -> Dict[str, Any]:
     """Closes one finding with an operator verdict and an audit trail."""
-    res = str(resolution or "").strip().lower()
+    raw_res = str(resolution or "").strip().lower()
+    res = _RESOLUTION_ALIASES.get(raw_res, raw_res)
     if res not in RESOLUTION_STATUSES:
         return {"error": f"resolution must be one of {list(RESOLUTION_STATUSES)}: "
-                         "'mitigated' means the defect was fixed, "
-                         "'false_positive' means the report is wrong."}
+                         "'mitigated' (or 'mark_resolved') means the defect was fixed, "
+                         "'false_positive' means the report is wrong, "
+                         "'accepted_risk' records an explicit risk acceptance."}
     if not str(reason or "").strip():
         return {"error": "A non-empty reason is required: it is the audit "
                          "trail for overriding the scanner."}
@@ -377,21 +436,98 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
         fid = int(finding_id)
     except (TypeError, ValueError):
         return {"error": f"finding_id must be an integer, got {finding_id!r}."}
-    from core.database import read_findings, update_finding_status_by_id
+    from core.database import (
+        read_finding_resolutions,
+        read_findings,
+        record_finding_resolution,
+        run_belongs_to_active_target,
+        run_target_roots,
+        update_finding_status_by_id,
+    )
 
-    def row_for(i):
-        for f in read_findings(state.db_path):
+    all_rows = read_findings(state.db_path)
+
+    def row_for(i: int, rows: Optional[List[Dict[str, Any]]] = None):
+        for f in (rows if rows is not None else read_findings(state.db_path)):
             if f.get("id") == i:
                 return f
         return None
 
-    row = row_for(fid)
+    row = row_for(fid, all_rows)
     if row is None:
         return {"error": f"No finding with id {fid}."}
     old_status = str(row.get("status") or "")
-    update_finding_status_by_id(state.db_path, fid, str(row.get("run_id") or ""), res)
-    new_status = str((row_for(fid) or {}).get("status") or "")
-    applied = new_status.lower() == res
+    old_lower = old_status.strip().lower()
+    lineage_id = str(row.get("lineage_id") or "").strip()
+    roots_map = run_target_roots(state.db_path)
+    repo_root = str(state.repo)
+
+    lineage_has_machine_proof = old_lower in ("dynamic_confirmed", "patch_verified")
+    if lineage_id and not lineage_has_machine_proof:
+        for sib in all_rows:
+            if str(sib.get("lineage_id") or "").strip() != lineage_id:
+                continue
+            if not run_belongs_to_active_target(
+                state.db_path, sib.get("run_id"), active_root=repo_root, roots_map=roots_map
+            ):
+                continue
+            if str(sib.get("status") or "").strip().lower() in ("dynamic_confirmed", "patch_verified"):
+                lineage_has_machine_proof = True
+                break
+
+    preserved_machine_proof = False
+    if res == "false_positive" and lineage_has_machine_proof:
+        applied = False
+        new_status = old_status
+    elif old_lower in _TERMINAL_CLOSED_STATUSES:
+        applied = False
+        new_status = old_status
+    elif res == "accepted_risk" and old_lower == "dynamic_confirmed":
+        existing_res = read_finding_resolutions(state.db_path, target_root=repo_root)
+        prev_res = str((existing_res.get(lineage_id) or {}).get("resolution") or "").strip().lower()
+        if not lineage_id or prev_res == "accepted_risk":
+            applied = False
+            new_status = old_status
+        else:
+            # Never overwrite machine-verified dynamic_confirmed evidence on the
+            # finding row; record the risk acceptance in finding_resolutions only.
+            applied = True
+            new_status = old_status
+            preserved_machine_proof = True
+    else:
+        update_finding_status_by_id(state.db_path, fid, str(row.get("run_id") or ""), res)
+        new_status = str((row_for(fid) or {}).get("status") or "")
+        applied = new_status.strip().lower() == res
+
+    if applied and lineage_id:
+        for sib in all_rows:
+            sib_id = sib.get("id")
+            if sib_id == fid or str(sib.get("lineage_id") or "").strip() != lineage_id:
+                continue
+            if not run_belongs_to_active_target(
+                state.db_path, sib.get("run_id"), active_root=repo_root, roots_map=roots_map
+            ):
+                continue
+            sib_status = str(sib.get("status") or "").strip().lower()
+            if sib_status in OPEN_FINDING_STATUSES and not (
+                res == "accepted_risk" and sib_status == "dynamic_confirmed"
+            ):
+                update_finding_status_by_id(
+                    state.db_path, int(sib_id), str(sib.get("run_id") or ""), res
+                )
+        rel_fp = state.rel(str(row.get("filepath") or ""))
+        file_sha = _file_sha256(state.repo / rel_fp) if rel_fp else ""
+        record_finding_resolution(
+            state.db_path,
+            lineage_id=lineage_id,
+            resolution=res,
+            reason=str(reason).strip(),
+            target_root=repo_root,
+            filepath=rel_fp or str(row.get("filepath") or ""),
+            resolved_file_sha256=file_sha,
+            finding_id=fid,
+        )
+
     with state.open_log("resolutions.log") as fh:
         fh.write(json.dumps({
             "at": time.time(),
@@ -403,11 +539,13 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
             "resolution": res,
             "reason": str(reason).strip(),
         }) + "\n")
-    out = {"finding_id": fid, "old_status": old_status,
-           "new_status": new_status, "applied": applied}
-    if not applied:
-        if (res == "false_positive"
-                and old_status.lower() in ("dynamic_confirmed", "patch_verified")):
+    out: Dict[str, Any] = {"finding_id": fid, "old_status": old_status,
+                           "new_status": new_status, "applied": applied}
+    if preserved_machine_proof:
+        out["note"] = ("Recorded accepted_risk in finding_resolutions while preserving "
+                       "machine-verified 'dynamic_confirmed' status on the finding row.")
+    elif not applied:
+        if res == "false_positive" and lineage_has_machine_proof:
             out["note"] = ("The monotonic status guard refused the transition: "
                            "a dismissal never overwrites machine-verified "
                            "evidence (dynamic_confirmed, patch_verified).")
@@ -422,6 +560,261 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
 
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_HUNK_FULL_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _unescape_git_path(raw: str, *, strip_prefix: bool = True) -> str:
+    """Normalizes a git diff header path (including C-quoted paths with octals)."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith('"'):
+        out = bytearray()
+        i = 1
+        while i < len(text):
+            ch = text[i]
+            if ch == '"':
+                break
+            if ch == "\\" and i + 1 < len(text):
+                nxt = text[i + 1]
+                if nxt in "01234567" and i + 3 < len(text) and all(c in "01234567" for c in text[i + 1:i + 4]):
+                    out.append(int(text[i + 1:i + 4], 8))
+                    i += 4
+                    continue
+                esc = {"n": ord("\n"), "t": ord("\t"), "r": ord("\r"), "\\": ord("\\"), '"': ord('"')}.get(nxt)
+                if esc is not None:
+                    out.append(esc)
+                    i += 2
+                    continue
+            out.extend(ch.encode("utf-8"))
+            i += 1
+        text = out.decode("utf-8", "replace")
+    else:
+        text = text.split("\t")[0].strip()
+    if text == "/dev/null":
+        return "/dev/null"
+    if strip_prefix and (text.startswith("a/") or text.startswith("b/")):
+        text = text[2:]
+    return text
+
+
+def parse_unified_diff_hunks(diff_text: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Parsed hunk descriptors per new-side file path. Never raises."""
+    per_file: Dict[str, List[Dict[str, Any]]] = {}
+    current = ""
+    old_line = 0
+    new_line = 0
+    old_left = 0
+    new_left = 0
+    active_hunk: Optional[Dict[str, Any]] = None
+
+    for raw in str(diff_text or "").splitlines():
+        in_hunk = old_left > 0 or new_left > 0
+        if in_hunk:
+            if raw.startswith("\\"):
+                continue
+            if raw.startswith("+"):
+                if active_hunk is not None:
+                    active_hunk["added_new"].add(new_line)
+                    active_hunk["new_to_old"][new_line] = max(1, old_line)
+                new_line += 1
+                new_left -= 1
+            elif raw.startswith("-"):
+                if active_hunk is not None:
+                    active_hunk["deleted_old"][old_line] = max(1, new_line)
+                old_line += 1
+                old_left -= 1
+            else:
+                if active_hunk is not None:
+                    active_hunk["kept_old_to_new"][old_line] = new_line
+                    active_hunk["new_to_old"][new_line] = old_line
+                old_line += 1
+                new_line += 1
+                old_left -= 1
+                new_left -= 1
+            continue
+        active_hunk = None
+        if raw.startswith("+++ "):
+            path = _unescape_git_path(raw[4:], strip_prefix=True)
+            current = "" if path in ("", "/dev/null") else path
+            if current:
+                per_file.setdefault(current, [])
+            continue
+        m = _HUNK_FULL_RE.match(raw)
+        if m:
+            o_start = int(m.group(1))
+            o_cnt = int(m.group(2)) if m.group(2) is not None else 1
+            n_start = int(m.group(3))
+            n_cnt = int(m.group(4)) if m.group(4) is not None else 1
+            old_line = o_start
+            new_line = n_start
+            old_left = o_cnt
+            new_left = n_cnt
+            if current:
+                active_hunk = {
+                    "old_start": o_start,
+                    "old_count": o_cnt,
+                    "new_start": n_start,
+                    "new_count": n_cnt,
+                    "deleted_old": {},
+                    "kept_old_to_new": {},
+                    "added_new": set(),
+                    "new_to_old": {},
+                }
+                per_file[current].append(active_hunk)
+            continue
+    for fp in per_file:
+        per_file[fp].sort(key=lambda h: (h["old_start"], h["new_start"]))
+    return per_file
+
+
+def translate_line_through_hunks(
+    old_line: int, hunks: List[Dict[str, Any]]
+) -> Tuple[int, bool]:
+    """Maps a pre-diff 1-based line number to `(new_line, directly_modified)`."""
+    ln = int(old_line)
+    if ln <= 0 or not hunks:
+        return max(1, ln), False
+    delta = 0
+    for h in hunks:
+        o_start = int(h["old_start"])
+        o_cnt = int(h["old_count"])
+        n_start = int(h["new_start"])
+        n_cnt = int(h["new_count"])
+        if o_cnt == 0:
+            # Pure insertion `@@ -k,0 +n_start,n_cnt @@` inserts AFTER old line k.
+            if ln <= o_start:
+                return max(1, ln + delta), False
+            delta += n_cnt
+            continue
+        o_end = o_start + o_cnt - 1
+        if ln < o_start:
+            return max(1, ln + delta), False
+        if o_start <= ln <= o_end:
+            kept = h.get("kept_old_to_new") or {}
+            if ln in kept:
+                return max(1, int(kept[ln])), False
+            deleted = h.get("deleted_old") or {}
+            return max(1, int(deleted.get(ln, max(1, n_start)))), True
+        delta += n_cnt - o_cnt
+    return max(1, ln + delta), False
+
+
+def _reverse_translate_line_through_hunks(
+    new_line: int, hunks: List[Dict[str, Any]]
+) -> Tuple[int, bool]:
+    """Maps a post-diff 1-based line number back to `(old_line, directly_added_or_deleted)`."""
+    ln = int(new_line)
+    if ln <= 0 or not hunks:
+        return max(1, ln), False
+    delta = 0
+    for h in hunks:
+        o_start = int(h["old_start"])
+        o_cnt = int(h["old_count"])
+        n_start = int(h["new_start"])
+        n_cnt = int(h["new_count"])
+        if n_cnt == 0:
+            anchor = max(1, n_start)
+            if ln < anchor:
+                return max(1, ln - delta), False
+            if ln == anchor:
+                return max(1, o_start), True
+            delta -= o_cnt
+            continue
+        n_end = n_start + n_cnt - 1
+        if ln < n_start:
+            return max(1, ln - delta), False
+        if n_start <= ln <= n_end:
+            n2o = h.get("new_to_old") or {}
+            added = h.get("added_new") or set()
+            if ln in n2o:
+                return max(1, int(n2o[ln])), (ln in added)
+            return max(1, o_start), True
+        delta += n_cnt - o_cnt
+    return max(1, ln - delta), False
+
+
+def parse_diff_moves(diff_text: str) -> Dict[str, Any]:
+    """Extracts `{"renamed": {old: new}, "deleted": [old, ...]}` from a unified/git diff.
+
+    Hunk bodies are counted and skipped just like `parse_unified_diff` so file
+    contents inside a hunk can never spoof `rename from` or `deleted file mode`.
+    """
+    renamed: Dict[str, str] = {}
+    deleted: List[str] = []
+    old_left = 0
+    new_left = 0
+
+    sec_rename_from = ""
+    sec_rename_to = ""
+    sec_deleted_mode = False
+    sec_minus = ""
+    sec_plus = ""
+    sec_git_old = ""
+
+    def _flush_section() -> None:
+        nonlocal sec_rename_from, sec_rename_to, sec_deleted_mode, sec_minus, sec_plus, sec_git_old
+        if sec_rename_from and sec_rename_to:
+            renamed[sec_rename_from] = sec_rename_to
+        elif (
+            (sec_plus == "/dev/null" and sec_minus and sec_minus != "/dev/null")
+            or (sec_deleted_mode and (sec_minus or sec_git_old))
+        ):
+            victim = sec_minus if (sec_minus and sec_minus != "/dev/null") else sec_git_old
+            if victim and victim not in deleted:
+                deleted.append(victim)
+        sec_rename_from = ""
+        sec_rename_to = ""
+        sec_deleted_mode = False
+        sec_minus = ""
+        sec_plus = ""
+        sec_git_old = ""
+
+    for raw in str(diff_text or "").splitlines():
+        if old_left > 0 or new_left > 0:
+            if raw.startswith("\\"):
+                continue
+            if raw.startswith("+"):
+                new_left -= 1
+            elif raw.startswith("-"):
+                old_left -= 1
+            else:
+                old_left -= 1
+                new_left -= 1
+            continue
+
+        if raw.startswith("diff --git "):
+            _flush_section()
+            rest = raw[len("diff --git "):].strip()
+            m_ab = re.match(r"^a/(.+?) b/(.+)$", rest)
+            if m_ab:
+                sec_git_old = m_ab.group(1)
+            continue
+        if raw.startswith("rename from "):
+            sec_rename_from = _unescape_git_path(raw[len("rename from "):], strip_prefix=False)
+            continue
+        if raw.startswith("rename to "):
+            sec_rename_to = _unescape_git_path(raw[len("rename to "):], strip_prefix=False)
+            continue
+        if raw.startswith("deleted file mode "):
+            sec_deleted_mode = True
+            continue
+        if raw.startswith("--- "):
+            if sec_minus and sec_plus:
+                _flush_section()
+            sec_minus = _unescape_git_path(raw[4:], strip_prefix=True)
+            continue
+        if raw.startswith("+++ "):
+            sec_plus = _unescape_git_path(raw[4:], strip_prefix=True)
+            continue
+        m = _HUNK_RE.match(raw)
+        if m:
+            old_left = int(m.group(1)) if m.group(1) is not None else 1
+            new_left = int(m.group(3)) if m.group(3) is not None else 1
+            continue
+
+    _flush_section()
+    return {"renamed": renamed, "deleted": deleted}
 
 
 def parse_unified_diff(diff_text: str) -> Dict[str, List[int]]:
@@ -529,10 +922,42 @@ def _uncovered(state: MantisState, rel_files: List[str]) -> Optional[List[str]]:
     return [rel for rel, ab in abs_map.items() if ab in unc_set and rel in unc_set]
 
 
+def _run_covered_file_shas(state: MantisState) -> Dict[Tuple[str, str], str]:
+    """Returns `{(run_id, repo_rel_path): content_sha256}` from `coverage_files`, if present."""
+    if not state.db_exists():
+        return {}
+    try:
+        from core.database import connect
+
+        conn = connect(state.db_path)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='coverage_files'"
+            ).fetchone()
+            if not row:
+                return {}
+            rows = conn.execute(
+                "SELECT run_id, path, content_hash FROM coverage_files ORDER BY id ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+    out: Dict[Tuple[str, str], str] = {}
+    for run_id, path, chash in rows:
+        if not run_id or not path or not chash:
+            continue
+        rel = state.rel(str(path))
+        if rel:
+            out[(str(run_id), rel)] = str(chash)
+    return out
+
+
 def check_change(state: MantisState, files: Optional[List[str]] = None,
                  diff: str = "", renamed: Optional[Dict[str, str]] = None,
                  deleted: Optional[List[str]] = None,
-                 include_coverage: bool = True) -> Dict[str, Any]:
+                 include_coverage: bool = True,
+                 post_diff_min_id: Optional[int] = None) -> Dict[str, Any]:
     """The deterministic gate: what Mantis knows about this change, as a verdict.
 
     BLOCK  -- an open HIGH/CRITICAL finding intersects the change.
@@ -558,9 +983,12 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
     of findings only. The default folds them in as REVIEW, as before.
     """
     raw_changed: Dict[str, List[int]] = parse_unified_diff(diff)
+    raw_hunks_by_file: Dict[str, List[Dict[str, Any]]] = parse_unified_diff_hunks(diff) if diff else {}
+    diff_moves = parse_diff_moves(diff) if diff else {"renamed": {}, "deleted": []}
     for f in files or []:
         raw_changed.setdefault(str(f or ""), [])
     changed: Dict[str, List[int]] = {}
+    hunks_by_file: Dict[str, List[Dict[str, Any]]] = {}
     rejected: List[str] = []
     for f, lines in raw_changed.items():
         r = state.rel(f)
@@ -568,13 +996,25 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
             changed.setdefault(r, []).extend(lines or [])
         elif f:
             rejected.append(f)
+    for f, f_hunks in raw_hunks_by_file.items():
+        r = state.rel(f)
+        if r:
+            hunks_by_file[r] = f_hunks
     changed = {f: sorted(set(lines)) for f, lines in changed.items()}
+
+    merged_renamed: Dict[str, str] = dict(diff_moves.get("renamed") or {})
+    merged_renamed.update(renamed or {})
     moved: Dict[str, str] = {}
-    for old, new in (renamed or {}).items():
+    for old, new in merged_renamed.items():
         o, n = state.rel(old), state.rel(new)
         if o and n:
             moved[o] = n
-    removed = [r for r in (state.rel(d) for d in (deleted or [])) if r]
+            changed.setdefault(n, [])
+
+    merged_deleted = list(
+        dict.fromkeys(list(diff_moves.get("deleted") or []) + list(deleted or []))
+    )
+    removed = [r for r in (state.rel(d) for d in merged_deleted) if r]
 
     verdict = VERDICT_PASS
     reasons: List[str] = []
@@ -608,28 +1048,57 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
 
     # Fail-closed context checks.
     idx = state.index()
-    if not idx.available():
-        gap("Structural index missing: blast radius unknown.",
-            "Run mantis_reindex, then re-run mantis_check_change.")
+    if not idx.available() and not idx.is_legitimately_empty():
+        if idx.failure_reason() == "degraded_empty":
+            gap("Structural index degraded (0 files indexed despite supported source files): blast radius unknown.",
+                "Run mantis_reindex, then re-run mantis_check_change.")
+        else:
+            gap("Structural index missing: blast radius unknown.",
+                "Run mantis_reindex, then re-run mantis_check_change.")
     if not state.db_exists():
         gap("No findings database: change set has never been audited.",
             "Run mantis_scan_change on the changed files.")
+
+    disk_shas: Dict[str, str] = {
+        rel_fp: _file_sha256(state.repo / rel_fp) for rel_fp in changed
+    }
 
     # Blast radius: changed lines -> enclosing functions -> direct callers.
     blast: List[Dict[str, Any]] = []
     radius_files = set(changed)
     if idx.available():
         for rel_fp, lines in changed.items():
+            file_hunks = hunks_by_file.get(rel_fp) or []
+            # When the catalog was built BEFORE this diff edited rel_fp on disk,
+            # its function boundaries sit at pre-diff line numbers: reverse-map
+            # new-side diff lines to query enclosing_symbol, then project the
+            # matched function's [start_line, end_line] forward onto new-side lines.
+            index_is_old = bool(
+                file_hunks and idx.file_matches_sha256(rel_fp, disk_shas.get(rel_fp, "")) is False
+            )
             for line in lines or []:
-                enc = idx.enclosing_symbol(rel_fp, line)
+                query_line = (
+                    _reverse_translate_line_through_hunks(line, file_hunks)[0]
+                    if index_is_old
+                    else line
+                )
+                enc = idx.enclosing_symbol(rel_fp, query_line)
                 if not enc.get("found"):
                     continue
+                s_ln = enc.get("start_line")
+                e_ln = enc.get("end_line")
+                if index_is_old:
+                    if isinstance(s_ln, int):
+                        s_ln = translate_line_through_hunks(s_ln, file_hunks)[0]
+                    if isinstance(e_ln, int):
+                        e_ln = translate_line_through_hunks(e_ln, file_hunks)[0]
                 entry = {
                     "file": enc.get("file_path", rel_fp),
                     "function": enc.get("qualified_name") or enc.get("signature"),
-                    "start_line": enc.get("start_line"),
-                    "end_line": enc.get("end_line"),
+                    "start_line": s_ln,
+                    "end_line": e_ln,
                     "callers": [],
+                    "caller_files": [],
                 }
                 if any(b["file"] == entry["file"] and b["function"] == entry["function"]
                        for b in blast):
@@ -646,22 +1115,73 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                         })
                         if c.get("file_path"):
                             radius_files.add(str(c["file_path"]))
+                    all_caller_paths = idx.caller_file_paths(sym)
+                    entry["caller_files"] = all_caller_paths
+                    entry["callers_total"] = int(callers.get("total") or len(entry["callers"]))
+                    entry["callers_truncated"] = bool(callers.get("truncated"))
+                    radius_files.update(all_caller_paths)
                 blast.append(entry)
 
     # Findings intersecting the change and its radius.
     hits: List[Dict[str, Any]] = []
     if state.db_exists():
-        from core.database import read_findings, run_belongs_to_active_target, run_target_roots
+        from core.database import (
+            read_finding_resolutions,
+            read_findings,
+            run_belongs_to_active_target,
+            run_target_roots,
+        )
 
         roots_map = run_target_roots(state.db_path)
         repo_root = str(state.repo)
+        resolutions = read_finding_resolutions(state.db_path, target_root=repo_root)
+        run_shas = _run_covered_file_shas(state)
+
+        # Deduplicate multiple open rows sharing a lineage_id across rescans,
+        # preferring dynamic_confirmed, blocking severity, and newest row id.
+        candidate_open: List[Dict[str, Any]] = []
+        by_lineage: Dict[str, Dict[str, Any]] = {}
         for f in read_findings(state.db_path):
             if not run_belongs_to_active_target(
                 state.db_path, f.get("run_id"), active_root=repo_root, roots_map=roots_map
             ):
                 continue
-            if str(f.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
+            f_status = str(f.get("status") or "").strip().lower()
+            if f_status not in OPEN_FINDING_STATUSES:
                 continue
+            lid = str(f.get("lineage_id") or "").strip()
+            if lid and lid in resolutions:
+                res_rec = resolutions[lid]
+                res_kind = str(res_rec.get("resolution") or "").strip().lower()
+                if res_kind == "false_positive":
+                    if f_status not in ("dynamic_confirmed", "patch_verified"):
+                        continue
+                elif res_kind == "accepted_risk":
+                    if f_status != "patch_verified":
+                        continue
+                elif res_kind == "mitigated" and f_status != "dynamic_confirmed":
+                    res_sha = str(res_rec.get("resolved_file_sha256") or "")
+                    f_rel = state.rel(str(f.get("filepath") or ""))
+                    cur_sha = disk_shas.get(f_rel) or (_file_sha256(state.repo / f_rel) if f_rel else "")
+                    if not res_sha or (cur_sha and cur_sha == res_sha):
+                        continue
+            if lid:
+                prev = by_lineage.get(lid)
+                if prev is not None:
+                    prev_dyn = str(prev.get("status") or "").strip().lower() == "dynamic_confirmed"
+                    cur_dyn = f_status == "dynamic_confirmed"
+                    prev_blk = str(prev.get("severity") or prev.get("priority") or "").upper() in BLOCKING_SEVERITIES
+                    cur_blk = str(f.get("severity") or f.get("priority") or "").upper() in BLOCKING_SEVERITIES
+                    if (cur_dyn, cur_blk, int(f.get("id") or 0)) > (prev_dyn, prev_blk, int(prev.get("id") or 0)):
+                        by_lineage[lid] = f
+                    continue
+                by_lineage[lid] = f
+            else:
+                candidate_open.append(f)
+        candidate_open.extend(by_lineage.values())
+        candidate_open.sort(key=lambda r: int(r.get("id") or 0))
+
+        for f in candidate_open:
             f_fp = str(f.get("filepath") or "")
             matched_files = [c for c in changed if _finding_matches(state, f_fp, c)]
             # A finding at a path this change renamed belongs to the new
@@ -697,6 +1217,8 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
             # side fails closed to "direct".
             direct = bool(via_rename)
             if in_file and not via_rename:
+                primary_rel = matched_files[0]
+                file_hunks = hunks_by_file.get(primary_rel) or []
                 diff_lines = sorted({
                     ln for c in matched_files for ln in (changed.get(c) or [])
                 })
@@ -706,19 +1228,39 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                 ]
                 if not diff_lines or not f_lines:
                     direct = True
-                elif any(abs(fl - cl) <= DIFF_LINE_PROXIMITY
-                         for fl in f_lines for cl in diff_lines):
-                    direct = True
                 else:
-                    for b in blast:
-                        b_file = str(b.get("file") or "")
-                        b_start = b.get("start_line")
-                        b_end = b.get("end_line")
-                        if (isinstance(b_start, int) and isinstance(b_end, int)
-                                and any(_finding_matches(state, b_file, c) for c in matched_files)
-                                and any(b_start <= fl <= b_end for fl in f_lines)):
-                            direct = True
-                            break
+                    f_id = int(f.get("id") or 0)
+                    f_run = str(f.get("run_id") or "")
+                    cur_disk_sha = disk_shas.get(primary_rel, "")
+                    is_post_diff = (
+                        (post_diff_min_id is not None and f_id >= post_diff_min_id)
+                        or bool(cur_disk_sha and run_shas.get((f_run, primary_rel)) == cur_disk_sha)
+                    )
+                    effective_lines: List[int] = []
+                    if file_hunks and not is_post_diff:
+                        for fl in f_lines:
+                            mapped_ln, was_mod = translate_line_through_hunks(fl, file_hunks)
+                            if was_mod:
+                                direct = True
+                            effective_lines.append(mapped_ln)
+                    else:
+                        effective_lines = list(f_lines)
+                    if not direct and any(
+                        abs(fl - cl) <= DIFF_LINE_PROXIMITY
+                        for fl in effective_lines
+                        for cl in diff_lines
+                    ):
+                        direct = True
+                    if not direct:
+                        for b in blast:
+                            b_file = str(b.get("file") or "")
+                            b_start = b.get("start_line")
+                            b_end = b.get("end_line")
+                            if (isinstance(b_start, int) and isinstance(b_end, int)
+                                    and any(_finding_matches(state, b_file, c) for c in matched_files)
+                                    and any(b_start <= fl <= b_end for fl in effective_lines)):
+                                direct = True
+                                break
 
             view = _finding_view(f)
             if direct:
@@ -804,8 +1346,81 @@ def _scan_cmd(state: MantisState, target: str, max_llm_calls: int, model: str) -
     return cmd
 
 
+def _mcp_repo_scan_cmd(
+    state: MantisState, rels: List[str], max_llm_calls: int, model: str
+) -> List[str]:
+    """Single repo-rooted pipeline invocation for a changed-file set.
+
+    Delegates to `_scan_cmd` so callers and tests overriding `_scan_cmd`
+    intercept the base command, while real `main.py` invocations receive
+    `--scan-mode changed`, `--changed-files=...`, and `--sandbox static-only`.
+    """
+    cmd = list(_scan_cmd(state, str(state.repo), max_llm_calls, model))
+    if len(cmd) >= 2 and str(cmd[1]).endswith("main.py"):
+        cmd += ["--scan-mode", "changed"]
+        cmd += [f"--changed-files={r}" for r in rels]
+        cmd += ["--sandbox", "static-only"]
+    return cmd
+
+
+_ACTIVE_SCAN_PROCS: set = set()
+_ACTIVE_PROCS_LOCK = threading.Lock()
+_SCAN_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
+
+
+def _terminate_proc_group(proc: subprocess.Popen, grace: float = 0.5) -> None:
+    """Terminates a `start_new_session=True` child and all its descendants."""
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.wait(timeout=max(0.05, grace))
+    except subprocess.TimeoutExpired:
+        pass
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _cleanup_all_active_scans() -> None:
+    with _ACTIVE_PROCS_LOCK:
+        procs = list(_ACTIVE_SCAN_PROCS)
+    for proc in procs:
+        if proc.poll() is None:
+            _terminate_proc_group(proc, grace=0.2)
+
+
+atexit.register(_cleanup_all_active_scans)
+
+
+def _persist_scan_record(scans_dir: Path, record: Dict[str, Any]) -> None:
+    try:
+        public = {k: v for k, v in record.items() if not k.startswith("_")}
+        tmp = scans_dir / f".{record['scan_id']}.json.tmp"
+        dst = scans_dir / f"{record['scan_id']}.json"
+        tmp.write_text(json.dumps(public, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp, dst)
+    except OSError:
+        pass
+
+
 def scan_change(state: MantisState, files: List[str],
-                max_llm_calls: int = 150, model: str = "") -> Dict[str, Any]:
+                max_llm_calls: int = 150, model: str = "",
+                timeout_seconds: float = MAX_SCAN_WALL_SECONDS) -> Dict[str, Any]:
     """Audits the changed files with the full pipeline, in the background."""
     rels: List[str] = []
     for f in files or []:
@@ -834,75 +1449,122 @@ def scan_change(state: MantisState, files: List[str],
         max_llm_calls = 0
     # 0 or less would drop the --max-llm-calls flag and with it the cap.
     max_llm_calls = min(max(max_llm_calls, 1), MAX_SCAN_LLM_CALLS)
+    try:
+        wall_cap = float(timeout_seconds)
+        if wall_cap <= 0:
+            wall_cap = MAX_SCAN_WALL_SECONDS
+    except (TypeError, ValueError):
+        wall_cap = MAX_SCAN_WALL_SECONDS
+
     with state._lock:
         running = sum(1 for s in state.scans.values() if s.get("status") == "running")
-    if running >= MAX_CONCURRENT_SCANS:
-        return {"error": f"{running} scan(s) already running (limit {MAX_CONCURRENT_SCANS}); "
-                         "poll mantis_scan_status and retry when one finishes."}
-    try:
-        state.ensure_home()
-    except PermissionError as exc:
-        return {"error": str(exc)}
-    scans_dir = state.home / "scans"
-    scans_dir.mkdir(exist_ok=True)
-    scan_id = uuid.uuid4().hex[:12]
-    log_path = scans_dir / f"{scan_id}.log"
-    done_event = threading.Event()
-    record = {
-        "scan_id": scan_id,
-        "files": rels,
-        "status": "running",
-        "started": time.time(),
-        "returncodes": [],
-        "log": str(log_path),
-    }
-    with state._lock:
+        if running >= MAX_CONCURRENT_SCANS:
+            return {"error": f"{running} scan(s) already running (limit {MAX_CONCURRENT_SCANS}); "
+                             "poll mantis_scan_status and retry when one finishes."}
+        try:
+            state.ensure_home()
+        except PermissionError as exc:
+            return {"error": str(exc)}
+        scans_dir = state.home / "scans"
+        scans_dir.mkdir(exist_ok=True)
+        scan_id = uuid.uuid4().hex[:12]
+        log_path = scans_dir / f"{scan_id}.log"
+        done_event = threading.Event()
+        record: Dict[str, Any] = {
+            "scan_id": scan_id,
+            "files": rels,
+            "status": "running",
+            "started": time.time(),
+            "returncodes": [],
+            "log": str(log_path),
+        }
         state.scans[scan_id] = record
         state._scan_events[scan_id] = done_event
+        state._scan_procs[scan_id] = None
+        _persist_scan_record(scans_dir, record)
 
     def _run() -> None:
         index_restored = False
+        timed_out = False
+        proc: Optional[subprocess.Popen] = None
         try:
             flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
             with os.fdopen(os.open(str(log_path), flags, 0o600), "ab") as log:
-                for rel_fp in rels:
-                    cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
-                    log.write(f"\n=== mantis scan {rel_fp} ===\n".encode())
-                    log.flush()
-                    try:
-                        proc = subprocess.run(cmd, stdout=log, stderr=log, cwd=str(_REF_ROOT))
-                        code = proc.returncode
-                    except Exception as exc:  # the loop must survive one bad file
-                        log.write(f"[mcp] scan failed to launch: {exc!r}\n".encode())
-                        code = -1
-                    with state._lock:
-                        record["returncodes"].append(code)
-                # The pipeline just rebuilt the shared catalog rooted at the
-                # scanned FILE, so repo-rooted paths stopped resolving and the
-                # gate's blast radius went blind (found against Juice Shop:
-                # callers vanished after the first scan). Restore the repo-rooted
-                # index before the record flips to done, so a poller that sees
-                # "done" never sees the clobbered catalog.
+                cmd = _mcp_repo_scan_cmd(state, rels, max_llm_calls, model)
+                log.write(f"\n=== mantis scan {', '.join(rels)} ===\n".encode())
+                log.flush()
                 try:
-                    result = reindex(state)
-                    index_restored = result.get("status") in ("complete", "partial")
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=log,
+                        cwd=str(_REF_ROOT),
+                        start_new_session=True,
+                    )
+                    with _ACTIVE_PROCS_LOCK:
+                        _ACTIVE_SCAN_PROCS.add(proc)
+                    cancel_now = False
+                    with state._lock:
+                        state._scan_procs[scan_id] = proc
+                        record["_pid"] = proc.pid
+                        cancel_now = bool(record.get("_cancel_requested"))
+                    if cancel_now:
+                        _terminate_proc_group(proc)
+                        code = -15
+                    else:
+                        try:
+                            code = proc.wait(timeout=wall_cap)
+                        except subprocess.TimeoutExpired:
+                            timed_out = True
+                            _terminate_proc_group(proc)
+                            log.write(
+                                f"[mcp] scan timed out after {wall_cap:.1f}s; process group terminated\n".encode()
+                            )
+                            code = -9
                 except Exception as exc:
-                    log.write(f"[mcp] reindex after scan failed: {exc!r}\n".encode())
-                    index_restored = False
+                    if proc is not None and proc.poll() is None:
+                        _terminate_proc_group(proc)
+                    log.write(f"[mcp] scan failed to launch: {exc!r}\n".encode())
+                    code = -1
+                with state._lock:
+                    record["returncodes"].append(code)
+
+                if not timed_out and not record.get("_cancel_requested"):
+                    try:
+                        idx = state.index()
+                        if (idx.available() or idx.is_legitimately_empty()) and (
+                            idx.manifest.get("code_root") == os.path.realpath(str(state.repo))
+                        ):
+                            index_restored = True
+                        else:
+                            result = reindex(state)
+                            index_restored = result.get("status") in ("complete", "partial") or (
+                                result.get("status") == "empty" and (result.get("total_files") or 0) == 0
+                            )
+                    except Exception as exc:
+                        log.write(f"[mcp] reindex after scan failed: {exc!r}\n".encode())
+                        index_restored = False
         finally:
+            if proc is not None:
+                with _ACTIVE_PROCS_LOCK:
+                    _ACTIVE_SCAN_PROCS.discard(proc)
             with state._lock:
+                state._scan_procs.pop(scan_id, None)
                 record["index_restored"] = index_restored
                 codes = record["returncodes"]
-                if codes and all(c == 0 for c in codes):
+                if record.get("_cancel_requested"):
+                    record["status"] = "cancelled"
+                elif timed_out:
+                    record["status"] = "timed_out"
+                elif codes and all(c == 0 for c in codes):
                     record["status"] = "done"
                 elif codes and all(c in (0, 2) for c in codes):
-                    # The pipeline exits 2 on a graceful budget pause (findings so
-                    # far are already in the database; the run is resumable with
-                    # --resume). It is not a failure, so do not label it as one.
                     record["status"] = "paused_at_budget"
                 else:
                     record["status"] = "finished_with_errors"
                 record["ended"] = time.time()
+                _persist_scan_record(scans_dir, record)
                 done_event.set()
 
     threading.Thread(target=_run, name=f"mantis-scan-{scan_id}", daemon=True).start()
@@ -912,11 +1574,44 @@ def scan_change(state: MantisState, files: List[str],
                     "mantis_check_change will see them."}
 
 
+def cancel_scan(state: MantisState, scan_id: str) -> Dict[str, Any]:
+    """Terminates a running background scan and its subprocess group."""
+    with state._lock:
+        rec = state.scans.get(scan_id)
+        if rec is None:
+            return {"error": f"Unknown scan_id '{scan_id}'."}
+        if rec.get("status") != "running":
+            return {"scan_id": scan_id, "status": rec.get("status"), "cancelled": False}
+        rec["_cancel_requested"] = True
+        proc = state._scan_procs.get(scan_id)
+        done_event = state._scan_events.get(scan_id)
+    if proc is not None:
+        _terminate_proc_group(proc)
+    if done_event is not None:
+        done_event.wait(timeout=5.0)
+    with state._lock:
+        snap = {k: v for k, v in (state.scans.get(scan_id) or {}).items() if not k.startswith("_")}
+    snap["cancelled"] = True
+    return snap
+
+
 def scan_status(state: MantisState, scan_id: str,
                 wait_seconds: float = 0) -> Dict[str, Any]:
     with state._lock:
-        record = dict(state.scans.get(scan_id) or {})
+        raw_rec = state.scans.get(scan_id)
+        record = {k: v for k, v in raw_rec.items() if not k.startswith("_")} if raw_rec else {}
         done_event = state._scan_events.get(scan_id)
+    if not record and _SCAN_ID_RE.match(str(scan_id or "")):
+        persisted = state.home / "scans" / f"{scan_id}.json"
+        if persisted.is_file():
+            try:
+                loaded = json.loads(persisted.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    if loaded.get("status") == "running":
+                        loaded["status"] = "interrupted"
+                    record = loaded
+            except (OSError, ValueError):
+                record = {}
     if not record:
         return {"error": f"Unknown scan_id '{scan_id}' (scans do not survive server restarts; "
                          "findings they wrote do)."}
@@ -927,7 +1622,8 @@ def scan_status(state: MantisState, scan_id: str,
     if wait_s > 0 and record.get("status") == "running" and done_event is not None:
         done_event.wait(timeout=wait_s)
         with state._lock:
-            record = dict(state.scans.get(scan_id) or {})
+            raw_rec = state.scans.get(scan_id)
+            record = {k: v for k, v in raw_rec.items() if not k.startswith("_")} if raw_rec else record
     out = dict(record)
     if state.db_exists():
         from core.database import read_findings
@@ -935,7 +1631,7 @@ def scan_status(state: MantisState, scan_id: str,
         rows = read_findings(state.db_path)
         out["findings_in_scanned_files"] = sum(
             1 for f in rows
-            if any(_finding_matches(state, str(f.get("filepath") or ""), r) for r in record["files"])
+            if any(_finding_matches(state, str(f.get("filepath") or ""), r) for r in (record.get("files") or []))
         )
     return out
 
@@ -1026,11 +1722,17 @@ def build_server(state: MantisState):
         return security_guidance(state, filepath, full=full)
 
     @srv.tool()
+    def mantis_scan_cancel(scan_id: str) -> dict:
+        """Terminates a running background scan started by mantis_scan_change."""
+        return cancel_scan(state, scan_id)
+
+    @srv.tool()
     def mantis_resolve_finding(finding_id: int, resolution: str, reason: str) -> dict:
-        """Closes a finding with an operator verdict: 'mitigated' (the defect
-        was fixed) or 'false_positive' (the report is wrong). Requires a
-        reason, which is appended to resolutions.log in the state directory as the audit
-        trail. Machine statuses (patch_verified, dynamic_confirmed) remain
+        """Closes a finding with an operator verdict: 'mitigated' / 'mark_resolved'
+        (the defect was fixed), 'false_positive' (the report is wrong), or
+        'accepted_risk' (explicit risk acceptance). Requires a reason, which is
+        persisted across rescans and appended to resolutions.log in the state
+        directory. Machine statuses (patch_verified, dynamic_confirmed) remain
         reserved for the verification pipeline, and a dismissal never
         overwrites machine-verified evidence."""
         return resolve_finding(state, finding_id, resolution, reason)
@@ -1038,8 +1740,16 @@ def build_server(state: MantisState):
     return srv
 
 
+class _GateArgumentParser(argparse.ArgumentParser):
+    """Exits 3 on CLI usage errors so exit code 2 stays reserved for VERDICT_BLOCK."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(3, f"{self.prog}: error: {message}\n")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Mantis MCP server (stdio)")
+    parser = _GateArgumentParser(description="Mantis MCP server (stdio)")
     parser.add_argument("--repo", default=os.environ.get("MANTIS_MCP_REPO", "."),
                         help="Repository root to serve (default: cwd)")
     parser.add_argument("--check", action="store_true",
@@ -1048,6 +1758,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "JSON, exit 0=PASS 1=REVIEW 2=BLOCK.")
     parser.add_argument("--files", nargs="*", default=None,
                         help="Changed files for --check when no diff is piped.")
+    parser.add_argument("--renamed", action="append", default=[],
+                        metavar="OLD=NEW",
+                        help="Renamed path pair OLD=NEW for --check (repeatable).")
+    parser.add_argument("--deleted", action="append", default=[],
+                        metavar="PATH",
+                        help="Deleted path for --check (repeatable).")
     parser.add_argument("--state-dir", default="",
                         help="Directory for this repository's knowledge database, catalog "
                              f"and logs; must be outside the repository (default: "
@@ -1062,10 +1778,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return 3
     if args.check:
-        diff = "" if sys.stdin.isatty() else sys.stdin.read()
-        out = check_change(state, files=args.files, diff=diff)
-        print(json.dumps(out, indent=2, default=str))
-        return {VERDICT_PASS: 0, VERDICT_REVIEW: 1, VERDICT_BLOCK: 2}[out["verdict"]]
+        try:
+            renamed_map: Dict[str, str] = {}
+            for item in args.renamed or []:
+                if "=" not in item:
+                    print(f"error: --renamed expects OLD=NEW, got {item!r}", file=sys.stderr)
+                    return 3
+                old_p, new_p = item.split("=", 1)
+                renamed_map[old_p] = new_p
+            diff = ""
+            if args.files is None and not sys.stdin.isatty():
+                diff = sys.stdin.read()
+            out = check_change(
+                state,
+                files=args.files,
+                diff=diff,
+                renamed=renamed_map or None,
+                deleted=args.deleted or None,
+            )
+            print(json.dumps(out, indent=2, default=str))
+            return {VERDICT_PASS: 0, VERDICT_REVIEW: 1, VERDICT_BLOCK: 2}[out["verdict"]]
+        except Exception as exc:
+            print(f"error: gate failed: {exc}", file=sys.stderr)
+            return 3
     build_server(state).run()
     return 0
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,15 +42,16 @@ case "$OS" in
 esac
 
 # --- Python Version Gate ---
-if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
-    echo "ERROR: Mantis requires Python 3.12 or newer." >&2
-    echo "       Current interpreter: $(python3 --version 2>&1 || echo 'none')" >&2
+PYTHON="${PYTHON:-python3}"
+if ! "$PYTHON" -c 'import sys; sys.exit(0 if (3, 12) <= sys.version_info < (3, 15) else 1)' 2>/dev/null; then
+    echo "ERROR: Mantis requires Python >= 3.12 and < 3.15." >&2
+    echo "       Current interpreter ($PYTHON): $("$PYTHON" --version 2>&1 || echo 'none')" >&2
     exit 1
 fi
 
 echo "Setting up virtual environment..."
-python3 -m venv .venv
-source .venv/bin/activate
+"$PYTHON" -m venv .venv
+. .venv/bin/activate
 
 echo "Installing dependencies..."
 pip install --require-hashes -r requirements.txt
@@ -59,20 +60,20 @@ pip install --require-hashes -r requirements.txt
 TAG="mantis-sandbox:latest"
 
 build_image() {
-    local tool="$1" tar
-    tar="$(mktemp -t mantis-sandbox-XXXXXX.tar)"
-    local status=0
+    _msb_tool="$1"
+    _msb_tar="$(mktemp -t mantis-sandbox-XXXXXX.tar)"
+    _msb_status=0
     {
-        "$tool" build -t "$TAG" ./sandbox &&
-        case "$tool" in
-            buildah) buildah push "$TAG" "oci-archive:$tar" ;;
-            podman)  podman save --format oci-archive -o "$tar" "$TAG" ;;
-            docker)  docker save -o "$tar" "$TAG" ;;
+        "$_msb_tool" build -t "$TAG" ./sandbox &&
+        case "$_msb_tool" in
+            buildah) buildah push "$TAG" "oci-archive:$_msb_tar" ;;
+            podman)  podman save --format oci-archive -o "$_msb_tar" "$TAG" ;;
+            docker)  docker save -o "$_msb_tar" "$TAG" ;;
         esac &&
-        .venv/bin/msb image load -i "$tar" -t "$TAG"
-    } || status=$?
-    rm -f "$tar"
-    return "$status"
+        .venv/bin/msb image load -i "$_msb_tar" -t "$TAG"
+    } || _msb_status=$?
+    rm -f "$_msb_tar"
+    return "$_msb_status"
 }
 
 if .venv/bin/msb image list 2>/dev/null | grep -q "mantis-sandbox"; then

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,21 +15,23 @@
 
 set -e
 
-if [ -z "$1" ]; then
+if [ "$#" -eq 0 ] || [ -z "$1" ]; then
     echo "Usage: ./run.sh <directory_or_file_to_scan> [extra_args...]"
     exit 1
 fi
 
+MANTIS_INVOCATION_DIR="$(pwd)"
+export MANTIS_INVOCATION_DIR
+
+FIRST_ARG="$1"
 TARGET="$1"
 # Anchor relative path to absolute without dereferencing symlinks.
 # POSIX `case` is used instead of bash's [[ ]] so anchoring still applies when the
 # script is invoked as `sh run.sh`, which would otherwise skip this branch entirely.
-if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-    case "$TARGET" in
-        /*) ;;
-        *) TARGET="$(pwd)/$TARGET" ;;
-    esac
-fi
+case "$TARGET" in
+    -*|/*) ;;
+    *) TARGET="$MANTIS_INVOCATION_DIR/$TARGET" ;;
+esac
 shift || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -40,6 +42,9 @@ if [ ! -d ".venv" ]; then
     exit 1
 fi
 
-source .venv/bin/activate
+. .venv/bin/activate
 export PYTHONUNBUFFERED=1
-python3 scripts/launch.py "$TARGET" "$@"
+case "$FIRST_ARG" in
+    -*) exec .venv/bin/python3 scripts/launch.py "$FIRST_ARG" "$@" ;;
+    *)  exec .venv/bin/python3 scripts/launch.py "$TARGET" "$@" ;;
+esac

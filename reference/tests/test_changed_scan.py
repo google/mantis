@@ -687,21 +687,22 @@ class DirectiveReachesEveryNodeTest(unittest.IsolatedAsyncioTestCase):
         from core.context import RunContext
         from core.graph_loader import CAMPAIGN_CONTEXT_MARKER, CAMPAIGN_DIRECTIVE_MARKER
 
-        ctx = RunContext(jail_dir="/tmp", db_path="", campaign_context="\n<memory>prior finding X</memory>",
-                         campaign_directive="\nCHANGE-SCOPED RUN: b.py")
-        for node in ("architect", "threat_modeler", "planner", "researcher", "researcher_2", "reviewer", "critic"):
-            req = self._run_cb(node, ctx)
-            joined = "".join(req.appended)
-            self.assertIn(CAMPAIGN_CONTEXT_MARKER, joined, node)
-            self.assertIn("prior finding X", joined, node)
-            self.assertIn(CAMPAIGN_DIRECTIVE_MARKER, joined, node)
-            self.assertLess(joined.index(CAMPAIGN_CONTEXT_MARKER), joined.index(CAMPAIGN_DIRECTIVE_MARKER),
-                            "data before instruction")
-        for node in ("history", "reproducer", "patcher", "calibrator", "reflector", "reporter"):
-            req = self._run_cb(node, ctx)
-            joined = "".join(req.appended)
-            self.assertNotIn(CAMPAIGN_CONTEXT_MARKER, joined, node)
-            self.assertIn(CAMPAIGN_DIRECTIVE_MARKER, joined, node)
+        with tempfile.TemporaryDirectory() as empty_jail:
+            ctx = RunContext(jail_dir=empty_jail, db_path="", campaign_context="\n<memory>prior finding X</memory>",
+                             campaign_directive="\nCHANGE-SCOPED RUN: b.py")
+            for node in ("architect", "threat_modeler", "planner", "researcher", "researcher_2", "reviewer", "critic"):
+                req = self._run_cb(node, ctx)
+                joined = "".join(req.appended)
+                self.assertIn(CAMPAIGN_CONTEXT_MARKER, joined, node)
+                self.assertIn("prior finding X", joined, node)
+                self.assertIn(CAMPAIGN_DIRECTIVE_MARKER, joined, node)
+                self.assertLess(joined.index(CAMPAIGN_CONTEXT_MARKER), joined.index(CAMPAIGN_DIRECTIVE_MARKER),
+                                "data before instruction")
+            for node in ("history", "reproducer", "patcher", "calibrator", "reflector", "reporter"):
+                req = self._run_cb(node, ctx)
+                joined = "".join(req.appended)
+                self.assertNotIn(CAMPAIGN_CONTEXT_MARKER, joined, node)
+                self.assertIn(CAMPAIGN_DIRECTIVE_MARKER, joined, node)
 
     async def test_context_is_bounded_and_a_cut_fence_is_closed(self):
         from core.context import RunContext
@@ -709,8 +710,9 @@ class DirectiveReachesEveryNodeTest(unittest.IsolatedAsyncioTestCase):
         from core.llm_gateway import UNTRUSTED_DATA_END, wrap_untrusted_content
 
         big = wrap_untrusted_content("x" * (MAX_CAMPAIGN_CONTEXT_CHARS * 2), filename="memory")
-        ctx = RunContext(jail_dir="/tmp", db_path="", campaign_context="\n" + big, campaign_directive="\nD")
-        req = self._run_cb("planner", ctx)
+        with tempfile.TemporaryDirectory() as empty_jail:
+            ctx = RunContext(jail_dir=empty_jail, db_path="", campaign_context="\n" + big, campaign_directive="\nD")
+            req = self._run_cb("planner", ctx)
         context_block, directive_block = req.appended
         self.assertLess(len(context_block), MAX_CAMPAIGN_CONTEXT_CHARS + 200)
         self.assertIn("[campaign context truncated]", context_block)
@@ -722,15 +724,16 @@ class DirectiveReachesEveryNodeTest(unittest.IsolatedAsyncioTestCase):
         from core.context import RunContext, current_run_context
         from core.graph_loader import _make_campaign_directive_before_model_callback
 
-        ctx = RunContext(jail_dir="/tmp", db_path="", campaign_context="\nC", campaign_directive="\nD")
-        req = self._req()
-        token = current_run_context.set(ctx)
-        try:
-            cb = _make_campaign_directive_before_model_callback("planner")
-            cb(None, req)
-            cb(None, req)
-        finally:
-            current_run_context.reset(token)
+        with tempfile.TemporaryDirectory() as empty_jail:
+            ctx = RunContext(jail_dir=empty_jail, db_path="", campaign_context="\nC", campaign_directive="\nD")
+            req = self._req()
+            token = current_run_context.set(ctx)
+            try:
+                cb = _make_campaign_directive_before_model_callback("planner")
+                cb(None, req)
+                cb(None, req)
+            finally:
+                current_run_context.reset(token)
         self.assertEqual(len(req.appended), 2)
 
     def test_execute_sub_task_sets_the_context_on_both_paths(self):

@@ -1500,6 +1500,56 @@ class StructuralIndex:
         rows = self._rows("SELECT * FROM coverage WHERE file_path = ?", (file_path,))
         return rows[0] if rows else {"status": "not_enumerated"}
 
+    def caller_file_paths(self, symbol: Dict[str, Any]) -> List[str]:
+        """Every distinct caller file_path for a resolved symbol, uncapped."""
+        if not self.available():
+            return []
+        where = "(e.callee_id = ? OR (e.callee_id IS NULL AND e.callee_name = ?))"
+        rows = self._rows(
+            f"SELECT DISTINCT e.file_path FROM call_edges e"
+            f" WHERE {where} AND e.file_path IS NOT NULL"
+            f" ORDER BY e.file_path",
+            (symbol["symbol_id"], symbol["name"]),
+        )
+        return [str(r["file_path"]) for r in rows if r.get("file_path")]
+
+    def is_legitimately_empty(self) -> bool:
+        """True when indexing completed over a tree with zero supported AST files."""
+        if not self._catalog.exists():
+            return False
+        if self.manifest.get("status") != "empty":
+            return False
+        cov = self.manifest.get("coverage")
+        if not isinstance(cov, dict) or "total_files" not in cov:
+            return False
+        try:
+            return int(cov["total_files"]) == 0
+        except (TypeError, ValueError):
+            return False
+
+    def file_matches_sha256(self, file_path: str, content_sha: str) -> Optional[bool]:
+        """True if `file_path` was indexed at `content_sha`, False if indexed at another hash, None if unknown."""
+        if not content_sha or not self.available():
+            return None
+        cov = self.file_coverage(file_path)
+        ukey = cov.get("unit_cache_key")
+        lang = _language_for(file_path)
+        if not ukey or not lang:
+            return None
+        return str(ukey) == _unit_cache_key(lang, content_sha)
+
+    def failure_reason(self) -> str:
+        """Why `available()` is False, or '' when the catalog is available."""
+        if self.available():
+            return ""
+        if not self._catalog.exists() or not self.manifest:
+            return "not_built"
+        if self.is_legitimately_empty():
+            return "no_supported_files"
+        if self.manifest.get("status") == "empty":
+            return "degraded_empty"
+        return str(self.manifest.get("status") or "unavailable")
+
 
 def _target_hash(target_root: str) -> str:
     real_t = os.path.realpath(str(target_root))

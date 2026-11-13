@@ -44,31 +44,97 @@ DEFAULT_MODELS = [
     ("vertex_ai/gemini-3.8-flash", "high"),
 ]
 
+def _parse_merged_target_title(description: Any) -> str:
+    """Extracts `<primary_title>` from `[MERGED: Duplicate of <primary_title> - Reason: ...]`."""
+    text = str(description or "")
+    marker = "[MERGED: Duplicate of "
+    idx = text.rfind(marker)
+    if idx < 0:
+        return ""
+    rest = text[idx + len(marker):]
+    end = rest.find(" - Reason:")
+    if end < 0:
+        end = rest.find("]")
+    return rest[:end].strip() if end >= 0 else ""
+
+
 def score_dedup_partition(db_findings: List[Dict[str, Any]], ground_truth: Dict[str, Any]) -> Dict[str, Any]:
     title_to_id = {f["title"]: f["id"] for f in ground_truth.get("findings", [])}
+    all_gt_ids = set(title_to_id.values())
+    row_id_to_gt: Dict[Any, Any] = {}
+    for f in db_findings:
+        fid = title_to_id.get(f.get("title"))
+        if fid is not None and f.get("id") is not None:
+            row_id_to_gt[f.get("id")] = fid
+
     merged_ids = set()
     active_ids = set()
+    direct_target: Dict[Any, Any] = {}
     for f in db_findings:
         fid = title_to_id.get(f.get("title"))
         if not fid:
             continue
-        if f.get("status") == "duplicate_merged":
+        if str(f.get("status") or "").strip().lower() == "duplicate_merged":
             merged_ids.add(fid)
+            raw_target = f.get("merged_into_id")
+            tgt_gt = None
+            if raw_target is not None:
+                tgt_gt = row_id_to_gt.get(raw_target)
+                if tgt_gt is None and raw_target in all_gt_ids:
+                    tgt_gt = raw_target
+            if tgt_gt is None:
+                parsed_title = _parse_merged_target_title(f.get("description"))
+                if parsed_title:
+                    tgt_gt = title_to_id.get(parsed_title)
+            if tgt_gt is not None:
+                direct_target[fid] = tgt_gt
         else:
             active_ids.add(fid)
+
+    def _ultimate_target(fid: Any) -> Any:
+        cur = direct_target.get(fid)
+        seen = {fid}
+        while cur is not None and cur in direct_target and cur not in seen:
+            seen.add(cur)
+            cur = direct_target[cur]
+        return cur
+
+    resolved_targets = {fid: _ultimate_target(fid) for fid in merged_ids}
+
     tp = 0; fn = 0; fp = 0; tn = 0
     false_merges = []; missed_merges = []
     clusters = ground_truth.get("ground_truth_clusters", {})
     for cname, cinfo in clusters.items():
-        fids = cinfo.get("finding_ids", [])
+        fids = list(cinfo.get("finding_ids", []))
+        fids_set = set(fids)
         relation = cinfo.get("relation", "DUPLICATE")
         if relation == "DUPLICATE":
-            is_merged = any(fid in merged_ids for fid in fids[1:])
-            if is_merged:
+            merged_in_cluster = [fid for fid in fids if fid in merged_ids]
+            present_in_db = [fid for fid in fids if fid in merged_ids or fid in active_ids]
+            active_in_cluster = [fid for fid in fids if fid in active_ids]
+            cross_cluster_merge = any(
+                resolved_targets.get(fid) is not None and resolved_targets.get(fid) not in fids_set
+                for fid in merged_in_cluster
+            )
+            all_suppressed = bool(present_in_db) and len(active_in_cluster) == 0 and len(merged_in_cluster) > 0
+            valid_equivalence_merge = (
+                len(fids) >= 2
+                and len(merged_in_cluster) == len(fids) - 1
+                and len(active_in_cluster) == 1
+                and not cross_cluster_merge
+                and all(
+                    resolved_targets.get(fid) in (None, active_in_cluster[0])
+                    for fid in merged_in_cluster
+                )
+            )
+            if valid_equivalence_merge:
                 tp += 1
             else:
                 fn += 1
                 missed_merges.append(cname)
+                if cross_cluster_merge or all_suppressed:
+                    fp += 1
+                    false_merges.append(cname)
         else:
             is_falsely_merged = any(fid in merged_ids for fid in fids)
             if is_falsely_merged:

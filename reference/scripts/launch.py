@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import os
 import re
+import signal
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -49,6 +50,21 @@ from scripts.configure import (
     run_preflight_checks,
     update_workflow_config,
 )
+
+
+class _SigtermInterrupt(BaseException):
+    """Raised on SIGTERM so finally blocks flush --spend-report with exit 143."""
+
+
+def _resolve_from_invocation_dir(val: str, inv_dir: str) -> str:
+    """Joins a relative CLI path onto MANTIS_INVOCATION_DIR without resolving
+    symlinks or collapsing '..' (preserving CP-3 traversal checks)."""
+    if not inv_dir or not val:
+        return val
+    p = Path(val)
+    if p.is_absolute():
+        return val
+    return str(Path(inv_dir) / p)
 
 
 class _LauncherArgumentParser(argparse.ArgumentParser):
@@ -248,6 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Scan mode: 'whole' scans the target as one campaign; "
             "'file-by-file' runs one campaign per source file; "
+            "'uncovered' runs one campaign per uncovered source file regardless of repo size; "
             "'cross-functional' hunts composite defects across ranked subsystems; "
             "'changed' scans only new/edited files since last covered and verifies "
             "prior findings touching them; 'auto' picks whole if small, else "
@@ -833,10 +850,25 @@ def run_launch(
         # dict so banner_resume_flags does not turn it into sticky --sandbox).
         effective_sandbox_override = {"type": "static-only", "options": {}}
 
-    # Launch Pipeline
-    try:
-        return asyncio.run(
-            pipeline(
+    async def _run_pipeline_with_sigterm() -> int:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        got_sigterm = False
+
+        def _on_sigterm() -> None:
+            nonlocal got_sigterm
+            got_sigterm = True
+            if task is not None and not task.done():
+                task.cancel()
+
+        installed = False
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+            installed = True
+        except (NotImplementedError, RuntimeError, ValueError):
+            installed = False
+        try:
+            return await pipeline(
                 scan_target=str(target_path),
                 workflow_path=wf_file,
                 model_override=model,
@@ -879,7 +911,20 @@ def run_launch(
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
             )
-        )
+        except asyncio.CancelledError:
+            if got_sigterm:
+                raise _SigtermInterrupt()
+            raise
+        finally:
+            if installed:
+                try:
+                    loop.remove_signal_handler(signal.SIGTERM)
+                except Exception:
+                    pass
+
+    # Launch Pipeline
+    try:
+        return asyncio.run(_run_pipeline_with_sigterm())
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
         return EXIT_AUTH
@@ -888,6 +933,16 @@ def run_launch(
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    inv_dir = os.environ.get("MANTIS_INVOCATION_DIR", "").strip()
+    if inv_dir:
+        args.target = _resolve_from_invocation_dir(args.target or ".", inv_dir)
+        args.workflow = _resolve_from_invocation_dir(args.workflow, inv_dir)
+        args.spend_report = _resolve_from_invocation_dir(args.spend_report, inv_dir)
+        args.transcript_out = _resolve_from_invocation_dir(args.transcript_out, inv_dir)
+        args.seed_report = _resolve_from_invocation_dir(args.seed_report, inv_dir)
+        args.import_knowledge = _resolve_from_invocation_dir(args.import_knowledge, inv_dir)
+        args.path_root = _resolve_from_invocation_dir(args.path_root, inv_dir)
 
     # Parsed here so a bad value is a usage error (exit 64), not a stack
     # trace from inside the run and not exit 2, which means "paused at
@@ -937,6 +992,12 @@ def main() -> int:
 
     _SPEND_REPORT["path"] = args.spend_report or ""
     exit_code: Optional[int] = None
+    prev_sigterm = None
+    try:
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: (_ for _ in ()).throw(_SigtermInterrupt()))
+    except (ValueError, OSError):
+        prev_sigterm = None
     try:
         exit_code = run_launch(
             target=args.target,
@@ -992,10 +1053,18 @@ def main() -> int:
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
         exit_code = EXIT_AUTH
+    except _SigtermInterrupt:
+        print("\nProcess terminated by SIGTERM.", file=sys.stderr)
+        exit_code = 143
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")
         exit_code = 130
     finally:
+        if prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError):
+                pass
         write_spend_report(args.spend_report, exit_code)
     return exit_code
 
@@ -1006,6 +1075,8 @@ if __name__ == "__main__":
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
         sys.exit(EXIT_AUTH)
+    except _SigtermInterrupt:
+        sys.exit(143)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")
         sys.exit(130)

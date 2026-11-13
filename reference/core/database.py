@@ -114,7 +114,7 @@ FALSE_POSITIVE_STATUSES = (
     "sample_or_test",
 )
 UNTRIAGED_STATUSES = ("reported",)
-CLOSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "mitigated", "archived")
+CLOSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "mitigated", "accepted_risk", "archived")
 CONFIRMED_LIVE_STATUSES = (
     "confirmed",
     "viable",
@@ -153,7 +153,7 @@ ARCHIVED_STATUS = "archived"
 # an opinion; only the harness's own stamps (update_status, merge_findings
 # within a run) may change these, under _terminal_clause_for.
 MONOTONIC_TERMINAL_STATUSES = frozenset({
-    "dynamic_confirmed", "patch_verified", "mitigated",
+    "dynamic_confirmed", "patch_verified", "mitigated", "accepted_risk",
     "false_positive", "duplicate_merged", "non_viable", "sample_or_test",
 })
 
@@ -487,6 +487,19 @@ def _ensure_findings_additive_schema(cursor) -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_signature ON findings(signature)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_run_pass ON findings(run_id, pass_index)")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS finding_resolutions (
+            lineage_id TEXT NOT NULL,
+            target_root TEXT NOT NULL DEFAULT '',
+            filepath TEXT NOT NULL DEFAULT '',
+            resolution TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            resolved_file_sha256 TEXT NOT NULL DEFAULT '',
+            resolved_at REAL NOT NULL,
+            finding_id INTEGER,
+            PRIMARY KEY (lineage_id, target_root)
+        )
+    """)
 
 
 def init_db(db_path: str):
@@ -1801,21 +1814,25 @@ def _terminal_clause_for(status: str) -> str:
     update_finding_status_by_id so the two can never drift apart.
     """
     if status in ("reported", "confirmed", "viable", "static_confirmed"):
-        return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'dynamic_confirmed', 'patch_verified')"
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'dynamic_confirmed', 'patch_verified')" + " AND LOWER(status) != 'accepted_risk'"
     if status in ("dynamic_confirmed", "patch_verified"):
-        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'patch_verified')"
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'accepted_risk', 'patch_verified')"
     if status in ("false_positive", "non_viable", "sample_or_test"):
         # A dismissal is an OPINION. It never overwrites machine-verified
         # evidence: INV-5 pins that dynamic proof supersedes a false_positive
         # verdict, and the reverse direction would let one bad review erase
         # a reproduced vulnerability.
-        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'accepted_risk', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
+    if status == "accepted_risk":
+        # Risk acceptance records an operator policy decision without erasing
+        # machine-verified exploit/patch evidence on the underlying finding row.
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'accepted_risk', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
     if status == "duplicate_merged":
         # A merge is bookkeeping by the deduplicator model. It may fold
         # unproven rows together; it may not fold away machine proof (the
         # confirmed row is the one to keep) or reopen a recorded closure.
-        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
-    return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated')"
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'accepted_risk', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
+    return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'accepted_risk')"
 
 
 def _campaign_scope_clause(norm_path: str) -> "tuple[str, List[str]]":
@@ -3497,11 +3514,13 @@ def consolidate_duplicate_findings(
                 """
                 UPDATE findings
                 SET status = 'duplicate_merged',
+                    merged_into_id = ?,
                     description = description || ?
                 WHERE id = ? AND run_id = ?
                   AND LOWER(COALESCE(status, '')) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'archived')
                 """,
                 (
+                    elected_id,
                     f"\n[CONSOLIDATED: Duplicate of #{elected_id} ({elected_title}) - Reason: {clean_reason}]",
                     dup_id,
                     str(run_id),
@@ -4012,5 +4031,87 @@ def query_security_guidance(
                 "guidance_summary": guidance_summary,
             }
         )
+
+
+def record_finding_resolution(
+    db_path: str,
+    lineage_id: str,
+    resolution: str,
+    reason: str,
+    *,
+    target_root: str = "",
+    filepath: str = "",
+    resolved_file_sha256: str = "",
+    resolved_at: Optional[float] = None,
+    finding_id: Optional[int] = None,
+) -> bool:
+    """Persists an operator triage decision on `(lineage_id, target_root)` across rescans."""
+    import time as _time
+
+    lid = str(lineage_id or "").strip()
+    res = str(resolution or "").strip().lower()
+    if not db_path or not lid or not res:
+        return False
+    root_norm = os.path.realpath(str(target_root)).rstrip("/") if target_root else ""
+    ts = float(_time.time() if resolved_at is None else resolved_at)
+    with _db(db_path) as conn:
+        cur = conn.cursor()
+        _ensure_findings_additive_schema(cur)
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO finding_resolutions (
+                lineage_id, target_root, filepath, resolution, reason,
+                resolved_file_sha256, resolved_at, finding_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lid,
+                root_norm,
+                str(filepath or ""),
+                res,
+                str(reason or "").strip()[:2000],
+                str(resolved_file_sha256 or ""),
+                ts,
+                int(finding_id) if finding_id is not None else None,
+            ),
+        )
+    return True
+
+
+def read_finding_resolutions(
+    db_path: str,
+    target_root: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    """Returns `{lineage_id: row_dict}` for operator resolutions compatible with `target_root`."""
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    root_norm = os.path.realpath(str(target_root)).rstrip("/") if target_root else ""
+    try:
+        with _db(db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='finding_resolutions'"
+            )
+            if cur.fetchone() is None:
+                return {}
+            rows = cur.execute(
+                "SELECT lineage_id, target_root, filepath, resolution, reason,"
+                " resolved_file_sha256, resolved_at, finding_id"
+                " FROM finding_resolutions ORDER BY resolved_at ASC"
+            ).fetchall()
+    except (sqlite3.Error, OSError, RuntimeError):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        rec = dict(r)
+        lid = str(rec.get("lineage_id") or "").strip()
+        if not lid:
+            continue
+        rec_root = str(rec.get("target_root") or "").strip()
+        if root_norm and rec_root and not run_targets_compatible(root_norm, rec_root):
+            continue
+        out[lid] = rec
+    return out
+
 
 

@@ -277,9 +277,90 @@ except (ImportError, ModuleNotFoundError):
         return res.strip()
 
 
-def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -> Dict[str, Any]:
+def _git_toplevel(start_dir: Path) -> str:
+    import subprocess as _sp
+
+    try:
+        out = _sp.run(
+            ["git", "-C", str(start_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return os.path.realpath(out.stdout.strip()).rstrip("/")
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_advisory_target(
+    raw_file: str, explicit_repo: str, db_path: str
+) -> tuple[str, Optional[str]]:
+    """Resolves a relative `--file` and target root against CWD and `run_target_roots(db_path)`."""
+    raw = str(raw_file or "").strip()
+    roots_map = run_target_roots(db_path) if db_path else {}
+    known_roots = sorted(
+        {os.path.realpath(v).rstrip("/") for v in roots_map.values() if v},
+        key=len,
+        reverse=True,
+    )
+    if explicit_repo:
+        eff_root = os.path.realpath(os.path.expanduser(explicit_repo)).rstrip("/")
+        if not raw:
+            return "", eff_root
+        if os.path.isabs(raw):
+            return os.path.realpath(raw), eff_root
+        if (Path.cwd() / raw).exists():
+            return os.path.realpath(str(Path.cwd() / raw)), eff_root
+        if (Path(eff_root) / raw).exists():
+            return os.path.realpath(str(Path(eff_root) / raw)), eff_root
+        return raw, eff_root
+
+    cwd_real = os.path.realpath(str(Path.cwd())).rstrip("/")
+    cand_abs = ""
+    if raw:
+        if os.path.isabs(raw) and os.path.exists(raw):
+            cand_abs = os.path.realpath(raw)
+        elif not os.path.isabs(raw) and (Path.cwd() / raw).exists():
+            cand_abs = os.path.realpath(str(Path.cwd() / raw))
+
+    if cand_abs:
+        for kr in known_roots:
+            if cand_abs == kr or cand_abs.startswith(kr + "/"):
+                return cand_abs, kr
+        top = _git_toplevel(Path(cand_abs).parent)
+        return cand_abs, (top or active_target_root(cand_abs) or None)
+
+    if raw and not os.path.isabs(raw):
+        for kr in known_roots:
+            if (cwd_real == kr or cwd_real.startswith(kr + "/")) and (Path(kr) / raw).exists():
+                return os.path.realpath(str(Path(kr) / raw)), kr
+        if len(known_roots) == 1 and (Path(known_roots[0]) / raw).exists():
+            return os.path.realpath(str(Path(known_roots[0]) / raw)), known_roots[0]
+        for kr in known_roots:
+            if cwd_real == kr or cwd_real.startswith(kr + "/"):
+                return raw, kr
+        return raw, None
+
+    if not raw:
+        for kr in known_roots:
+            if cwd_real == kr or cwd_real.startswith(kr + "/"):
+                return "", kr
+        if len(known_roots) == 1:
+            return "", known_roots[0]
+        return "", (active_target_root("") or None)
+
+    return raw, (active_target_root(raw) or None)
+
+
+def query_guidance_standalone(
+    db_path: str, filepath: str, full: bool = False, target_root: Optional[str] = None
+) -> Dict[str, Any]:
     """Queries knowledge.db directly using standard sqlite3 to generate an advisory dossier."""
-    eff_root = active_target_root(filepath)
+    eff_root = (
+        os.path.realpath(target_root).rstrip("/") if target_root else active_target_root(filepath)
+    )
     roots_map = run_target_roots(db_path) if eff_root else {}
 
     def _same_target(row_run_id: Any) -> bool:
@@ -612,9 +693,17 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
     )
 
 
-def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str = "", filepath: str = "") -> List[Dict[str, Any]]:
+def query_lineage_standalone(
+    db_path: str,
+    lineage_id: str = "",
+    signature: str = "",
+    filepath: str = "",
+    target_root: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Queries lineage history directly from knowledge.db."""
-    eff_root = active_target_root(filepath)
+    eff_root = (
+        os.path.realpath(target_root).rstrip("/") if target_root else active_target_root(filepath)
+    )
     roots_map = run_target_roots(db_path) if eff_root else {}
     norm_fp = _canonical_query_filepath(filepath, eff_root, roots_map) if filepath else ""
     conn = _connect(resolve_db_path(db_path))
@@ -652,10 +741,17 @@ def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str 
     return sanitize_egress_data(rows)
 
 
-def query_remediation_standalone(db_path: str, finding_id_or_target: str, full: bool = False) -> Dict[str, Any]:
+def query_remediation_standalone(
+    db_path: str,
+    finding_id_or_target: str,
+    full: bool = False,
+    target_root: Optional[str] = None,
+) -> Dict[str, Any]:
     """Generates a structured Architectural Remediation Dossier for a specific finding or target."""
     target_str = str(finding_id_or_target or "").strip()
-    eff_root = active_target_root(target_str)
+    eff_root = (
+        os.path.realpath(target_root).rstrip("/") if target_root else active_target_root(target_str)
+    )
     roots_map = run_target_roots(db_path) if eff_root else {}
 
     def _same_target(row_run_id: Any) -> bool:
@@ -679,12 +775,12 @@ def query_remediation_standalone(db_path: str, finding_id_or_target: str, full: 
     if target_str.isdigit():
         finding_row = _first_matching("SELECT * FROM findings WHERE id = ?", (int(target_str),))
 
-    if not finding_row and target_str:
+    if not finding_row and target_str and not target_str.isdigit():
         finding_row = _first_matching(
             "SELECT * FROM findings WHERE lineage_id = ? ORDER BY id DESC", (target_str,)
         )
 
-    if not finding_row and target_str:
+    if not finding_row and target_str and not target_str.isdigit():
         norm = _canonical_query_filepath(target_str, eff_root, roots_map)
         if norm:
             finding_row = _first_matching(
@@ -692,7 +788,7 @@ def query_remediation_standalone(db_path: str, finding_id_or_target: str, full: 
                 (norm,),
             )
 
-    if not finding_row and target_str:
+    if not finding_row and target_str and not target_str.isdigit():
         finding_row = _first_matching(
             "SELECT * FROM findings WHERE title LIKE ? ORDER BY id DESC",
             (f"%{target_str}%",),
@@ -716,7 +812,9 @@ def query_remediation_standalone(db_path: str, finding_id_or_target: str, full: 
     row_root = (roots_map or run_target_roots(db_path)).get(str(f_dict.get("run_id") or ""), "") or eff_root
     fp_for_guidance = os.path.join(row_root, fp) if (row_root and fp and not os.path.isabs(fp)) else fp
 
-    guidance = query_guidance_standalone(db_path, filepath=fp_for_guidance, full=full)
+    guidance = query_guidance_standalone(
+        db_path, filepath=fp_for_guidance, full=full, target_root=row_root or None
+    )
 
     clean_title = safe_markdown_span(str(f_dict.get('title', '')))
     desc = safe_markdown_inline(str(f_dict.get("description", "No description provided.")).strip())
@@ -852,6 +950,12 @@ def main():
         action="store_true",
         help="Include full unabridged markdown bodies and un-truncated patch diffs."
     )
+    parser.add_argument(
+        "--repo", "--target-root",
+        default="",
+        dest="repo",
+        help="Explicit repository/target root to scope multi-repository database queries."
+    )
 
     args = parser.parse_args()
 
@@ -900,8 +1004,18 @@ def main():
     def emit_json(payload: Any) -> None:
         print(json.dumps(sanitize_egress_data(payload), indent=2))
 
+    resolved_file, eff_target_root = _resolve_advisory_target(args.file, args.repo, db_path)
+
     if args.remediate:
-        res = query_remediation_standalone(db_path, finding_id_or_target=args.remediate, full=args.full)
+        rem_target = args.remediate
+        rem_root = eff_target_root
+        if not rem_target.strip().isdigit():
+            rem_resolved, rem_r = _resolve_advisory_target(rem_target, args.repo, db_path)
+            if rem_r:
+                rem_target, rem_root = rem_resolved, rem_r
+        res = query_remediation_standalone(
+            db_path, finding_id_or_target=rem_target, full=args.full, target_root=rem_root
+        )
         if args.json:
             emit_json(res)
         else:
@@ -909,7 +1023,13 @@ def main():
         return
 
     if args.lineage or args.signature:
-        records = query_lineage_standalone(db_path, lineage_id=args.lineage, signature=args.signature, filepath=args.file)
+        records = query_lineage_standalone(
+            db_path,
+            lineage_id=args.lineage,
+            signature=args.signature,
+            filepath=resolved_file,
+            target_root=eff_target_root,
+        )
         if args.json:
             emit_json(records)
         else:
@@ -943,9 +1063,13 @@ def main():
     else:
         try:
             from core.database import query_security_guidance
-            guidance = query_security_guidance(db_path, filepath=args.file, full=args.full)
+            guidance = query_security_guidance(
+                db_path, filepath=resolved_file, full=args.full, target_root=eff_target_root
+            )
         except (ImportError, ModuleNotFoundError):
-            guidance = query_guidance_standalone(db_path, filepath=args.file, full=args.full)
+            guidance = query_guidance_standalone(
+                db_path, filepath=resolved_file, full=args.full, target_root=eff_target_root
+            )
 
         if args.json:
             emit_json(guidance)

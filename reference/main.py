@@ -1413,6 +1413,7 @@ SCAN_MODE_WHOLE = "whole"
 SCAN_MODE_FILE_BY_FILE = "file-by-file"
 SCAN_MODE_CROSS_FUNCTIONAL = "cross-functional"
 SCAN_MODE_CHANGED = "changed"
+SCAN_MODE_UNCOVERED = "uncovered"
 
 # Superseded spellings. Accepted forever on input so existing workflow.json files and
 # saved recipes keep working (INV-6), but never emitted.
@@ -1430,6 +1431,7 @@ _SCAN_MODES = (
     SCAN_MODE_FILE_BY_FILE,
     SCAN_MODE_CROSS_FUNCTIONAL,
     SCAN_MODE_CHANGED,
+    SCAN_MODE_UNCOVERED,
 )
 
 # Budget triggers that describe ONE campaign's behaviour rather than the run's
@@ -1568,6 +1570,8 @@ def validate_resume_scan_mode(
     norm_recorded = normalize_scan_mode(recorded)
     requested = normalize_scan_mode(scan_mode_override)
     if requested == norm_recorded:
+        return None
+    if requested == SCAN_MODE_UNCOVERED and norm_recorded == SCAN_MODE_FILE_BY_FILE:
         return None
     return (
         f"--resume cannot switch --scan-mode from '{norm_recorded}' "
@@ -2279,6 +2283,59 @@ def resolve_scan_targets(
             scope_out["changed_files"] = [f for f in focus if f in set(edited.get("files") or [])]
             scope_out["nothing_changed"] = False
         return [g["dir"] for g in groups], None, SCAN_MODE_CHANGED
+
+    if mode == SCAN_MODE_UNCOVERED:
+        if target_path.is_file():
+            return whole
+        if not discovered_files:
+            return [], None, SCAN_MODE_UNCOVERED
+        if not db_path:
+            print(
+                f"Scan mode {SCAN_MODE_UNCOVERED}: no database given; "
+                f"examining all {len(discovered_files)} source file(s) one per campaign.",
+                file=sys.stderr,
+            )
+            all_files = list(discovered_files)
+            return all_files, None, SCAN_MODE_FILE_BY_FILE
+        uncovered_list: Optional[list] = None
+        try:
+            from core.config import normalize_model_id
+            from core.cost import uncovered_files
+
+            run_model = normalize_model_id(str(config.get("default_model") or ""))
+            harness_fp = str(config.get("harness_fingerprint") or "")
+            uncovered_list = uncovered_files(
+                db_path,
+                discovered_files,
+                model=run_model,
+                harness_fingerprint=harness_fp,
+                rescan_changed_harness=bool(config.get("rescan_changed_harness")),
+            )
+        except Exception as exc:
+            print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
+            uncovered_list = None
+        if uncovered_list is None:
+            print(
+                f"Scan mode {SCAN_MODE_UNCOVERED}: the coverage ledger cannot be read; "
+                "scanning the whole target.",
+                file=sys.stderr,
+            )
+            return whole
+        if not uncovered_list:
+            print(
+                f"Scan mode {SCAN_MODE_UNCOVERED}: every one of {len(discovered_files)} source "
+                "file(s) has already been covered; nothing to scan.",
+                file=sys.stderr,
+            )
+            if scope_out is not None:
+                scope_out["nothing_uncovered"] = True
+            return [], None, SCAN_MODE_UNCOVERED
+        print(
+            f"Scan mode {SCAN_MODE_UNCOVERED}: {len(uncovered_list)} of {len(discovered_files)} "
+            "source file(s) uncovered; running one campaign per uncovered file.",
+            file=sys.stderr,
+        )
+        return list(uncovered_list), None, SCAN_MODE_FILE_BY_FILE
 
     if mode == SCAN_MODE_FILE_BY_FILE:
         # discover_files already produced this list and, until now, nothing consumed it:
@@ -3675,10 +3732,10 @@ async def pipeline(
     if saved_plan and int(saved_plan.get("passes") or 1) > 1 and int(passes or 1) <= 1:
         total_passes = int(saved_plan["passes"])
         banner_resume_flags["--passes"] = total_passes
-    # `changed` with nothing changed is a complete answer, not an empty plan:
-    # the resolver printed it, and a run that scans nothing must not confirm
-    # a work plan, open campaigns, or write an empty report.
-    if scan_mode == SCAN_MODE_CHANGED and not targets_to_scan:
+    # `changed` / `uncovered` with nothing left is a complete answer, not an
+    # empty plan: the resolver printed it, and a run that scans nothing must
+    # not confirm a work plan, open campaigns, or write an empty report.
+    if scan_mode in (SCAN_MODE_CHANGED, SCAN_MODE_UNCOVERED) and not targets_to_scan:
         try:
             from core.database import mark_run_finalized
 
