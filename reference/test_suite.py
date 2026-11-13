@@ -104,6 +104,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "Found SQL injection in query handler.",
                     "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Review completed."}),
@@ -117,7 +118,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
+                    "planner", "explorer", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
                     "chainer", "patcher", "calibrator", "reflector", "reporter"
                 ],
@@ -131,6 +132,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "Found potential buffer overflow.",
                     "Findings deduplicated.",
                     json.dumps({"route": "false_positive", "reason": "Input is bounded."}),
@@ -138,7 +140,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
+                    "planner", "explorer", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "calibrator", "reflector", "reporter"
                 ],
                 "false_positive",
@@ -151,6 +153,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "Found logic bug.",
                     "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
@@ -162,7 +165,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
+                    "planner", "explorer", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
                     "calibrator", "reflector", "reporter"
                 ],
@@ -176,6 +179,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "Found candidate issue.",
                     "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Plausible statically."}),
@@ -184,7 +188,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
+                    "planner", "explorer", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "critic", "critic_classifier", "calibrator", "reflector", "reporter"
                 ],
                 "non_viable",
@@ -197,11 +201,12 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "No issues found.",
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "findings_gate", "reporter"
+                    "planner", "explorer", "researcher", "findings_gate", "reporter"
                 ],
                 None,
                 False,
@@ -288,6 +293,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "Analysis done.",
                     "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
@@ -308,6 +314,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "Analysis done.",
                     "Findings deduplicated.",
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
@@ -326,6 +333,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
+                    "Explorer read planned files.",
                     "Analysis done.",
                     "Findings deduplicated.",
                     json.dumps({"route": "false_positive", "reason": "Score: 0"}),
@@ -2174,6 +2182,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             "Architecture KB created.",
             "Threat model created.",
             "Plan created.",
+            "Explorer read planned files.",
             "Analysis done.",
             "Findings deduplicated.",
             json.dumps({"route": "confirmed", "reason": "Analysis done."}),

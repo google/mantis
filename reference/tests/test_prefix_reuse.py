@@ -341,13 +341,28 @@ class _ToolCallingEndpoint:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 outer.requests.append(body)
                 tools = {t.get("function", {}).get("name") for t in body.get("tools") or []}
-                answered = any(m.get("role") == "tool" for m in body.get("messages") or [])
+                msgs = list(body.get("messages") or [])
+                active_stage = None
+                stage_msg_idx = -1
+                for idx_m, m in enumerate(msgs):
+                    txt = str(m.get("content") or "")
+                    if "[ACTIVE STAGE ASSIGNMENT: " in txt:
+                        active_stage = txt.split("[ACTIVE STAGE ASSIGNMENT: ", 1)[1].split("]", 1)[0].strip()
+                        stage_msg_idx = idx_m
+                tail_msgs = msgs[stage_msg_idx + 1:] if stage_msg_idx >= 0 else msgs
+                answered = any(m.get("role") == "tool" for m in tail_msgs)
                 message = {"role": "assistant", "content": "No issues found."}
                 call = None
-                if not answered and "record_summary" in tools:
-                    call = ("record_summary", {"summary": {"architecture_overview": "SHARED-ARCH"}})
-                elif not answered and "record_threat_model" in tools:
-                    call = ("record_threat_model", {"threat_model": {"threats": ["SHARED-THREAT"]}})
+                if active_stage is not None:
+                    if not answered and active_stage == "architect" and "record_summary" in tools:
+                        call = ("record_summary", {"summary": {"architecture_overview": "SHARED-ARCH"}})
+                    elif not answered and active_stage == "threat_modeler" and "record_threat_model" in tools:
+                        call = ("record_threat_model", {"threat_model": {"threats": ["SHARED-THREAT"]}})
+                else:
+                    if not answered and "record_summary" in tools:
+                        call = ("record_summary", {"summary": {"architecture_overview": "SHARED-ARCH"}})
+                    elif not answered and "record_threat_model" in tools:
+                        call = ("record_threat_model", {"threat_model": {"threats": ["SHARED-THREAT"]}})
                 if call:
                     message = {"role": "assistant", "content": None, "tool_calls": [{
                         "id": f"c{len(outer.requests)}", "type": "function",
@@ -400,9 +415,30 @@ class ChangedRunEndToEndTest(unittest.TestCase):
             capture_output=True, text=True, timeout=300, env=env, cwd=_REF_ROOT)
         out = proc.stdout + proc.stderr
 
+        def _last_stage(req: dict) -> str | None:
+            found = None
+            for m in req.get("messages") or []:
+                txt = str(m.get("content") or "")
+                if "[ACTIVE STAGE ASSIGNMENT: " in txt:
+                    found = txt.split("[ACTIVE STAGE ASSIGNMENT: ", 1)[1].split("]", 1)[0].strip()
+            return found
+
+        stage_for_tool = {"record_summary": "architect", "record_threat_model": "threat_modeler"}
+
         def offering(tool):
-            return [r for r in endpoint.requests
-                    if tool in {t.get("function", {}).get("name") for t in r.get("tools") or []}]
+            want_stage = stage_for_tool.get(tool)
+            out_reqs = []
+            for r in endpoint.requests:
+                tset = {t.get("function", {}).get("name") for t in r.get("tools") or []}
+                if tool not in tset:
+                    continue
+                st = _last_stage(r)
+                if st is not None and want_stage is not None:
+                    if st == want_stage:
+                        out_reqs.append(r)
+                else:
+                    out_reqs.append(r)
+            return out_reqs
 
         self.assertEqual(out.count("Reused the summary"), 1, out[-3000:])
         self.assertEqual(out.count("Reused the threat_model"), 1)

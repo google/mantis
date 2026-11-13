@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -1127,6 +1128,31 @@ def _effective_context_window(model: Any) -> Optional[int]:
     return min(limits) if limits else None
 
 
+_CONTEXT_EDITING_TRIGGER_ENV = "MANTIS_CONTEXT_EDITING_TRIGGER_TOKENS"
+
+
+def _resolve_context_editing_trigger_cap(config: Optional[dict] = None) -> Optional[int]:
+    """Optional explicit token trigger ceiling from env or workflow config."""
+    raw_env = os.environ.get(_CONTEXT_EDITING_TRIGGER_ENV, "").strip()
+    if raw_env:
+        try:
+            parsed_env = int(raw_env)
+            if parsed_env > 0:
+                return parsed_env
+        except (TypeError, ValueError):
+            pass
+    if isinstance(config, Mapping):
+        raw_cfg = config.get("context_editing_trigger_tokens")
+        if raw_cfg is not None and not isinstance(raw_cfg, bool):
+            try:
+                parsed_cfg = int(raw_cfg)
+                if parsed_cfg > 0:
+                    return parsed_cfg
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Optional[dict]:
     """The `context_management` parameter for `model`, or None when it must not
     be sent: not a Claude model, switched off (config `context_editing: off`
@@ -1138,11 +1164,17 @@ def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Opti
     limit = _effective_context_window(model)
     if not limit:
         return None
+    trigger = int(limit * CONTEXT_EDITING_TRIGGER_RATIO)
+    clear_at_least = int(limit * CONTEXT_EDITING_CLEAR_RATIO)
+    cap = _resolve_context_editing_trigger_cap(config)
+    if cap is not None:
+        trigger = min(trigger, cap)
+        clear_at_least = min(clear_at_least, max(1, int(cap * 0.4)))
     return {"edits": [{
         "type": CONTEXT_EDITING_EDIT_TYPE,
-        "trigger": {"type": "input_tokens", "value": int(limit * CONTEXT_EDITING_TRIGGER_RATIO)},
+        "trigger": {"type": "input_tokens", "value": trigger},
         "keep": {"type": "tool_uses", "value": CONTEXT_EDITING_KEEP_TOOL_USES},
-        "clear_at_least": {"type": "input_tokens", "value": int(limit * CONTEXT_EDITING_CLEAR_RATIO)},
+        "clear_at_least": {"type": "input_tokens", "value": clear_at_least},
     }]}
 
 
@@ -1160,10 +1192,16 @@ def client_context_editing(model: Any, config: Optional[dict] = None) -> Optiona
     limit = _effective_context_window(model)
     if not limit:
         return None
+    trigger = int(limit * CONTEXT_EDITING_TRIGGER_RATIO)
+    clear_at_least = int(limit * CONTEXT_EDITING_CLEAR_RATIO)
+    cap = _resolve_context_editing_trigger_cap(config)
+    if cap is not None:
+        trigger = min(trigger, cap)
+        clear_at_least = min(clear_at_least, max(1, int(cap * 0.4)))
     return {
-        "trigger_tokens": int(limit * CONTEXT_EDITING_TRIGGER_RATIO),
+        "trigger_tokens": trigger,
         "keep": CONTEXT_EDITING_KEEP_TOOL_USES,
-        "clear_at_least_tokens": int(limit * CONTEXT_EDITING_CLEAR_RATIO),
+        "clear_at_least_tokens": clear_at_least,
     }
 
 
@@ -1983,6 +2021,326 @@ def _strip_empty_injection_points(kwargs: dict[str, Any]) -> None:
         kwargs.pop("cache_control_injection_points", None)
 
 
+# Explicit Vertex/Gemini CachedContent stem pinning state passed from
+# ResilientLiteLlm.generate_content_async down to ResilientLiteLLMClient.acompletion.
+_ACTIVE_EXPLICIT_CACHE_HANDLE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_active_explicit_cache_handle", default=None
+)
+EXPLICIT_CACHE_MIN_TOKENS_DEFAULT = 4096
+EXPLICIT_CACHE_TTL_SECONDS_DEFAULT = 900
+
+
+def is_explicit_gemini_cache_eligible(model_id: Any, ctx: Any) -> bool:
+    """True when `model_id` and `ctx` support explicit Gemini `cachedContents` stem pinning."""
+    flag = os.environ.get("MANTIS_EXPLICIT_STEM_CACHE", "1").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return False
+    if ctx is None or getattr(ctx, "sandbox", None) is None:
+        return False
+    if not bool(getattr(ctx, "enable_context_cache", True)):
+        return False
+    norm = str(model_id or "").strip().lower()
+    if not (norm.startswith("vertex_ai/gemini-") or norm.startswith("gemini/")):
+        return False
+    if "gemini-4" in norm:
+        return False
+    return True
+
+
+def _estimate_stem_tokens(
+    base_instruction: str,
+    stem_contents: list[Any],
+    tools_list: list[Any],
+) -> int:
+    chars = len(base_instruction or "")
+    for content in stem_contents or ():
+        for part in getattr(content, "parts", None) or ():
+            txt = getattr(part, "text", None)
+            if txt:
+                chars += len(txt)
+            fc = getattr(part, "function_call", None)
+            if fc is not None:
+                chars += len(json.dumps(getattr(fc, "args", None) or {}, default=str))
+            fr = getattr(part, "function_response", None)
+            if fr is not None:
+                chars += len(json.dumps(getattr(fr, "response", None) or {}, default=str))
+    for tool_obj in tools_list or ():
+        try:
+            chars += len(json.dumps(tool_obj.model_dump(mode="json", exclude_none=True), default=str))
+        except Exception:
+            chars += 500
+    return chars // 4
+
+
+def _is_cached_content_rejection(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    resp = getattr(exc, "response", None)
+    if status is None and resp is not None:
+        status = getattr(resp, "status_code", None)
+    if status in (400, 404):
+        return True
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        tok in msg
+        for tok in ("cachedcontent", "cached_content", "not_found", "not found", "expired", "404", "badrequest")
+    )
+
+
+async def ensure_explicit_stem_cache(
+    *,
+    ctx: Any,
+    cache_slot_key: str,
+    model_id: str,
+    additional_args: dict[str, Any],
+    base_instruction: str,
+    tools_list: list[Any],
+    stem_contents: list[Any],
+) -> Optional[dict[str, Any]]:
+    """Creates (or returns existing) explicit Gemini `CachedContent` handle for `stem_contents`."""
+    if not is_explicit_gemini_cache_eligible(model_id, ctx):
+        return None
+    handles = getattr(ctx, "explicit_cache_handles", None)
+    if not isinstance(handles, dict):
+        return None
+    existing = handles.get(cache_slot_key)
+    if isinstance(existing, dict):
+        if existing.get("failed") or existing.get("evicted"):
+            return None
+        if existing.get("name"):
+            return existing
+
+    try:
+        min_tokens = max(
+            1,
+            int(os.environ.get("MANTIS_EXPLICIT_CACHE_MIN_TOKENS", str(EXPLICIT_CACHE_MIN_TOKENS_DEFAULT))),
+        )
+    except ValueError:
+        min_tokens = EXPLICIT_CACHE_MIN_TOKENS_DEFAULT
+    if _estimate_stem_tokens(base_instruction, stem_contents, tools_list) < min_tokens:
+        return None
+
+    if not stem_contents or getattr(stem_contents[-1], "role", "") != "model":
+        return None
+
+    try:
+        import httpx
+        from google.adk.models.lite_llm import _get_completion_inputs
+        from google.adk.models.llm_request import LlmRequest
+        from google.genai import types as genai_types
+        from litellm.llms.vertex_ai.context_caching.vertex_ai_context_caching import (
+            ContextCachingEndpoints,
+        )
+        from litellm.llms.vertex_ai.gemini.transformation import _transform_request_body
+
+        norm_model = str(model_id).strip()
+        if norm_model.startswith("gemini/"):
+            provider = "gemini"
+            bare_model = norm_model.split("/", 1)[1]
+        else:
+            provider = "vertex_ai"
+            bare_model = norm_model.split("/", 1)[1] if "/" in norm_model else norm_model
+
+        stem_req = LlmRequest(
+            contents=list(stem_contents),
+            config=genai_types.GenerateContentConfig(
+                system_instruction=base_instruction,
+                tools=list(tools_list) if tools_list else None,
+            ),
+        )
+        messages, wire_tools, _rf, _gen_params, _ = await _get_completion_inputs(
+            stem_req, model=norm_model
+        )
+        opt_params: dict[str, Any] = {}
+        if wire_tools:
+            # `_get_completion_inputs` yields OpenAI-format tools
+            # (`{"type": "function", "function": {...}}`); `cachedContents`
+            # needs Gemini `function_declarations`. litellm.completion maps
+            # these via `map_openai_params` before `_transform_request_body`,
+            # so do the same here or the POST is rejected with HTTP 400.
+            if provider == "gemini":
+                from litellm.llms.gemini.chat.transformation import (
+                    GoogleAIStudioGeminiConfig as _GeminiParamCfg,
+                )
+            else:
+                from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+                    VertexGeminiConfig as _GeminiParamCfg,
+                )
+            opt_params = _GeminiParamCfg().map_openai_params(
+                non_default_params={"tools": wire_tools},
+                optional_params={},
+                model=bare_model,
+                drop_params=False,
+            )
+
+        transformed = _transform_request_body(
+            messages=messages,
+            model=bare_model,
+            optional_params=opt_params,
+            custom_llm_provider=provider,  # type: ignore[arg-type]
+            litellm_params={},
+            cached_content=None,
+        )
+
+        endpoints = ContextCachingEndpoints()
+        api_base = additional_args.get("api_base") or os.environ.get("LLM_API_BASE") or None
+        if provider == "gemini":
+            api_key = (
+                additional_args.get("api_key")
+                or os.environ.get("GEMINI_API_KEY")
+                or os.environ.get("GOOGLE_API_KEY")
+                or ""
+            )
+            if not api_key:
+                handles[cache_slot_key] = {"failed": True}
+                return None
+            _auth_hdr, url = endpoints._get_token_and_url_context_caching(
+                gemini_api_key=str(api_key),
+                custom_llm_provider="gemini",
+                api_base=api_base,
+                vertex_project=None,
+                vertex_location=None,
+                vertex_auth_header=None,
+                model=bare_model,
+            )
+            headers = {"x-goog-api-key": str(api_key), "Content-Type": "application/json"}
+            model_resource = f"models/{bare_model}"
+        else:
+            vertex_project = (
+                additional_args.get("vertex_project")
+                or os.environ.get("VERTEXAI_PROJECT")
+                or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            )
+            vertex_location = (
+                additional_args.get("vertex_location")
+                or os.environ.get("VERTEXAI_LOCATION")
+                or os.environ.get("GOOGLE_CLOUD_LOCATION")
+                or "global"
+            )
+            vertex_credentials = additional_args.get("vertex_credentials")
+            token, resolved_proj = await endpoints._ensure_access_token_async(
+                credentials=vertex_credentials,
+                project_id=vertex_project,
+                custom_llm_provider="vertex_ai",
+            )
+            eff_proj = resolved_proj or vertex_project
+            if not eff_proj:
+                handles[cache_slot_key] = {"failed": True}
+                return None
+            auth_hdr, url = endpoints._get_token_and_url_context_caching(
+                gemini_api_key=None,
+                custom_llm_provider="vertex_ai",
+                api_base=api_base,
+                vertex_project=eff_proj,
+                vertex_location=vertex_location,
+                vertex_auth_header=token,
+                model=bare_model,
+            )
+            headers = endpoints.set_headers(auth_header=auth_hdr, extra_headers=None)
+            model_resource = (
+                f"projects/{eff_proj}/locations/{vertex_location}/publishers/google/models/{bare_model}"
+            )
+
+        try:
+            ttl_sec = max(
+                60,
+                int(os.environ.get("MANTIS_EXPLICIT_CACHE_TTL_SECONDS", str(EXPLICIT_CACHE_TTL_SECONDS_DEFAULT))),
+            )
+        except ValueError:
+            ttl_sec = EXPLICIT_CACHE_TTL_SECONDS_DEFAULT
+
+        payload: dict[str, Any] = {
+            "model": model_resource,
+            "ttl": f"{ttl_sec}s",
+            "contents": transformed.get("contents") or [],
+        }
+        if "system_instruction" in transformed:
+            payload["systemInstruction"] = transformed["system_instruction"]
+        elif "systemInstruction" in transformed:
+            payload["systemInstruction"] = transformed["systemInstruction"]
+        if "tools" in transformed:
+            payload["tools"] = transformed["tools"]
+        if "toolConfig" in transformed:
+            payload["toolConfig"] = transformed["toolConfig"]
+        elif "tool_config" in transformed:
+            payload["toolConfig"] = transformed["tool_config"]
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, headers=headers, content=json.dumps(payload).encode("utf-8"))
+        if resp.status_code >= 400:
+            print(
+                f"[CONTEXT CACHE] Explicit CachedContent creation returned HTTP {resp.status_code}; "
+                "falling back to implicit prefix caching.",
+                file=sys.stderr,
+            )
+            handles[cache_slot_key] = {"failed": True}
+            return None
+        resp_json = resp.json() if resp.content else {}
+        handle_name = str(resp_json.get("name") or "").strip()
+        if not handle_name:
+            handles[cache_slot_key] = {"failed": True}
+            return None
+
+        if provider == "gemini":
+            base_prefix = url.rsplit("/cachedContents", 1)[0]
+            delete_url = f"{base_prefix}/{handle_name.lstrip('/')}"
+        else:
+            if "/projects/" in url and handle_name.startswith("projects/"):
+                delete_url = f"{url.split('/projects/', 1)[0]}/{handle_name}"
+            else:
+                delete_url = f"{url.rstrip('/')}/{handle_name.rsplit('/', 1)[-1]}"
+
+        entry = {
+            "name": handle_name,
+            "stem_len": len(stem_contents),
+            "delete_url": delete_url,
+            "headers": dict(headers),
+            "provider": provider,
+        }
+        handles[cache_slot_key] = entry
+        _observe("explicit_caches_created")
+        return entry
+    except Exception as exc:
+        print(
+            f"[CONTEXT CACHE] Explicit CachedContent unavailable ({type(exc).__name__}: {exc}); "
+            "using implicit prefix caching.",
+            file=sys.stderr,
+        )
+        handles[cache_slot_key] = {"failed": True}
+        return None
+
+
+async def cleanup_explicit_caches(ctx: Any) -> int:
+    """Best-effort async DELETE of every active `CachedContent` handle stored on `ctx`."""
+    if ctx is None:
+        return 0
+    handles = getattr(ctx, "explicit_cache_handles", None)
+    if not isinstance(handles, dict) or not handles:
+        return 0
+    to_delete = [
+        v
+        for v in list(handles.values())
+        if isinstance(v, dict) and v.get("name") and v.get("delete_url") and not v.get("deleted")
+    ]
+    handles.clear()
+    if not to_delete:
+        return 0
+    deleted = 0
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for item in to_delete:
+                try:
+                    resp = await client.delete(item["delete_url"], headers=item.get("headers") or {})
+                    if resp.status_code < 400 or resp.status_code == 404:
+                        deleted += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return deleted
+
+
 class ResilientLiteLLMClient(LiteLLMClient):
     """LiteLLMClient with full jitter exponential backoff (min offset 5s, 1h patience) on 429/quota exhaustion.
 
@@ -2015,6 +2373,19 @@ class ResilientLiteLLMClient(LiteLLMClient):
         enforce_context_budget(model, messages, tools, context_management=kwargs.get("context_management"))
         if kwargs.get("context_management"):
             _observe("context_edit_requests")
+
+        explicit_cache_handle = kwargs.get("cached_content") or _ACTIVE_EXPLICIT_CACHE_HANDLE.get()
+        if explicit_cache_handle:
+            kwargs["cached_content"] = explicit_cache_handle
+            tools = None
+            kwargs.pop("tools", None)
+            kwargs.pop("tool_choice", None)
+            if isinstance(messages, list):
+                messages = [
+                    m
+                    for m in messages
+                    if not (isinstance(m, Mapping) and m.get("role") in ("system", "developer"))
+                ]
 
         if stream:
             # Returned, not awaited into a response: callers receive the async
@@ -2432,12 +2803,18 @@ class ResilientLiteLlm(LiteLlm):
     """LiteLlm wrapper with resilient full jitter retry (min 5s offset, 1h patience) on quota and rate limits."""
 
     llm_client: LiteLLMClient = Field(default_factory=ResilientLiteLLMClient, exclude=True)
+    _output_schema_override: Any = PrivateAttr(default=None)
+    _preserve_system_prefix: bool = PrivateAttr(default=False)
 
     def __init__(self, model: str, **kwargs: Any) -> None:
+        output_schema_override = kwargs.pop("output_schema_override", None)
+        preserve_system_prefix = bool(kwargs.pop("preserve_system_prefix", False))
         if LiteLlm is not object:
             super().__init__(model=model, **kwargs)
         else:
             self.model = model
+        self._output_schema_override = output_schema_override
+        self._preserve_system_prefix = preserve_system_prefix
         if getattr(self, "llm_client", None) is None:
             self.llm_client = ResilientLiteLLMClient()
         if "gemini" in str(model).lower():
@@ -2468,23 +2845,15 @@ class ResilientLiteLlm(LiteLlm):
         return getattr(super(), "capabilities", None)
 
     @staticmethod
-    def _inject_stage_turn_reminder(llm_request: Any) -> None:
-        """Injects a termination reminder or reporting directive on every turn."""
-        schema_cls = getattr(getattr(llm_request, "config", None), "response_schema", None)
-        has_set_model_response = False
-        tools_dict = getattr(llm_request, "tools_dict", None)
-        if schema_cls is None:
-            if isinstance(tools_dict, dict) and "set_model_response" in tools_dict:
-                has_set_model_response = True
-                schema_cls = getattr(tools_dict["set_model_response"], "output_schema", None)
-        else:
-            if isinstance(tools_dict, dict) and "set_model_response" in tools_dict:
-                has_set_model_response = True
-
-        has_report_findings = isinstance(tools_dict, dict) and "report_findings" in tools_dict
-
+    def build_stage_turn_reminder_entries(
+        schema_cls: Any = None,
+        *,
+        has_set_model_response: bool = False,
+        has_report_findings: bool = False,
+    ) -> list[tuple[str, str]]:
+        """Builds deterministic `(header, text)` stage reminder entries without mutating a request."""
         if schema_cls is None and not has_report_findings:
-            return
+            return []
 
         reminder_entries: list[tuple[str, str]] = []
 
@@ -2545,6 +2914,47 @@ class ResilientLiteLlm(LiteLlm):
             )
             reminder_entries.append((reporting_header, reporting_directive))
 
+        return reminder_entries
+
+    @staticmethod
+    def render_stage_turn_reminder(
+        schema_cls: Any = None,
+        *,
+        has_set_model_response: bool = False,
+        has_report_findings: bool = False,
+    ) -> str:
+        """Renders stage turn reminders as a single string for user-turn envelope injection."""
+        entries = ResilientLiteLlm.build_stage_turn_reminder_entries(
+            schema_cls,
+            has_set_model_response=has_set_model_response,
+            has_report_findings=has_report_findings,
+        )
+        return "".join(text for _header, text in entries)
+
+    @staticmethod
+    def _inject_stage_turn_reminder(llm_request: Any) -> None:
+        """Injects a termination reminder or reporting directive on every turn."""
+        schema_cls = getattr(getattr(llm_request, "config", None), "response_schema", None)
+        has_set_model_response = False
+        tools_dict = getattr(llm_request, "tools_dict", None)
+        if schema_cls is None:
+            if isinstance(tools_dict, dict) and "set_model_response" in tools_dict:
+                has_set_model_response = True
+                schema_cls = getattr(tools_dict["set_model_response"], "output_schema", None)
+        else:
+            if isinstance(tools_dict, dict) and "set_model_response" in tools_dict:
+                has_set_model_response = True
+
+        has_report_findings = isinstance(tools_dict, dict) and "report_findings" in tools_dict
+
+        reminder_entries = ResilientLiteLlm.build_stage_turn_reminder_entries(
+            schema_cls,
+            has_set_model_response=has_set_model_response,
+            has_report_findings=has_report_findings,
+        )
+        if not reminder_entries:
+            return
+
         # Into the instruction, never into the messages. Both reminders are
         # the same text on every call of a stage, so they belong to the
         # stable head of the prompt. Appending them to the LAST message
@@ -2575,6 +2985,43 @@ class ResilientLiteLlm(LiteLlm):
             config.system_instruction = current + text
 
     @staticmethod
+    def get_or_render_findings_snapshot(cache_scope_key: str) -> str:
+        """Computes and caches the campaign's active findings snapshot for `cache_scope_key`."""
+        from core.context import current_run_context
+        from core.database import read_findings
+
+        ctx = current_run_context.get()
+        if ctx is None or not ctx.db_path or not os.path.exists(ctx.db_path):
+            return ""
+        pass_idx = max(1, int(getattr(ctx, "pass_index", 1) or 1))
+        active_node = str(getattr(ctx, "active_node", "") or "")
+        if (
+            pass_idx > 1
+            and not bool(getattr(ctx, "reported_in_pass", False))
+            and (
+                active_node in ("architect", "threat_modeler", "planner", "explorer")
+                or active_node == "researcher"
+                or active_node.startswith("researcher_")
+            )
+        ):
+            return ""
+        store = getattr(ctx, "node_context", None)
+        snapshots = store.setdefault("_findings_snapshot", {}) if isinstance(store, dict) else {}
+        key = f"{pass_idx}:{cache_scope_key}"
+        if key not in snapshots:
+            try:
+                findings = read_findings(
+                    ctx.db_path, run_id=ctx.run_id,
+                    scope_path=(getattr(ctx, "target_file", "") or None),
+                    campaign=(getattr(ctx, "target_file", "") or None),
+                    pass_index=pass_idx,
+                )
+            except Exception:
+                return ""
+            snapshots[key] = ResilientLiteLlm._render_findings_snapshot(findings)
+        return str(snapshots.get(key) or "")
+
+    @staticmethod
     def _inject_active_findings_state(llm_request: Any) -> None:
         """Tells a stage, once, which findings its campaign has already recorded.
 
@@ -2590,44 +3037,13 @@ class ResilientLiteLlm(LiteLlm):
         it is appended to, so each stage of a campaign takes its own snapshot
         and a continued attempt takes a fresh one.
         """
-        from core.context import current_run_context
-        from core.database import read_findings
-
-        ctx = current_run_context.get()
-        if ctx is None or not ctx.db_path or not os.path.exists(ctx.db_path):
-            return
         header = FINDINGS_SNAPSHOT_HEADER
         config = getattr(llm_request, "config", None)
         instruction = str(getattr(config, "system_instruction", "") or "") if config is not None else ""
         if header in instruction:
             return
-        pass_idx = max(1, int(getattr(ctx, "pass_index", 1) or 1))
-        active_node = str(getattr(ctx, "active_node", "") or "")
-        if (
-            pass_idx > 1
-            and not bool(getattr(ctx, "reported_in_pass", False))
-            and (
-                active_node in ("architect", "threat_modeler", "planner")
-                or active_node == "researcher"
-                or active_node.startswith("researcher_")
-            )
-        ):
-            return
-        store = getattr(ctx, "node_context", None)
-        snapshots = store.setdefault("_findings_snapshot", {}) if isinstance(store, dict) else {}
-        key = f"{pass_idx}:{hashlib.sha256(instruction.encode('utf-8', 'replace')).hexdigest()}"
-        if key not in snapshots:
-            try:
-                findings = read_findings(
-                    ctx.db_path, run_id=ctx.run_id,
-                    scope_path=(getattr(ctx, "target_file", "") or None),
-                    campaign=(getattr(ctx, "target_file", "") or None),
-                    pass_index=pass_idx,
-                )
-            except Exception:
-                return
-            snapshots[key] = ResilientLiteLlm._render_findings_snapshot(findings)
-        block = snapshots[key]
+        digest = hashlib.sha256(instruction.encode("utf-8", "replace")).hexdigest()
+        block = ResilientLiteLlm.get_or_render_findings_snapshot(digest)
         if block:
             ResilientLiteLlm._append_instruction_once(llm_request, header, block)
 
@@ -2659,16 +3075,110 @@ class ResilientLiteLlm(LiteLlm):
         )
 
     @staticmethod
-    def _sanitize_structured_response(response: Any, schema_cls: Any) -> Any:
+    def _extract_valid_structured_json(text: str, schema_cls: Any) -> tuple[bool, Optional[str]]:
+        """Validates raw or fenced/embedded JSON against `schema_cls`.
+
+        Returns `(is_valid, salvaged_json)` where `salvaged_json` is `None` when
+        `text.strip()` already validated verbatim, or the normalized JSON string
+        when salvaged from fences/prose.
+        """
+        raw_stripped = (text or "").strip()
+        if not raw_stripped or schema_cls is None:
+            return False, None
+
+        candidates: list[str] = [raw_stripped]
+        clean_text = raw_stripped
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        elif clean_text.startswith("```"):
+            clean_text = clean_text[3:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+        if clean_text and clean_text not in candidates:
+            candidates.append(clean_text)
+
+        for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE):
+            cand_fenced = m.group(1).strip()
+            if cand_fenced and cand_fenced not in candidates:
+                candidates.append(cand_fenced)
+
+        decoder = json.JSONDecoder()
+        search_pos = 0
+        while True:
+            brace_idx = text.find("{", search_pos)
+            if brace_idx == -1:
+                break
+            try:
+                _obj, end_idx = decoder.raw_decode(text, brace_idx)
+                if isinstance(_obj, dict):
+                    cand_obj = text[brace_idx:end_idx].strip()
+                    if cand_obj and cand_obj not in candidates:
+                        candidates.append(cand_obj)
+                search_pos = end_idx
+            except Exception:
+                search_pos = brace_idx + 1
+
+        for cand in candidates:
+            try:
+                if hasattr(schema_cls, "model_validate_json"):
+                    validated = schema_cls.model_validate_json(cand)
+                    salvaged = (
+                        validated.model_dump_json()
+                        if cand != raw_stripped and hasattr(validated, "model_dump_json")
+                        else (cand if cand != raw_stripped else None)
+                    )
+                    return True, salvaged
+                elif hasattr(schema_cls, "validate_json"):
+                    schema_cls.validate_json(cand)
+                    return True, (cand if cand != raw_stripped else None)
+            except Exception:
+                continue
+        return False, None
+
+    @staticmethod
+    def _sanitize_structured_response(
+        response: Any,
+        schema_cls: Any,
+        *,
+        allow_set_model_response_tool: bool = True,
+    ) -> Any:
         """Sanitizes model responses when a structured schema is required to prevent Pydantic ValidationError on refusals."""
         if schema_cls is None or getattr(response, "partial", False):
             return response
 
+        from google.genai import types
+
         # If the response contains function calls (e.g. set_model_response or tool calls), let ADK handle it
+        # -- unless set_model_response is NOT registered (prefix_group raw-JSON mode), in which case a
+        # hallucinated set_model_response call is converted directly into validated raw JSON text.
         parts = getattr(getattr(response, "content", None), "parts", None)
         if parts:
-            if any(getattr(p, "function_call", None) is not None for p in parts):
-                return response
+            fcs = [getattr(p, "function_call", None) for p in parts if getattr(p, "function_call", None) is not None]
+            if fcs:
+                if (
+                    not allow_set_model_response_tool
+                    and len(fcs) == 1
+                    and getattr(fcs[0], "name", "") == "set_model_response"
+                    and isinstance(getattr(fcs[0], "args", None), dict)
+                ):
+                    try:
+                        cand_json = json.dumps(dict(fcs[0].args))
+                        ok, salvaged = ResilientLiteLlm._extract_valid_structured_json(cand_json, schema_cls)
+                        if ok:
+                            final_json = salvaged if salvaged is not None else cand_json
+                            thought_parts = [p for p in parts if getattr(p, "thought", False)]
+                            sig = next(
+                                (getattr(p, "thought_signature", None) for p in reversed(parts) if getattr(p, "thought_signature", None)),
+                                None,
+                            )
+                            txt_part = types.Part(text=final_json, thought_signature=sig) if sig else types.Part.from_text(text=final_json)
+                            response.content.parts = thought_parts + [txt_part]
+                            return response
+                    except Exception:
+                        pass
+                else:
+                    return response
 
         # Extract text content from parts
         text = ""
@@ -2679,72 +3189,29 @@ class ResilientLiteLlm(LiteLlm):
                 if not getattr(p, "thought", False)
             )
 
-        from google.genai import types
         is_safety_block = getattr(response, "finish_reason", None) in (types.FinishReason.SAFETY, "SAFETY") or getattr(response, "error_code", None) == "SAFETY"
 
         # Check if the text (or fenced/embedded JSON inside it) validates against schema_cls.
         is_valid = False
         salvaged_json: Optional[str] = None
-        raw_stripped = text.strip()
-        if raw_stripped and not is_safety_block and not getattr(response, "error_code", None):
-            candidates: list[str] = [raw_stripped]
-            clean_text = raw_stripped
-            if clean_text.startswith("```json"):
-                clean_text = clean_text[7:]
-            elif clean_text.startswith("```"):
-                clean_text = clean_text[3:]
-            if clean_text.endswith("```"):
-                clean_text = clean_text[:-3]
-            clean_text = clean_text.strip()
-            if clean_text and clean_text not in candidates:
-                candidates.append(clean_text)
-
-            for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE):
-                cand_fenced = m.group(1).strip()
-                if cand_fenced and cand_fenced not in candidates:
-                    candidates.append(cand_fenced)
-
-            decoder = json.JSONDecoder()
-            search_pos = 0
-            while True:
-                brace_idx = text.find("{", search_pos)
-                if brace_idx == -1:
-                    break
-                try:
-                    _obj, end_idx = decoder.raw_decode(text, brace_idx)
-                    if isinstance(_obj, dict):
-                        cand_obj = text[brace_idx:end_idx].strip()
-                        if cand_obj and cand_obj not in candidates:
-                            candidates.append(cand_obj)
-                    search_pos = end_idx
-                except Exception:
-                    search_pos = brace_idx + 1
-
-            for cand in candidates:
-                try:
-                    if hasattr(schema_cls, "model_validate_json"):
-                        validated = schema_cls.model_validate_json(cand)
-                        is_valid = True
-                        salvaged_json = (
-                            validated.model_dump_json()
-                            if cand != raw_stripped and hasattr(validated, "model_dump_json")
-                            else (cand if cand != raw_stripped else None)
-                        )
-                        break
-                    elif hasattr(schema_cls, "validate_json"):
-                        schema_cls.validate_json(cand)
-                        is_valid = True
-                        salvaged_json = cand if cand != raw_stripped else None
-                        break
-                except Exception:
-                    continue
+        if text.strip() and not is_safety_block and not getattr(response, "error_code", None):
+            is_valid, salvaged_json = ResilientLiteLlm._extract_valid_structured_json(text, schema_cls)
 
         if is_safety_block:
             is_valid = False
 
         if is_valid and salvaged_json is not None:
             thought_parts = [p for p in (parts or []) if getattr(p, "thought", False)]
-            new_parts = thought_parts + [types.Part.from_text(text=salvaged_json)]
+            sig = next(
+                (
+                    getattr(p, "thought_signature", None)
+                    for p in reversed(parts or [])
+                    if not getattr(p, "thought", False) and getattr(p, "thought_signature", None)
+                ),
+                None,
+            )
+            txt_part = types.Part(text=salvaged_json, thought_signature=sig) if sig else types.Part.from_text(text=salvaged_json)
+            new_parts = thought_parts + [txt_part]
             if getattr(response, "content", None) is None:
                 response.content = types.Content(role="model", parts=new_parts)
             else:
@@ -2860,12 +3327,17 @@ class ResilientLiteLlm(LiteLlm):
     async def generate_content_async(
         self, llm_request: Any, stream: bool = False
     ) -> Any:
-        self._inject_stage_turn_reminder(llm_request)
-        self._inject_active_findings_state(llm_request)
+        if not self._preserve_system_prefix:
+            self._inject_stage_turn_reminder(llm_request)
+            self._inject_active_findings_state(llm_request)
         schema_cls = getattr(getattr(llm_request, "config", None), "response_schema", None)
-        if schema_cls is None and isinstance(getattr(llm_request, "tools_dict", None), dict):
-            if "set_model_response" in llm_request.tools_dict:
+        has_smr_tool = False
+        if isinstance(getattr(llm_request, "tools_dict", None), dict) and "set_model_response" in llm_request.tools_dict:
+            has_smr_tool = True
+            if schema_cls is None:
                 schema_cls = getattr(llm_request.tools_dict["set_model_response"], "output_schema", None)
+        if schema_cls is None and self._output_schema_override is not None:
+            schema_cls = self._output_schema_override
 
         max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
         initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
@@ -2890,66 +3362,152 @@ class ResilientLiteLlm(LiteLlm):
         empty_turns = 0
         auth_refreshed = False
         schema_error_retried = False
+        invalid_json_retried = False
         current_stream = stream
+        active_request = llm_request
+        stem_cache_meta = getattr(llm_request, "_mantis_stem_cache", None)
         while True:
             streamed_content = False  # per attempt: has this turn yielded an answer yet
             yielded_any = False       # per attempt: did upstream yield any LlmResponse at all
             pending_empty = None      # a final with no answer, held until the stream shows what follows
             retry_schema_turn = False
+            used_cache_entry: Optional[dict[str, Any]] = None
+            wire_request = active_request
+            cache_tok = None
             try:
                 from google.genai import types as genai_types
-                async for response in super().generate_content_async(llm_request, stream=current_stream):
+                if isinstance(stem_cache_meta, dict):
+                    from core.context import current_run_context
+
+                    rc_cache = current_run_context.get()
+                    stem_len = int(stem_cache_meta.get("stem_len") or 0)
+                    slot_key = str(stem_cache_meta.get("slot_key") or "")
+                    full_contents = list(getattr(active_request, "contents", None) or [])
                     if (
-                        current_stream
-                        and (
-                            getattr(response, "error_code", None) in (getattr(genai_types.FinishReason, "MAX_TOKENS", None), "MAX_TOKENS")
-                            or getattr(response, "finish_reason", None) in (getattr(genai_types.FinishReason, "MAX_TOKENS", None), "MAX_TOKENS")
-                        )
-                        and "Tool call arguments were truncated" in str(getattr(response, "error_message", ""))
+                        rc_cache is not None
+                        and slot_key
+                        and stem_len > 0
+                        and len(full_contents) > stem_len
                     ):
-                        meter_response_usage(response)
-                        raise MantisStreamingTruncationError(str(getattr(response, "error_message", "")))
-                    if pending_empty is not None:
-                        # Something followed it, so it was not the end of the
-                        # turn: pass it on as it came.
-                        yielded_any = True
-                        yield self._sanitize_structured_response(pending_empty, schema_cls)
-                        pending_empty = None
-                    if is_empty_stop_response(response) and not streamed_content:
-                        # Streamed or not: ADK ends a streamed turn with one
-                        # final, non-partial response, and that is the one
-                        # judged here (is_empty_stop_response ignores
-                        # partial chunks). A finish-only final after an
-                        # answer was streamed in this attempt is not an
-                        # empty turn; streamed thought summaries are not an
-                        # answer, so they do not count as one. Held rather
-                        # than judged at once: an aggregator may emit a
-                        # thought-only final ahead of the tool call that
-                        # ends the turn, and only the stream's end says.
-                        pending_empty = response
-                        continue
-                    if (
-                        schema_cls is not None
-                        and not getattr(response, "partial", False)
-                        and not schema_error_retried
-                        and not streamed_content
-                        and (
-                            (
-                                getattr(response, "error_code", None)
-                                and str(getattr(response, "error_code", "")) not in ("SAFETY", "MAX_TOKENS")
+                        entry = await ensure_explicit_stem_cache(
+                            ctx=rc_cache,
+                            cache_slot_key=slot_key,
+                            model_id=str(getattr(self, "model", "") or ""),
+                            additional_args=dict(getattr(self, "_additional_args", None) or {}),
+                            base_instruction=str(
+                                getattr(getattr(active_request, "config", None), "system_instruction", "") or ""
+                            ),
+                            tools_list=list(getattr(getattr(active_request, "config", None), "tools", None) or []),
+                            stem_contents=full_contents[:stem_len],
+                        )
+                        if entry and entry.get("name") and not entry.get("evicted"):
+                            used_cache_entry = entry
+                            wire_request = active_request.model_copy()
+                            wire_request.contents = full_contents[stem_len:]
+                            orig_cfg = getattr(active_request, "config", None)
+                            if orig_cfg is not None:
+                                cfg_copy = orig_cfg.model_copy()
+                                cfg_copy.system_instruction = None
+                                cfg_copy.tools = None
+                                if hasattr(cfg_copy, "tool_config"):
+                                    cfg_copy.tool_config = None
+                                wire_request.config = cfg_copy
+                            wire_request.tools_dict = {}
+                            cache_tok = _ACTIVE_EXPLICIT_CACHE_HANDLE.set(str(entry["name"]))
+                try:
+                    async for response in super().generate_content_async(wire_request, stream=current_stream):
+                        if (
+                            current_stream
+                            and (
+                                getattr(response, "error_code", None) in (getattr(genai_types.FinishReason, "MAX_TOKENS", None), "MAX_TOKENS")
+                                or getattr(response, "finish_reason", None) in (getattr(genai_types.FinishReason, "MAX_TOKENS", None), "MAX_TOKENS")
                             )
-                            or str(getattr(response, "finish_reason", "")).endswith("MALFORMED_FUNCTION_CALL")
+                            and "Tool call arguments were truncated" in str(getattr(response, "error_message", ""))
+                        ):
+                            meter_response_usage(response)
+                            raise MantisStreamingTruncationError(str(getattr(response, "error_message", "")))
+                        if pending_empty is not None:
+                            # Something followed it, so it was not the end of the
+                            # turn: pass it on as it came.
+                            yielded_any = True
+                            yield self._sanitize_structured_response(
+                                pending_empty, schema_cls, allow_set_model_response_tool=has_smr_tool
+                            )
+                            pending_empty = None
+                        if is_empty_stop_response(response) and not streamed_content:
+                            pending_empty = response
+                            continue
+                        if (
+                            schema_cls is not None
+                            and not getattr(response, "partial", False)
+                            and not schema_error_retried
+                            and not streamed_content
+                            and (
+                                (
+                                    getattr(response, "error_code", None)
+                                    and str(getattr(response, "error_code", "")) not in ("SAFETY", "MAX_TOKENS")
+                                )
+                                or str(getattr(response, "finish_reason", "")).endswith("MALFORMED_FUNCTION_CALL")
+                            )
+                        ):
+                            meter_response_usage(response)
+                            schema_error_retried = True
+                            retry_schema_turn = True
+                            current_stream = False
+                            break
+                        if (
+                            self._output_schema_override is not None
+                            and schema_cls is not None
+                            and not getattr(response, "partial", False)
+                            and not invalid_json_retried
+                            and not getattr(response, "error_code", None)
+                            and getattr(response, "finish_reason", None) not in (genai_types.FinishReason.SAFETY, "SAFETY")
+                        ):
+                            resp_parts = getattr(getattr(response, "content", None), "parts", None) or []
+                            resp_fcs = [getattr(p, "function_call", None) for p in resp_parts if getattr(p, "function_call", None) is not None]
+                            if not resp_fcs:
+                                resp_text = "".join(
+                                    getattr(p, "text", "") or ""
+                                    for p in resp_parts
+                                    if not getattr(p, "thought", False)
+                                )
+                                is_ok, _ = self._extract_valid_structured_json(resp_text, schema_cls)
+                                if not is_ok:
+                                    meter_response_usage(response)
+                                    invalid_json_retried = True
+                                    retry_schema_turn = True
+                                    current_stream = False
+                                    schema_label = getattr(schema_cls, "__name__", "verdict")
+                                    retry_req = active_request.model_copy()
+                                    appended = list(getattr(active_request, "contents", None) or [])
+                                    if getattr(response, "content", None) is not None and resp_parts:
+                                        appended.append(response.content)
+                                    appended.append(
+                                        genai_types.Content(
+                                            role="user",
+                                            parts=[
+                                                genai_types.Part.from_text(
+                                                    text=(
+                                                        f"Your response did not contain valid {schema_label} JSON. "
+                                                        f"Emit ONLY a raw JSON object conforming to {schema_label} "
+                                                        "(no markdown fences, no prose, and no tool calls)."
+                                                    )
+                                                )
+                                            ],
+                                        )
+                                    )
+                                    retry_req.contents = appended
+                                    active_request = retry_req
+                                    break
+                        if response_has_meaningful_content(response):
+                            streamed_content = True
+                        yielded_any = True
+                        yield self._sanitize_structured_response(
+                            response, schema_cls, allow_set_model_response_tool=has_smr_tool
                         )
-                    ):
-                        meter_response_usage(response)
-                        schema_error_retried = True
-                        retry_schema_turn = True
-                        current_stream = False
-                        break
-                    if response_has_meaningful_content(response):
-                        streamed_content = True
-                    yielded_any = True
-                    yield self._sanitize_structured_response(response, schema_cls)
+                finally:
+                    if cache_tok is not None:
+                        _ACTIVE_EXPLICIT_CACHE_HANDLE.reset(cache_tok)
                 if retry_schema_turn:
                     continue
                 if pending_empty is not None:
@@ -3005,6 +3563,20 @@ class ResilientLiteLlm(LiteLlm):
                 )
                 await asyncio.sleep(delay)
             except Exception as e:
+                if (
+                    used_cache_entry is not None
+                    and not yielded_any
+                    and _is_cached_content_rejection(e)
+                ):
+                    used_cache_entry["evicted"] = True
+                    print(
+                        f"\n[CONTEXT CACHE] CachedContent '{used_cache_entry.get('name')}' rejected "
+                        f"({type(e).__name__}); evicting handle and retrying with full stem...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
                 if current_stream and any(p in str(e).lower() for p in ("unterminated string", "jsondecodeerror", "truncated while streaming")):
                     model_name = str(getattr(self, "model", getattr(llm_request, "model", "llm")))
                     print(
@@ -3074,14 +3646,16 @@ class ResilientLiteLlm(LiteLlm):
                             candidates_token_count=0,
                             total_token_count=0,
                         )
-                        yield self._sanitize_structured_response(giveup_resp, schema_cls)
+                        yield self._sanitize_structured_response(
+                            giveup_resp, schema_cls, allow_set_model_response_tool=has_smr_tool
+                        )
                     else:
                         yield empty_turn_final_response()
                     return
                 if isinstance(e, MantisEmptyResponseError) and empty_turns >= 2:
                     # The same bytes drew nothing twice; ask, once, whether
                     # the stage is done. Appended, never edited.
-                    append_empty_turn_nudge(llm_request)
+                    append_empty_turn_nudge(active_request)
                 if not is_retryable_llm_error(e) or elapsed >= max_patience:
                     raise
 

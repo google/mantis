@@ -293,8 +293,18 @@ class TestPerFindingVerdictsAndSanitizer(unittest.IsolatedAsyncioTestCase):
                     critic_agent = agent
                     break
         self.assertIsNotNone(critic_agent)
-        self.assertIs(critic_agent.output_schema, ext_cls)
-        self.assertIn("PER-FINDING VERDICTS:", critic_agent.instruction(None))
+        self.assertIsNone(critic_agent.output_schema)
+        self.assertIs(critic_agent.model._output_schema_override, ext_cls)
+        closure_texts = [
+            c.cell_contents
+            for cb in (critic_agent.before_model_callback or [])
+            for c in (getattr(cb, "__closure__", None) or ())
+            if isinstance(getattr(c, "cell_contents", None), str)
+        ]
+        self.assertTrue(
+            any("PER-FINDING VERDICTS:" in t for t in closure_texts),
+            "PER-FINDING VERDICTS missing from prefix_group critic stage_role_prompt",
+        )
 
     async def test_sanitizer_salvages_fenced_and_embedded_json_without_fallback(self):
         ext_critic = cfg_mod.ExtendedCriticVerdict

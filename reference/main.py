@@ -897,8 +897,14 @@ async def _drive_campaign(
                                     m in part.text
                                     for m in (
                                         "] Reused the ",
+                                        "] Reused repo-root ",
+                                        "] Recorded deterministic single-file ",
+                                        "] Skipped deduplication:",
+                                        "] Recorded deterministic executive report summary",
                                         "] Deferred per-campaign report ",
                                         "] Zero active findings in scope; recorded clean report summary without LLM call.",
+                                        "Skipped stage in static-only sandbox mode.",
+                                        "Skipped dynamic reproduction in static-only sandbox mode.",
                                     )
                                 )
                                 if budget_controller and usage is None and not _is_shortcircuit:
@@ -1019,6 +1025,12 @@ async def _drive_campaign(
     finally:
         # Session trajectories are retained in session_service database for auditability and rehydration
         _flush_parallel_lines(force=True)
+        try:
+            from core.config import cleanup_explicit_caches
+
+            await cleanup_explicit_caches(current_run_context.get())
+        except Exception:
+            pass
             
     print("\n" + "-" * 60)
     return bool(fatal_tool_errors or pending_node_errors)
@@ -1741,6 +1753,102 @@ def _confirm_work_plan(
     return answer in ("y", "yes")
 
 
+_NON_COUNTABLE_DOC_LOCK_EXTS = frozenset({
+    ".md",
+    ".rst",
+    ".txt",
+    ".adoc",
+    ".lock",
+    ".sum",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".pdf",
+    ".map",
+    ".snap",
+    ".csv",
+    ".tsv",
+    ".log",
+})
+
+_NON_COUNTABLE_BASENAMES = frozenset({
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "cargo.lock",
+    "gemfile.lock",
+    "composer.lock",
+    "go.sum",
+    "license",
+    "notice",
+    "changelog",
+})
+
+
+def _is_countable_source_file(filepath: str) -> bool:
+    """True when `filepath` is code or runtime configuration rather than prose docs/lockfiles."""
+    name = os.path.basename(str(filepath or "")).lower()
+    if not name or name in _NON_COUNTABLE_BASENAMES:
+        return False
+    if name.endswith((".min.js", ".min.css", ".d.ts.map")):
+        return False
+    _, ext = os.path.splitext(name)
+    return ext not in _NON_COUNTABLE_DOC_LOCK_EXTS
+
+
+def _risk_order_file_sweep_targets(
+    files: list[str],
+    target_root: str | Path,
+    exclude: Any = (),
+) -> list[str]:
+    """Deterministically permutes `files` so high-risk surveyed slices and code files run first."""
+    if len(files) <= 1:
+        return list(files)
+    try:
+        from core.surveyor import survey
+
+        root_real = os.path.realpath(str(target_root)).rstrip("/")
+        astm = survey(Path(root_real), max_slices=10_000, exclude=exclude)
+        slice_ranks: list[tuple[str, int]] = []
+        for idx, sl in enumerate((astm or {}).get("slices") or []):
+            for rp in sl.get("root_paths") or ():
+                rp_str = str(rp or "").strip().strip("/")
+                full_rp = os.path.realpath(os.path.join(root_real, rp_str)).rstrip("/") if rp_str and rp_str != "." else root_real
+                slice_ranks.append((full_rp, idx))
+        default_slice_rank = len(slice_ranks) + 1
+
+        def _rank_key(item_and_idx: tuple[int, str]) -> tuple[int, int, int, int]:
+            orig_i, fp = item_and_idx
+            is_src = 0 if _is_countable_source_file(fp) else 1
+            fp_real = os.path.realpath(str(fp))
+            best_sl = default_slice_rank
+            best_depth = -1
+            for s_root, s_idx in slice_ranks:
+                if fp_real == s_root or fp_real.startswith(s_root + os.sep):
+                    depth = len(s_root)
+                    if depth > best_depth or (depth == best_depth and s_idx < best_sl):
+                        best_depth = depth
+                        best_sl = s_idx
+            low_fp = fp_real.replace("\\", "/").lower()
+            is_test = 1 if ("/test/" in low_fp or "/tests/" in low_fp or os.path.basename(low_fp).startswith("test_")) else 0
+            return (is_src, best_sl, is_test, orig_i)
+
+        ordered = [fp for _, fp in sorted(enumerate(files), key=_rank_key)]
+        if sorted(ordered) == sorted(files):
+            return ordered
+    except Exception:
+        pass
+    return list(files)
+
+
 def resolve_scan_targets(
     target_path: Path,
     config: dict,
@@ -1847,6 +1955,9 @@ def resolve_scan_targets(
         #
         # Either way it states what it selected, what that leaves unexamined, and
         # what the alternative costs, in numbers.
+        countable_sources = sum(1 for f in discovered_files if _is_countable_source_file(f))
+        if countable_sources > 0 and countable_sources <= threshold < len(discovered_files):
+            threshold = len(discovered_files)
         if len(discovered_files) <= threshold:
             mode = SCAN_MODE_WHOLE
             # A small repository is rescanned whole every run; that is the
@@ -3966,6 +4077,11 @@ async def pipeline(
     # of the list it was given, so the set of paths scanned stays exactly the CP-3
     # validated set `resolve_scan_targets` produced. Repo-derived and prior-LLM data may
     # direct attention here; it can never introduce a target or widen anything.
+    if scan_mode == SCAN_MODE_FILE_BY_FILE and len(targets_to_scan) > 1:
+        targets_to_scan = _risk_order_file_sweep_targets(
+            list(targets_to_scan), target_path, exclude=exclude
+        )
+
     coverage_plan = {"available": False}
     try:
         from core.memory import load_coverage, recall
@@ -4264,6 +4380,8 @@ async def pipeline(
         parallel_workers=worker_count,
         shared_prefix_runs={},
         defer_reporter=multi_campaign_run,
+        enable_context_cache=bool(use_context_cache),
+        enable_narrative_report=bool(config.get("enable_narrative_report", False)),
         enable_memory=not bool(no_memory),
         intra_run_learning=bool(intra_run_learning),
         freeze_memory_to_prior_runs=not bool(intra_run_learning),
@@ -4377,6 +4495,7 @@ async def pipeline(
                 finding_evidence={},
                 node_context={},
                 read_file_counts={},
+                explicit_cache_handles={},
                 audit_checklist=None,
                 pass_index=pass_idx,
                 artifact_resource=pass_resource,

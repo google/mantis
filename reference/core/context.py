@@ -116,6 +116,10 @@ class RunContext:
     enable_memory: bool = True
     intra_run_learning: bool = False
     freeze_memory_to_prior_runs: bool = False
+    # Explicit provider context-cache controls & active per-campaign CachedContent handles.
+    enable_context_cache: bool = True
+    enable_narrative_report: bool = False
+    explicit_cache_handles: dict[str, dict] = field(default_factory=dict)
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

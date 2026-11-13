@@ -853,6 +853,7 @@ CODE_READ_TOOLS = ("read_file", "get_function_boundary")
 # withheld with a visible warning, and the slice is rescanned -- never
 # silently stamped.
 AUDIT_NODES = (
+    "explorer",
     "researcher",
     "researcher_structural",
     "researcher_domain",

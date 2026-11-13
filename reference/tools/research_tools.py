@@ -23,7 +23,16 @@ import stat
 import subprocess
 from typing import Any, Optional, Union
 from pydantic import ValidationError
-from core.schemas import VulnerabilityReport
+from core.schemas import (
+    AuditPlanInput,
+    ExecutiveReportInput,
+    ExploitChainInput,
+    FindingSchema,
+    LearningInput,
+    ReportedFindingInput,
+    ReportedFindingsBatch,
+    VulnerabilityReport,
+)
 from core.database import (
     write_findings,
     read_findings,
@@ -982,13 +991,47 @@ def _citation_problems(
     return problems
 
 
-def report_findings(report: VulnerabilityReport) -> str:
+_FORBIDDEN_REPORT_FINDINGS_STAGES = (
+    "explorer",
+    "reviewer",
+    "critic",
+    "architect",
+    "threat_modeler",
+    "planner",
+    "reproducer",
+    "chainer",
+    "patcher",
+    "calibrator",
+    "reflector",
+    "reporter",
+    "history",
+    "structural_index",
+)
+
+
+def report_findings(report: ReportedFindingsBatch) -> str:
     """Submit the structured report of all vulnerabilities found in the file."""
     ctx = current_run_context.get()
     if ctx is None:
         return "Error: No active execution context."
+    active_stage = str(getattr(ctx, "active_node", "") or "").strip().lower()
+    if active_stage and any(
+        active_stage == s or active_stage.startswith(s + "_") or active_stage.startswith(s + "-")
+        for s in _FORBIDDEN_REPORT_FINDINGS_STAGES
+    ):
+        return (
+            f"Error: Tool 'report_findings' is not permitted in stage '{active_stage}' "
+            "(INV-2 separation of duties)."
+        )
     try:
-        if isinstance(report, VulnerabilityReport):
+        if isinstance(report, ReportedFindingsBatch):
+            findings = [
+                FindingSchema.model_validate(item.model_dump(exclude_unset=True))
+                if isinstance(item, ReportedFindingInput)
+                else FindingSchema.model_validate(item)
+                for item in report.findings
+            ]
+        elif isinstance(report, VulnerabilityReport):
             findings = report.findings
         elif isinstance(report, dict):
             report_obj = VulnerabilityReport.model_validate(report)
@@ -997,7 +1040,7 @@ def report_findings(report: VulnerabilityReport) -> str:
             report_obj = VulnerabilityReport(findings=report)
             findings = report_obj.findings
         else:
-            return "Error: report must be a VulnerabilityReport, dict, or list."
+            return "Error: report must be a ReportedFindingsBatch, VulnerabilityReport, dict, or list."
 
         active_node = str(getattr(ctx, "active_node", "") or "").strip().lower()
         is_dedupe_node = active_node in ("deduplicator", "dedupe") or "dedupe" in active_node
@@ -1839,14 +1882,14 @@ def _without_excluded(ctx, rel_paths):
     return [p for p in rel_paths if not is_excluded(str(p), patterns)]
 
 
-def record_plan(plan: dict) -> str:
+def record_plan(plan: AuditPlanInput) -> str:
     """Validates and records the strategic review plan solely into the SQLite database."""
     from core.schemas import ReviewPlan
     ctx = current_run_context.get()
     if ctx is None:
         return "Error: No active execution context."
     try:
-        plan_obj = ReviewPlan.model_validate(plan) if isinstance(plan, dict) else plan
+        plan_obj = ReviewPlan.model_validate(plan) if isinstance(plan, dict) else ReviewPlan.model_validate(plan.model_dump(exclude_unset=True)) if not isinstance(plan, ReviewPlan) else plan
         content_json = plan_obj.model_dump_json(indent=2)
         _persist_artifact(ctx, "plan", "workspace/.structured/plan.json", content_json)
         return f"SUCCESS: Recorded review plan with {len(plan_obj.investigations)} targeted investigation(s)."
@@ -1979,7 +2022,7 @@ def get_summary() -> str:
         return f"ERROR READING ARTIFACT: {e}"
 
 
-def record_exploit_chain(chain: dict) -> str:
+def record_exploit_chain(chain: ExploitChainInput) -> str:
     """Validates and records a multi-stage exploit chain solely into the SQLite database."""
     from core.schemas import ExploitChain
     ctx = current_run_context.get()
@@ -1994,15 +2037,71 @@ def record_exploit_chain(chain: dict) -> str:
         return f"ERROR SAVING EXPLOIT CHAIN: {e}"
 
 
-def record_learning(learning: dict) -> str:
+def record_learning(learning: LearningInput) -> str:
     """Validates and persists a learning entry solely into the SQLite database."""
     from core.schemas import LearningEntry
-    from core.database import record_learning as db_record_learning
+    from core.database import CONFIRMED_LIVE_STATUSES, record_learning as db_record_learning
     ctx = current_run_context.get()
     if ctx is None:
         return "Error: No active execution context."
     try:
-        learn_obj = LearningEntry.model_validate(learning) if isinstance(learning, dict) else learning
+        if isinstance(learning, LearningEntry):
+            raw_dict = learning.model_dump(exclude_unset=True)
+        elif hasattr(learning, "model_dump"):
+            raw_dict = learning.model_dump(exclude_unset=True)
+        elif isinstance(learning, dict):
+            raw_dict = dict(learning)
+        else:
+            return "ERROR SAVING LEARNING: learning must be a LearningInput or dict."
+
+        body_txt = str(raw_dict.get("learning") or raw_dict.get("insight") or "").strip()
+        if not body_txt:
+            cue_s = str(raw_dict.get("cue") or "").strip()
+            lesson_s = str(raw_dict.get("lesson") or "").strip()
+            if cue_s and lesson_s:
+                body_txt = f"When {cue_s}: {lesson_s}"
+            elif lesson_s:
+                body_txt = lesson_s
+            elif cue_s:
+                body_txt = cue_s
+
+        if not body_txt:
+            return (
+                "ERROR SAVING LEARNING: 'learning' text is required and cannot be empty — "
+                "nothing was recorded."
+            )
+
+        target_stage = str(raw_dict.get("target_stage") or "").strip().lower()
+        if target_stage and f"[target_stage={target_stage}]" not in body_txt:
+            body_txt = f"[target_stage={target_stage}] {body_txt}"
+
+        cat = str(raw_dict.get("category") or target_stage or "general").strip() or "general"
+        tags: list[str] = [str(t) for t in (raw_dict.get("tags") or []) if str(t).strip()]
+        conf = str(raw_dict.get("confidence") or "").strip().lower()
+        ev_str = str(raw_dict.get("evidence") or "").strip()
+        if conf == "high":
+            has_confirmed_ref = False
+            if ev_str and ctx.db_path and os.path.exists(ctx.db_path):
+                cited_ids = {int(m) for m in re.findall(r"#?(\d+)", ev_str)}
+                if cited_ids:
+                    rows = read_findings(ctx.db_path, run_id=ctx.run_id)
+                    confirmed_ids = {
+                        int(r["id"])
+                        for r in rows
+                        if r.get("id") is not None
+                        and str(r.get("status") or "").lower() in CONFIRMED_LIVE_STATUSES
+                    }
+                    has_confirmed_ref = bool(cited_ids & confirmed_ids)
+            if not has_confirmed_ref:
+                conf = "medium"
+        if conf and f"confidence:{conf}" not in tags:
+            tags.append(f"confidence:{conf}")
+        if ev_str and not any(t.startswith("evidence:") for t in tags):
+            tags.append(f"evidence:{ev_str[:120]}")
+
+        learn_obj = LearningEntry.model_validate(
+            {**raw_dict, "category": cat, "learning": body_txt, "tags": tags}
+        )
         if ctx.db_path:
             db_record_learning(ctx.db_path, ctx.run_id, learn_obj.category, learn_obj.learning, learn_obj.tags)
         return f"SUCCESS: Recorded learning under category '{learn_obj.category}'."
@@ -2159,7 +2258,7 @@ def record_patch(
         return f"ERROR RECORDING PATCH: {e}"
 
 
-def generate_report(report: dict) -> str:
+def generate_report(report: ExecutiveReportInput) -> str:
     """Validates and records the executive vulnerability review packet solely into the SQLite database."""
     from core.schemas import ExecutiveReport
     ctx = current_run_context.get()

@@ -5,6 +5,7 @@
     "retry_attempts": 3,
     "default_model": "vertex_ai/gemini-3.8-flash",
     "reasoning_effort": "medium",
+    "context_editing_trigger_tokens": 180000,
     "timeout": 180,
     "seed_prompt": "Initial Task Input: Evaluate {filepath}",
     "sandbox": {
@@ -36,24 +37,39 @@
     {
       "id": "architect",
       "type": "agent",
+      "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "list_files", "record_summary", "get_summary"]
     },
     {
       "id": "threat_modeler",
       "type": "agent",
+      "fork_from": "architect",
+      "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "list_files", "get_summary", "record_threat_model", "get_threat_model"]
     },
     {
       "id": "planner",
       "type": "agent",
+      "fork_from": "threat_modeler",
+      "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "record_plan", "get_plan"]
     },
     {
+      "id": "explorer",
+      "type": "agent",
+      "fork_from": "planner",
+      "prefix_group": "audit_stem",
+      "reasoning_effort": "medium",
+      "tools": ["list_files", "read_file", "get_summary", "get_threat_model", "get_plan", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "write_file"]
+    },
+    {
       "id": "researcher",
       "type": "agent",
+      "fork_from": "explorer",
+      "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
       "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check"]
     },
@@ -71,6 +87,8 @@
     {
       "id": "reviewer",
       "type": "agent",
+      "fork_from": "explorer",
+      "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
       "tools": ["read_file", "get_findings", "get_threat_model", "get_summary", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check"],
       "output_schema": "ReviewVerdict",
@@ -84,7 +102,9 @@
     {
       "id": "critic",
       "type": "agent",
-      "reasoning_effort": "high",
+      "fork_from": "explorer",
+      "prefix_group": "audit_stem",
+      "reasoning_effort": "medium",
       "tools": ["read_file", "get_findings", "get_threat_model", "find_symbol", "find_callers", "find_callees", "get_function_boundary"],
       "output_schema": "CriticVerdict",
       "output_key": "verdict"
@@ -97,7 +117,10 @@
     {
       "id": "reproducer",
       "type": "agent",
-      "reasoning_effort": "high",
+      "fork_from": "explorer",
+      "prefix_group": "audit_stem",
+      "reasoning_effort": "medium",
+      "skip_when_static": true,
       "tools": ["run_sandbox", "run_sandbox_with_evidence", "get_findings", "get_threat_model", "read_file", "write_file", "get_function_boundary", "find_callers", "get_prior_poc", "record_regression_check"],
       "on_enter_status": "static_confirmed",
       "output_schema": "ReproVerdict",
@@ -147,7 +170,8 @@
     {"from": "structural_index", "to": "architect"},
     {"from": "architect", "to": "threat_modeler"},
     {"from": "threat_modeler", "to": "planner"},
-    {"from": "planner", "to": "researcher"},
+    {"from": "planner", "to": "explorer"},
+    {"from": "explorer", "to": "researcher"},
     {"from": "researcher", "to": "findings_gate"},
     {"from": "findings_gate", "to": "deduplicator", "on": "__DEFAULT__"},
     {"from": "findings_gate", "to": "reporter", "on": "clean"},

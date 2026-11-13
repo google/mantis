@@ -271,6 +271,8 @@ class InvestigationTargetSchema(BaseModel):
     model_config = ConfigDict(extra="allow")
     title: str = Field(description='Title of planned investigation')
     target_files: List[str] = Field(description='Files targeted for review')
+    line_range: Optional[List[int]] = Field(default=None, description='Optional [start_line, end_line] span to inspect')
+    priority: Optional[str] = Field(default='medium', description='Investigation priority (high, medium, low)')
     focus_areas: Optional[List[str]] = Field(default_factory=list, description='Security focus areas')
     kb_references: Optional[List[str]] = Field(default_factory=list, description='KB documentation files')
     question: Optional[str] = Field(default='', description='Prompting question for researcher')
@@ -282,6 +284,49 @@ class PlanSchema(BaseModel):
     investigations: List[InvestigationTargetSchema] = Field(description='Targeted investigations')
     focus_areas: Optional[List[str]] = Field(default_factory=list, description='Focus areas')
     rationale: Optional[str] = Field(default='', description='Strategic rationale')
+
+class ReportedFindingInput(BaseModel):
+    """Lean 9-field vulnerability finding input exposed on the report_findings tool schema."""
+    model_config = ConfigDict(extra="allow")
+    title: str = Field(description="Concise vulnerability title")
+    severity: Optional[Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]] = Field(default="MEDIUM", description="Severity tier")
+    filepath: Optional[str] = Field(default="", description="Target-relative source file path")
+    line_numbers: Optional[List[int]] = Field(default_factory=list, description="1-indexed line numbers of the vulnerable code")
+    code_paths: Optional[List[str]] = Field(default_factory=list, description="Cited file:line or file:line:symbol locations")
+    cwe: Optional[str] = Field(default="", description="CWE identifier (e.g. CWE-89)")
+    description: Optional[str] = Field(default="", description="Detailed technical explanation of root cause, source, and sink")
+    remediation: Optional[str] = Field(
+        default="",
+        validation_alias=AliasChoices("remediation", "mitigation"),
+        description="Concrete code-level fix recommendation",
+    )
+    prior_finding_id: Optional[int] = Field(default=None, description="Optional prior finding ID for regression linking")
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _norm_sev(cls, v: Any) -> Any:
+        return v.strip().upper() if isinstance(v, str) else v
+
+class ReportedFindingsBatch(BaseModel):
+    """Lean batch schema declared on the report_findings tool."""
+    model_config = ConfigDict(extra="forbid")
+    findings: List[ReportedFindingInput] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("findings", "vulnerabilities"),
+        description="List of candidate vulnerabilities discovered in scope.",
+    )
+
+class LearningInput(BaseModel):
+    """Typed input schema for record_learning supporting both classic and <experience> vocabularies."""
+    model_config = ConfigDict(extra="allow")
+    category: Optional[str] = Field(default="", description="Vulnerability or engineering category")
+    learning: Optional[str] = Field(default=None, description="Actionable lesson text")
+    tags: Optional[List[str]] = Field(default_factory=list, description="Optional indexing tags")
+    cue: Optional[str] = Field(default=None, description="Trigger pattern or audit context")
+    lesson: Optional[str] = Field(default=None, description="Specific action the target stage should take")
+    evidence: Optional[str] = Field(default=None, description="Concrete finding #id or file:line trajectory evidence")
+    confidence: Optional[Literal["high", "medium", "low"]] = Field(default=None, description="Lesson confidence tier")
+    target_stage: Optional[str] = Field(default=None, description="Target pipeline stage (planner, researcher, reviewer, reproducer, patcher)")
 
 # ---------------------------------------------------------------------------
 # Canonical Type Aliases (Connecting Pipeline Tools to Canonical Schemas)
@@ -440,6 +485,10 @@ class ExecutiveReport(BaseModel):
     executive_summary: str = Field(description='High level executive summary of findings and risk posture')
     critical_findings_count: int = Field(default=0, description='Total critical findings recorded')
     recommendations: List[str] = Field(default_factory=list, description='Prioritized remediation actions')
+
+AuditPlanInput = PlanSchema
+ExploitChainInput = ExploitChain
+ExecutiveReportInput = ExecutiveReport
 
 class FindingCalibration(BaseModel):
     """Structured risk calibration for an individual vulnerability finding."""

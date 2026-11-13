@@ -181,9 +181,9 @@ class TestExtendedVerdictWireCompat(unittest.TestCase):
         self.assertEqual(fv.finding_id, 1)
 
     def test_shipped_reviewer_node_binds_extended_verdict_without_fork_from(self):
-        """Regression test: shipped workflow.json has no fork_from on reviewer,
-        yet reviewer MUST bind ExtendedReviewVerdict and receive the
-        PER-FINDING VERDICTS instruction contract."""
+        """Regression test: shipped workflow.json (shared-prefix audit_stem) and
+        standalone non-prefix_group reviewer nodes BOTH bind ExtendedReviewVerdict
+        and carry the PER-FINDING VERDICTS instruction contract."""
         wf_path = Path(_REF_ROOT) / "workflow.json"
         wf, _cfg = gl.load_workflow_from_json(str(wf_path), load_local=False)
         reviewer_agent = None
@@ -194,9 +194,40 @@ class TestExtendedVerdictWireCompat(unittest.TestCase):
                     reviewer_agent = agent
                     break
         self.assertIsNotNone(reviewer_agent)
-        self.assertIs(reviewer_agent.output_schema, ExtendedReviewVerdict)
-        inst = reviewer_agent.instruction(None)
-        self.assertIn("PER-FINDING VERDICTS:", inst)
+        # Shipped workflow.json places reviewer in prefix_group="audit_stem", so
+        # ExtendedReviewVerdict is bound via model._output_schema_override (keeping
+        # ADK's tool list free of stage-mutating set_model_response) and PER-FINDING
+        # VERDICTS rides in u_reviewer's stage_role_prompt closure.
+        self.assertIsNone(reviewer_agent.output_schema)
+        self.assertIs(reviewer_agent.model._output_schema_override, ExtendedReviewVerdict)
+        closure_texts = [
+            c.cell_contents
+            for cb in (reviewer_agent.before_model_callback or [])
+            for c in (getattr(cb, "__closure__", None) or ())
+            if isinstance(getattr(c, "cell_contents", None), str)
+        ]
+        self.assertTrue(
+            any("PER-FINDING VERDICTS:" in t for t in closure_texts),
+            "PER-FINDING VERDICTS missing from prefix_group reviewer stage_role_prompt",
+        )
+
+        # Also verify a non-prefix_group reviewer without fork_from binds output_schema directly.
+        with tempfile.TemporaryDirectory() as td:
+            raw = json.loads(wf_path.read_text(encoding="utf-8"))
+            for nd in raw["nodes"]:
+                nd.pop("prefix_group", None)
+                nd.pop("fork_from", None)
+            plain_p = Path(td) / "plain_wf.json"
+            plain_p.write_text(json.dumps(raw), encoding="utf-8")
+            wf_plain, _ = gl.load_workflow_from_json(str(plain_p), load_local=False)
+            plain_rev = next(
+                getattr(n, "agent", n)
+                for e in wf_plain.edges
+                for n in (e.from_node, e.to_node)
+                if getattr(getattr(n, "agent", n), "name", None) == "reviewer"
+            )
+            self.assertIs(plain_rev.output_schema, ExtendedReviewVerdict)
+            self.assertIn("PER-FINDING VERDICTS:", plain_rev.instruction(None))
 
 
 # ===========================================================================

@@ -29,7 +29,15 @@ from google.adk.models import LlmRequest
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.agents.context import Context
 from google.genai import types
-from core.prompts import get_stage_prompt, STAGE_PROMPTS
+from core.prompts import (
+    ARCHITECT_PREFIX_STEM_ADDENDUM,
+    PLANNER_PREFIX_STEM_ADDENDUM,
+    PREFIX_FORKED_STAGE_ADDENDUM,
+    PREFIX_GROUP_BASE_INSTRUCTION,
+    STAGE_PROMPTS,
+    THREAT_MODELER_PREFIX_STEM_ADDENDUM,
+    get_stage_prompt,
+)
 
 
 from core.config import (
@@ -118,6 +126,14 @@ class AgentNode(_Base):
     # fork of that stage's conversation instead of a fresh context. See
     # _make_fork_before_model_callback for what is inherited and why.
     fork_from: Optional[str] = None
+    # Shared-prefix KV-cache group name (e.g. "audit_stem"). Nodes sharing a
+    # prefix_group receive a byte-identical base system_instruction and unified
+    # tool schema, with stage-specific prompts/directives moved to each stage's
+    # opening user turn and per-stage tool permissions enforced in Python.
+    prefix_group: Optional[str] = None
+    # Short-circuit this node via before_agent_callback when RunContext.sandbox
+    # is an explicit static-only environment (preserving completion stamps).
+    skip_when_static: bool = False
 
 
 class ClassifierNode(_Base):
@@ -179,7 +195,9 @@ class GlobalConfig(_Base):
     # model's window (see MAX_NODE_CONTINUATIONS for the reasoning behind
     # the default). 0 ends or fails the stage at its first ceiling.
     max_node_continuations: int = Field(default=6, ge=0)
+    context_editing_trigger_tokens: Optional[int] = Field(default=None, gt=0)
     enable_context_cache: bool = True
+    enable_narrative_report: bool = False
     # Stream model turns (default). The request timeout then applies
     # between chunks, so a long thinking turn that keeps producing is never
     # cut short, while a hung connection still is (core.config
@@ -813,30 +831,64 @@ def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
     return _stamp_on_success
 
 
+def _parse_verdict_value(raw: Any, routes: Sequence[str] = ()) -> Any:
+    """Parses a verdict payload from dict, Pydantic model, or raw/fenced/accumulated JSON text."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict) and "route" in raw:
+        return raw
+    if hasattr(raw, "route") and getattr(raw, "route") is not None:
+        return raw
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict) and "route" in parsed:
+                return parsed
+            if isinstance(parsed, str) and parsed in routes:
+                return parsed
+        except Exception:
+            pass
+        # Salvage fenced or trailing JSON object (e.g. when ADK output_key
+        # accumulated intermediate tool-turn text ahead of the final raw JSON).
+        decoder = json.JSONDecoder()
+        last_route_dict: Optional[dict] = None
+        pos = 0
+        while True:
+            brace = stripped.find("{", pos)
+            if brace == -1:
+                break
+            try:
+                obj, end_pos = decoder.raw_decode(stripped, brace)
+                if isinstance(obj, dict) and "route" in obj:
+                    last_route_dict = obj
+                pos = end_pos
+            except Exception:
+                pos = brace + 1
+        if last_route_dict is not None:
+            return last_route_dict
+        if stripped in routes:
+            return stripped
+    return None
+
+
 def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
 
     async def _classify(ctx: Context, node_input: Any = None):
         state_key = f"{node_id}_visits"
         visits = ctx.state.get(state_key, 0) + 1
 
-        verdict = None
-        if isinstance(node_input, dict) and "route" in node_input:
-            verdict = node_input
-        elif hasattr(node_input, "route") and getattr(node_input, "route") is not None:
-            verdict = node_input
-        elif isinstance(node_input, str):
-            try:
-                parsed = json.loads(node_input)
-                if isinstance(parsed, dict) and "route" in parsed:
-                    verdict = parsed
-                elif isinstance(parsed, str) and parsed in routes:
-                    verdict = parsed
-            except Exception:
-                if node_input in routes:
-                    verdict = node_input
+        verdict = _parse_verdict_value(node_input, routes)
 
         if verdict is None:
-            verdict = ctx.state.get("verdict") or (node_input if isinstance(node_input, dict) else {})
+            state_verdict = ctx.state.get("verdict")
+            verdict = (
+                _parse_verdict_value(state_verdict, routes)
+                or state_verdict
+                or (node_input if isinstance(node_input, dict) else {})
+            )
 
         if isinstance(verdict, dict):
             route = verdict.get("route")
@@ -876,6 +928,28 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
 
         if max_visits and max_visits > 1 and visits >= max_visits:
             return adk.Event(output=node_input, state={state_key: visits}, route="exceeded")
+
+        if route == "success" and "success" in routes and "repro" in node_id:
+            try:
+                from core.context import current_run_context
+
+                rc_gate = current_run_context.get()
+                if rc_gate is not None and getattr(rc_gate, "sandbox", None) is not None:
+                    ev_map = getattr(rc_gate, "finding_evidence", None) or {}
+                    has_ev = (
+                        any(isinstance(v, dict) and v.get("reproduced") for v in ev_map.values())
+                        if ev_map
+                        else True
+                    )
+                    if not getattr(rc_gate, "sandbox_executed", False) or not has_ev:
+                        print(
+                            f"[INV-1 GUARD] {node_id}: downgrading unverified 'success' verdict "
+                            f"(sandbox_executed={getattr(rc_gate, 'sandbox_executed', False)}) to fallback.",
+                            file=sys.stderr,
+                        )
+                        route = DEFAULT_ROUTE
+            except Exception:
+                pass
 
         if route and route in routes:
             return adk.Event(output=node_input, state={state_key: visits}, route=route)
@@ -1092,6 +1166,10 @@ def compute_harness_fingerprint(
         # keep the fingerprint they had.
         if raw.get("fork_from"):
             entry["fork_from"] = str(raw["fork_from"])
+        if raw.get("prefix_group"):
+            entry["prefix_group"] = str(raw["prefix_group"])
+        if raw.get("skip_when_static"):
+            entry["skip_when_static"] = True
         normalized.append(entry)
     normalized.sort(key=lambda n: n["id"])
     payload = json.dumps(
@@ -1601,6 +1679,67 @@ def bound_appended_instruction(
     return f"{kept}\n{_APPENDED_TRUNCATION_MARKER.format(omitted=omitted)}", omitted
 
 
+def _render_stage_experience_block(
+    node_id: str,
+    cached_blocks: dict[tuple[str, str, str], str],
+    truncation_state: list[bool],
+) -> str:
+    """Renders and caches the bounded `[STAGE EXPERIENCE]` block for `node_id`."""
+    stage_key = "researcher" if node_id.startswith("researcher") else node_id
+    from core.context import current_run_context
+    from core.paths import resolve_db_path
+
+    ctx = current_run_context.get()
+    if ctx is None or not ctx.db_path:
+        return ""
+    if not bool(getattr(ctx, "enable_memory", True)):
+        return ""
+    if int(getattr(ctx, "pass_index", 1) or 1) > 1:
+        return ""
+    resolved_db = resolve_db_path(ctx.db_path)
+    if not os.path.exists(resolved_db):
+        return ""
+    target_file = str(getattr(ctx, "target_file", "") or "")
+    cache_key = (
+        resolved_db,
+        str(getattr(ctx, "run_id", "") or ""),
+        target_file,
+    )
+    if cache_key not in cached_blocks:
+        from core.memory import render_stage_learnings_for_agent
+
+        rendered = render_stage_learnings_for_agent(
+            resolved_db,
+            stage_key,
+            target=target_file,
+        )
+        bounded, omitted = bound_appended_instruction(rendered)
+        if omitted and not truncation_state[0]:
+            truncation_state[0] = True
+            print(
+                f"[{node_id}] stage experience for '{stage_key}' rendered to "
+                f"{len(rendered)} chars; appended {len(bounded)} "
+                f"(cap {MAX_APPENDED_INSTRUCTION_CHARS}), {omitted} omitted. "
+                f"The block carries a truncation marker.",
+                file=sys.stderr,
+            )
+        cached_blocks[cache_key] = bounded
+    return str(cached_blocks.get(cache_key) or "")
+
+
+def _stamp_active_node(node_id: str) -> Any:
+    """Stamps `RunContext.active_node = node_id` at stage entry/turn-1 before events stream."""
+    try:
+        from core.context import current_run_context
+
+        ctx = current_run_context.get()
+        if ctx is not None:
+            ctx.active_node = node_id
+        return ctx
+    except Exception:
+        return None
+
+
 def _make_stage_experience_before_model_callback(node_id: str):
     """Injects stage-targeted <experience> lessons into the agent's LlmRequest.
 
@@ -1610,12 +1749,11 @@ def _make_stage_experience_before_model_callback(node_id: str):
     block itself, so an operator reading the prompt can see memory was
     shortened rather than wonder why a lesson is missing.
     """
-    stage_key = "researcher" if node_id.startswith("researcher") else node_id
     cached_blocks: dict[tuple[str, str, str], str] = {}
-    truncation_logged = False
+    truncation_state = [False]
 
     def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
-        nonlocal truncation_logged
+        _stamp_active_node(node_id)
         try:
             if llm_request is None:
                 return None
@@ -1624,45 +1762,7 @@ def _make_stage_experience_before_model_callback(node_id: str):
             )
             if "[STAGE EXPERIENCE" in sys_inst:
                 return None
-            from core.context import current_run_context
-            from core.paths import resolve_db_path
-
-            ctx = current_run_context.get()
-            if ctx is None or not ctx.db_path:
-                return None
-            if not bool(getattr(ctx, "enable_memory", True)):
-                return None
-            if int(getattr(ctx, "pass_index", 1) or 1) > 1:
-                return None
-            resolved_db = resolve_db_path(ctx.db_path)
-            if not os.path.exists(resolved_db):
-                return None
-            target_file = str(getattr(ctx, "target_file", "") or "")
-            cache_key = (
-                resolved_db,
-                str(getattr(ctx, "run_id", "") or ""),
-                target_file,
-            )
-            if cache_key not in cached_blocks:
-                from core.memory import render_stage_learnings_for_agent
-
-                rendered = render_stage_learnings_for_agent(
-                    resolved_db,
-                    stage_key,
-                    target=target_file,
-                )
-                bounded, omitted = bound_appended_instruction(rendered)
-                if omitted and not truncation_logged:
-                    truncation_logged = True
-                    print(
-                        f"[{node_id}] stage experience for '{stage_key}' rendered to "
-                        f"{len(rendered)} chars; appended {len(bounded)} "
-                        f"(cap {MAX_APPENDED_INSTRUCTION_CHARS}), {omitted} omitted. "
-                        f"The block carries a truncation marker.",
-                        file=sys.stderr,
-                    )
-                cached_blocks[cache_key] = bounded
-            block = cached_blocks[cache_key]
+            block = _render_stage_experience_block(node_id, cached_blocks, truncation_state)
             if not block:
                 return None
             if hasattr(llm_request, "append_instructions"):
@@ -2012,39 +2112,231 @@ def _clear_function_response(content: Any, index: int) -> None:
 
 
 FORK_NOTICE_MARKER = "[FORKED CONTEXT]"
+PREFIX_U_STATE_KEY_PREFIX = "_mantis_prefix_u:"
+ACTIVE_STAGE_HEADER_PREFIX = "[ACTIVE STAGE ASSIGNMENT: "
 
 
-def forked_contents(events: Any, parent_id: str) -> list:
-    """The parent stage's transcript as request contents: every event the
-    stage authored in this campaign's session -- its text, tool calls and
-    tool results, in order -- with thinking parts and signatures left out.
+def _final_attempt_events(events: Any, author_id: str) -> list[Any]:
+    """Events from `author_id`'s final non-empty retry/continuation attempt.
 
-    Thinking is dropped because it was produced under the parent's
-    instruction and tools; a model that binds reasoning to its prefix
-    would reject it under the child's, and providers allow omitting
-    thinking from earlier turns. Tool calls keep their ids so each pairs
-    with its result. The user seed and other stages' events are not the
-    parent's and are not inherited.
+    ADK node retries and `NodeContextExhausted` continuations append attempt 1's
+    events followed by an `error_code` event and then attempt 2's events under
+    the same `author`. Splitting on `error_code` markers (and distinct non-empty
+    `node_info.path` invocations) and selecting the last non-empty segment
+    ensures downstream forks inherit only the surviving attempt while keeping a
+    trailing standalone error event after completed work safe.
+    """
+    segments: list[list[Any]] = [[]]
+    current_path = ""
+    want = str(author_id)
+    for ev in events or ():
+        if str(getattr(ev, "author", "") or "") != want:
+            continue
+        if getattr(ev, "partial", False) or _is_end_of_agent(ev):
+            continue
+        if getattr(ev, "error_code", None):
+            if segments[-1]:
+                segments.append([])
+            current_path = ""
+            continue
+        ev_path = str(getattr(getattr(ev, "node_info", None), "path", "") or "")
+        if ev_path and current_path and ev_path != current_path:
+            if segments[-1]:
+                segments.append([])
+        if ev_path:
+            current_path = ev_path
+        segments[-1].append(ev)
+    return next((seg for seg in reversed(segments) if seg), [])
+
+
+def _part_is_adk_visible(part: Any) -> bool:
+    """Mirrors ADK `_is_part_invisible(..., include_thoughts=False)`."""
+    if getattr(part, "function_call", None) or getattr(part, "function_response", None):
+        return True
+    if getattr(part, "thought_signature", None):
+        return True
+    if getattr(part, "tool_call", None) or getattr(part, "tool_response", None):
+        return True
+    if getattr(part, "thought", False):
+        return False
+    return bool(
+        getattr(part, "text", None)
+        or getattr(part, "inline_data", None)
+        or getattr(part, "file_data", None)
+        or getattr(part, "executable_code", None)
+        or getattr(part, "code_execution_result", None)
+    )
+
+
+def forked_contents(
+    events: Any,
+    parent_id: str,
+    *,
+    preserve_signatures: bool = False,
+) -> list:
+    """The parent stage's transcript as request contents: every event from
+    `parent_id`'s final attempt in this campaign's session.
+
+    When `preserve_signatures=False` (legacy per-edge `fork_from`), thinking
+    parts and `thought_signature`s are stripped because the child has its own
+    system instruction and tool declarations.
+
+    When `preserve_signatures=True` (`prefix_group` shared-prefix stem with
+    matching model), `part.thought` and `part.thought_signature` are preserved
+    verbatim so the request prefix `[S_base, T_shared, *stem]` is 100%
+    byte-identical to the stem's wire requests, satisfying Gemini 3 signature
+    verification and enabling Turn-1 implicit KV-cache hits.
     """
     out: list = []
-    for ev in events or []:
-        if str(getattr(ev, "author", "") or "") != str(parent_id):
+    for ev in _final_attempt_events(events, parent_id):
+        content = getattr(ev, "content", None)
+        parts = getattr(content, "parts", None) if content is not None else None
+        if not parts:
+            continue
+        if preserve_signatures:
+            if not any(_part_is_adk_visible(p) for p in parts):
+                continue
+            kept = [p.model_copy() for p in parts]
+        else:
+            kept = []
+            for part in parts:
+                if getattr(part, "thought", False):
+                    continue
+                if getattr(part, "thought_signature", None):
+                    part = part.model_copy(update={"thought_signature": None})
+                kept.append(part)
+        if kept:
+            out.append(types.Content(role=getattr(content, "role", None) or "model", parts=kept))
+    return out
+
+
+def _root_seed_user_content(events: Any) -> Optional[types.Content]:
+    """Extracts the campaign's initial `author=='user'` seed message from `events`, if present."""
+    for ev in events or ():
+        if str(getattr(ev, "author", "") or "") != "user":
             continue
         if getattr(ev, "partial", False) or getattr(ev, "error_code", None):
+            continue
+        ev_path = str(getattr(getattr(ev, "node_info", None), "path", "") or "")
+        if ev_path:
             continue
         content = getattr(ev, "content", None)
         parts = getattr(content, "parts", None) if content is not None else None
         if not parts:
             continue
-        kept = []
-        for part in parts:
-            if getattr(part, "thought", False):
-                continue
-            if getattr(part, "thought_signature", None):
-                part = part.model_copy(update={"thought_signature": None})
-            kept.append(part)
-        if kept:
-            out.append(types.Content(role=getattr(content, "role", None) or "model", parts=kept))
+        if any(getattr(p, "function_response", None) for p in parts):
+            continue
+        user_parts = [p.model_copy() for p in parts if not getattr(p, "thought", False)]
+        if user_parts:
+            return types.Content(role="user", parts=user_parts)
+    return None
+
+
+_SHORTCIRCUIT_ANCESTOR_PHRASES = (
+    "] Reused the ",
+    "] Reused repo-root ",
+    "] Recorded deterministic single-file ",
+    "Skipped stage in static-only sandbox mode.",
+    "Skipped dynamic reproduction in static-only sandbox mode.",
+)
+
+
+def _is_shortcircuit_only_transcript(contents: Sequence[Any]) -> bool:
+    """True when `contents` consists solely of a harness `before_agent_callback` short-circuit reply."""
+    if len(contents) != 1 or getattr(contents[0], "role", "") != "model":
+        return False
+    parts = getattr(contents[0], "parts", None) or ()
+    if not parts or any(getattr(p, "function_call", None) is not None for p in parts):
+        return False
+    combined = "\n".join(str(getattr(p, "text", "") or "") for p in parts)
+    return any(marker in combined for marker in _SHORTCIRCUIT_ANCESTOR_PHRASES)
+
+
+def forked_prefix_contents(
+    events: Any,
+    ancestor_chain: Sequence[str],
+    *,
+    state: Optional[dict[str, Any]] = None,
+    preserve_signatures: bool = True,
+) -> list:
+    """Reconstructs the transitive `[u_0, *anc_1, u_1, *anc_2, ...]` stem transcript
+    across `ancestor_chain` for a `prefix_group` stage.
+
+    ADK removes a single-turn workflow node's injected `user` opener event from
+    `session.events` in its `finally:` block once the node finishes. Each
+    `prefix_group` node therefore records its exact opening `u_stage` text under
+    `PREFIX_U_STATE_KEY_PREFIX + node_id` (and in `RunContext.node_context`),
+    allowing downstream stages to replay the exact byte-for-byte `[u_stage,
+    m_1, fr_1, ..., m_final]` sequence sent during the stem. When called on
+    synthetic unit-test event lists where callbacks have not populated state,
+    falls back deterministically to the root `author=='user'` seed event.
+    """
+    out: list[types.Content] = []
+    state_map = state if isinstance(state, dict) else {}
+    rc_nodes: dict[str, Any] = {}
+    try:
+        from core.context import current_run_context
+
+        rc = current_run_context.get()
+        if rc is not None and isinstance(getattr(rc, "node_context", None), dict):
+            rc_nodes = rc.node_context
+    except Exception:
+        rc_nodes = {}
+
+    for anc_id in ancestor_chain:
+        anc_contents = forked_contents(
+            events, anc_id, preserve_signatures=preserve_signatures
+        )
+        if not anc_contents:
+            continue
+
+        u_anc: Optional[types.Content] = None
+        stored_text = state_map.get(f"{PREFIX_U_STATE_KEY_PREFIX}{anc_id}")
+        if not stored_text and isinstance(rc_nodes.get(anc_id), dict):
+            stored_text = rc_nodes[anc_id].get("prefix_u_text")
+        if not stored_text and _is_shortcircuit_only_transcript(anc_contents):
+            continue
+        if isinstance(stored_text, str) and stored_text:
+            u_anc = types.Content(
+                role="user", parts=[types.Part.from_text(text=stored_text)]
+            )
+        elif not out:
+            u_anc = _root_seed_user_content(events)
+            if u_anc is None and getattr(anc_contents[0], "role", "") == "model":
+                u_anc = types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=f"{ACTIVE_STAGE_HEADER_PREFIX}{anc_id}]")],
+                )
+        elif getattr(anc_contents[0], "role", "") == "model":
+            u_anc = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=f"{ACTIVE_STAGE_HEADER_PREFIX}{anc_id}]")],
+            )
+
+        if u_anc is not None and getattr(anc_contents[0], "role", "") == "model":
+            if out and getattr(out[-1], "role", "") == "user":
+                merged_parts = list(getattr(out[-1], "parts", None) or []) + list(
+                    getattr(u_anc, "parts", None) or []
+                )
+                out[-1] = types.Content(role="user", parts=merged_parts)
+            else:
+                out.append(u_anc)
+
+        for item in anc_contents:
+            item_role = getattr(item, "role", "") or "model"
+            if (
+                out
+                and item_role == "user"
+                and getattr(out[-1], "role", "") == "user"
+                and not any(getattr(p, "function_response", None) for p in (getattr(item, "parts", None) or []))
+                and not any(getattr(p, "function_response", None) for p in (getattr(out[-1], "parts", None) or []))
+            ):
+                merged = list(getattr(out[-1], "parts", None) or []) + list(
+                    getattr(item, "parts", None) or []
+                )
+                out[-1] = types.Content(role="user", parts=merged)
+            else:
+                out.append(item)
     return out
 
 
@@ -2073,6 +2365,7 @@ def _make_fork_before_model_callback(node_id: str, parent_id: str):
     inherited transcript like the node's own.
     """
     async def _before_model(callback_context: Any = None, llm_request: Any = None):
+        _stamp_active_node(node_id)
         if llm_request is None or callback_context is None:
             return None
         try:
@@ -2116,7 +2409,31 @@ def _make_fork_before_model_callback(node_id: str, parent_id: str):
     return _before_model
 
 
-def _make_client_context_editing_before_model_callback(node_id: str, model: Any = None, config: Any = None):
+def _count_protected_inherited_tool_responses(llm_request: Any, node_id: str) -> int:
+    """Counts `function_response` parts belonging to the inherited stem before `node_id`'s own turn."""
+    marker = f"{ACTIVE_STAGE_HEADER_PREFIX}{node_id}]"
+    count = 0
+    found_marker = False
+    for content in getattr(llm_request, "contents", None) or ():
+        parts = getattr(content, "parts", None) or ()
+        if getattr(content, "role", "") == "user" and any(
+            marker in (getattr(p, "text", None) or "") for p in parts
+        ):
+            found_marker = True
+            break
+        for part in parts:
+            if getattr(part, "function_response", None) is not None:
+                count += 1
+    return count if found_marker else 0
+
+
+def _make_client_context_editing_before_model_callback(
+    node_id: str,
+    model: Any = None,
+    config: Any = None,
+    *,
+    preserve_system_prefix: bool = False,
+):
     """Clears a stage's older tool results before dispatch, for models that
     do not bind their reasoning to the request prefix (Gemini, OpenAI):
     the harness-side counterpart of Anthropic context editing, same trigger,
@@ -2156,10 +2473,16 @@ def _make_client_context_editing_before_model_callback(node_id: str, model: Any 
         if slot is None:
             return None
         keep = max(0, int(editing.get("keep") or 0))
-        responses = _function_response_parts(llm_request)
+        all_responses = _function_response_parts(llm_request)
+        protected = (
+            _count_protected_inherited_tool_responses(llm_request, node_id)
+            if preserve_system_prefix
+            else 0
+        )
+        responses = all_responses[protected:]
         clearable = max(0, len(responses) - keep)
         cleared = min(max(0, int(slot.get(NODE_CONTEXT_CLEARED_KEY) or 0)), clearable)
-        if hasattr(llm_request, "append_instructions"):
+        if not preserve_system_prefix and hasattr(llm_request, "append_instructions"):
             sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
             if "[CONTEXT EDITING]" not in sys_inst:
                 llm_request.append_instructions([NODE_CONTEXT_EDITING_NOTICE])
@@ -2202,6 +2525,7 @@ def _make_client_context_editing_before_model_callback(node_id: str, model: Any 
 def _make_node_context_ceiling_before_model_callback(
     node_id: str, model: Any = None, has_schema: bool = False, keep_tool_results: Optional[int] = None,
     llm_factory: Any = None, max_continuations: Optional[int] = None,
+    *, preserve_system_prefix: bool = False,
 ):
     """Keeps a stage's own context inside the model's window, append-only.
 
@@ -2269,7 +2593,7 @@ def _make_node_context_ceiling_before_model_callback(
             if stored:
                 slot["handoff"], slot["continuations"] = stored, max(1, number)
         continuations = int(slot.get("continuations") or 0) if slot else 0
-        if hasattr(llm_request, "append_instructions"):
+        if not preserve_system_prefix and hasattr(llm_request, "append_instructions"):
             sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
             if keep_tool_results is not None and "[CONTEXT EDITING]" not in sys_inst:
                 llm_request.append_instructions([NODE_CONTEXT_EDITING_NOTICE])
@@ -2352,13 +2676,13 @@ MAX_CAMPAIGN_DIRECTIVE_CHARS = 12000
 #: Stages that receive the deterministic slice sink/entrypoint checklist so
 #: planning and vulnerability discovery cover indexed sinks systematically
 #: without biasing independent downstream review/critic stages.
-CHECKLIST_STAGES = ("planner", "researcher")
+CHECKLIST_STAGES = ("planner", "explorer", "researcher")
 #: The stages that decide where to look. Matched by node id prefix, so
 #: `researcher_2` in a parallel archetype counts. The reproducer, patcher,
 #: calibrator, reflector and reporter work from this run's findings through
 #: tools, and earlier runs' findings in their instructions would be a way
 #: for history to leak into this run's report.
-CONTEXT_STAGES = ("architect", "threat_modeler", "planner", "researcher", "reviewer", "critic")
+CONTEXT_STAGES = ("architect", "threat_modeler", "planner", "explorer", "researcher", "reviewer", "critic")
 
 
 def _wants_campaign_context(node_id: str) -> bool:
@@ -2384,6 +2708,47 @@ def _close_open_fence(text: str) -> str:
     return text
 
 
+def _render_campaign_directive_blocks(
+    node_id: str,
+    existing_text: str = "",
+) -> list[str]:
+    """Renders bounded campaign context, checklist, and directive blocks missing from `existing_text`."""
+    from core.context import current_run_context
+
+    ctx = current_run_context.get()
+    if ctx is None:
+        return []
+    wants_context = _wants_campaign_context(node_id)
+    wants_checklist = _wants_audit_checklist(node_id)
+    directive = str(getattr(ctx, "campaign_directive", "") or "")
+    context = str(getattr(ctx, "campaign_context", "") or "") if wants_context else ""
+    checklist = ""
+    if wants_checklist and getattr(ctx, "target_file", ""):
+        cached_cl = getattr(ctx, "audit_checklist", None)
+        if cached_cl is None:
+            from core.checklist import build_slice_audit_checklist
+
+            cached_cl = build_slice_audit_checklist(ctx)
+            ctx.audit_checklist = cached_cl
+        checklist = str(cached_cl or "")
+    if not directive and not context and not checklist:
+        return []
+    blocks: list[str] = []
+    if context and CAMPAIGN_CONTEXT_MARKER not in existing_text:
+        block = f"\n\n{CAMPAIGN_CONTEXT_MARKER}{context}"
+        if len(block) > MAX_CAMPAIGN_CONTEXT_CHARS:
+            block = _close_open_fence(block[:MAX_CAMPAIGN_CONTEXT_CHARS]) + "\n[campaign context truncated]"
+        blocks.append(block)
+    if checklist and AUDIT_CHECKLIST_MARKER not in existing_text:
+        blocks.append(_close_open_fence(checklist))
+    if directive and CAMPAIGN_DIRECTIVE_MARKER not in existing_text:
+        block = f"\n\n{CAMPAIGN_DIRECTIVE_MARKER}{directive}"
+        if len(block) > MAX_CAMPAIGN_DIRECTIVE_CHARS:
+            block = _close_open_fence(block[:MAX_CAMPAIGN_DIRECTIVE_CHARS]) + "\n[directive truncated]"
+        blocks.append(block)
+    return blocks
+
+
 def _make_campaign_directive_before_model_callback(node_id: str):
     """Appends the campaign's directive and context (RunContext
     .campaign_directive / .campaign_context) to this node's model requests.
@@ -2400,47 +2765,15 @@ def _make_campaign_directive_before_model_callback(node_id: str):
     Idempotent per request (markers), bounded, never the reason a request
     fails.
     """
-    wants_context = _wants_campaign_context(node_id)
-    wants_checklist = _wants_audit_checklist(node_id)
-
     def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
+        _stamp_active_node(node_id)
         try:
             if llm_request is None:
-                return None
-            from core.context import current_run_context
-
-            ctx = current_run_context.get()
-            if ctx is None:
-                return None
-            directive = str(getattr(ctx, "campaign_directive", "") or "")
-            context = str(getattr(ctx, "campaign_context", "") or "") if wants_context else ""
-            checklist = ""
-            if wants_checklist:
-                cached_cl = getattr(ctx, "audit_checklist", None)
-                if cached_cl is None:
-                    from core.checklist import build_slice_audit_checklist
-
-                    cached_cl = build_slice_audit_checklist(ctx)
-                    ctx.audit_checklist = cached_cl
-                checklist = str(cached_cl or "")
-            if not directive and not context and not checklist:
                 return None
             sys_inst = str(
                 getattr(getattr(llm_request, "config", None), "system_instruction", "") or ""
             )
-            blocks = []
-            if context and CAMPAIGN_CONTEXT_MARKER not in sys_inst:
-                block = f"\n\n{CAMPAIGN_CONTEXT_MARKER}{context}"
-                if len(block) > MAX_CAMPAIGN_CONTEXT_CHARS:
-                    block = _close_open_fence(block[:MAX_CAMPAIGN_CONTEXT_CHARS]) + "\n[campaign context truncated]"
-                blocks.append(block)
-            if checklist and AUDIT_CHECKLIST_MARKER not in sys_inst:
-                blocks.append(_close_open_fence(checklist))
-            if directive and CAMPAIGN_DIRECTIVE_MARKER not in sys_inst:
-                block = f"\n\n{CAMPAIGN_DIRECTIVE_MARKER}{directive}"
-                if len(block) > MAX_CAMPAIGN_DIRECTIVE_CHARS:
-                    block = _close_open_fence(block[:MAX_CAMPAIGN_DIRECTIVE_CHARS]) + "\n[directive truncated]"
-                blocks.append(block)
+            blocks = _render_campaign_directive_blocks(node_id, existing_text=sys_inst)
             if blocks and hasattr(llm_request, "append_instructions"):
                 llm_request.append_instructions(blocks)
         except Exception:
@@ -2448,6 +2781,666 @@ def _make_campaign_directive_before_model_callback(node_id: str):
         return None
 
     return _before_model
+
+
+def _make_active_node_before_tool_callback(node_id: str):
+    """Stamps `ctx.active_node = node_id` before any tool invocation on non-prefix_group agents."""
+
+    def _before_tool(
+        tool: Any = None,
+        args: Optional[dict[str, Any]] = None,
+        tool_context: Any = None,
+        **_kwargs: Any,
+    ) -> Optional[dict[str, Any]]:
+        _stamp_active_node(node_id)
+        return None
+
+    return _before_tool
+
+
+def _make_prefix_group_before_tool_callback(node_id: str, allowed_tools: Sequence[str]):
+    """Deterministically enforces per-stage tool permissions and stamps `ctx.active_node` (`INV-2`)."""
+    allowed_set = frozenset(str(t) for t in allowed_tools)
+    allowed_sorted = sorted(allowed_set)
+
+    def _before_tool(
+        tool: Any = None,
+        args: Optional[dict[str, Any]] = None,
+        tool_context: Any = None,
+        **_kwargs: Any,
+    ) -> Optional[dict[str, Any]]:
+        _stamp_active_node(node_id)
+        tool_name = str(getattr(tool, "name", None) or getattr(tool, "__name__", "") or "")
+        if tool_name not in allowed_set:
+            return {
+                "error": (
+                    f"Tool '{tool_name}' is not permitted in stage '{node_id}'. "
+                    f"Allowed tools: {allowed_sorted}"
+                )
+            }
+        return None
+
+    return _before_tool
+
+
+def _is_in_scope_stem_code_read(ctx: Any, tool_name: str, call_args: Any) -> bool:
+    """Checks whether `tool_name(call_args)` reads an in-scope target source file (never workspace/*)."""
+    from core.budget import CODE_READ_TOOLS
+
+    if tool_name not in CODE_READ_TOOLS or not isinstance(call_args, dict):
+        return False
+    raw_fp = str(call_args.get("filepath") or "").strip()
+    if not raw_fp:
+        return False
+    clean_fp = raw_fp.replace("\\", "/").lstrip("./")
+    if (
+        clean_fp in ("workspace", "findings", "mantis-summary.md", "learnings.jsonl")
+        or clean_fp.startswith("workspace/")
+        or clean_fp.startswith("findings/")
+    ):
+        return False
+    if ctx is None or not getattr(ctx, "jail_dir", None) or not getattr(ctx, "target_file", None):
+        return True
+    try:
+        jail_real = os.path.realpath(ctx.jail_dir).rstrip("/")
+        if os.path.isfile(ctx.target_file):
+            return True
+        scope_roots = [
+            os.path.realpath(str(p)).rstrip("/")
+            for p in (ctx.target_file, *getattr(ctx, "group_targets", ()))
+            if p
+        ]
+        if not scope_roots or any(sr == jail_real for sr in scope_roots):
+            return True
+        sb = getattr(ctx, "sandbox", None)
+        workdir = str(getattr(sb, "working_dir", "") or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+        rel_cand = clean_fp
+        if rel_cand == workdir or rel_cand.startswith(workdir + "/"):
+            rel_cand = rel_cand[len(workdir):].lstrip("/")
+        candidates = [os.path.realpath(os.path.join(jail_real, rel_cand)).rstrip("/")]
+        path_root = str(getattr(ctx, "path_root", "") or "").strip()
+        if path_root and os.path.isdir(path_root):
+            candidates.append(os.path.realpath(os.path.join(path_root, rel_cand)).rstrip("/"))
+        return any(
+            cand == sr or cand.startswith(sr + os.sep)
+            for cand in candidates
+            for sr in scope_roots
+        )
+    except OSError:
+        return True
+
+
+def _count_inherited_in_scope_code_reads(ctx: Any, contents: Sequence[Any]) -> int:
+    """Counts non-error, in-scope `CODE_READ_TOOLS` invocations present in `contents`."""
+    from core.budget import CODE_READ_TOOLS
+
+    pending_by_id: dict[str, str] = {}
+    pending_by_name: dict[str, int] = {}
+    credited = 0
+    for c in contents or ():
+        for part in getattr(c, "parts", None) or ():
+            call = getattr(part, "function_call", None)
+            if call is not None:
+                c_name = str(getattr(call, "name", "") or "")
+                c_args = getattr(call, "args", None) or {}
+                if c_name in CODE_READ_TOOLS and _is_in_scope_stem_code_read(ctx, c_name, c_args):
+                    c_id = str(getattr(call, "id", "") or "")
+                    if c_id:
+                        pending_by_id[c_id] = c_name
+                    else:
+                        pending_by_name[c_name] = pending_by_name.get(c_name, 0) + 1
+            fn_resp = getattr(part, "function_response", None)
+            if fn_resp is not None:
+                r_name = str(getattr(fn_resp, "name", "") or "")
+                r_id = str(getattr(fn_resp, "id", "") or "")
+                matched = False
+                if r_id and r_id in pending_by_id:
+                    pending_by_id.pop(r_id, None)
+                    matched = True
+                elif pending_by_name.get(r_name, 0) > 0:
+                    pending_by_name[r_name] -= 1
+                    matched = True
+                if not matched:
+                    continue
+                raw_resp = getattr(fn_resp, "response", {})
+                if isinstance(raw_resp, dict):
+                    resp_text = str(
+                        raw_resp.get("response")
+                        or raw_resp.get("result")
+                        or raw_resp.get("output")
+                        or raw_resp
+                    )
+                else:
+                    resp_text = str(raw_resp)
+                is_untrusted = resp_text.startswith("<<<UNTRUSTED_SOURCE_CODE_DATA_START")
+                is_err = not is_untrusted and resp_text.startswith(
+                    (
+                        "SANDBOX-ERROR",
+                        "ERROR SAVING DB",
+                        "FATAL ERROR",
+                        "Error",
+                        "ERROR",
+                        "NO_DATA:",
+                        "SANDBOX-UNAVAILABLE",
+                    )
+                )
+                if not is_err:
+                    credited += 1
+    return credited
+
+
+def _chain_before_agent_callbacks(*callbacks: Any):
+    """Composes multiple `before_agent_callback` callables, returning the first non-None `Content`."""
+    active = [cb for cb in callbacks if callable(cb)]
+    if len(active) == 1:
+        return active[0]
+
+    def _chained(callback_context: Any = None):
+        for cb in active:
+            res = cb(callback_context)
+            if res is not None:
+                return res
+        return None
+
+    return _chained
+
+
+def _make_single_file_stem_skip_before_agent_callback(node_id: str):
+    """Skips `architect`, `threat_modeler`, and `planner` on single-file campaigns (`ctx.sandbox is not None`),
+    reusing repo-root artifacts when present and persisting a deterministic single-file audit plan."""
+
+    def _before_agent(callback_context: Any = None):
+        try:
+            from core.context import current_run_context
+            from core.database import read_artifact, record_artifact
+            from core.paths import resolve_db_path
+
+            ctx = current_run_context.get()
+            if ctx is None or ctx.sandbox is None:
+                return None
+            target = str(getattr(ctx, "target_file", "") or "")
+            if not target or not os.path.isfile(target):
+                return None
+            if not ctx.db_path or not ctx.run_id:
+                return None
+            db = resolve_db_path(ctx.db_path)
+            if not os.path.exists(db):
+                return None
+
+            own = str(getattr(ctx, "artifact_resource", "") or target)
+            jail_or_root = str(getattr(ctx, "path_root", "") or getattr(ctx, "jail_dir", "") or "")
+            canon_root = os.path.realpath(jail_or_root) if jail_or_root else ""
+            try:
+                rel_fp = (
+                    os.path.relpath(os.path.realpath(target), canon_root).replace(os.sep, "/")
+                    if canon_root and os.path.realpath(target).startswith(canon_root + os.sep)
+                    else os.path.basename(target)
+                )
+            except ValueError:
+                rel_fp = os.path.basename(target)
+
+            if node_id in _PREFIX_REUSE_ARTIFACTS:
+                kind = _PREFIX_REUSE_ARTIFACTS[node_id]
+                art = None
+                if canon_root:
+                    art = read_artifact(db, artifact_type=kind, run_id=ctx.run_id, resource=canon_root)
+                if not _artifact_says_something(art):
+                    art = read_artifact(db, artifact_type=kind, run_id=ctx.run_id, resource=own)
+                if _artifact_says_something(art):
+                    if own != canon_root:
+                        record_artifact(
+                            db,
+                            ctx.run_id,
+                            kind,
+                            _PREFIX_REUSE_PATHS[kind],
+                            art,
+                            metadata={
+                                "resource": own,
+                                "snapshot_id": getattr(ctx, "snapshot_id", ""),
+                                "reused_from": canon_root or own,
+                            },
+                        )
+                    ctx.active_node = node_id
+                    return types.Content(
+                        role="model",
+                        parts=[
+                            types.Part.from_text(
+                                text=f"[{node_id}] Reused repo-root {kind} artifact for single-file campaign."
+                            )
+                        ],
+                    )
+                if kind == "summary":
+                    det_payload = json.dumps(
+                        {"overview": f"Single-file security audit target: {rel_fp}", "key_modules": [rel_fp], "tech_stack": []},
+                        indent=2,
+                    )
+                else:
+                    det_payload = json.dumps(
+                        {"entry_points": [rel_fp], "trust_boundaries": [], "threats": [f"Audit untrusted inputs and sinks in {rel_fp}"]},
+                        indent=2,
+                    )
+                record_artifact(
+                    db,
+                    ctx.run_id,
+                    kind,
+                    _PREFIX_REUSE_PATHS[kind],
+                    det_payload,
+                    metadata={"resource": own, "snapshot_id": getattr(ctx, "snapshot_id", "")},
+                )
+                ctx.active_node = node_id
+                return types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=f"[{node_id}] Recorded deterministic single-file {kind} for '{rel_fp}'."
+                        )
+                    ],
+                )
+
+            if node_id == "planner":
+                det_plan = json.dumps(
+                    {
+                        "pass_number": int(getattr(ctx, "pass_index", 1) or 1),
+                        "investigations": [
+                            {
+                                "title": f"Audit {rel_fp}",
+                                "target_files": [rel_fp],
+                                "priority": "high",
+                                "focus_areas": ["input validation", "authorization", "dangerous sinks"],
+                            }
+                        ],
+                        "rationale": f"Single-file campaign targeting {rel_fp}.",
+                    },
+                    indent=2,
+                )
+                record_artifact(
+                    db,
+                    ctx.run_id,
+                    "plan",
+                    "workspace/.structured/plan.json",
+                    det_plan,
+                    metadata={"resource": own, "snapshot_id": getattr(ctx, "snapshot_id", "")},
+                )
+                ctx.active_node = node_id
+                return types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=f"[{node_id}] Recorded deterministic single-file audit plan for '{rel_fp}'."
+                        )
+                    ],
+                )
+        except Exception:
+            return None
+        return None
+
+    return _before_agent
+
+
+def _make_deduplicator_skip_before_agent_callback(node_id: str):
+    """Skips `deduplicator` LLM invocation when `ctx.sandbox is not None` and `<= 1` active finding exists."""
+
+    def _before_agent(callback_context: Any = None):
+        try:
+            from core.context import current_run_context
+            from core.paths import resolve_db_path
+
+            ctx = current_run_context.get()
+            if ctx is None or ctx.sandbox is None or not ctx.db_path or not ctx.run_id:
+                return None
+            db = resolve_db_path(ctx.db_path)
+            if not os.path.exists(db):
+                return None
+            eff_pass = max(1, int(getattr(ctx, "pass_index", 1) or 1))
+            open_ids = _active_campaign_finding_ids(
+                db,
+                str(getattr(ctx, "target_file", "") or ""),
+                ctx.run_id,
+                pass_index=eff_pass,
+            )
+            if len(open_ids) <= 1:
+                ctx.active_node = node_id
+                return types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=f"[{node_id}] Skipped deduplication: {len(open_ids)} active finding(s) in scope."
+                        )
+                    ],
+                )
+        except Exception:
+            return None
+        return None
+
+    return _before_agent
+
+
+def _make_static_skip_before_agent_callback(
+    node_id: str,
+    *,
+    stamp_status: str = "",
+    emit_repro_verdict: bool = False,
+):
+    """Short-circuits `history` (whenever `ctx.sandbox is not None`) or `reproducer`
+    (when `RunContext.sandbox` is an explicit static-only environment), preserving completion stamps."""
+    norm_stamp = str(stamp_status or "").strip().lower()
+
+    def _before_agent(callback_context: Any = None):
+        try:
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            if ctx is None or ctx.sandbox is None:
+                return None
+            if node_id != "history" and type(ctx.sandbox).__name__ not in (
+                "StaticOnlyEnvironment",
+                "StaticOnlySandbox",
+            ):
+                return None
+            ctx.active_node = node_id
+            if norm_stamp:
+                apply_completion_stamp(ctx, norm_stamp, node_id)
+            if node_id == "history" and ctx.db_path and ctx.run_id:
+                try:
+                    from core.database import record_artifact
+                    from core.paths import resolve_db_path
+
+                    db = resolve_db_path(ctx.db_path)
+                    if os.path.exists(db):
+                        own_res = str(getattr(ctx, "artifact_resource", "") or getattr(ctx, "target_file", "") or "")
+                        record_artifact(
+                            db,
+                            ctx.run_id,
+                            "workspace_file",
+                            "workspace/historical_learnings.jsonl",
+                            '{"history_status": "SKIPPED_STATIC_SANDBOX"}',
+                            metadata={"resource": own_res, "snapshot_id": getattr(ctx, "snapshot_id", "")},
+                        )
+                except Exception:
+                    pass
+            if emit_repro_verdict:
+                verdict_text = json.dumps({
+                    "route": "failed_repro",
+                    "reason": f"[{node_id}] Skipped dynamic reproduction in static-only sandbox mode.",
+                })
+                _store_callback_state_value(callback_context, "verdict", verdict_text)
+                return types.Content(role="model", parts=[types.Part.from_text(text=verdict_text)])
+            return types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=f"[{node_id}] Skipped stage in static-only sandbox mode.")],
+            )
+        except Exception:
+            return None
+
+    return _before_agent
+
+
+def _extract_callback_state_dict(callback_context: Any) -> dict[str, Any]:
+    """Reads merged state dictionary from `callback_context` and `session` without raising."""
+    merged: dict[str, Any] = {}
+    if callback_context is None:
+        return merged
+    sess = getattr(callback_context, "session", None)
+    if sess is None:
+        sess = getattr(getattr(callback_context, "_invocation_context", None), "session", None)
+    for holder in (sess, callback_context):
+        if holder is None:
+            continue
+        st = getattr(holder, "state", None)
+        if st is None:
+            continue
+        try:
+            if hasattr(st, "to_dict"):
+                merged.update(st.to_dict())
+            elif isinstance(st, dict):
+                merged.update(st)
+        except Exception:
+            pass
+    return merged
+
+
+def _store_callback_state_value(callback_context: Any, key: str, value: str) -> None:
+    """Writes `key=value` into `callback_context.state` (persisting via ADK `state_delta`) and `session.state`."""
+    if callback_context is None:
+        return
+    try:
+        cb_state = getattr(callback_context, "state", None)
+        if cb_state is not None:
+            cb_state[key] = value
+    except Exception:
+        pass
+    try:
+        sess = getattr(callback_context, "session", None)
+        if sess is None:
+            sess = getattr(getattr(callback_context, "_invocation_context", None), "session", None)
+        sess_state = getattr(sess, "state", None) if sess is not None else None
+        if isinstance(sess_state, dict):
+            sess_state[key] = value
+    except Exception:
+        pass
+
+
+def _make_prefix_group_before_model_callback(
+    node_id: str,
+    *,
+    base_instruction: str,
+    stage_role_prompt: str,
+    ancestor_chain: Sequence[str] = (),
+    parent_id: Optional[str] = None,
+    preserve_signatures: bool = True,
+    prefix_group: str = "",
+    enable_explicit_stem_cache: bool = False,
+):
+    """Builds the shared-prefix request envelope (`[S_base, T_shared, *inherited, u_stage, *own_turns]`).
+
+    All stage-specific prompt instructions, experience lessons, campaign context/checklists/directives,
+    active findings snapshots, and structured output reminders are combined deterministically into
+    `u_stage` (`role="user"`), cached across Turns 1..N of `node_id` and recorded into session state so
+    any downstream stage forking from `node_id` replays the exact byte-identical prefix.
+    """
+    exp_cached_blocks: dict[tuple[str, str, str], str] = {}
+    exp_truncation_state = [False]
+    ancestors = tuple(str(a) for a in ancestor_chain if a)
+    state_key = f"{PREFIX_U_STATE_KEY_PREFIX}{node_id}"
+
+    async def fork_before_model(callback_context: Any = None, llm_request: Any = None):
+        if llm_request is None:
+            return None
+        try:
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            if ctx is not None:
+                ctx.active_node = node_id
+        except Exception:
+            ctx = None
+
+        session = getattr(callback_context, "session", None) if callback_context is not None else None
+        if session is None and callback_context is not None:
+            session = getattr(getattr(callback_context, "_invocation_context", None), "session", None)
+        events = getattr(session, "events", None) if session is not None else None
+        state_dict = _extract_callback_state_dict(callback_context)
+
+        inherited: list[types.Content] = []
+        if ancestors and events:
+            try:
+                inherited = forked_prefix_contents(
+                    events,
+                    ancestors,
+                    state=state_dict,
+                    preserve_signatures=preserve_signatures,
+                )
+            except Exception:
+                inherited = []
+
+        own = list(getattr(llm_request, "contents", None) or [])
+        has_opener = bool(
+            own
+            and getattr(own[0], "role", "") == "user"
+            and not any(getattr(p, "function_response", None) for p in (getattr(own[0], "parts", None) or []))
+        )
+        opener_text = ""
+        if has_opener:
+            opener_text = "\n".join(
+                str(getattr(p, "text", "") or "")
+                for p in (getattr(own[0], "parts", None) or [])
+                if getattr(p, "text", None) and not getattr(p, "thought", False)
+            ).strip()
+        own_tail = own[1:] if has_opener else own
+
+        is_first_turn_of_attempt = not any(
+            getattr(c, "role", "") == "model"
+            or any(getattr(p, "function_response", None) for p in (getattr(c, "parts", None) or []))
+            for c in own
+        )
+
+        slot = _node_context_slot(node_id)
+        if slot is not None and not slot.get("continuations") and not slot.get("handoff"):
+            stored_ho, ho_num = _stored_handoff(node_id)
+            if stored_ho:
+                slot["handoff"], slot["continuations"] = stored_ho, max(1, ho_num)
+        continuations = int(slot.get("continuations") or 0) if slot else 0
+
+        if (
+            (node_id == "researcher" or node_id.startswith("researcher_"))
+            and is_first_turn_of_attempt
+            and continuations == 0
+            and inherited
+            and ctx is not None
+        ):
+            bc = getattr(ctx, "budget_controller", None)
+            already_credited = bool(slot.get("credited_inherited_reads")) if slot is not None else False
+            if bc is not None and not already_credited and events:
+                try:
+                    from core.budget import AUDIT_NODES
+
+                    non_audit_ancestors = [a for a in ancestors if a not in AUDIT_NODES]
+                    anc_to_credit = (
+                        non_audit_ancestors
+                        if int(getattr(bc, "audit_code_reads", 0) or 0) > 0
+                        else list(ancestors)
+                    )
+                    if anc_to_credit:
+                        credit_contents = forked_prefix_contents(
+                            events,
+                            anc_to_credit,
+                            state=state_dict,
+                            preserve_signatures=False,
+                        )
+                        stem_reads = _count_inherited_in_scope_code_reads(ctx, credit_contents)
+                        if stem_reads > 0:
+                            bc.audit_code_reads += stem_reads
+                    if slot is not None:
+                        slot["credited_inherited_reads"] = True
+                except Exception:
+                    pass
+
+        u_stage_text: Optional[str] = None
+        if not is_first_turn_of_attempt:
+            cached_u = state_dict.get(state_key)
+            if not cached_u and slot is not None:
+                cached_u = slot.get("prefix_u_text")
+            if isinstance(cached_u, str) and cached_u:
+                u_stage_text = cached_u
+
+        if not u_stage_text:
+            sections: list[str] = [f"{ACTIVE_STAGE_HEADER_PREFIX}{node_id}]\n{stage_role_prompt}"]
+            if inherited and parent_id:
+                sections.append(
+                    f"\n\n{FORK_NOTICE_MARKER} The conversation turns before this message are the "
+                    f"'{parent_id}' stem's work in this campaign: its reading of the code, tool "
+                    f"results, and structural context. Build on those file reads directly without "
+                    f"repeating reads already in context unless you need a different line range; "
+                    f"execute ONLY your own '{node_id}' stage assignment independently."
+                )
+            else:
+                seed_content = _root_seed_user_content(events)
+                seed_text = ""
+                if seed_content is not None:
+                    seed_text = "\n".join(
+                        str(getattr(p, "text", "") or "")
+                        for p in (getattr(seed_content, "parts", None) or [])
+                        if getattr(p, "text", None)
+                    ).strip()
+                if seed_text:
+                    sections.append(f"\n\n[CAMPAIGN TASK INPUT]\n{seed_text}")
+                if opener_text and opener_text != seed_text:
+                    sections.append(f"\n\n[UPSTREAM STAGE SUMMARY]\n{opener_text}")
+
+            try:
+                exp_block = _render_stage_experience_block(
+                    node_id, exp_cached_blocks, exp_truncation_state
+                )
+                if exp_block:
+                    sections.append(f"\n\n{exp_block}")
+            except Exception:
+                pass
+
+            try:
+                dir_blocks = _render_campaign_directive_blocks(node_id, existing_text="")
+                if dir_blocks:
+                    sections.extend(dir_blocks)
+            except Exception:
+                pass
+
+            try:
+                snap_block = ResilientLiteLlm.get_or_render_findings_snapshot(
+                    f"prefix_stage:{node_id}:{continuations}"
+                )
+                if snap_block:
+                    sections.append(snap_block)
+            except Exception:
+                pass
+
+            if continuations and slot is not None:
+                sections.append(_continuation_block(slot.get("handoff", ""), continuations))
+
+            u_stage_text = "".join(sections)
+            _store_callback_state_value(callback_context, state_key, u_stage_text)
+            if slot is not None:
+                slot["prefix_u_text"] = u_stage_text
+
+        u_stage_content = types.Content(
+            role="user", parts=[types.Part.from_text(text=u_stage_text)]
+        )
+        if inherited and getattr(inherited[-1], "role", "") == "user":
+            merged_parts = list(getattr(inherited[-1], "parts", None) or []) + list(
+                u_stage_content.parts or []
+            )
+            llm_request.contents = (
+                list(inherited[:-1])
+                + [types.Content(role="user", parts=merged_parts)]
+                + own_tail
+            )
+        else:
+            llm_request.contents = list(inherited) + [u_stage_content] + own_tail
+
+        if getattr(llm_request, "config", None) is not None:
+            llm_request.config.system_instruction = base_instruction
+
+        if inherited:
+            _observe("forked_requests")
+            if (
+                enable_explicit_stem_cache
+                and preserve_signatures
+                and prefix_group
+                and getattr(inherited[-1], "role", "") == "model"
+            ):
+                setattr(
+                    llm_request,
+                    "_mantis_stem_cache",
+                    {
+                        "slot_key": f"{prefix_group}:{','.join(ancestors)}:{len(inherited)}",
+                        "stem_len": len(inherited),
+                    },
+                )
+            else:
+                setattr(llm_request, "_mantis_stem_cache", None)
+        else:
+            setattr(llm_request, "_mantis_stem_cache", None)
+        return None
+
+    return fork_before_model
 
 
 def _make_reporter_skip_before_agent_callback(node_id: str):
@@ -2469,6 +3462,7 @@ def _make_reporter_skip_before_agent_callback(node_id: str):
             if ctx is None:
                 return None
             if bool(getattr(ctx, "defer_reporter", False)):
+                ctx.active_node = node_id
                 return types.Content(
                     role="model",
                     parts=[types.Part(text=(
@@ -2479,8 +3473,9 @@ def _make_reporter_skip_before_agent_callback(node_id: str):
             if not ctx.db_path or not ctx.run_id:
                 return None
             db = resolve_db_path(ctx.db_path)
+            target_scope = str(getattr(ctx, "target_file", "") or "")
             has_live = campaign_has_findings_to_triage(
-                db, ctx.run_id, str(getattr(ctx, "target_file", "") or "")
+                db, ctx.run_id, target_scope
             )
             if has_live is False:
                 if not read_artifact(db, artifact_type="report", run_id=ctx.run_id):
@@ -2492,6 +3487,7 @@ def _make_reporter_skip_before_agent_callback(node_id: str):
                     record_artifact(
                         db, ctx.run_id, "report", "workspace/.structured/report.json", clean_rpt
                     )
+                ctx.active_node = node_id
                 return types.Content(
                     role="model",
                     parts=[types.Part(text=(
@@ -2499,6 +3495,59 @@ def _make_reporter_skip_before_agent_callback(node_id: str):
                         "clean report summary without LLM call."
                     ))],
                 )
+            if (
+                has_live is True
+                and getattr(ctx, "sandbox", None) is not None
+                and not bool(getattr(ctx, "enable_narrative_report", False))
+            ):
+                from core.database import is_suppressed, read_findings
+
+                eff_pass = max(1, int(getattr(ctx, "pass_index", 1) or 1))
+                rows = read_findings(
+                    db,
+                    run_id=ctx.run_id,
+                    scope_path=target_scope or None,
+                    campaign=target_scope or None,
+                    pass_index=eff_pass,
+                )
+                active_rows = [
+                    r for r in rows if not is_suppressed(str(r.get("status") or ""))
+                ]
+                if active_rows:
+                    if not read_artifact(db, artifact_type="report", run_id=ctx.run_id):
+                        crit_n = sum(
+                            1
+                            for r in active_rows
+                            if str(r.get("severity") or "").strip().upper() == "CRITICAL"
+                        )
+                        recs: list[str] = []
+                        for r in active_rows:
+                            rem = str(r.get("remediation") or r.get("mitigation") or "").strip()
+                            if rem and rem not in recs:
+                                recs.append(rem)
+                            if len(recs) >= 10:
+                                break
+                        det_rpt = json.dumps(
+                            {
+                                "executive_summary": (
+                                    f"Confirmed {len(active_rows)} active vulnerability finding(s) in scope."
+                                ),
+                                "critical_findings_count": crit_n,
+                                "recommendations": recs,
+                            },
+                            indent=2,
+                        )
+                        record_artifact(
+                            db, ctx.run_id, "report", "workspace/.structured/report.json", det_rpt
+                        )
+                    ctx.active_node = node_id
+                    return types.Content(
+                        role="model",
+                        parts=[types.Part(text=(
+                            f"[{node_id}] Recorded deterministic executive report summary "
+                            f"for {len(active_rows)} finding(s) without LLM call."
+                        ))],
+                    )
         except Exception:
             return None
         return None
@@ -2556,9 +3605,7 @@ def create_findings_gate(node_id: str):
     through to the default route and the full pipeline runs as before.
     """
     async def _gate(ctx: Context, node_input: Any = None):
-        from core.context import current_run_context
-
-        rc = current_run_context.get()
+        rc = _stamp_active_node(node_id)
         db_path = (getattr(rc, "db_path", None) or ctx.state.get("db_path") or "")
         run_id = (getattr(rc, "run_id", None) or ctx.state.get("run_id") or "")
         target_file = (getattr(rc, "target_file", None) or "")
@@ -2581,9 +3628,7 @@ def create_structural_index_node(node_id: str):
     and the campaign proceeds exactly as it would without an index.
     """
     async def _build(ctx: Context, node_input: Any = None):
-        from core.context import current_run_context
-
-        rc = current_run_context.get()
+        rc = _stamp_active_node(node_id)
         try:
             import asyncio
             from core.paths import resolve_db_path
@@ -2777,7 +3822,6 @@ def create_calibrator_node(
 ):
     """Creates a deterministic per-finding calibration loop node with structured output schemas."""
     async def _calibrate(ctx: Context, node_input: Any = None):
-        from core.context import current_run_context
         from core.database import (
             read_findings,
             update_finding_calibration,
@@ -2786,7 +3830,7 @@ def create_calibrator_node(
         )
         from core.schemas import FindingCalibration
 
-        run_ctx = current_run_context.get()
+        run_ctx = _stamp_active_node(node_id)
         db_path = (getattr(run_ctx, "db_path", None) or ctx.state.get("db_path") or "knowledge.db")
         try:
             from core.paths import resolve_db_path
@@ -3356,7 +4400,54 @@ def load_workflow_from_json(
     declared_node_ids = set()
     # Agent nodes by id, for `fork_from`: a fork names a stage whose
     # transcript exists, i.e. another agent node of this graph.
-    agent_node_ids = {n.id for n in spec.nodes if isinstance(n, AgentNode)}
+    agent_nodes_by_id: dict[str, AgentNode] = {
+        n.id: n for n in spec.nodes if isinstance(n, AgentNode)
+    }
+    agent_node_ids = set(agent_nodes_by_id.keys())
+    # Pre-resolve per-node model IDs, shared tool unions, and canonical reasoning_effort
+    # for prefix_group nodes (Vertex Gemini binds thinkingLevel into its implicit KV-cache key).
+    pre_resolved_models: dict[str, str] = {}
+    prefix_group_tool_names: dict[str, list[str]] = {}
+    prefix_group_nodes: dict[str, list[AgentNode]] = {}
+    prefix_group_reasoning_effort: dict[str, Optional[str]] = {}
+    for n_pre in spec.nodes:
+        if not isinstance(n_pre, AgentNode) or n_pre.id == "structural_index":
+            continue
+        n_def_model = (
+            _resolve_fast_tier_default(
+                spec.config.default_model,
+                spec.config.fast_model,
+                model_override,
+                n_pre.api_base or spec.config.api_base,
+            )
+            if (not n_pre.model and n_pre.id in _FAST_TIER_NODE_IDS)
+            else spec.config.default_model
+        )
+        pre_resolved_models[n_pre.id] = resolve_model_id(
+            n_pre.model, n_def_model, model_override
+        )
+        if n_pre.prefix_group is not None and not n_pre.system_prompt:
+            pg_name = n_pre.prefix_group.strip()
+            if not pg_name:
+                errors.append(f"Node {n_pre.id}: prefix_group must be a non-empty string when set.")
+            else:
+                prefix_group_nodes.setdefault(pg_name, []).append(n_pre)
+                bucket = prefix_group_tool_names.setdefault(pg_name, [])
+                for t_name in n_pre.tools:
+                    if t_name not in bucket:
+                        bucket.append(t_name)
+    for pg_name, t_list in list(prefix_group_tool_names.items()):
+        prefix_group_tool_names[pg_name] = sorted(t_list)
+    for pg_name, pg_members in prefix_group_nodes.items():
+        member_ids = {m.id for m in pg_members}
+        root_member = next(
+            (m for m in pg_members if not m.fork_from or m.fork_from not in member_ids),
+            pg_members[0],
+        )
+        prefix_group_reasoning_effort[pg_name] = (
+            root_member.reasoning_effort or spec.config.reasoning_effort
+        )
+
     # Material for the harness fingerprint (compute_harness_fingerprint):
     # every node by id, and for agent nodes the resolved tools, model and
     # final instruction. Gathered here because this loop is the only place
@@ -3422,6 +4513,20 @@ def load_workflow_from_json(
             )
             if node_model_id not in resolved_node_models:
                 resolved_node_models.append(node_model_id)
+            node_pg = None if node_cfg.system_prompt else ((node_cfg.prefix_group or "").strip() or None)
+            effective_reasoning_effort = node_cfg.reasoning_effort
+            if node_pg and node_pg in prefix_group_reasoning_effort:
+                pg_effort = prefix_group_reasoning_effort[node_pg]
+                node_eff = node_cfg.reasoning_effort or spec.config.reasoning_effort
+                if node_eff != pg_effort:
+                    print(
+                        f"[graph_loader] node '{node_id}' in prefix_group '{node_pg}': "
+                        f"normalizing reasoning_effort '{node_eff}' -> '{pg_effort}' to preserve "
+                        "provider KV-cache prefix parity.",
+                        file=sys.stderr,
+                    )
+                effective_reasoning_effort = pg_effort
+
             # The exact call graph build used to make eagerly, frozen as a
             # zero-argument resolver so it can run either here (normal path)
             # or inside DeferredEnvLiteLlm at first LLM call (hermetic path).
@@ -3435,7 +4540,7 @@ def load_workflow_from_json(
                 default_api_base=spec.config.api_base,
                 timeout=node_cfg.timeout,
                 default_timeout=spec.config.timeout,
-                reasoning_effort=node_cfg.reasoning_effort,
+                reasoning_effort=effective_reasoning_effort,
                 default_reasoning_effort=spec.config.reasoning_effort,
                 global_model_override=model_override,
                 config=spec.config.model_dump(),
@@ -3503,6 +4608,7 @@ def load_workflow_from_json(
                     schema_cls = ExtendedReviewVerdict
                 elif node_cfg.output_schema == "CriticVerdict" and ExtendedCriticVerdict is not None:
                     schema_cls = ExtendedCriticVerdict
+            ancestor_chain: list[str] = []
             if node_cfg.fork_from is not None:
                 if node_cfg.fork_from == node_id:
                     errors.append(f"Node {node_id}: fork_from names itself.")
@@ -3510,14 +4616,38 @@ def load_workflow_from_json(
                 elif node_cfg.fork_from not in agent_node_ids:
                     errors.append(f"Node {node_id}: fork_from '{node_cfg.fork_from}' is not an agent node of this graph.")
                     node_has_error = True
+                else:
+                    seen_anc: list[str] = []
+                    cur_fk: Optional[str] = node_cfg.fork_from
+                    while cur_fk:
+                        if cur_fk == node_id or cur_fk in seen_anc:
+                            errors.append(f"Node {node_id}: fork_from cycle detected involving '{cur_fk}'.")
+                            node_has_error = True
+                            break
+                        if cur_fk not in agent_nodes_by_id:
+                            errors.append(f"Node {node_id}: transitive fork_from '{cur_fk}' is not an agent node of this graph.")
+                            node_has_error = True
+                            break
+                        seen_anc.append(cur_fk)
+                        cur_fk = agent_nodes_by_id[cur_fk].fork_from
+                    ancestor_chain = list(reversed(seen_anc))
 
             if node_has_error:
                 continue
 
+            prefix_group = None if node_cfg.system_prompt else ((node_cfg.prefix_group or "").strip() or None)
+            is_prefix_group = bool(prefix_group)
+
             # Invariant: Every agent node MUST include the untrusted code audit guard (covers both skill and system_prompt)
             guard_text = UNTRUSTED_CODE_AUDIT_GUARD.strip()
-            if guard_text not in instruction:
+            if not is_prefix_group and guard_text not in instruction:
                 instruction = f"{instruction.rstrip()}\n\n{guard_text}"
+
+            model_extra_kwargs: dict[str, Any] = {}
+            if is_prefix_group:
+                model_extra_kwargs["preserve_system_prefix"] = True
+                if schema_cls is not None:
+                    model_extra_kwargs["output_schema_override"] = schema_cls
 
             # One model instance per node, built here so the calibrator path
             # and the regular agent path share the hermetic deferral: when
@@ -3529,11 +4659,14 @@ def load_workflow_from_json(
                 model_inst = DeferredEnvLiteLlm(
                     model=str(node_cfg.model or spec.config.default_model or DEFAULT_MODEL),
                     env_resolver=llm_kwargs_resolver,
+                    **model_extra_kwargs,
                 )
             else:
-                model_inst = LiteLlm(**llm_kwargs)
+                model_inst = LiteLlm(**llm_kwargs, **model_extra_kwargs)
 
             if node_id == "calibrator" or (node_cfg.skill and "mantis-calibrate" in node_cfg.skill):
+                if guard_text not in instruction:
+                    instruction = f"{instruction.rstrip()}\n\n{guard_text}"
                 nodes[node_id] = create_calibrator_node(
                     node_id=node_id,
                     llm_model=model_inst,
@@ -3548,17 +4681,38 @@ def load_workflow_from_json(
                 })
                 continue
 
+            if is_prefix_group and not node_cfg.system_prompt:
+                if node_id == "architect":
+                    instruction = f"{instruction.rstrip()}\n{ARCHITECT_PREFIX_STEM_ADDENDUM}"
+                elif node_id == "threat_modeler":
+                    instruction = f"{instruction.rstrip()}\n{THREAT_MODELER_PREFIX_STEM_ADDENDUM}"
+                elif node_id == "planner":
+                    instruction = f"{instruction.rstrip()}\n{PLANNER_PREFIX_STEM_ADDENDUM}"
+                if node_cfg.fork_from:
+                    instruction = f"{instruction.rstrip()}\n{PREFIX_FORKED_STAGE_ADDENDUM}"
+
             if schema_cls:
-                instruction = (
-                    f"{instruction.rstrip()}\n\n"
-                    f"CRITICAL TERMINATION CONTRACT: When your analysis for this stage is complete, "
-                    f"submit your final verdict using the 'set_model_response' tool (e.g. set_model_response(route=..., reason=...)) "
-                    f"or emit it directly as raw JSON response text conforming to '{node_cfg.output_schema}' "
-                    f"(e.g. {{\"route\": \"...\", \"reason\": \"...\"}}). "
-                    f"Do NOT call write_file, run_sandbox, or any other general tool to signal completion, and do NOT write dummy marker or verdict files "
-                    f"(e.g. do NOT write 'verdict.json', 'done.txt', or 'status.json'). Also do NOT run probe shell commands "
-                    f"(e.g. do NOT run 'echo done', 'echo 1', 'true', or 'exit 0')."
-                )
+                if is_prefix_group:
+                    instruction = (
+                        f"{instruction.rstrip()}\n\n"
+                        f"CRITICAL TERMINATION CONTRACT: When your analysis for this stage is complete, "
+                        f"emit your final verdict directly as raw JSON response text conforming to '{node_cfg.output_schema}' "
+                        f"(e.g. {{\"route\": \"...\", \"reason\": \"...\"}}). "
+                        f"Do NOT call write_file, run_sandbox, set_model_response, or any other tool to signal completion, "
+                        f"and do NOT write dummy marker or verdict files (e.g. do NOT write 'verdict.json', 'done.txt', or 'status.json'). "
+                        f"Also do NOT run probe shell commands (e.g. do NOT run 'echo done', 'echo 1', 'true', or 'exit 0')."
+                    )
+                else:
+                    instruction = (
+                        f"{instruction.rstrip()}\n\n"
+                        f"CRITICAL TERMINATION CONTRACT: When your analysis for this stage is complete, "
+                        f"submit your final verdict using the 'set_model_response' tool (e.g. set_model_response(route=..., reason=...)) "
+                        f"or emit it directly as raw JSON response text conforming to '{node_cfg.output_schema}' "
+                        f"(e.g. {{\"route\": \"...\", \"reason\": \"...\"}}). "
+                        f"Do NOT call write_file, run_sandbox, or any other general tool to signal completion, and do NOT write dummy marker or verdict files "
+                        f"(e.g. do NOT write 'verdict.json', 'done.txt', or 'status.json'). Also do NOT run probe shell commands "
+                        f"(e.g. do NOT run 'echo done', 'echo 1', 'true', or 'exit 0')."
+                    )
                 if node_cfg.output_schema == "ReviewVerdict" and schema_cls is ExtendedReviewVerdict:
                     # P6: one verdict per finding. A live run pushed 14
                     # findings through ONE campaign-level verdict, so a single
@@ -3593,13 +4747,46 @@ def load_workflow_from_json(
                         f"route/reason summarize the overall outcome (viable if ANY finding is viable)."
                     )
 
-            harness_nodes.append({
+            stage_role_prompt = instruction
+            if is_prefix_group:
+                allowed_sorted_str = ", ".join(sorted(str(t) for t in node_cfg.tools))
+                stage_role_prompt = (
+                    f"{stage_role_prompt.rstrip()}\n\n"
+                    f"STAGE TOOL PERMISSIONS: In stage '{node_id}', you may ONLY call: [{allowed_sorted_str}]. "
+                    f"Any other tool in the shared schema is forbidden for this stage."
+                )
+                reminder_suffix = ResilientLiteLlm.render_stage_turn_reminder(
+                    schema_cls,
+                    has_set_model_response=False,
+                    has_report_findings=("report_findings" in node_cfg.tools),
+                )
+                if reminder_suffix:
+                    stage_role_prompt = f"{stage_role_prompt}{reminder_suffix}"
+                agent_instruction_text = PREFIX_GROUP_BASE_INSTRUCTION
+                shared_names = prefix_group_tool_names.get(prefix_group or "", [])
+                effective_agent_tools = [
+                    resolvable_tools[t_name]
+                    for t_name in shared_names
+                    if t_name in resolvable_tools
+                ]
+                effective_output_schema = None
+            else:
+                agent_instruction_text = instruction
+                effective_agent_tools = agent_tools
+                effective_output_schema = schema_cls
+
+            harness_entry: dict[str, Any] = {
                 "id": node_id,
                 "tools": list(node_cfg.tools),
                 "model": node_model_id,
-                "instruction": instruction,
+                "instruction": stage_role_prompt if is_prefix_group else instruction,
                 "fork_from": node_cfg.fork_from or "",
-            })
+            }
+            if prefix_group:
+                harness_entry["prefix_group"] = prefix_group
+            if node_cfg.skip_when_static:
+                harness_entry["skip_when_static"] = True
+            harness_nodes.append(harness_entry)
 
             agent_kwargs: dict[str, Any] = {
                 "name": node_id,
@@ -3612,9 +4799,9 @@ def load_workflow_from_json(
                 # the threat modeler). Nothing in Mantis uses state templating
                 # in node instructions; the seed prompt's {filepath} is
                 # substituted by main.py itself.
-                "instruction": _literal_instruction(instruction),
-                "tools": agent_tools,
-                "output_schema": schema_cls,
+                "instruction": _literal_instruction(agent_instruction_text),
+                "tools": effective_agent_tools,
+                "output_schema": effective_output_schema,
                 "output_key": node_cfg.output_key,
             }
             if node_cfg.include_contents is not None:
@@ -3654,14 +4841,33 @@ def load_workflow_from_json(
                     node_id, stamp_status
                 )
 
-            if node_id in _PREFIX_REUSE_ARTIFACTS and not node_cfg.on_enter_status:
-                # Repo-scope prefix reuse (cross-functional runs only; see
-                # _make_prefix_reuse_callbacks). Attached only when the node
-                # carries no completion stamp, so a future on_enter_status on
-                # these nodes disables reuse rather than displacing the stamp.
+            if (
+                node_cfg.skip_when_static
+                or node_id == "history"
+                or (node_id == "reproducer" and node_cfg.output_schema == "ReproVerdict")
+            ):
+                agent_kwargs["before_agent_callback"] = _make_static_skip_before_agent_callback(
+                    node_id,
+                    stamp_status=stamp_status,
+                    emit_repro_verdict=(node_cfg.output_schema == "ReproVerdict"),
+                )
+            elif node_id in _PREFIX_REUSE_ARTIFACTS and not node_cfg.on_enter_status:
+                # Repo-scope prefix reuse (cross-functional / changed runs) plus
+                # deterministic single-file stem bypass when ctx.sandbox is set.
                 before_reuse, after_reuse = _make_prefix_reuse_callbacks(node_id)
-                agent_kwargs["before_agent_callback"] = before_reuse
+                agent_kwargs["before_agent_callback"] = _chain_before_agent_callbacks(
+                    _make_single_file_stem_skip_before_agent_callback(node_id),
+                    before_reuse,
+                )
                 agent_kwargs["after_agent_callback"] = after_reuse
+            elif node_id == "planner" and "before_agent_callback" not in agent_kwargs:
+                agent_kwargs["before_agent_callback"] = (
+                    _make_single_file_stem_skip_before_agent_callback(node_id)
+                )
+            elif node_id == "deduplicator" and "before_agent_callback" not in agent_kwargs:
+                agent_kwargs["before_agent_callback"] = (
+                    _make_deduplicator_skip_before_agent_callback(node_id)
+                )
             elif (
                 node_id == "reporter"
                 or (node_cfg.skill and "mantis-report" in node_cfg.skill)
@@ -3673,6 +4879,14 @@ def load_workflow_from_json(
             # Every agent node: bounds each tool response to its model's window
             # and, where the node has structural navigation, steers repeated
             # whole-file reads toward it.
+            if is_prefix_group:
+                agent_kwargs["before_tool_callback"] = _make_prefix_group_before_tool_callback(
+                    node_id, node_cfg.tools
+                )
+            else:
+                agent_kwargs["before_tool_callback"] = _make_active_node_before_tool_callback(
+                    node_id
+                )
             agent_kwargs["after_tool_callback"] = _make_after_tool_guard_callback(
                 node_id, node_cfg.tools, model=node_model_id
             )
@@ -3680,31 +4894,74 @@ def load_workflow_from_json(
                 node_id
             )
 
-            agent_kwargs["before_model_callback"] = [
-                _make_stage_experience_before_model_callback(node_id),
-                _make_campaign_directive_before_model_callback(node_id),
-                # Models without prefix binding: the harness clears older
-                # tool results itself (None for Claude, whose provider does).
-                _make_client_context_editing_before_model_callback(
-                    node_id, model=node_model_id, config=spec.config.model_dump(),
-                ),
-                # Last: measures the request as the three above leave it.
-                _make_node_context_ceiling_before_model_callback(
-                    node_id, model=node_model_id, has_schema=bool(node_cfg.output_schema),
-                    keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
-                    # The handoff is written by the stage's own model, built
-                    # from the same kwargs; None under the hermetic path.
-                    llm_factory=(
-                        (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw)) if llm_kwargs else None
+            if is_prefix_group:
+                pg_members_here = prefix_group_nodes.get(prefix_group or "", [])
+                pg_parent_ids = {m.fork_from for m in pg_members_here if m.fork_from}
+                same_prefix_and_model = bool(
+                    ancestor_chain
+                    and all(
+                        (agent_nodes_by_id[a].prefix_group or "").strip() == prefix_group
+                        and pre_resolved_models.get(a) == node_model_id
+                        for a in ancestor_chain
+                    )
+                )
+                agent_kwargs["before_model_callback"] = [
+                    _make_prefix_group_before_model_callback(
+                        node_id,
+                        base_instruction=agent_instruction_text,
+                        stage_role_prompt=stage_role_prompt,
+                        ancestor_chain=ancestor_chain,
+                        parent_id=node_cfg.fork_from,
+                        preserve_signatures=same_prefix_and_model,
+                        prefix_group=prefix_group or "",
+                        enable_explicit_stem_cache=(node_id not in pg_parent_ids),
                     ),
-                    max_continuations=spec.config.max_node_continuations,
-                ),
-            ]
-            if node_cfg.fork_from:
-                # First: the inherited transcript is part of the request the
-                # callbacks below measure and trim.
-                agent_kwargs["before_model_callback"].insert(
-                    0, _make_fork_before_model_callback(node_id, node_cfg.fork_from))
+                    _make_client_context_editing_before_model_callback(
+                        node_id,
+                        model=node_model_id,
+                        config=spec.config.model_dump(),
+                        preserve_system_prefix=True,
+                    ),
+                    _make_node_context_ceiling_before_model_callback(
+                        node_id,
+                        model=node_model_id,
+                        has_schema=bool(node_cfg.output_schema),
+                        keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
+                        llm_factory=(
+                            (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw, preserve_system_prefix=True))
+                            if llm_kwargs
+                            else None
+                        ),
+                        max_continuations=spec.config.max_node_continuations,
+                        preserve_system_prefix=True,
+                    ),
+                ]
+            else:
+                agent_kwargs["before_model_callback"] = [
+                    _make_stage_experience_before_model_callback(node_id),
+                    _make_campaign_directive_before_model_callback(node_id),
+                    # Models without prefix binding: the harness clears older
+                    # tool results itself (None for Claude, whose provider does).
+                    _make_client_context_editing_before_model_callback(
+                        node_id, model=node_model_id, config=spec.config.model_dump(),
+                    ),
+                    # Last: measures the request as the three above leave it.
+                    _make_node_context_ceiling_before_model_callback(
+                        node_id, model=node_model_id, has_schema=bool(node_cfg.output_schema),
+                        keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
+                        # The handoff is written by the stage's own model, built
+                        # from the same kwargs; None under the hermetic path.
+                        llm_factory=(
+                            (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw)) if llm_kwargs else None
+                        ),
+                        max_continuations=spec.config.max_node_continuations,
+                    ),
+                ]
+                if node_cfg.fork_from:
+                    # First: the inherited transcript is part of the request the
+                    # callbacks below measure and trim.
+                    agent_kwargs["before_model_callback"].insert(
+                        0, _make_fork_before_model_callback(node_id, node_cfg.fork_from))
             if node_id == "reflector" or (
                 node_cfg.skill and "mantis-reflect" in node_cfg.skill
             ):
