@@ -120,6 +120,11 @@ class RunContext:
     enable_context_cache: bool = True
     enable_narrative_report: bool = False
     explicit_cache_handles: dict[str, dict] = field(default_factory=dict)
+    # Universal operator steering delivered to hunting stages only (INV-2):
+    # `operator_focus` is sanitized unfenced operator instruction; `seed_report_block`
+    # is CP-4 fenced untrusted bug-report evidence to hunt variants of.
+    operator_focus: str = ""
+    seed_report_block: str = ""
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

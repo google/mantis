@@ -41,14 +41,19 @@ from core.prompts import (
 
 
 from core.config import (
+    ConfigValidationError,
     DEFAULT_MODEL,
     DEFAULT_VERTEX_FAST_MODEL,
     DeferredEnvLiteLlm,
     ExtendedCriticVerdict,
     ExtendedReviewVerdict,
     ResilientLiteLlm,
+    _HANDOFF_PLAIN_TEXT_TURN,
+    _HandoffLiteLlm,
     get_llm_kwargs,
+    is_claude_model,
     resolve_model_id,
+    validate_llm_env_vars,
 )
 from core.config import context_editing_keeps as _context_editing_keeps
 
@@ -204,6 +209,10 @@ class GlobalConfig(_Base):
     # llm_streaming_enabled; MANTIS_LLM_STREAM overrides).
     llm_streaming: bool = True
     budget: Optional[dict[str, Any]] = None
+    # Optional absolute input-token trigger cap for context editing (e.g. 180000).
+    context_editing_trigger_tokens: Optional[int] = Field(default=None, gt=0)
+    # Optional per-sandbox-backend option map preserved across --sandbox switches.
+    sandbox_profiles: Optional[dict[str, dict[str, Any]]] = None
     # Paths under the target that are not scanned: patterns relative to the
     # target, see core.exclusions. A list, or one comma-separated string.
     exclude: Optional[list[str] | str] = None
@@ -2060,14 +2069,18 @@ async def _write_handoff(
             pass
         text_parts: list[str] = []
         tokens = 0
-        async for response in llm.generate_content_async(request, stream=False):
-            content = getattr(response, "content", None)
-            for part in (getattr(content, "parts", None) or []):
-                if getattr(part, "text", None) and not getattr(part, "thought", False):
-                    text_parts.append(part.text)
-            usage = getattr(response, "usage_metadata", None)
-            if usage and getattr(usage, "total_token_count", None):
-                tokens = int(usage.total_token_count)
+        handoff_tok = _HANDOFF_PLAIN_TEXT_TURN.set(True)
+        try:
+            async for response in llm.generate_content_async(request, stream=False):
+                content = getattr(response, "content", None)
+                for part in (getattr(content, "parts", None) or []):
+                    if getattr(part, "text", None) and not getattr(part, "thought", False):
+                        text_parts.append(part.text)
+                usage = getattr(response, "usage_metadata", None)
+                if usage and getattr(usage, "total_token_count", None):
+                    tokens = int(usage.total_token_count)
+        finally:
+            _HANDOFF_PLAIN_TEXT_TURN.reset(handoff_tok)
         return "".join(text_parts).strip(), tokens
     except Exception as exc:
         print(f"[CONTEXT CEILING] {node_id}: handoff call failed ({type(exc).__name__}: {str(exc)[:160]}).",
@@ -2427,6 +2440,36 @@ def _count_protected_inherited_tool_responses(llm_request: Any, node_id: str) ->
     return count if found_marker else 0
 
 
+def _strip_claude_thoughts_up_to_last_cleared(
+    llm_request: Any, last_cleared_content: Any
+) -> None:
+    """Strips prefix-bound `thought` blocks and `thought_signature` metadata
+    from `role='model'` turns at or before `last_cleared_content` when
+    client-side context editing mutates historical tool results on a Claude
+    route (e.g. Bedrock Converse or OpenRouter), keeping `function_call`
+    pairings and recent kept turns intact."""
+    contents = list(getattr(llm_request, "contents", None) or [])
+    last_idx = next((i for i, c in enumerate(contents) if c is last_cleared_content), -1)
+    if last_idx < 0:
+        return
+    updated_contents = []
+    for idx, content in enumerate(contents):
+        if idx <= last_idx and getattr(content, "role", None) == "model":
+            kept_parts = []
+            for part in getattr(content, "parts", None) or []:
+                if getattr(part, "thought", False):
+                    continue
+                if getattr(part, "thought_signature", None) is not None:
+                    part = part.model_copy(update={"thought_signature": None})
+                kept_parts.append(part)
+            if kept_parts:
+                content.parts = kept_parts
+                updated_contents.append(content)
+        else:
+            updated_contents.append(content)
+    llm_request.contents = updated_contents
+
+
 def _make_client_context_editing_before_model_callback(
     node_id: str,
     model: Any = None,
@@ -2435,7 +2478,8 @@ def _make_client_context_editing_before_model_callback(
     preserve_system_prefix: bool = False,
 ):
     """Clears a stage's older tool results before dispatch, for models that
-    do not bind their reasoning to the request prefix (Gemini, OpenAI):
+    do not run server-side `clear_tool_uses_20250919` (Gemini, OpenAI, and
+    non-direct Claude routes like Bedrock Converse / OpenRouter):
     the harness-side counterpart of Anthropic context editing, same trigger,
     keep and clear-at-least (core.config.client_context_editing).
 
@@ -2450,7 +2494,8 @@ def _make_client_context_editing_before_model_callback(
     continuation, whose attempt starts with no tool results of its own.
 
     Runs before the ceiling callback, which then measures the request as
-    cleared. Claude models get None here: the provider edits for them.
+    cleared. Direct Anthropic / Vertex Claude models get None here: the
+    provider edits for them.
     """
     editing_cache: dict[str, Any] = {}
 
@@ -2488,6 +2533,7 @@ def _make_client_context_editing_before_model_callback(
                 llm_request.append_instructions([NODE_CONTEXT_EDITING_NOTICE])
         for content, index, _chars in responses[:cleared]:
             _clear_function_response(content, index)
+        effective_cleared = cleared
         estimated = _request_chars(llm_request) // NODE_CONTEXT_CHARS_PER_TOKEN
         trigger = int(editing.get("trigger_tokens") or 0)
         if trigger and estimated >= trigger and cleared < clearable:
@@ -2505,6 +2551,7 @@ def _make_client_context_editing_before_model_callback(
                 new_cleared += 1
             for content, index, _chars in responses[cleared:new_cleared]:
                 _clear_function_response(content, index)
+            effective_cleared = new_cleared
             slot[NODE_CONTEXT_CLEARED_KEY] = new_cleared
             _observe("context_edits_applied")
             _observe("context_edit_cleared_tokens", freed // NODE_CONTEXT_CHARS_PER_TOKEN)
@@ -2517,6 +2564,10 @@ def _make_client_context_editing_before_model_callback(
             )
         elif slot.get(NODE_CONTEXT_CLEARED_KEY) != cleared:
             slot[NODE_CONTEXT_CLEARED_KEY] = cleared
+        if effective_cleared > 0 and is_claude_model(model):
+            _strip_claude_thoughts_up_to_last_cleared(
+                llm_request, responses[effective_cleared - 1][0]
+            )
         return None
 
     return _before_model
@@ -2667,6 +2718,8 @@ def _make_node_context_ceiling_before_model_callback(
 CAMPAIGN_DIRECTIVE_MARKER = "[CAMPAIGN DIRECTIVE]"
 CAMPAIGN_CONTEXT_MARKER = "[CAMPAIGN CONTEXT]"
 AUDIT_CHECKLIST_MARKER = "[DETERMINISTIC AUDIT CHECKLIST]"
+OPERATOR_FOCUS_MARKER = "[OPERATOR FOCUS]"
+OPERATOR_SEED_REPORT_MARKER = "[OPERATOR SEED REPORT]"
 #: Characters of campaign context appended per node. Larger than the stage
 #: experience cap: the memory block alone lists every earlier finding here.
 MAX_CAMPAIGN_CONTEXT_CHARS = 8000
@@ -2677,6 +2730,11 @@ MAX_CAMPAIGN_DIRECTIVE_CHARS = 12000
 #: planning and vulnerability discovery cover indexed sinks systematically
 #: without biasing independent downstream review/critic stages.
 CHECKLIST_STAGES = ("planner", "explorer", "researcher")
+#: Hunting stages that receive operator `--focus` and `--seed-report` across
+#: all scan modes. Verification/judge stages (`reviewer`, `critic`,
+#: `reproducer`, `patcher`, `calibrator`) are deliberately excluded to preserve
+#: independent separation-of-duties neutrality (INV-2).
+HUNTING_STAGES = ("architect", "threat_modeler", "planner", "researcher", "explorer")
 #: The stages that decide where to look. Matched by node id prefix, so
 #: `researcher_2` in a parallel archetype counts. The reproducer, patcher,
 #: calibrator, reflector and reporter work from this run's findings through
@@ -2693,6 +2751,11 @@ def _wants_campaign_context(node_id: str) -> bool:
 def _wants_audit_checklist(node_id: str) -> bool:
     nid = str(node_id or "")
     return any(nid == s or nid.startswith(s + "_") or nid.startswith(s + "-") for s in CHECKLIST_STAGES)
+
+
+def _wants_operator_steering(node_id: str) -> bool:
+    nid = str(node_id or "")
+    return any(nid == s or nid.startswith(s + "_") or nid.startswith(s + "-") for s in HUNTING_STAGES)
 
 
 def _close_open_fence(text: str) -> str:
@@ -2720,25 +2783,36 @@ def _render_campaign_directive_blocks(
         return []
     wants_context = _wants_campaign_context(node_id)
     wants_checklist = _wants_audit_checklist(node_id)
+    wants_steering = _wants_operator_steering(node_id)
     directive = str(getattr(ctx, "campaign_directive", "") or "")
     context = str(getattr(ctx, "campaign_context", "") or "") if wants_context else ""
+    seed_block = str(getattr(ctx, "seed_report_block", "") or "") if wants_steering else ""
+    op_focus = str(getattr(ctx, "operator_focus", "") or "") if wants_steering else ""
     checklist = ""
-    if wants_checklist and getattr(ctx, "target_file", ""):
+    if wants_checklist:
         cached_cl = getattr(ctx, "audit_checklist", None)
-        if cached_cl is None:
+        if cached_cl is None and (
+            getattr(ctx, "db_path", "")
+            or getattr(ctx, "target_file", "")
+            or getattr(ctx, "path_root", "")
+        ):
             from core.checklist import build_slice_audit_checklist
 
             cached_cl = build_slice_audit_checklist(ctx)
             ctx.audit_checklist = cached_cl
         checklist = str(cached_cl or "")
-    if not directive and not context and not checklist:
+    if not directive and not context and not checklist and not seed_block and not op_focus:
         return []
+    # Data before instruction: untrusted context / seed evidence come first, and
+    # the trusted operator focus last, so it is never enclosed by a fence.
     blocks: list[str] = []
     if context and CAMPAIGN_CONTEXT_MARKER not in existing_text:
         block = f"\n\n{CAMPAIGN_CONTEXT_MARKER}{context}"
         if len(block) > MAX_CAMPAIGN_CONTEXT_CHARS:
             block = _close_open_fence(block[:MAX_CAMPAIGN_CONTEXT_CHARS]) + "\n[campaign context truncated]"
         blocks.append(block)
+    if seed_block and OPERATOR_SEED_REPORT_MARKER not in existing_text:
+        blocks.append(_close_open_fence(f"\n\n{OPERATOR_SEED_REPORT_MARKER}{seed_block}"))
     if checklist and AUDIT_CHECKLIST_MARKER not in existing_text:
         blocks.append(_close_open_fence(checklist))
     if directive and CAMPAIGN_DIRECTIVE_MARKER not in existing_text:
@@ -2746,6 +2820,8 @@ def _render_campaign_directive_blocks(
         if len(block) > MAX_CAMPAIGN_DIRECTIVE_CHARS:
             block = _close_open_fence(block[:MAX_CAMPAIGN_DIRECTIVE_CHARS]) + "\n[directive truncated]"
         blocks.append(block)
+    if op_focus and OPERATOR_FOCUS_MARKER not in existing_text:
+        blocks.append(f"\n\n{OPERATOR_FOCUS_MARKER}{op_focus}")
     return blocks
 
 
@@ -2760,8 +2836,10 @@ def _make_campaign_directive_before_model_callback(node_id: str):
     the slice briefing), therefore cannot ride in the seed; they are
     appended to each node's instructions, the way stage experience is.
     The directive reaches every node; the context reaches the stages that
-    decide where to look (CONTEXT_STAGES). Data before instruction, so the
-    directive is never enclosed by a context block's untrusted-data fence.
+    decide where to look (CONTEXT_STAGES); operator `--focus` and
+    `--seed-report` reach `HUNTING_STAGES` only across all scan modes.
+    Data before instruction, so trusted operator directives are never enclosed
+    by a context or seed block's untrusted-data fence.
     Idempotent per request (markers), bounded, never the reason a request
     fails.
     """
@@ -4058,18 +4136,20 @@ def merge_config_dicts(base: dict, overlay: dict) -> dict:
                 sb_proj = v.get("options", {}).get("project") if isinstance(v.get("options"), dict) else None
                 if sb_proj and not merged.get("project"):
                     merged["project"] = sb_proj
-            elif new_type != base_type or ("options" in v and v["options"] == {}):
+            elif new_type != base_type:
                 merged["sandbox"] = dict(v)
                 if "options" not in merged["sandbox"] or not isinstance(merged["sandbox"]["options"], dict):
                     merged["sandbox"]["options"] = {}
             else:
-                merged["sandbox"] = {
-                    "type": new_type,
-                    "options": merge_config_dicts(
-                        base_sb.get("options", {}) if isinstance(base_sb.get("options"), dict) else {},
-                        v.get("options", {}) if isinstance(v.get("options"), dict) else {},
-                    ),
-                }
+                merged["sandbox"] = dict(base_sb)
+                for sb_k, sb_v in v.items():
+                    if sb_k != "options":
+                        merged["sandbox"][sb_k] = sb_v
+                merged["sandbox"]["type"] = new_type
+                merged["sandbox"]["options"] = merge_config_dicts(
+                    base_sb.get("options", {}) if isinstance(base_sb.get("options"), dict) else {},
+                    v.get("options", {}) if isinstance(v.get("options"), dict) else {},
+                )
         elif k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
             merged[k] = merge_config_dicts(merged[k], v)
         else:
@@ -4097,50 +4177,83 @@ def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> t
     ]
 
     abs_json = os.path.abspath(json_path)
-    if load_local:
+    base_cfg = raw_json.get("config") if isinstance(raw_json.get("config"), dict) else {}
+    overlay_meta: dict[str, Any] = {
+        "base_timeout_was_shipped_180": (
+            os.path.basename(abs_json) == "workflow.json" and base_cfg.get("timeout") == 180
+        ),
+        "local_timeout_set": False,
+        "local_reasoning_effort": None,
+    }
+    ignore_local = str(os.environ.get("MANTIS_IGNORE_LOCAL_CONFIG", "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if load_local and not ignore_local:
         for cand in local_candidates:
             if os.path.exists(cand) and os.path.abspath(cand) != abs_json:
                 try:
                     with open(cand, 'r', encoding='utf-8') as lf:
                         local_data = json.load(lf)
-                    if isinstance(local_data, dict):
-                        if "config" in local_data and isinstance(local_data["config"], dict):
-                            raw_json["config"] = merge_config_dicts(
-                                raw_json.get("config", {}), local_data["config"]
+                except json.JSONDecodeError as je:
+                    raise ConfigValidationError(
+                        f"Malformed JSON in local configuration overlay '{cand}' "
+                        f"(line {je.lineno}, column {je.colno}: {je.msg}). "
+                        "Fix or remove the file, or set MANTIS_IGNORE_LOCAL_CONFIG=1."
+                    ) from je
+                except OSError as oe:
+                    raise ConfigValidationError(
+                        f"Could not read local configuration overlay '{cand}': {oe}"
+                    ) from oe
+                if not isinstance(local_data, dict):
+                    raise ConfigValidationError(
+                        f"Local configuration overlay '{cand}' must be a JSON object, "
+                        f"got {type(local_data).__name__}."
+                    )
+                local_cfg = local_data.get("config") if isinstance(local_data.get("config"), dict) else {}
+                if "timeout" in local_cfg or "timeout" in local_data:
+                    overlay_meta["local_timeout_set"] = True
+                if local_cfg.get("reasoning_effort") or local_data.get("reasoning_effort"):
+                    overlay_meta["local_reasoning_effort"] = (
+                        local_cfg.get("reasoning_effort") or local_data.get("reasoning_effort")
+                    )
+                if "config" in local_data and isinstance(local_data["config"], dict):
+                    raw_json["config"] = merge_config_dicts(
+                        raw_json.get("config", {}), local_data["config"]
+                    )
+                # Also check top-level config keys placed directly at root of overlay
+                for top_k in (
+                    "sandbox",
+                    "default_model",
+                    "fast_model",
+                    "api_base",
+                    "timeout",
+                    "reasoning_effort",
+                    "db_path",
+                    "seed_prompt",
+                ):
+                    if top_k in local_data and (
+                        "config" not in local_data
+                        or top_k not in local_data.get("config", {})
+                    ):
+                        if top_k == "sandbox" and isinstance(local_data[top_k], dict):
+                            raw_json.setdefault("config", {})["sandbox"] = merge_config_dicts(
+                                {"sandbox": raw_json.get("config", {}).get("sandbox", {})},
+                                {"sandbox": local_data["sandbox"]},
+                            )["sandbox"]
+                        elif isinstance(local_data[top_k], dict) and isinstance(raw_json.get("config", {}).get(top_k), dict):
+                            raw_json.setdefault("config", {})[top_k] = merge_config_dicts(
+                                raw_json.get("config", {}).get(top_k, {}), local_data[top_k]
                             )
-                        # Also check top-level config keys placed directly at root of overlay
-                        for top_k in (
-                            "sandbox",
-                            "default_model",
-                            "fast_model",
-                            "api_base",
-                            "timeout",
-                            "reasoning_effort",
-                            "db_path",
-                            "seed_prompt",
-                        ):
-                            if top_k in local_data and (
-                                "config" not in local_data
-                                or top_k not in local_data.get("config", {})
-                            ):
-                                if top_k == "sandbox" and isinstance(local_data[top_k], dict):
-                                    raw_json.setdefault("config", {})["sandbox"] = merge_config_dicts(
-                                        {"sandbox": raw_json.get("config", {}).get("sandbox", {})},
-                                        {"sandbox": local_data["sandbox"]},
-                                    )["sandbox"]
-                                elif isinstance(local_data[top_k], dict) and isinstance(raw_json.get("config", {}).get(top_k), dict):
-                                    raw_json.setdefault("config", {})[top_k] = merge_config_dicts(
-                                        raw_json.get("config", {}).get(top_k, {}), local_data[top_k]
-                                    )
-                                else:
-                                    raw_json.setdefault("config", {})[top_k] = local_data[top_k]
-                        for k in ("name", "nodes", "edges"):
-                            if k in local_data:
-                                raw_json[k] = local_data[k]
-                    break
-                except Exception as e:
-                    print(f"[CONFIG WARNING] Could not load local overlay {cand}: {e}")
+                        else:
+                            raw_json.setdefault("config", {})[top_k] = local_data[top_k]
+                for k in ("name", "nodes", "edges"):
+                    if k in local_data:
+                        raw_json[k] = local_data[k]
+                break
 
+    raw_json["_overlay_meta"] = overlay_meta
     return raw_json, base_dir
 
 
@@ -4329,8 +4442,21 @@ def load_workflow_from_json(
     load_local: bool = True,
 ) -> tuple[Workflow, dict]:
     raw_json, base_dir = load_raw_workflow_with_overlay(json_path, load_local=load_local)
+    overlay_meta = raw_json.pop("_overlay_meta", {}) if isinstance(raw_json, dict) else {}
+    validate_llm_env_vars()
 
     spec = WorkflowSpec.model_validate(raw_json)
+
+    # Shipped `workflow.json` carries a legacy `timeout: 180` that predates
+    # effort-scaled thinking timeouts (`REQUEST_TIMEOUT_BY_EFFORT`, up to 1800s).
+    # Clear it when neither `workflow.local.json` nor `--timeout` explicitly set
+    # a timeout so `default_request_timeout(model, effort)` governs.
+    if (
+        overlay_meta.get("base_timeout_was_shipped_180")
+        and not overlay_meta.get("local_timeout_set")
+        and timeout_override is None
+    ):
+        spec.config.timeout = None
 
     # Apply global runtime overrides if provided
     if model_override:
@@ -4344,10 +4470,27 @@ def load_workflow_from_json(
     if db_override:
         spec.config.db_path = db_override
     if sandbox_override:
+        base_sb_dump = spec.config.sandbox.model_dump()
         if isinstance(sandbox_override, str):
-            spec.config.sandbox = SandboxConfig(type=sandbox_override)
+            merged_sb = merge_config_dicts(
+                {"sandbox": base_sb_dump}, {"sandbox": {"type": sandbox_override}}
+            )["sandbox"]
+            profiles = spec.config.sandbox_profiles
+            if (
+                sandbox_override != spec.config.sandbox.type
+                and isinstance(profiles, dict)
+                and isinstance(profiles.get(sandbox_override), dict)
+            ):
+                merged_sb = merge_config_dicts(
+                    {"sandbox": merged_sb},
+                    {"sandbox": {"type": sandbox_override, **profiles[sandbox_override]}},
+                )["sandbox"]
+            spec.config.sandbox = SandboxConfig.model_validate(merged_sb)
         elif isinstance(sandbox_override, dict):
-            spec.config.sandbox = SandboxConfig.model_validate(sandbox_override)
+            merged_sb = merge_config_dicts(
+                {"sandbox": base_sb_dump}, {"sandbox": sandbox_override}
+            )["sandbox"]
+            spec.config.sandbox = SandboxConfig.model_validate(merged_sb)
 
     errors = []
 
@@ -4532,23 +4675,41 @@ def load_workflow_from_json(
             # or inside DeferredEnvLiteLlm at first LLM call (hermetic path).
             # Freezing the arguments NOW matters: spec/node config is loop
             # state that must not be re-read later through a stale closure.
+            effective_node_api_base = api_base_override or node_cfg.api_base
+            effective_node_timeout = (
+                timeout_override if timeout_override is not None else node_cfg.timeout
+            )
+            # Operator-wide reasoning effort (CLI `--reasoning-effort`, env
+            # `REASONING_EFFORT`, or `workflow.local.json`) applies to EVERY node
+            # uniformly, so it beats per-node values without breaking
+            # prefix_group KV-cache parity. Otherwise the prefix_group-normalized
+            # effort (or the node's own) is used.
+            global_effort_override = (
+                reasoning_effort_override
+                or (os.environ.get("REASONING_EFFORT") or "").strip()
+                or overlay_meta.get("local_reasoning_effort")
+            )
+            effective_node_effort = global_effort_override or effective_reasoning_effort
             llm_kwargs_resolver = functools.partial(
                 get_llm_kwargs,
                 node_cfg.model,
                 node_default_model,
-                api_base=node_cfg.api_base,
+                api_base=effective_node_api_base,
                 default_api_base=spec.config.api_base,
-                timeout=node_cfg.timeout,
+                timeout=effective_node_timeout,
                 default_timeout=spec.config.timeout,
-                reasoning_effort=effective_reasoning_effort,
+                reasoning_effort=effective_node_effort,
                 default_reasoning_effort=spec.config.reasoning_effort,
                 global_model_override=model_override,
                 config=spec.config.model_dump(),
+                explicit_reasoning_effort=bool(reasoning_effort_override),
             )
             deferred_env = False
             llm_kwargs = {}
             try:
                 _, llm_kwargs = llm_kwargs_resolver()
+            except ConfigValidationError:
+                raise
             except ValueError as e:
                 if "VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT" in str(e):
                     # Missing cloud credentials, and ONLY missing cloud
@@ -4928,7 +5089,7 @@ def load_workflow_from_json(
                         has_schema=bool(node_cfg.output_schema),
                         keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
                         llm_factory=(
-                            (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw, preserve_system_prefix=True))
+                            (lambda kw=dict(llm_kwargs): _HandoffLiteLlm(**kw, preserve_system_prefix=True))
                             if llm_kwargs
                             else None
                         ),
@@ -4952,7 +5113,7 @@ def load_workflow_from_json(
                         # The handoff is written by the stage's own model, built
                         # from the same kwargs; None under the hermetic path.
                         llm_factory=(
-                            (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw)) if llm_kwargs else None
+                            (lambda kw=dict(llm_kwargs): _HandoffLiteLlm(**kw)) if llm_kwargs else None
                         ),
                         max_continuations=spec.config.max_node_continuations,
                     ),
@@ -5110,6 +5271,16 @@ def load_workflow_from_json(
     # because it is part of the config contract main.py reads unconditionally.
     cfg["on_enter_status"] = {}
     cfg["resolved_node_models"] = list(resolved_node_models)
+    if model_override:
+        cfg["_cli_model_override"] = model_override
+    if api_base_override:
+        cfg["_cli_api_base"] = api_base_override
+    if timeout_override is not None:
+        cfg["_cli_timeout"] = timeout_override
+    if reasoning_effort_override:
+        cfg["_cli_reasoning_effort"] = reasoning_effort_override
+    if overlay_meta.get("local_reasoning_effort"):
+        cfg["_local_reasoning_effort"] = overlay_meta["local_reasoning_effort"]
     if spec.budget:
         cfg["budget"] = spec.budget
     elif "budget" in raw_json and isinstance(raw_json["budget"], dict):

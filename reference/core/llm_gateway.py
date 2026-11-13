@@ -98,11 +98,19 @@ class SecretScrubber:
             re.compile(r"(?i)(bearer[ \t]{1,16})[A-Za-z0-9_\-\.\/\+=]{20,}"),
             r"\1[REDACTED_BEARER_TOKEN]",
         ),
+        # Quoted literal credential assignments (preserves assignment syntax and leaves
+        # unquoted code expressions like `password = request.form.get("password")` intact)
         (
             re.compile(
-                r"(?i)(api[_-]?key|secret|token|password|auth_token)[ \t]{0,16}[:=][ \t]{0,16}['\"]?([A-Za-z0-9_\-\.\/\+=]{16,})['\"]?"
+                r'(?i)(\b(?:[A-Za-z0-9_]{1,32}_)?(?:password|passwd|pwd|secret|api[_-]?key|access_token|auth_token|client_secret|private_key|token)\b[\'"]?\]?[ \t]{0,16}[:=][ \t]{0,16})"(?!(?:password|passwd|changeme|change_me|placeholder|redacted|example|none|null|undefined|your_[a-z0-9_]+)"|\$\{|\{\{|\[REDACTED_|<<<UNTRUSTED_)([^"\s\r\n]{8,})"'
             ),
-            r"\1: [REDACTED_CREDENTIAL]",
+            r'\1"[REDACTED_CREDENTIAL]"',
+        ),
+        (
+            re.compile(
+                r"(?i)(\b(?:[A-Za-z0-9_]{1,32}_)?(?:password|passwd|pwd|secret|api[_-]?key|access_token|auth_token|client_secret|private_key|token)\b['\"]?\]?[ \t]{0,16}[:=][ \t]{0,16})'(?!(?:password|passwd|changeme|change_me|placeholder|redacted|example|none|null|undefined|your_[a-z0-9_]+)'|\$\{|\{\{|\[REDACTED_|<<<UNTRUSTED_)([^'\s\r\n]{8,})'"
+            ),
+            r"\1'[REDACTED_CREDENTIAL]'",
         ),
         # Webhook URLs
         (

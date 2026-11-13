@@ -27,6 +27,10 @@ from typing import Any, Optional
 
 # Suppress noisy ADK preview/experimental feature notices
 warnings.filterwarnings("ignore", message=r".*\[EXPERIMENTAL\].*")
+# Keep LiteLLM 100% hermetic before `google.adk` imports `litellm`
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+os.environ.setdefault("LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS", "True")
+os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
 
 from google.genai import types
 from google.adk.runners import Runner, RunConfig
@@ -57,7 +61,15 @@ from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT, pref
 from core.context import RunContext, current_run_context
 from core.transcript import TranscriptWriter, event_transcript_rows
 from core.paths import resolve_db_path
-from core.config import EXIT_AUTH, MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
+from core.config import (
+    ConfigValidationError,
+    EXIT_AUTH,
+    MantisAuthError,
+    ResilientLiteLlm,
+    format_auth_error_message,
+    get_run_llm_kwargs,
+    is_auth_error,
+)
 from core.config import configure_llm_streaming, llm_streaming_enabled
 from core.compactor import MantisEventsSummarizer
 from core.llm_gateway import strip_terminal_control
@@ -419,6 +431,29 @@ def _rehydrate_campaign_resume_state(
             branch_ctx.promoted_finding_ids = promoted
     except Exception:
         pass
+
+
+def _build_operator_steering_blocks(focus: str, seed_report: str) -> tuple[str, str]:
+    """Builds `(operator_focus_block, seed_report_block)` for per-campaign
+    `HUNTING_STAGES` injection across all scan modes (`whole`, `file-by-file`,
+    `cross-functional`, `changed`).
+
+    Preserves the planner's strict trust split (`INV-2`, CP-4):
+    - `operator_focus_block`: sanitized unfenced operator directive.
+    - `seed_report_block`: sanitized CP-4 fenced untrusted bug-report evidence.
+    """
+    from core.planner import (
+        _render_focus_section,
+        _render_seed_section,
+        _sanitize_focus,
+        _sanitize_seed,
+    )
+
+    clean_focus = _sanitize_focus(focus)
+    clean_seed = _sanitize_seed(seed_report)[:3000].strip()
+    focus_block = _render_focus_section(clean_focus) if clean_focus else ""
+    seed_block = _render_seed_section(clean_seed) if clean_seed else ""
+    return focus_block, seed_block
 
 
 def _prepare_overflow_restart_handoff(db_path: str, run_id: str, filepath: str) -> str:
@@ -3235,6 +3270,12 @@ async def pipeline(
         banner_resume_flags["--no-memory"] = True
     if intra_run_learning:
         banner_resume_flags["--intra-run-learning"] = True
+    if focus:
+        banner_resume_flags["--focus"] = focus
+    if seed_report_path:
+        banner_resume_flags["--seed-report"] = seed_report_path
+    if os.environ.get("VERTEX_FLEX") in ("1", "true", "True"):
+        banner_resume_flags["--flex"] = True
 
     effective_sandbox_override = sandbox_override
     # Auto-resolve unconfigured placeholders if enabled
@@ -3282,6 +3323,9 @@ async def pipeline(
             reasoning_effort_override=reasoning_effort_override,
             load_local=effective_load_local,
         )
+    except ConfigValidationError as e:
+        print(f"Configuration Error: {e}", file=sys.stderr)
+        return 64
     except ValueError as e:
         print(f"Workflow Specification Error: {e}", file=sys.stderr)
         return 1
@@ -3719,9 +3763,7 @@ async def pipeline(
             try:
                 planner_model_id = config.get("planner_model") or config.get("default_model")
                 if planner_model_id:
-                    from core.config import get_llm_kwargs
-
-                    _, planner_kwargs = get_llm_kwargs(planner_model_id, config=config)
+                    _, planner_kwargs = get_run_llm_kwargs(planner_model_id, config=config)
                     planner_llm = ResilientLiteLlm(**planner_kwargs)
             except Exception:
                 planner_llm = None
@@ -3752,9 +3794,7 @@ async def pipeline(
                 planner_model_id = config.get("planner_model") or config.get("default_model")
                 planner_llm = None
                 if planner_model_id:
-                    from core.config import get_llm_kwargs
-
-                    _, planner_kwargs = get_llm_kwargs(
+                    _, planner_kwargs = get_run_llm_kwargs(
                         planner_model_id, config=config
                     )
                     planner_llm = ResilientLiteLlm(**planner_kwargs)
@@ -4314,20 +4354,16 @@ async def pipeline(
     use_compaction = config.get("enable_compaction", False) if enable_compaction is None else enable_compaction
     if use_compaction:
         comp_model_id = config.get("compaction_model") or config.get("default_model") or "vertex_ai/gemini-3.5-flash-lite"
-        # Through the SAME kwargs resolution every other model uses: a bare
-        # ResilientLiteLlm(model=...) never learns vertex_location, so litellm
-        # falls back to us-central1 and 404s on any model that only exists in
-        # `global` -- the exact failure the planner had. It survives today only
-        # because the fallback compaction model exists in the default region.
-        from core.config import get_llm_kwargs as _get_comp_kwargs
-
-        _, comp_kwargs = _get_comp_kwargs(comp_model_id, config=config)
-        comp_llm = ResilientLiteLlm(**comp_kwargs)
-        compaction_config = EventsCompactionConfig(
-            token_threshold=int(config.get("compaction_token_threshold", 500000)),
-            event_retention_size=int(config.get("compaction_event_retention", 50)),
-            summarizer=MantisEventsSummarizer(llm=comp_llm),
-        )
+        try:
+            _, comp_kwargs = get_run_llm_kwargs(comp_model_id, config=config)
+            comp_llm = ResilientLiteLlm(**comp_kwargs)
+            compaction_config = EventsCompactionConfig(
+                token_threshold=int(config.get("compaction_token_threshold", 500000)),
+                event_retention_size=int(config.get("compaction_event_retention", 50)),
+                summarizer=MantisEventsSummarizer(llm=comp_llm),
+            )
+        except ValueError as comp_err:
+            print(f"[COMPACTION WARNING] {comp_err}; session compaction disabled.", file=sys.stderr)
 
     context_cache_config = None
     use_context_cache = config.get("enable_context_cache", True) if enable_context_cache is None else enable_context_cache
@@ -4365,6 +4401,7 @@ async def pipeline(
 
     worker_count = max(1, int(parallel or 1))
     multi_campaign_run = len(campaign_groups) > 1
+    op_focus_block, seed_report_block = _build_operator_steering_blocks(focus, seed_report)
     base_ctx = RunContext(
         jail_dir=jail_dir,
         db_path=db_path,
@@ -4385,6 +4422,8 @@ async def pipeline(
         enable_memory=not bool(no_memory),
         intra_run_learning=bool(intra_run_learning),
         freeze_memory_to_prior_runs=not bool(intra_run_learning),
+        operator_focus=op_focus_block,
+        seed_report_block=seed_report_block,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")

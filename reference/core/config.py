@@ -17,16 +17,21 @@ import contextvars
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Tuple, Union
 
 # Suppress ADK warning regarding Gemini via LiteLLM to maintain unified error handling and backoff
 os.environ.setdefault("ADK_SUPPRESS_GEMINI_LITELLM_WARNINGS", "true")
+# Keep LiteLLM 100% hermetic at import/call time (no live GitHub HTTP fetches or implicit CWD .env loads)
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+os.environ.setdefault("LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS", "True")
+os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
 
 try:
     import litellm
@@ -64,8 +69,62 @@ try:
             AnthropicConfig,
             REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT,
         )
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+        # LiteLLM's local model map frequently adds newer Claude 4.6+/5.x
+        # revisions (e.g. claude-opus-5-5) under the `anthropic` fallback
+        # generalization before adding explicit `vertex_ai/` entries. When a
+        # Vertex Claude model has no explicit `vertex_ai` capability entry
+        # (`None`), fall back to `anthropic` without overriding explicit `False`
+        # flags, and treat any adaptive-thinking model as supporting
+        # `output_config.effort` so `_apply_output_config` does not silently
+        # drop `output_config` under `drop_params=True`.
+        _orig_get_provider_cap = AnthropicModelInfo._get_provider_resolved_capability
+
+        @staticmethod
+        def _safe_get_provider_cap(model: str, key: str, custom_llm_provider: str):
+            val = _orig_get_provider_cap(model, key, custom_llm_provider)
+            if val is None and str(custom_llm_provider or "").startswith("vertex_ai"):
+                return _orig_get_provider_cap(model, key, "anthropic")
+            return val
+
+        AnthropicModelInfo._get_provider_resolved_capability = _safe_get_provider_cap
+
+        _orig_model_supports_effort = AnthropicConfig._model_supports_effort_param
+
+        @staticmethod
+        def _safe_model_supports_effort(model: str, custom_llm_provider: str) -> bool:
+            if _orig_model_supports_effort(model, custom_llm_provider):
+                return True
+            try:
+                return bool(AnthropicConfig._is_adaptive_thinking_model(model, custom_llm_provider))
+            except Exception:
+                return False
+
+        AnthropicConfig._model_supports_effort_param = _safe_model_supports_effort
 
         _orig_vertex_anthropic_map_openai_params = VertexAIAnthropicConfig.map_openai_params
+        _orig_vertex_anthropic_supported_params = VertexAIAnthropicConfig.get_supported_openai_params
+
+        def _is_vertex_claude_adaptive(model: str, provider: str) -> bool:
+            for prov in (provider, "anthropic"):
+                try:
+                    if AnthropicConfig._is_adaptive_thinking_model(model, prov):
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        def _safe_vertex_anthropic_supported_params(self, model: str) -> list:
+            params = list(_orig_vertex_anthropic_supported_params(self, model))
+            provider = getattr(self, "_resolved_provider", "vertex_ai")
+            if (
+                "thinking" not in params or "reasoning_effort" not in params
+            ) and _is_vertex_claude_adaptive(model, provider):
+                for param_name in ("thinking", "reasoning_effort"):
+                    if param_name not in params:
+                        params.append(param_name)
+            return params
 
         def _safe_vertex_anthropic_map_openai_params(
             self,
@@ -76,11 +135,7 @@ try:
         ) -> dict:
             original_model = model
             provider = getattr(self, "_resolved_provider", "vertex_ai")
-            is_adaptive = False
-            try:
-                is_adaptive = AnthropicConfig._is_adaptive_thinking_model(original_model, provider)
-            except Exception:
-                pass
+            is_adaptive = _is_vertex_claude_adaptive(original_model, provider)
 
             res = _orig_vertex_anthropic_map_openai_params(
                 self,
@@ -91,15 +146,20 @@ try:
             )
 
             if is_adaptive:
+                existing_display = (
+                    res["thinking"].get("display")
+                    if isinstance(res.get("thinking"), dict) and res["thinking"].get("display")
+                    else "summarized"
+                )
                 raw_effort = non_default_params.get("reasoning_effort")
                 if isinstance(raw_effort, dict):
                     raw_effort = raw_effort.get("effort")
                 if raw_effort and raw_effort != "none":
                     mapped_effort = REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT.get(raw_effort, raw_effort)
-                    res["thinking"] = {"type": "adaptive"}
+                    res["thinking"] = {"type": "adaptive", "display": existing_display}
                     res["output_config"] = {"effort": mapped_effort}
-                elif "thinking" in res and isinstance(res["thinking"], dict) and res["thinking"].get("type") == "enabled":
-                    res["thinking"] = {"type": "adaptive"}
+                elif "thinking" in res and isinstance(res["thinking"], dict) and res["thinking"].get("type") in ("enabled", "adaptive"):
+                    res["thinking"] = {"type": "adaptive", "display": existing_display}
 
                 # If thinking is enabled on an adaptive model, drop non-1.0 temperature and top_p
                 if "thinking" in res:
@@ -109,6 +169,7 @@ try:
                     res.pop("top_p", None)
             return res
 
+        VertexAIAnthropicConfig.get_supported_openai_params = _safe_vertex_anthropic_supported_params
         VertexAIAnthropicConfig.map_openai_params = _safe_vertex_anthropic_map_openai_params
     except Exception:
         pass
@@ -329,6 +390,97 @@ def is_placeholder(val: Any) -> bool:
     return False
 
 
+class ConfigValidationError(ValueError):
+    """Raised when local workflow overlay JSON or numeric LLM environment variables are invalid."""
+
+
+def _parse_env_number(
+    names: tuple[str, ...],
+    *,
+    as_int: bool = False,
+    default: Optional[Union[int, float]] = None,
+    min_val: Optional[float] = None,
+) -> Optional[Union[int, float]]:
+    """Parses the first set environment variable in `names` as an int/float,
+    raising `ConfigValidationError` on non-numeric or out-of-range strings."""
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        text = str(raw).strip()
+        try:
+            val: Union[int, float] = int(text) if as_int else float(text)
+            if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                raise ValueError("must be finite")
+        except (TypeError, ValueError) as exc:
+            kind = "integer" if as_int else "number"
+            raise ConfigValidationError(
+                f"Invalid {kind} in environment variable {name}={raw!r}."
+            ) from exc
+        if min_val is not None and val < min_val:
+            raise ConfigValidationError(
+                f"Environment variable {name}={raw!r} must be >= {min_val}."
+            )
+        return val
+    return default
+
+
+def validate_llm_env_vars() -> None:
+    """Validates numeric LLM/retry environment variables upfront."""
+    _parse_env_number(("LLM_TIMEOUT", "MANTIS_TIMEOUT", "LLM_REQUEST_TIMEOUT"), min_val=0.001)
+    _parse_env_number(("LLM_MAX_TOKENS", "MANTIS_MAX_TOKENS"), as_int=True, min_val=1)
+    _parse_env_number(("MANTIS_LLM_MAX_PATIENCE_SECONDS",), default=3600.0, min_val=0.0)
+    _parse_env_number(("MANTIS_LLM_RETRY_INITIAL_DELAY",), default=5.0, min_val=0.0)
+    _parse_env_number(("MANTIS_LLM_RETRY_MAX_DELAY",), default=60.0, min_val=0.0)
+    _parse_env_number(("MANTIS_LLM_MIN_OFFSET", "MANTIS_LLM_RETRY_MIN_OFFSET"), default=5.0, min_val=0.0)
+    _parse_env_number(("MANTIS_LLM_RETRY_BACKOFF",), default=2.0, min_val=0.0)
+    _parse_env_number(("MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS",), as_int=True, default=6, min_val=1)
+
+
+def _llm_retry_params() -> tuple[float, float, float, float, float]:
+    """Returns `(max_patience, initial_delay, max_delay, min_offset, backoff_factor)`."""
+    max_patience = float(
+        _parse_env_number(("MANTIS_LLM_MAX_PATIENCE_SECONDS",), default=3600.0, min_val=0.0) or 0.0
+    )
+    initial_delay = float(
+        _parse_env_number(("MANTIS_LLM_RETRY_INITIAL_DELAY",), default=5.0, min_val=0.0) or 0.0
+    )
+    max_delay = float(
+        _parse_env_number(("MANTIS_LLM_RETRY_MAX_DELAY",), default=60.0, min_val=0.0) or 0.0
+    )
+    min_offset = float(
+        _parse_env_number(
+            ("MANTIS_LLM_MIN_OFFSET", "MANTIS_LLM_RETRY_MIN_OFFSET"), default=5.0, min_val=0.0
+        )
+        or 0.0
+    )
+    backoff_factor = float(
+        _parse_env_number(("MANTIS_LLM_RETRY_BACKOFF",), default=2.0, min_val=0.0) or 0.0
+    )
+    return max_patience, initial_delay, max_delay, min_offset, backoff_factor
+
+
+_VERSIONED_REASONING_FAMILY_RE = re.compile(
+    r"(?:^|[/:_-])(?:"
+    r"gemini-(?:2\.5|3(?:\.\d+|[-_]|$))"
+    r"|glm-5(?:\.\d+|[-_]|$)"
+    r"|deepseek-r1(?:[-_.]|$)"
+    r"|qwen3(?:[-_.]|$)"
+    r"|gpt-5(?:\.\d+|[-_]|$)"
+    r"|o1(?:[-_]|$)"
+    r"|o3(?:[-_]|$)"
+    r"|o4(?:[-_]|$)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_versioned_reasoning_model(model: Any) -> bool:
+    """True for versioned reasoning model families whose `reasoning_effort`
+    must pass through `litellm.drop_params = True` even when unlisted."""
+    return bool(_VERSIONED_REASONING_FAMILY_RE.search(str(model or "").strip()))
+
+
 def normalize_model_id(model_id: str) -> str:
     """Normalizes model names and routes bare gemini/claude models to vertex_ai or gemini/ based on credentials."""
     if not model_id:
@@ -351,6 +503,7 @@ def normalize_model_id(model_id: str) -> str:
             or os.environ.get("GOOGLE_CLOUD_PROJECT")
         ):
             return f"vertex_ai/{cleaned}"
+        return f"anthropic/{cleaned}"
     if cleaned in (
         "glm-5.2-maas",
         "zai-org/glm-5.2-maas",
@@ -363,6 +516,30 @@ def normalize_model_id(model_id: str) -> str:
     return cleaned
 
 
+def _http_status_of(e: Exception) -> Optional[int]:
+    status = getattr(e, "status_code", None) or getattr(e, "code", None)
+    if isinstance(status, int):
+        return status
+    resp = getattr(e, "response", None)
+    resp_status = getattr(resp, "status_code", None) if resp is not None else None
+    return resp_status if isinstance(resp_status, int) else None
+
+
+def _is_deterministic_non_retryable_exc(e: Exception) -> bool:
+    """True for deterministic client/request errors (4xx / schema / param errors)
+    that must fail immediately rather than burning backoff patience."""
+    status = _http_status_of(e)
+    if status in (429, 503, 529):
+        return False
+    if status in (400, 401, 403, 404, 413, 422):
+        return True
+    non_retryable = set(globals().get("_NON_RETRYABLE_EXC_NAMES", ()))
+    for cls in type(e).__mro__:
+        if cls.__name__ in non_retryable:
+            return status not in (408, 429, 500, 502, 503, 504, 529)
+    return False
+
+
 def is_rate_limit_error(e: Exception) -> bool:
     """Detects whether an exception represents a 429 / RateLimitError / RESOURCE_EXHAUSTED error."""
     try:
@@ -371,12 +548,11 @@ def is_rate_limit_error(e: Exception) -> bool:
             return True
     except Exception:
         pass
-    status = getattr(e, "status_code", None) or getattr(e, "code", None)
+    status = _http_status_of(e)
     if status in (429, 503, 529):
         return True
-    resp = getattr(e, "response", None)
-    if resp and getattr(resp, "status_code", None) in (429, 503, 529):
-        return True
+    if _is_deterministic_non_retryable_exc(e) or (status is not None and status not in (429, 503, 529)):
+        return False
     msg = str(e).lower()
     if any(k in msg for k in ("ratelimiterror", "resource_exhausted", "quota exceeded", "rate limit", "rate_limit", "overloaded", "too many requests")):
         return True
@@ -387,7 +563,9 @@ def is_rate_limit_error(e: Exception) -> bool:
 
 def is_retryable_llm_error(e: Exception) -> bool:
     """Detects whether an exception represents a retryable transient error (429, 408, 5xx, timeout, or network reset)."""
-    if is_auth_error(e) or isinstance(e, (MantisAuthError, PermissionError, FileNotFoundError)):
+    if is_auth_error(e) or isinstance(e, (MantisAuthError, ConfigValidationError, PermissionError, FileNotFoundError)):
+        return False
+    if _is_deterministic_non_retryable_exc(e):
         return False
     if is_rate_limit_error(e):
         return True
@@ -424,12 +602,11 @@ def is_retryable_llm_error(e: Exception) -> bool:
         pass
     if isinstance(e, (asyncio.TimeoutError, TimeoutError, ConnectionResetError, BrokenPipeError)):
         return True
-    status = getattr(e, "status_code", None) or getattr(e, "code", None)
+    status = _http_status_of(e)
     if status in (408, 429, 500, 502, 503, 504, 529):
         return True
-    resp = getattr(e, "response", None)
-    if resp and getattr(resp, "status_code", None) in (408, 429, 500, 502, 503, 504, 529):
-        return True
+    if status is not None:
+        return False
     msg = str(e).lower()
     if any(
         k in msg
@@ -579,7 +756,12 @@ def resolve_output_ceiling(model: str) -> Optional[int]:
         import litellm
         known = litellm.get_max_tokens(name)
         if known:
-            return int(known)
+            raw_ceiling = int(known)
+            max_input = resolve_context_limit(name)
+            if isinstance(max_input, int) and max_input > 0 and raw_ceiling >= max_input:
+                quarter = max(4096, max_input // 4) if max_input > 8192 else max(1, max_input // 2)
+                return min(raw_ceiling, quarter, 32768)
+            return raw_ceiling
     except Exception:
         pass
     if "claude" in name.lower():
@@ -1010,6 +1192,24 @@ def resolve_context_limit(model: Any) -> Optional[int]:
         if isinstance(value, int) and value > 0:
             return value
 
+    # Newer Vertex/provider-prefixed Claude revisions (e.g. vertex_ai/claude-opus-5-5)
+    # may lag behind LiteLLM's local model_cost map, causing get_model_info() to either
+    # raise or fall back to the generic 200k Claude default even though the bare or
+    # family-major entry (e.g. claude-opus-5) is already registered at 1M tokens.
+    model_cost = getattr(litellm, "model_cost", None)
+    if is_claude_model(model_name) and isinstance(model_cost, Mapping) and model_name not in model_cost:
+        bare = model_name.rsplit("/", 1)[-1].split("@", 1)[0].strip().lower()
+        candidates = [bare]
+        m_fam = re.match(r"^(claude-[a-z]+-\d+)(?:-\d+)+$", bare)
+        if m_fam:
+            candidates.append(m_fam.group(1))
+        for cand in candidates:
+            entry = model_cost.get(cand)
+            if isinstance(entry, Mapping):
+                val = entry.get("max_input_tokens")
+                if isinstance(val, int) and val > 0:
+                    return val
+
     try:
         info = litellm.get_model_info(model_name)
     except Exception:
@@ -1099,12 +1299,52 @@ CONTEXT_EDITING_KEEP_TOOL_USES = 5
 CONTEXT_EDITING_CLEAR_RATIO = 0.2
 CONTEXT_EDITING_EDIT_TYPE = "clear_tool_uses_20250919"
 _CONTEXT_EDITING_ENV = "MANTIS_CONTEXT_EDITING"
+_CONTEXT_EDITING_TRIGGER_CAP_ENV = "MANTIS_CONTEXT_EDITING_TRIGGER_TOKENS"
 _OFF_WORDS = frozenset({"off", "false", "0", "no", "disabled"})
 
 
 def is_claude_model(model: Any) -> bool:
     """A Claude model on any provider route."""
     return "claude" in str(model or "").lower()
+
+
+def supports_server_clear_tool_uses(model: Any) -> bool:
+    """True only on routes where the provider natively applies Anthropic's
+    `clear_tool_uses_20250919` server-side edit (direct `anthropic/` and
+    `vertex_ai/claude*`). Routes like `bedrock/` Converse or `openrouter/`
+    drop or ignore `clear_tool_uses_20250919`, so they use client-side context
+    editing instead."""
+    raw = str(model or "").strip().lower()
+    if not raw or not is_claude_model(raw):
+        return False
+    if raw.startswith("claude-"):
+        return True
+    if raw.startswith("anthropic/"):
+        return True
+    if raw.startswith("vertex_ai/") and "openai/" not in raw:
+        return True
+    return False
+
+
+def _context_editing_trigger_cap(config: Optional[Mapping[str, Any]]) -> Optional[int]:
+    env_raw = str(os.environ.get(_CONTEXT_EDITING_TRIGGER_CAP_ENV, "") or "").strip()
+    if env_raw:
+        try:
+            env_cap = int(env_raw)
+            if env_cap > 0:
+                return env_cap
+        except ValueError:
+            pass
+    if isinstance(config, Mapping):
+        cfg_raw = config.get("context_editing_trigger_tokens")
+        if cfg_raw is not None:
+            try:
+                cfg_cap = int(cfg_raw)
+                if cfg_cap > 0:
+                    return cfg_cap
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _context_editing_off(config: Optional[dict]) -> bool:
@@ -1128,31 +1368,6 @@ def _effective_context_window(model: Any) -> Optional[int]:
     return min(limits) if limits else None
 
 
-_CONTEXT_EDITING_TRIGGER_ENV = "MANTIS_CONTEXT_EDITING_TRIGGER_TOKENS"
-
-
-def _resolve_context_editing_trigger_cap(config: Optional[dict] = None) -> Optional[int]:
-    """Optional explicit token trigger ceiling from env or workflow config."""
-    raw_env = os.environ.get(_CONTEXT_EDITING_TRIGGER_ENV, "").strip()
-    if raw_env:
-        try:
-            parsed_env = int(raw_env)
-            if parsed_env > 0:
-                return parsed_env
-        except (TypeError, ValueError):
-            pass
-    if isinstance(config, Mapping):
-        raw_cfg = config.get("context_editing_trigger_tokens")
-        if raw_cfg is not None and not isinstance(raw_cfg, bool):
-            try:
-                parsed_cfg = int(raw_cfg)
-                if parsed_cfg > 0:
-                    return parsed_cfg
-            except (TypeError, ValueError):
-                pass
-    return None
-
-
 def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Optional[dict]:
     """The `context_management` parameter for `model`, or None when it must not
     be sent: not a Claude model, switched off (config `context_editing: off`
@@ -1166,10 +1381,13 @@ def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Opti
         return None
     trigger = int(limit * CONTEXT_EDITING_TRIGGER_RATIO)
     clear_at_least = int(limit * CONTEXT_EDITING_CLEAR_RATIO)
-    cap = _resolve_context_editing_trigger_cap(config)
-    if cap is not None:
-        trigger = min(trigger, cap)
-        clear_at_least = min(clear_at_least, max(1, int(cap * 0.4)))
+    cap = _context_editing_trigger_cap(config)
+    if cap is not None and cap < trigger:
+        trigger = cap
+        clear_at_least = min(
+            clear_at_least,
+            max(1, int(cap * (CONTEXT_EDITING_CLEAR_RATIO / CONTEXT_EDITING_TRIGGER_RATIO))),
+        )
     return {"edits": [{
         "type": CONTEXT_EDITING_EDIT_TYPE,
         "trigger": {"type": "input_tokens", "value": trigger},
@@ -1180,12 +1398,12 @@ def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Opti
 
 def client_context_editing(model: Any, config: Optional[dict] = None) -> Optional[dict]:
     """The harness-side counterpart of `anthropic_context_editing` for models
-    that do not bind their reasoning to the request prefix (Gemini, OpenAI):
-    the same trigger, keep and clear-at-least, applied by the harness to the
-    request before dispatch (core.graph_loader). `{"trigger_tokens", "keep",
-    "clear_at_least_tokens"}`, or None for a Claude model (the provider does
-    it), when switched off, or a window we cannot size against."""
-    if is_claude_model(model):
+    whose route does not run server-side `clear_tool_uses_20250919`: the same
+    trigger, keep and clear-at-least, applied by the harness to the request
+    before dispatch (core.graph_loader). `{"trigger_tokens", "keep",
+    "clear_at_least_tokens"}`, or None when the provider performs server-side
+    clearing, when switched off, or when no window is known."""
+    if supports_server_clear_tool_uses(model):
         return None
     if _context_editing_off(config):
         return None
@@ -1194,10 +1412,13 @@ def client_context_editing(model: Any, config: Optional[dict] = None) -> Optiona
         return None
     trigger = int(limit * CONTEXT_EDITING_TRIGGER_RATIO)
     clear_at_least = int(limit * CONTEXT_EDITING_CLEAR_RATIO)
-    cap = _resolve_context_editing_trigger_cap(config)
-    if cap is not None:
-        trigger = min(trigger, cap)
-        clear_at_least = min(clear_at_least, max(1, int(cap * 0.4)))
+    cap = _context_editing_trigger_cap(config)
+    if cap is not None and cap < trigger:
+        trigger = cap
+        clear_at_least = min(
+            clear_at_least,
+            max(1, int(cap * (CONTEXT_EDITING_CLEAR_RATIO / CONTEXT_EDITING_TRIGGER_RATIO))),
+        )
     return {
         "trigger_tokens": trigger,
         "keep": CONTEXT_EDITING_KEEP_TOOL_USES,
@@ -2026,8 +2247,158 @@ def _strip_empty_injection_points(kwargs: dict[str, Any]) -> None:
 _ACTIVE_EXPLICIT_CACHE_HANDLE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_active_explicit_cache_handle", default=None
 )
+# Shared-stem boundary hint for forked Claude `prefix_group` stages so
+# ResilientLiteLLMClient.acompletion can place a 3rd Anthropic `cache_control`
+# breakpoint right at the end of the shared stem (explorer's final assistant
+# message), caching 100% of the stem and refreshing its TTL on every turn.
+_ACTIVE_CLAUDE_STEM_BOUNDARY: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
+    "_active_claude_stem_boundary", default=None
+)
 EXPLICIT_CACHE_MIN_TOKENS_DEFAULT = 4096
 EXPLICIT_CACHE_TTL_SECONDS_DEFAULT = 900
+
+
+def _count_stem_openai_messages(stem_contents: Sequence[Any]) -> int:
+    """Counts the OpenAI-format messages ADK produces for `stem_contents`."""
+    count = 0
+    for content in stem_contents or ():
+        parts = getattr(content, "parts", None) or ()
+        if not parts:
+            continue
+        fr_count = sum(1 for p in parts if getattr(p, "function_response", None) is not None)
+        if fr_count > 0:
+            count += fr_count
+            has_other = any(
+                getattr(p, "function_response", None) is None
+                and (
+                    getattr(p, "text", None)
+                    or getattr(p, "function_call", None)
+                    or getattr(p, "inline_data", None)
+                )
+                for p in parts
+            )
+            if has_other:
+                count += 1
+        else:
+            count += 1
+    return count
+
+
+def _extract_content_text_prefix(content: Any, limit: int = 64) -> str:
+    parts = getattr(content, "parts", None) or ()
+    chunks = [
+        str(getattr(p, "text", "") or "")
+        for p in parts
+        if not getattr(p, "thought", False) and getattr(p, "text", None)
+    ]
+    return "".join(chunks).strip()[:limit]
+
+
+def _message_text_prefix(msg: Mapping[str, Any], limit: int = 64) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content.strip()[:limit]
+    if isinstance(content, list):
+        chunks = [
+            str(b.get("text") or "")
+            for b in content
+            if isinstance(b, Mapping) and b.get("type") == "text" and b.get("text")
+        ]
+        return "".join(chunks).strip()[:limit]
+    return ""
+
+
+def _message_has_cacheable_block(msg: Mapping[str, Any]) -> bool:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list) and content:
+        last = content[-1]
+        if isinstance(last, Mapping):
+            btype = str(last.get("type") or "").lower()
+            if btype in ("thinking", "redacted_thinking"):
+                return False
+            if btype == "text":
+                return bool(str(last.get("text") or "").strip())
+            return True
+    return False
+
+
+def _build_claude_stem_boundary_hint(
+    stem_contents: Sequence[Any],
+    first_delta_content: Any = None,
+) -> Optional[dict[str, Any]]:
+    """Builds a boundary hint for pinning a Claude `cache_control` breakpoint at
+    the end of `stem_contents`."""
+    if not stem_contents or getattr(stem_contents[-1], "role", "") != "model":
+        return None
+    msg_count = _count_stem_openai_messages(stem_contents)
+    if msg_count <= 0:
+        return None
+    delta_prefix = _extract_content_text_prefix(first_delta_content) if first_delta_content is not None else ""
+    return {"stem_msg_count": msg_count, "delta_prefix": delta_prefix}
+
+
+def _inject_claude_stem_breakpoint(
+    model: Any,
+    messages: Any,
+    kwargs: dict[str, Any],
+    boundary: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Inserts a 3rd Anthropic `cache_control` breakpoint at the shared stem
+    boundary on forked Claude requests, preserving the existing TTL and staying
+    strictly within Anthropic's 4-breakpoint cap."""
+    if boundary is None:
+        boundary = _ACTIVE_CLAUDE_STEM_BOUNDARY.get()
+    if not boundary or not is_claude_model(model) or not isinstance(messages, list):
+        return
+    raw_points = kwargs.get("cache_control_injection_points")
+    if not isinstance(raw_points, list) or not raw_points or len(raw_points) >= 4:
+        return
+
+    stem_msg_count = int(boundary.get("stem_msg_count") or 0)
+    if stem_msg_count <= 0:
+        return
+    has_sys = 1 if (messages and isinstance(messages[0], Mapping) and messages[0].get("role") == "system") else 0
+    target_idx = has_sys + stem_msg_count - 1
+    if not (0 <= target_idx < len(messages) - 1):
+        return
+
+    stem_end_msg = messages[target_idx]
+    delta_msg = messages[target_idx + 1]
+    if not (isinstance(stem_end_msg, Mapping) and isinstance(delta_msg, Mapping)):
+        return
+    if stem_end_msg.get("role") != "assistant" or delta_msg.get("role") != "user":
+        return
+    if not _message_has_cacheable_block(stem_end_msg):
+        return
+    delta_prefix = str(boundary.get("delta_prefix") or "")
+    if delta_prefix and not _message_text_prefix(delta_msg, len(delta_prefix)).startswith(delta_prefix):
+        return
+
+    for pt in raw_points:
+        if isinstance(pt, Mapping) and pt.get("location") == "message" and pt.get("index") == target_idx:
+            return
+
+    control_template: dict[str, Any] = {"type": "ephemeral"}
+    for pt in reversed(raw_points):
+        if isinstance(pt, Mapping) and isinstance(pt.get("control"), Mapping):
+            control_template = dict(pt["control"])
+            break
+
+    stem_point = {
+        "location": "message",
+        "index": target_idx,
+        "control": control_template,
+    }
+    updated = list(raw_points)
+    insert_at = len(updated)
+    for idx, pt in enumerate(updated):
+        if isinstance(pt, Mapping) and pt.get("location") == "message" and pt.get("index") == -1:
+            insert_at = idx
+            break
+    updated.insert(insert_at, stem_point)
+    kwargs["cache_control_injection_points"] = updated
 
 
 def is_explicit_gemini_cache_eligible(model_id: Any, ctx: Any) -> bool:
@@ -2367,6 +2738,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
         # sees the kwargs.
         no_continue = bool(kwargs.pop("_mantis_no_continue", False))
         _strip_empty_injection_points(kwargs)
+        _inject_claude_stem_breakpoint(model, messages, kwargs)
 
         # Before the retry loop, not inside it: an oversized request is deterministic, so
         # every pass through the loop would upload the same doomed payload again.
@@ -2394,11 +2766,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
             # eagerly, at call time, not at first iteration.
             return self._astream_with_retry(model, messages, tools, kwargs)
 
-        max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
-        initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
-        max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
-        min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
-        backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+        max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
 
         start_time = time.time()
         attempt = 0
@@ -2540,11 +2908,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
         point. Returns (first_chunk, iterator); (None, None) for an empty stream."""
         import litellm
 
-        max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
-        initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
-        max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
-        min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
-        backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+        max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
 
         start_time = time.time()
         attempt = 0
@@ -2630,11 +2994,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
             # budget guards both dispatch paths.
             return self._stream_with_retry(model, messages, tools, kwargs)
 
-        max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
-        initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
-        max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
-        min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
-        backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+        max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
 
         start_time = time.time()
         attempt = 0
@@ -2703,11 +3063,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
         """Sync mirror of _astream_with_retry; see that method for the boundary rationale."""
         import litellm
 
-        max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
-        initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
-        max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
-        min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
-        backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+        max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
 
         start_time = time.time()
         attempt = 0
@@ -3330,32 +3686,35 @@ class ResilientLiteLlm(LiteLlm):
         if not self._preserve_system_prefix:
             self._inject_stage_turn_reminder(llm_request)
             self._inject_active_findings_state(llm_request)
-        schema_cls = getattr(getattr(llm_request, "config", None), "response_schema", None)
         has_smr_tool = False
         if isinstance(getattr(llm_request, "tools_dict", None), dict) and "set_model_response" in llm_request.tools_dict:
             has_smr_tool = True
-            if schema_cls is None:
+        if getattr(self, "_skip_structured_sanitizer", False) or _HANDOFF_PLAIN_TEXT_TURN.get():
+            # Plain-text context-ceiling handoff turn: never coerce the summary
+            # into a schema verdict (or a `Fallback:` dismissal).
+            schema_cls = None
+        else:
+            schema_cls = getattr(getattr(llm_request, "config", None), "response_schema", None)
+            if schema_cls is None and has_smr_tool:
                 schema_cls = getattr(llm_request.tools_dict["set_model_response"], "output_schema", None)
-        if schema_cls is None and self._output_schema_override is not None:
-            schema_cls = self._output_schema_override
+            if schema_cls is None and self._output_schema_override is not None:
+                schema_cls = self._output_schema_override
 
-        max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
-        initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
-        max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
-        min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
-        backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+        max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
         # An empty STOP turn is retried like a 429, but it is not a 429: a
         # request the model has answered with nothing this many times in a
         # row is being answered, and the answer is nothing. Past the cap the
         # empty turn is passed on (below) instead of burning the rest of the
         # patience window one identical request at a time.
-        try:
-            max_empty_turns = max(
-                1,
-                int(os.environ.get("MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS", str(DEFAULT_EMPTY_TURN_MAX_ATTEMPTS))),
+        max_empty_turns = int(
+            _parse_env_number(
+                ("MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS",),
+                as_int=True,
+                default=DEFAULT_EMPTY_TURN_MAX_ATTEMPTS,
+                min_val=1,
             )
-        except ValueError:
-            max_empty_turns = DEFAULT_EMPTY_TURN_MAX_ATTEMPTS
+            or DEFAULT_EMPTY_TURN_MAX_ATTEMPTS
+        )
 
         start_time = time.time()
         attempt = 0
@@ -3374,6 +3733,7 @@ class ResilientLiteLlm(LiteLlm):
             used_cache_entry: Optional[dict[str, Any]] = None
             wire_request = active_request
             cache_tok = None
+            claude_stem_tok = None
             try:
                 from google.genai import types as genai_types
                 if isinstance(stem_cache_meta, dict):
@@ -3389,10 +3749,17 @@ class ResilientLiteLlm(LiteLlm):
                         and stem_len > 0
                         and len(full_contents) > stem_len
                     ):
+                        model_str = str(getattr(self, "model", "") or "")
+                        if is_claude_model(model_str) and bool(getattr(rc_cache, "enable_context_cache", True)):
+                            stem_hint = _build_claude_stem_boundary_hint(
+                                full_contents[:stem_len], full_contents[stem_len]
+                            )
+                            if stem_hint is not None:
+                                claude_stem_tok = _ACTIVE_CLAUDE_STEM_BOUNDARY.set(stem_hint)
                         entry = await ensure_explicit_stem_cache(
                             ctx=rc_cache,
                             cache_slot_key=slot_key,
-                            model_id=str(getattr(self, "model", "") or ""),
+                            model_id=model_str,
                             additional_args=dict(getattr(self, "_additional_args", None) or {}),
                             base_instruction=str(
                                 getattr(getattr(active_request, "config", None), "system_instruction", "") or ""
@@ -3508,6 +3875,8 @@ class ResilientLiteLlm(LiteLlm):
                 finally:
                     if cache_tok is not None:
                         _ACTIVE_EXPLICIT_CACHE_HANDLE.reset(cache_tok)
+                    if claude_stem_tok is not None:
+                        _ACTIVE_CLAUDE_STEM_BOUNDARY.reset(claude_stem_tok)
                 if retry_schema_turn:
                     continue
                 if pending_empty is not None:
@@ -3688,6 +4057,24 @@ class ResilientLiteLlm(LiteLlm):
                 await asyncio.sleep(delay)
 
 
+_HANDOFF_PLAIN_TEXT_TURN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_handoff_plain_text_turn", default=False
+)
+
+
+class _HandoffLiteLlm(ResilientLiteLlm):
+    """Plain-text handoff wrapper around `ResilientLiteLlm` for context-ceiling
+    continuations on schema-bound nodes (`reviewer`, `critic`, `reproducer`).
+
+    Preserves `_inject_stage_turn_reminder` and tool declarations byte-for-byte
+    so provider prompt caches hit, while bypassing `_sanitize_structured_response`
+    so mid-stage plain-text handoff summaries are never coerced into `Fallback:`
+    dismissal verdicts.
+    """
+
+    _skip_structured_sanitizer: bool = PrivateAttr(default=True)
+
+
 class DeferredEnvLiteLlm(ResilientLiteLlm):
     """ResilientLiteLlm that resolves cloud credentials at CALL time, not build time.
 
@@ -3785,17 +4172,21 @@ def get_llm_kwargs(
     default_reasoning_effort: Optional[str] = None,
     global_model_override: Optional[str] = None,
     config: Optional[dict] = None,
+    *,
+    explicit_reasoning_effort: bool = False,
 ) -> Tuple[str, dict]:
     """Resolves the LLM mapping details cleanly with precedence: global_override > MANTIS_MODEL > node > MODEL_ID > default."""
+    validate_llm_env_vars()
     resolved_model = resolve_model_id(model_id, default_model, global_model_override)
     resolved_api_base = api_base or os.environ.get("LLM_API_BASE") or default_api_base
-    raw_timeout = timeout if timeout is not None else (
-        os.environ.get("LLM_TIMEOUT")
-        or os.environ.get("MANTIS_TIMEOUT")
-        or os.environ.get("LLM_REQUEST_TIMEOUT")
-        or default_timeout
+    env_timeout = _parse_env_number(
+        ("LLM_TIMEOUT", "MANTIS_TIMEOUT", "LLM_REQUEST_TIMEOUT"), min_val=0.001
     )
-    effort = reasoning_effort or os.environ.get("REASONING_EFFORT") or default_reasoning_effort
+    raw_timeout = timeout if timeout is not None else (
+        env_timeout if env_timeout is not None else default_timeout
+    )
+    env_reasoning_effort = (os.environ.get("REASONING_EFFORT") or "").strip() or None
+    effort = reasoning_effort or env_reasoning_effort or default_reasoning_effort
     if raw_timeout is None:
         raw_timeout = default_request_timeout(resolved_model, effort)
 
@@ -3803,21 +4194,25 @@ def get_llm_kwargs(
     if resolved_api_base:
         llm_kwargs["api_base"] = resolved_api_base
     if effort:
-        llm_kwargs["reasoning_effort"] = str(effort).lower().strip()
+        clean_effort = str(effort).lower().strip()
+        llm_kwargs["reasoning_effort"] = clean_effort
+        if not is_claude_model(resolved_model) and (
+            is_versioned_reasoning_model(resolved_model)
+            or explicit_reasoning_effort
+            or bool(env_reasoning_effort)
+        ):
+            llm_kwargs["allowed_openai_params"] = ["reasoning_effort"]
     if raw_timeout is not None:
         try:
             timeout_val = float(raw_timeout)
             if timeout_val > 0:
                 llm_kwargs["timeout"] = timeout_val
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as exc:
+            raise ConfigValidationError(f"Invalid timeout value {raw_timeout!r}.") from exc
 
-    max_tokens_val = os.environ.get("LLM_MAX_TOKENS") or os.environ.get("MANTIS_MAX_TOKENS")
-    if max_tokens_val:
-        try:
-            llm_kwargs["max_tokens"] = int(max_tokens_val)
-        except (ValueError, TypeError):
-            pass
+    env_max_tokens = _parse_env_number(("LLM_MAX_TOKENS", "MANTIS_MAX_TOKENS"), as_int=True, min_val=1)
+    if env_max_tokens is not None:
+        llm_kwargs["max_tokens"] = int(env_max_tokens)
     else:
         # The most the model allows (resolve_output_ceiling): thinking
         # shares the output budget, and a turn that reaches the ceiling
@@ -3861,10 +4256,17 @@ def get_llm_kwargs(
             llm_kwargs["vertex_project"] = project
             llm_kwargs["vertex_location"] = location
 
-        if os.environ.get("VERTEX_FLEX") in ("1", "true", "True") or os.environ.get("VERTEXAI_SERVICE_TIER", "").lower() == "flex":
-            headers = llm_kwargs.get("extra_headers") or {}
+        if (
+            os.environ.get("VERTEX_FLEX") in ("1", "true", "True")
+            or os.environ.get("VERTEXAI_SERVICE_TIER", "").lower() == "flex"
+            or (isinstance(config, Mapping) and bool(config.get("flex")))
+        ):
+            headers = dict(llm_kwargs.get("extra_headers") or {})
             headers["X-Vertex-AI-LLM-Request-Type"] = "shared"
+            headers["X-Vertex-AI-LLM-Shared-Request-Type"] = "flex"
             llm_kwargs["extra_headers"] = headers
+            if timeout is None and env_timeout is None and default_timeout is None:
+                llm_kwargs["timeout"] = max(float(llm_kwargs.get("timeout") or 0.0), 600.0)
 
     # Relax the category filters for Gemini models, which sometimes trigger on
     # defensive security analysis and vulnerability remediation. Applied on
@@ -3904,12 +4306,52 @@ def get_llm_kwargs(
             except Exception:
                 pass
 
-    # Anthropic context editing, Claude models only (see
-    # anthropic_context_editing): the provider clears older tool results
-    # before the model reads a request that has grown past the trigger.
-    editing = anthropic_context_editing(resolved_model, config=config)
+    # Anthropic server-side context editing, only on routes whose upstream
+    # adapter forwards `clear_tool_uses_20250919` (`anthropic/`, `vertex_ai/claude*`).
+    editing = (
+        anthropic_context_editing(resolved_model, config=config)
+        if supports_server_clear_tool_uses(resolved_model)
+        else None
+    )
     if editing:
         llm_kwargs["context_management"] = editing
 
     return resolved_model, llm_kwargs
+
+
+def get_run_llm_kwargs(
+    model_id: Optional[str] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    *,
+    api_base: Optional[str] = None,
+    timeout: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
+    global_model_override: Optional[str] = None,
+) -> Tuple[str, dict]:
+    """Resolves `get_llm_kwargs` for auxiliary run-level LLM clients (planner,
+    mid-run replanner, session compactor) so they inherit `--api-base`,
+    `--timeout`, `--reasoning-effort`, and `--flex` headers identically to
+    graph agent nodes."""
+    cfg = dict(config) if isinstance(config, Mapping) else {}
+    eff_api_base = api_base or cfg.get("_cli_api_base") or None
+    eff_timeout = timeout if timeout is not None else cfg.get("_cli_timeout")
+    eff_effort = (
+        reasoning_effort
+        or cfg.get("_cli_reasoning_effort")
+        or cfg.get("_local_reasoning_effort")
+        or None
+    )
+    return get_llm_kwargs(
+        model_id=model_id,
+        default_model=str(cfg.get("default_model") or DEFAULT_MODEL),
+        api_base=eff_api_base,
+        default_api_base=cfg.get("api_base"),
+        timeout=eff_timeout,
+        default_timeout=cfg.get("timeout"),
+        reasoning_effort=eff_effort,
+        default_reasoning_effort=cfg.get("reasoning_effort"),
+        global_model_override=global_model_override or cfg.get("_cli_model_override"),
+        config=cfg,
+        explicit_reasoning_effort=bool(reasoning_effort or cfg.get("_cli_reasoning_effort")),
+    )
 
