@@ -1591,6 +1591,10 @@ def _parse_args(argv: list[str] | None = None):
         help="parallel worker processes (default: min(8, cpu_count))",
     )
     parser.add_argument(
+        "--filter", default="",
+        help="optional regex filter matching scenario names or patched file paths",
+    )
+    parser.add_argument(
         "scenarios", nargs="*",
         help="optional subset of scenario names to evaluate",
     )
@@ -1599,5 +1603,16 @@ def _parse_args(argv: list[str] | None = None):
 
 if __name__ == "__main__":
     cli_args = _parse_args()
-    success = run_matrix(cli_args.scenarios or None, jobs=cli_args.jobs)
+    selected = list(cli_args.scenarios) if cli_args.scenarios else None
+    if cli_args.filter:
+        import re as _re
+
+        pat = _re.compile(cli_args.filter)
+        matched = [
+            name
+            for name, patches in SCENARIOS.items()
+            if pat.search(name) or any(pat.search(p[0]) for p in patches)
+        ]
+        selected = [s for s in selected if s in matched] if selected is not None else matched
+    success = run_matrix(selected, jobs=cli_args.jobs)
     sys.exit(0 if success else 1)

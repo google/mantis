@@ -1775,10 +1775,27 @@ async def write_file(filepath: str, content: str) -> str:
         return f"SUCCESS: Recorded artifact '{clean_fp}' ({len(content)} characters)."
 
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "write_file"):
-        try:
-            await ctx.sandbox.write_file(Path(filepath), content)
-            from tools.sandbox_tools import invalidate_patch_reattack_state
+        from tools.sandbox_tools import can_write_sandbox_target, invalidate_patch_reattack_state
 
+        allowed_stage, stage_err = can_write_sandbox_target(ctx, str(filepath))
+        if not allowed_stage:
+            return stage_err
+        try:
+            if hasattr(ctx.sandbox, "write_file_and_rebuild") and getattr(ctx.sandbox, "rebuild_cmd", None):
+                rb_rc, rb_out = await ctx.sandbox.write_file_and_rebuild(Path(filepath), content)
+                invalidate_patch_reattack_state(ctx)
+                if rb_rc != 0:
+                    return (
+                        f"Error: Wrote {len(content)} characters to {filepath}, "
+                        f"but rebuild_cmd failed (exit={rb_rc}) and was rolled back:\n{rb_out[:2000]}"
+                    )
+                if rb_out.strip():
+                    return (
+                        f"SUCCESS: Wrote {len(content)} characters to {filepath}\n"
+                        f"[REBUILD OK]\n{rb_out.strip()[:1000]}"
+                    )
+                return f"SUCCESS: Wrote {len(content)} characters to {filepath}"
+            await ctx.sandbox.write_file(Path(filepath), content)
             invalidate_patch_reattack_state(ctx)
             if hasattr(ctx.sandbox, "run_rebuild") and getattr(ctx.sandbox, "rebuild_cmd", None):
                 rb_rc, rb_out = await ctx.sandbox.run_rebuild()
@@ -1950,10 +1967,21 @@ async def list_files(directory: str = "") -> str:
         and os.path.isdir(ctx.target_file)
         and os.path.isdir(ctx.jail_dir)
     ):
-        jail_real = os.path.realpath(ctx.jail_dir)
-        slice_real = os.path.realpath(ctx.target_file)
-        if slice_real != jail_real and slice_real.startswith(jail_real + os.sep):
-            directory = os.path.relpath(slice_real, jail_real).replace(os.sep, "/")
+        from core.graph_loader import prefix_reuse_applies
+
+        if not (
+            getattr(ctx, "active_node", "") in ("architect", "threat_modeler")
+            and prefix_reuse_applies(
+                getattr(ctx, "scan_mode", ""),
+                getattr(ctx, "jail_dir", ""),
+                getattr(ctx, "path_root", ""),
+                getattr(ctx, "target_file", ""),
+            )
+        ):
+            jail_real = os.path.realpath(ctx.jail_dir)
+            slice_real = os.path.realpath(ctx.target_file)
+            if slice_real != jail_real and slice_real.startswith(jail_real + os.sep):
+                directory = os.path.relpath(slice_real, jail_real).replace(os.sep, "/")
 
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:

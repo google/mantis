@@ -189,9 +189,12 @@ class RemoteTargetEnvironmentTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[PATCH APPLIED; REBUILD FAILED]", fail_out)
         self.assertIn("compile error", fail_out)
 
-        # close() resets remote target state
+        # close() resets remote target state and re-runs rebuild_cmd cleanly
+        (self.remote_dir / "transient.txt").write_text("dirty", encoding="utf-8")
+        (self.remote_dir / "rebuilt.marker").unlink(missing_ok=True)
         await env.close()
-        self.assertFalse((self.remote_dir / "rebuilt.marker").exists())
+        self.assertFalse((self.remote_dir / "transient.txt").exists())
+        self.assertTrue((self.remote_dir / "rebuilt.marker").exists())
 
     async def test_ssh_and_container_transport_hardening_and_read_bounds(self):
         # Reject insecure SSH host key policy or option-injected host/container names

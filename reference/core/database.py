@@ -3161,6 +3161,49 @@ def record_run(
         return False
 
 
+def mark_run_finalized(db_path: str, run_id: str, finalized: bool = True) -> bool:
+    """Marks a run's `runs.metadata_json` finalized state. Never raises (INV-6)."""
+    if not db_path or not run_id:
+        return False
+    try:
+        with _db(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS runs (
+                    run_id TEXT PRIMARY KEY,
+                    model TEXT,
+                    started DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    metadata_json TEXT DEFAULT '{}'
+                )
+            """)
+            row = cursor.execute(
+                "SELECT metadata_json FROM runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            meta: dict[str, Any] = {}
+            if row is not None:
+                try:
+                    parsed = json.loads(row[0] or "{}")
+                    if isinstance(parsed, dict):
+                        meta = dict(parsed)
+                except (TypeError, ValueError):
+                    meta = {}
+                meta["finalized"] = bool(finalized)
+                cursor.execute(
+                    "UPDATE runs SET metadata_json = ? WHERE run_id = ?",
+                    (json.dumps(meta), str(run_id)),
+                )
+            else:
+                meta["finalized"] = bool(finalized)
+                cursor.execute(
+                    "INSERT OR IGNORE INTO runs (run_id, model, metadata_json) VALUES (?, '', ?)",
+                    (str(run_id), json.dumps(meta)),
+                )
+        return True
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
 def run_models(db_path: str) -> Dict[str, str]:
     """{run_id: model} for every run the database knows the model of.
     Empty when there is no table yet. Never raises."""

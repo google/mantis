@@ -170,7 +170,7 @@ class GceEnvironment(BaseEnvironment):
         no_service_account: bool = True,
         no_external_ip: bool = True,
         verify_isolation: bool = True,
-        max_run_duration: str = "30m",
+        max_run_duration: str = "2h",
         gcloud_bin: Optional[str] = None,
     ):
         super().__init__()
@@ -613,6 +613,18 @@ class GceEnvironment(BaseEnvironment):
 
         return await asyncio.to_thread(_read)
 
+    def _get_static_env(self):
+        static_env = getattr(self, "_static_env", None)
+        if static_env is None:
+            from .static_env import StaticOnlyEnvironment
+
+            static_env = StaticOnlyEnvironment(
+                target_path=self.target_path,
+                workdir=str(self._workdir),
+            )
+            self._static_env = static_env
+        return static_env
+
     async def read_guest_file(self, path: Union[Path, str]) -> bytes:
         """Dynamic-plane sentinel/scaffold reader: never boots a VM or touches host files."""
         if not getattr(self, "_started", False):
@@ -622,7 +634,13 @@ class GceEnvironment(BaseEnvironment):
         return await self._read_started_vm_file(path)
 
     async def read_file(self, path: Union[Path, str]) -> bytes:
-        """Reads a file from the guest VM workspace without output truncation."""
+        """Reads a file lazily from the local static target before VM boot, or from the live GCE VM once started."""
+        if (
+            not getattr(self, "_started", False)
+            and getattr(self, "target_path", "")
+            and os.path.exists(self.target_path)
+        ):
+            return await self._get_static_env().read_file(Path(path))
         await self._ensure()
         return await self._read_started_vm_file(path)
 
@@ -651,12 +669,18 @@ class GceEnvironment(BaseEnvironment):
         await asyncio.to_thread(_write)
 
     async def list_files(self, directory: str = "") -> List[str]:
-        """Lists files inside the guest VM workspace under directory without output truncation."""
+        """Lists files lazily from the local static target before VM boot, or from the live GCE VM once started."""
+        if (
+            not getattr(self, "_started", False)
+            and getattr(self, "target_path", "")
+            and os.path.exists(self.target_path)
+        ):
+            return await self._get_static_env().list_files(directory)
         await self._ensure()
         target_dir = str(self._resolve_guest_path(directory)) if directory else str(self._workdir)
         guest_cmd = (
             f"if [ ! -d {shlex.quote(target_dir)} ]; then exit 44; fi; "
-            f"find {shlex.quote(target_dir)} -maxdepth 5 -type f ! -path '*/.*' | sort"
+            f"find {shlex.quote(target_dir)} -maxdepth 25 -type f ! -path '*/.*' | sort"
         )
         ssh_args = self._ssh_args() + ["--command", guest_cmd]
 

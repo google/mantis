@@ -111,6 +111,7 @@ class RunContext:
     verdict_fallbacks: int = 0
     # Mid-invocation --resume accounting.
     pre_pause_tokens: int = 0
+    pre_pause_llm_calls: int = 0
     resumed_mid_invocation: bool = False
     # Cross-run memory policy controls (--no-memory / --intra-run-learning).
     enable_memory: bool = True

@@ -368,6 +368,21 @@ def _is_non_repro_node(ctx) -> bool:
     return bool(active and active not in ("reproducer", "patcher"))
 
 
+def can_write_sandbox_target(ctx: Any, filepath: str = "") -> Tuple[bool, str]:
+    """Permits non-`workspace/` sandbox target writes only from `reproducer` or `patcher`."""
+    if ctx is None:
+        return True, ""
+    active = str(getattr(ctx, "active_node", "") or "").strip()
+    if not active or active in ("reproducer", "patcher") or active.startswith(("reproducer_", "patcher_")):
+        return True, ""
+    return (
+        False,
+        f"Error: Stage '{active}' is not permitted to modify target file '{filepath}'; "
+        "only 'reproducer' and 'patcher' may write outside 'workspace/'. "
+        "Store notes and artifacts under 'workspace/'.",
+    )
+
+
 def _note_dynamic_evidence(
     ctx,
     output: str,

@@ -932,22 +932,7 @@ def run_preflight_checks(
         )
 
 
-def update_workflow_config(
-    workflow_path: str,
-    updates: dict,
-    save: bool = True,
-    update_all_nodes: bool = False,
-    save_tracked: bool = False,
-) -> dict:
-    """Updates workflow configuration.
-    
-    If save_tracked is True, modifies base workflow.json directly.
-    If save_tracked is False, applies updates to workflow data and saves local config
-    to workflow.local.json, preserving tracked workflow.json.
-    """
-    wf_data = load_workflow_dict(workflow_path, load_local=not save_tracked)
-    cfg = wf_data.setdefault("config", {})
-
+def _apply_config_updates_to_dict(cfg: dict, updates: dict) -> None:
     if "default_model" in updates:
         cfg["default_model"] = updates["default_model"]
     if "fast_model" in updates:
@@ -983,6 +968,24 @@ def update_workflow_config(
                 if k not in ("type", "options"):
                     current_sb.setdefault("options", {})[k] = v
 
+
+def update_workflow_config(
+    workflow_path: str,
+    updates: dict,
+    save: bool = True,
+    update_all_nodes: bool = False,
+    save_tracked: bool = False,
+) -> dict:
+    """Updates workflow configuration.
+    
+    If save_tracked is True, modifies base workflow.json directly.
+    If save_tracked is False, applies updates to workflow data and saves only the
+    delta config keys to workflow.local.json, never freezing base workflow.json defaults.
+    """
+    wf_data = load_workflow_dict(workflow_path, load_local=not save_tracked)
+    cfg = wf_data.setdefault("config", {})
+    _apply_config_updates_to_dict(cfg, updates)
+
     if update_all_nodes and "default_model" in updates:
         for node in wf_data.get("nodes", []):
             if node.get("type") == "agent":
@@ -998,8 +1001,21 @@ def update_workflow_config(
         else:
             save_path = get_local_workflow_path(workflow_path)
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-            local_payload = {"config": cfg}
-            if update_all_nodes and "nodes" in wf_data:
+            local_payload: dict[str, Any] = {}
+            if os.path.exists(save_path):
+                try:
+                    with open(save_path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        local_payload = loaded
+                except Exception:
+                    local_payload = {}
+            local_cfg = local_payload.setdefault("config", {})
+            if not isinstance(local_cfg, dict):
+                local_cfg = {}
+                local_payload["config"] = local_cfg
+            _apply_config_updates_to_dict(local_cfg, updates)
+            if update_all_nodes and "default_model" in updates and "nodes" in wf_data:
                 local_payload["nodes"] = wf_data["nodes"]
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(local_payload, f, indent=2)
@@ -1203,7 +1219,9 @@ async def ensure_configured_async(
                 resolved_proj = caps.get("gcp_project") or caps.get("vertex_project")
                 if resolved_proj and "gce" in caps.get("available_sandboxes", []) and not sb_preflight_failed:
                     sb_opts["project"] = resolved_proj
-                    updates["sandbox"] = {"type": "gce", "options": sb_opts}
+                    cfg = {**cfg, "sandbox": {"type": "gce", "options": dict(sb_opts)}}
+                    if "sandbox" not in overrides or persist_overrides:
+                        updates["sandbox"] = {"type": "gce", "options": sb_opts}
                     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", resolved_proj)
                     os.environ.setdefault("VERTEXAI_PROJECT", resolved_proj)
                 else:
@@ -1272,11 +1290,21 @@ async def ensure_configured_async(
             # Safety net: never allow a downgraded sandbox type to be persisted to disk
             if all_updates.get("sandbox", {}).get("type") == "static-only" and sb_type not in ("", "static-only"):
                 del all_updates["sandbox"]
+            # Never write workflow.local.json when --no-auto-configure (auto=False) or
+            # when an explicit per-invocation CLI --sandbox override is active without --save-config.
+            effective_save = bool(
+                save
+                and (
+                    save_tracked
+                    or persist_overrides
+                    or (auto and "sandbox" not in overrides)
+                )
+            )
             if all_updates:
                 wf_data = update_workflow_config(
                     target_wf,
                     all_updates,
-                    save=save,
+                    save=effective_save,
                     save_tracked=save_tracked,
                 )
                 if overrides and not persist_overrides:

@@ -314,17 +314,46 @@ class MicrosandboxEnvironment(BaseEnvironment):
                 ) from e
 
     async def list_files(self, directory: str = "") -> List[str]:
-        await self._ensure()
-        resolved_dir = str(self._resolve_guest_path(directory)) if directory else "."
+        import posixpath
+
+        sb = await self._ensure()
+        workdir_str = posixpath.normpath(str(self._workdir))
+        resolved_dir = str(self._resolve_guest_path(directory)) if directory else workdir_str
         target_dir = shlex.quote(resolved_dir)
-        res = await self.execute(f"find {target_dir} -maxdepth 5 -not -path '*/.*' -type f")
-        if res.exit_code != 0:
-            raise RuntimeError(f"Failed to list files in MicroSandbox: {res.stderr or res.stdout}")
+        cmd = (
+            f"if [ ! -d {target_dir} ]; then exit 44; fi; "
+            f"find {target_dir} -maxdepth 25 -not -path '*/.*' -type f"
+        )
+        if hasattr(sb, "shell"):
+            out = await sb.shell(cmd, cwd=workdir_str, timeout=self.timeout)
+            exit_code = int(getattr(out, "exit_code", 0) or 0)
+            stdout_text = getattr(out, "stdout_text", "") or ""
+            stderr_text = getattr(out, "stderr_text", "") or ""
+        else:
+            res = await self.execute(cmd)
+            exit_code = res.exit_code
+            stdout_text = res.stdout or ""
+            stderr_text = res.stderr or ""
+        if exit_code == 44:
+            raise FileNotFoundError(f"Directory not found in MicroSandbox: {directory}")
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to list files in MicroSandbox: {stderr_text or stdout_text}")
+        workdir_prefix = workdir_str.rstrip("/") + "/"
         file_list = []
-        for line in res.stdout.strip().splitlines():
-            line = line.strip()
-            if line:
-                rel = os.path.relpath(line, ".")
+        for raw_line in stdout_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            norm_line = posixpath.normpath(line)
+            if norm_line == workdir_str:
+                continue
+            if norm_line.startswith(workdir_prefix):
+                rel = norm_line[len(workdir_prefix):]
+            elif not norm_line.startswith("/"):
+                rel = norm_line.removeprefix("./")
+            else:
+                rel = posixpath.relpath(norm_line, workdir_str)
+            if rel and rel != "." and not rel.startswith("../"):
                 file_list.append(rel)
         return sorted(file_list)
 

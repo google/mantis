@@ -222,15 +222,26 @@ def _message_text(finding: Dict[str, Any]) -> str:
     # evidence for the run (verified_evidence); the export adds no gate.
     if is_untriaged(status):
         note = "untriaged: review did not complete; requires manual review"
+    elif patch_status == "VERIFIED_SECURE":
+        note = _VERIFICATION_NOTE["VERIFIED_SECURE"]
+    elif status_low in ("dynamic_confirmed", "reproduced") or (
+        status_low == "patch_verified" and patch_status != "VERIFIED_SECURE"
+    ):
+        if patch_status == "MITIGATION_PROPOSED":
+            patch_clause = "a patch is proposed but was not confirmed"
+        elif patch_status == "VERIFICATION_INCOMPLETE":
+            patch_clause = "patch verification did not complete"
+        elif patch_status == "VERIFICATION_FAILED":
+            patch_clause = "patch verification was attempted and failed"
+        else:
+            patch_clause = "no verified patch recorded"
+        note = f"reproduced: reached-sink evidence recorded; {patch_clause}"
     else:
         note = _VERIFICATION_NOTE.get(patch_status)
         if note is None:
-            if status_low in ("dynamic_confirmed", "reproduced"):
-                note = "reproduced: reached-sink evidence recorded; no verified patch recorded"
-            else:
-                # No patch verification ran. Say so rather than staying silent: silence
-                # reads as confidence, and this is the most common case.
-                note = "unverified: no reproduction or patch verification is recorded"
+            # No patch verification ran. Say so rather than staying silent: silence
+            # reads as confidence, and this is the most common case.
+            note = "unverified: no reproduction or patch verification is recorded"
 
     parts = [title]
     if description:
@@ -263,6 +274,7 @@ def build_sarif(
     scan_root: str = "",
     tool_version: str = "",
     include_suppressed: bool = False,
+    run_properties: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """Builds a SARIF 2.1.0 document. Returns `(document, skipped_reasons)`.
 
@@ -273,13 +285,18 @@ def build_sarif(
     """
     rules: List[Dict[str, Any]] = []
     rule_index: Dict[str, int] = {}
+    rule_max_level: Dict[str, str] = {}
+    rule_max_score: Dict[str, float] = {}
     results: List[Dict[str, Any]] = []
     skipped: List[str] = []
+    untriaged_omitted = 0
 
     from core.database import is_suppressed, is_untriaged
 
     for finding in findings or []:
         status = str(finding.get("status") or "")
+        if not include_suppressed and is_untriaged(status):
+            untriaged_omitted += 1
         if not include_suppressed and is_suppressed(status):
             continue
 
@@ -313,9 +330,23 @@ def build_sarif(
                         else "Finding reported by Mantis without a CWE classification"
                     )
                 },
-                "defaultConfiguration": {"level": level},
+                "defaultConfiguration": {"level": result_level},
                 "properties": {"security-severity": score, "tags": tags},
             })
+            rule_max_level[rid] = result_level
+            try:
+                rule_max_score[rid] = float(score)
+            except ValueError:
+                rule_max_score[rid] = fallback_score
+        else:
+            if _LEVELS.index(result_level) > _LEVELS.index(rule_max_level[rid]):
+                rule_max_level[rid] = result_level
+            try:
+                s_val = float(score)
+            except ValueError:
+                s_val = fallback_score
+            if s_val > rule_max_score[rid]:
+                rule_max_score[rid] = s_val
 
         props: Dict[str, Any] = {
             "security-severity": score,
@@ -343,6 +374,12 @@ def build_sarif(
             result["partialFingerprints"] = fingerprints
         results.append(result)
 
+    # Pass 2: stamp max defaultConfiguration.level and security-severity per rule.
+    for rid, idx in rule_index.items():
+        rules[idx]["defaultConfiguration"]["level"] = rule_max_level[rid]
+        if isinstance(rules[idx]["properties"].get("security-severity"), str):
+            rules[idx]["properties"]["security-severity"] = f"{rule_max_score[rid]:.1f}"
+
     driver: Dict[str, Any] = {
         "name": TOOL_NAME,
         "informationUri": TOOL_INFORMATION_URI,
@@ -351,6 +388,11 @@ def build_sarif(
     if tool_version:
         driver["version"] = str(tool_version)
 
+    run_props: Dict[str, Any] = {"untriaged_omitted": untriaged_omitted}
+    if isinstance(run_properties, dict):
+        for k, v in run_properties.items():
+            run_props[str(k)] = v
+
     document = {
         "$schema": SARIF_SCHEMA,
         "version": SARIF_VERSION,
@@ -358,7 +400,7 @@ def build_sarif(
         # holds an absolute host path, which would reintroduce exactly the
         # disclosure `_relative_uri` exists to prevent. A plain relative URI is
         # already interpreted against the repository root.
-        "runs": [{"tool": {"driver": driver}, "results": results}],
+        "runs": [{"tool": {"driver": driver}, "results": results, "properties": run_props}],
     }
     return document, skipped
 
@@ -465,6 +507,7 @@ def write_sarif(
     scan_root: str = "",
     tool_version: str = "",
     include_suppressed: bool = False,
+    run_properties: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, List[str]]:
     """Writes validated SARIF to `path`. Returns `(result_count, skipped_reasons)`.
 
@@ -478,6 +521,7 @@ def write_sarif(
     document, skipped = build_sarif(
         findings, scan_root=scan_root, tool_version=tool_version,
         include_suppressed=include_suppressed,
+        run_properties=run_properties,
     )
     problems = validate_sarif(document)
     if problems:
@@ -485,12 +529,24 @@ def write_sarif(
             "Refusing to write invalid SARIF:\n  " + "\n  ".join(problems)
         )
 
-    parent = os.path.dirname(os.path.abspath(path))
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        # allow_nan=False: Python emits bare NaN/Infinity by default, which is not
-        # valid JSON. `mantis_risk_score` is a REAL column, so this is reachable.
-        json.dump(document, handle, indent=2, allow_nan=False)
-        handle.write("\n")
+    tmp_path = f"{abs_path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            # allow_nan=False: Python emits bare NaN/Infinity by default, which is not
+            # valid JSON. `mantis_risk_score` is a REAL column, so this is reachable.
+            json.dump(document, handle, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+        os.replace(tmp_path, abs_path)
+    except BaseException:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return len(document["runs"][0]["results"]), skipped

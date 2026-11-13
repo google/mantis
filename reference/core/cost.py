@@ -1338,13 +1338,17 @@ def latest_run_id(db_path: str, target: str = "") -> str:
                     _touch(run_id_col, ts, spend_target)
             except sqlite3.OperationalError:
                 pass
+            runs_with_findings: set[str] = set()
+            finalized_runs: set[str] = set()
             try:
                 for run_id_col, ts, _max_id in conn.execute(
                     "SELECT run_id, MAX(timestamp) AS ts, MAX(id) AS max_id FROM findings "
                     "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id ORDER BY max_id ASC"
                 ).fetchall():
-                    if str(run_id_col).strip() in imported:
+                    rid_clean = str(run_id_col).strip()
+                    if rid_clean in imported:
                         continue
+                    runs_with_findings.add(rid_clean)
                     _touch(run_id_col, ts, "")
             except sqlite3.OperationalError:
                 pass
@@ -1353,13 +1357,16 @@ def latest_run_id(db_path: str, target: str = "") -> str:
                     "SELECT run_id, metadata_json, started FROM runs "
                     "WHERE run_id IS NOT NULL AND run_id != '' ORDER BY rowid ASC"
                 ).fetchall():
-                    if str(run_id_col).strip() in imported:
+                    rid_clean = str(run_id_col).strip()
+                    if rid_clean in imported:
                         continue
                     r_target = ""
                     try:
                         meta = json.loads(meta_json or "{}")
                         if isinstance(meta, dict):
                             r_target = str(meta.get("target") or meta.get("target_root") or "").strip()
+                            if meta.get("finalized") is True:
+                                finalized_runs.add(rid_clean)
                     except (TypeError, ValueError):
                         r_target = ""
                     _touch(run_id_col, started, r_target)
@@ -1369,11 +1376,15 @@ def latest_run_id(db_path: str, target: str = "") -> str:
             conn.close()
     except Exception:
         return ""
+    for rid_done in list(finalized_runs):
+        if rid_done not in runs_with_findings:
+            merged.pop(rid_done, None)
     if not merged:
         return ""
 
     if not root:
-        ordered = sorted(merged.items(), key=lambda kv: (kv[1]["ts"], kv[1]["seq"]), reverse=True)
+        pool = [kv for kv in merged.items() if kv[0] not in finalized_runs] or list(merged.items())
+        ordered = sorted(pool, key=lambda kv: (kv[1]["ts"], kv[1]["seq"]), reverse=True)
         return str(ordered[0][0])
 
     def _under_root(t: str) -> bool:
@@ -1393,8 +1404,47 @@ def latest_run_id(db_path: str, target: str = "") -> str:
         scoped = [(rid, info) for rid, info in merged.items() if not info["targets"]]
     if not scoped:
         return ""
+    unfinalized = [kv for kv in scoped if kv[0] not in finalized_runs]
+    if unfinalized:
+        scoped = unfinalized
     scoped.sort(key=lambda kv: (kv[1]["ts"], kv[1]["seq"]), reverse=True)
     return str(scoped[0][0])
+
+
+def prior_run_llm_calls(db_path: str, run_id: str) -> int:
+    """Total `llm_calls` already recorded in `campaign_spend` for `run_id`.
+
+    Used on `--resume` so the final `--spend-report` (`spend.json`) reflects
+    cumulative LLM calls across prior process invocations without inflating the
+    resumed process's fresh `max_llm_calls` guard. Never raises (INV-6).
+    """
+    if not db_path or not run_id or not _db_exists(db_path):
+        return 0
+    total = 0
+    try:
+        conn = _connect(db_path)
+        try:
+            for calls_col, meta_json in conn.execute(
+                "SELECT llm_calls, metadata_json FROM campaign_spend WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchall():
+                if _meta_imported(meta_json):
+                    continue
+                try:
+                    meta = json.loads(meta_json or "{}")
+                    if isinstance(meta, dict) and meta.get("group_member"):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    total += max(0, int(calls_col or 0))
+                except (TypeError, ValueError):
+                    continue
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+    return total
 
 
 def record_spend(

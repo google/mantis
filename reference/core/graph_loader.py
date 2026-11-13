@@ -935,8 +935,10 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
             _persist_dismissal_verdict(node_id, route, verdict)
             _persist_finding_promotions(node_id, [], route, verdict)
 
+        state_out = {state_key: visits, "verdict": None}
+
         if max_visits and max_visits > 1 and visits >= max_visits:
-            return adk.Event(output=node_input, state={state_key: visits}, route="exceeded")
+            return adk.Event(output=node_input, state=state_out, route="exceeded")
 
         if route == "success" and "success" in routes and "repro" in node_id:
             try:
@@ -961,12 +963,12 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
                 pass
 
         if route and route in routes:
-            return adk.Event(output=node_input, state={state_key: visits}, route=route)
+            return adk.Event(output=node_input, state=state_out, route=route)
 
         if route and route != DEFAULT_ROUTE and route not in ("false_positive", "non_viable", "failed_repro", "not_attempted"):
             print(f"[{node_id}] verdict '{route}' not in declared routes {routes}; routing to fallback")
 
-        return adk.Event(output=node_input, state={state_key: visits}, route=DEFAULT_ROUTE)
+        return adk.Event(output=node_input, state=state_out, route=DEFAULT_ROUTE)
 
     return node(_classify, name=node_id)
 
@@ -1551,7 +1553,10 @@ def _make_prefix_reuse_callbacks(node_id: str):
     spend on every campaign after the first.
     """
     # run_id -> the campaign (target) whose completed stage is reused.
+    import asyncio
+
     completed_runs: dict[str, str] = {}
+    local_inflight: dict[str, asyncio.Event] = {}
 
     def _runs_map(ctx) -> dict[str, str]:
         shared = getattr(ctx, "shared_prefix_runs", None)
@@ -1559,27 +1564,28 @@ def _make_prefix_reuse_callbacks(node_id: str):
             return shared.setdefault(node_id, {})
         return completed_runs
 
+    def _inflight_map(ctx) -> dict[str, asyncio.Event]:
+        shared = getattr(ctx, "shared_prefix_runs", None)
+        if isinstance(shared, dict):
+            inflight_root = shared.setdefault("_inflight", {})
+            if isinstance(inflight_root, dict):
+                return inflight_root.setdefault(node_id, {})
+        return local_inflight
+
     def _run_key(ctx) -> str:
+        pass_idx = max(1, int(getattr(ctx, "pass_index", 1) or 1))
+        base = f"{ctx.run_id}::pass{pass_idx}" if pass_idx > 1 else str(ctx.run_id)
         subrepo = _enclosing_subrepo_key(
             getattr(ctx, "jail_dir", ""), getattr(ctx, "target_file", "")
         )
-        return f"{ctx.run_id}::{subrepo}" if subrepo else str(ctx.run_id)
+        return f"{base}::{subrepo}" if subrepo else base
 
     def _shares_jail(ctx) -> bool:
         return prefix_reuse_applies(getattr(ctx, "scan_mode", ""), getattr(ctx, "jail_dir", ""),
                                     getattr(ctx, "path_root", ""), getattr(ctx, "target_file", ""))
 
-    def _before(callback_context=None):
+    def _try_reuse(ctx, runs_map: dict[str, str], rkey: str):
         try:
-            from core.context import current_run_context
-
-            ctx = current_run_context.get()
-            if ctx is None or not ctx.run_id or not ctx.db_path:
-                return None
-            if not _shares_jail(ctx):
-                return None
-            runs_map = _runs_map(ctx)
-            rkey = _run_key(ctx)
             if rkey not in runs_map:
                 return None
             from core.database import read_artifact, record_artifact
@@ -1609,6 +1615,80 @@ def _make_prefix_reuse_callbacks(node_id: str):
         except Exception:
             return None
 
+    def _claim_inflight_event(inflight: dict[str, asyncio.Event], rkey: str) -> None:
+        ev = asyncio.Event()
+        inflight[rkey] = ev
+        try:
+            owner_task = asyncio.current_task()
+        except RuntimeError:
+            owner_task = None
+        # Remember who produces: a node-level retry of the producing stage
+        # runs in the SAME task and must not wait on its own claim.
+        ev._mantis_owner = owner_task  # type: ignore[attr-defined]
+        if owner_task is not None:
+            def _release_on_task_done(_t, _inf=inflight, _rk=rkey, _ev=ev) -> None:
+                if _inf.get(_rk) is _ev:
+                    _inf.pop(_rk, None)
+                _ev.set()
+
+            owner_task.add_done_callback(_release_on_task_done)
+
+    def _before(callback_context=None):
+        try:
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            if ctx is None or not ctx.run_id or not ctx.db_path:
+                return None
+            if not _shares_jail(ctx):
+                return None
+            runs_map = _runs_map(ctx)
+            rkey = _run_key(ctx)
+            reused = _try_reuse(ctx, runs_map, rkey)
+            if reused is not None:
+                return reused
+            try:
+                asyncio.get_running_loop()
+                has_loop = True
+            except RuntimeError:
+                has_loop = False
+            if not has_loop or (
+                int(getattr(ctx, "parallel_workers", 1) or 1) <= 1
+                and not isinstance(getattr(ctx, "shared_prefix_runs", None), dict)
+            ):
+                return None
+            inflight = _inflight_map(ctx)
+            ev = inflight.get(rkey)
+            if ev is None:
+                _claim_inflight_event(inflight, rkey)
+                return None
+            owner = getattr(ev, "_mantis_owner", None)
+            if owner is not None and owner is asyncio.current_task():
+                # A retry of the producing attempt (ADK node retry re-enters
+                # the callback in the same task): keep the claim and run.
+                return None
+
+            async def _await_producer():
+                wait_ev = ev
+                try:
+                    while wait_ev is not None:
+                        await wait_ev.wait()
+                        got = _try_reuse(ctx, runs_map, rkey)
+                        if got is not None:
+                            return got
+                        wait_ev = inflight.get(rkey)
+                        if wait_ev is None:
+                            runs_map.pop(rkey, None)
+                            _claim_inflight_event(inflight, rkey)
+                            return None
+                    return None
+                except Exception:
+                    return None
+
+            return _await_producer()
+        except Exception:
+            return None
+
     def _after(callback_context=None):
         # The runtime fires this only when the stage completed without
         # raising; the artifact row is still verified at reuse time.
@@ -1618,7 +1698,38 @@ def _make_prefix_reuse_callbacks(node_id: str):
             ctx = current_run_context.get()
             if ctx and ctx.run_id and _shares_jail(ctx):
                 own_res = str(getattr(ctx, "artifact_resource", "") or getattr(ctx, "target_file", "") or "")
-                _runs_map(ctx).setdefault(_run_key(ctx), own_res)
+                rkey = _run_key(ctx)
+                try:
+                    cur_task = asyncio.current_task()
+                except RuntimeError:
+                    cur_task = None
+                cancelling = bool(
+                    cur_task is not None
+                    and hasattr(cur_task, "cancelling")
+                    and cur_task.cancelling() > 0
+                )
+                if not cancelling:
+                    rmap = _runs_map(ctx)
+                    if rkey not in rmap:
+                        rmap[rkey] = own_res
+                    elif rmap[rkey] != own_res and ctx.db_path:
+                        from core.database import read_artifact
+                        from core.paths import resolve_db_path
+
+                        db = resolve_db_path(ctx.db_path)
+                        kind = _PREFIX_REUSE_ARTIFACTS[node_id]
+                        prev_art = read_artifact(
+                            db, artifact_type=kind, run_id=ctx.run_id, resource=rmap[rkey]
+                        )
+                        if not _artifact_says_something(prev_art):
+                            own_art = read_artifact(
+                                db, artifact_type=kind, run_id=ctx.run_id, resource=own_res
+                            )
+                            if _artifact_says_something(own_art):
+                                rmap[rkey] = own_res
+                ev = _inflight_map(ctx).pop(rkey, None)
+                if ev is not None:
+                    ev.set()
         except Exception:
             pass
         return None
@@ -2785,6 +2896,24 @@ def _render_campaign_directive_blocks(
     wants_checklist = _wants_audit_checklist(node_id)
     wants_steering = _wants_operator_steering(node_id)
     directive = str(getattr(ctx, "campaign_directive", "") or "")
+    if (
+        node_id in _PREFIX_REUSE_ARTIFACTS
+        and getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL
+        and prefix_reuse_applies(
+            getattr(ctx, "scan_mode", ""),
+            getattr(ctx, "jail_dir", ""),
+            getattr(ctx, "path_root", ""),
+            getattr(ctx, "target_file", ""),
+        )
+    ):
+        # The repo-scope summary / threat model are reused by every slice of
+        # this run: withhold the slice-narrowing directive from them.
+        directive = (
+            "Shared Repository Prefix Stage: your architectural summary and threat model "
+            "are reused across all subsystem slices of this run. Build a repository-wide "
+            "model and enumerate from the repository root with list_files('.') rather "
+            "than restricting scope to a single slice."
+        )
     context = str(getattr(ctx, "campaign_context", "") or "") if wants_context else ""
     seed_block = str(getattr(ctx, "seed_report_block", "") or "") if wants_steering else ""
     op_focus = str(getattr(ctx, "operator_focus", "") or "") if wants_steering else ""
@@ -3838,14 +3967,16 @@ def _update_finding_artifact(
     run_id: str,
     finding: dict[str, Any],
     calib: Any,
+    resource: Optional[str] = None,
 ) -> None:
     from datetime import datetime, timezone
     from core.database import read_artifact, record_artifact
 
     f_id = finding.get("id")
     art_path = f"workspace/findings/{f_id}.json"
+    eff_res = str(resource) if resource is not None else None
 
-    existing_raw = read_artifact(db_path, filepath=art_path, run_id=run_id)
+    existing_raw = read_artifact(db_path, filepath=art_path, run_id=run_id, resource=eff_res)
     data = None
     if existing_raw:
         try:
@@ -3889,7 +4020,7 @@ def _update_finding_artifact(
         "workspace_file",
         art_path,
         json.dumps(data, indent=2),
-        metadata={"resource": data.get("filepath", ""), "agent_authored": True},
+        metadata={"resource": eff_res if eff_res is not None else data.get("filepath", ""), "agent_authored": True},
     )
 
 
@@ -3918,11 +4049,13 @@ def create_calibrator_node(
         except Exception:
             pass
         run_id = (getattr(run_ctx, "run_id", None) or ctx.state.get("run_id") or "")
-        target_file = (getattr(run_ctx, "target_file", None) or "")
+        target_file = str(getattr(run_ctx, "target_file", None) or ctx.state.get("filepath") or "")
         pass_idx = max(1, int(getattr(run_ctx, "pass_index", 1) or 1)) if run_ctx is not None else None
-        own_res = (
-            str(getattr(run_ctx, "artifact_resource", "") or target_file or "") or None
-        ) if run_ctx is not None else None
+        own_res = str(
+            (getattr(run_ctx, "artifact_resource", "") if run_ctx is not None else "")
+            or target_file
+            or ""
+        )
 
         findings = []
         if db_path and os.path.exists(db_path):
@@ -4102,7 +4235,7 @@ def create_calibrator_node(
                     run_id=run_id,
                 )
 
-                _update_finding_artifact(db_path, run_id, f, calib)
+                _update_finding_artifact(db_path, run_id, f, calib, resource=own_res)
             except Exception as db_err:
                 print(f"  [{node_id}] Warning: DB update for finding {f_id} failed: {db_err}", file=sys.stderr, flush=True)
 
@@ -4284,6 +4417,7 @@ def validate_workflow_topology(
     spec: WorkflowSpec,
     *,
     strict_synthesis: bool = False,
+    require_promotion_gate: Optional[bool] = None,
 ) -> tuple[list[str], list[str]]:
     """Pure static topology & promotion-path validator for WorkflowSpec.
 
@@ -4393,7 +4527,8 @@ def validate_workflow_topology(
                 "followed by a classifier node (e.g. 'review_decision'), or a stage with "
                 "on_enter_status='static_confirmed', so confirmed findings exit 'reported' status."
             )
-            if strict_synthesis:
+            check_promo = strict_synthesis if require_promotion_gate is None else bool(require_promotion_gate)
+            if check_promo:
                 errors.append(msg)
             else:
                 warnings.append(msg)

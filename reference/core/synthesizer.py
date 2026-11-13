@@ -434,9 +434,67 @@ class ResearchGraphSynthesizer:
     and deterministic archetype-based synthesis with fail-safe fallback.
     """
 
-    def __init__(self, default_model: str = DEFAULT_SYNTHESIZER_MODEL, db_path: str = "knowledge.db"):
-        self.default_model = default_model
-        self.db_path = db_path
+    def __init__(
+        self,
+        default_model: Optional[str] = None,
+        db_path: Optional[str] = None,
+        *,
+        workflow_path: str = "",
+        load_local: bool = False,
+        operator_config: Optional[Dict[str, Any]] = None,
+    ):
+        op_cfg: Dict[str, Any] = {}
+        if isinstance(operator_config, dict):
+            op_cfg.update(operator_config)
+        elif load_local:
+            try:
+                from scripts.configure import find_workflow_json, load_workflow_dict
+
+                wf_file = find_workflow_json(workflow_path)
+                wf_data = load_workflow_dict(wf_file, load_local=True)
+                if isinstance(wf_data, dict) and isinstance(wf_data.get("config"), dict):
+                    op_cfg.update(wf_data["config"])
+            except Exception:
+                pass
+        self._operator_config = op_cfg
+        self.default_model = (
+            default_model
+            or str(op_cfg.get("default_model") or "").strip()
+            or DEFAULT_SYNTHESIZER_MODEL
+        )
+        self.db_path = (
+            db_path
+            or str(op_cfg.get("db_path") or "").strip()
+            or "knowledge.db"
+        )
+
+    def _apply_operator_config_defaults(
+        self,
+        config_dict: Dict[str, Any],
+        final_sandbox_type: str,
+    ) -> None:
+        op_cfg = getattr(self, "_operator_config", None) or {}
+        if not op_cfg:
+            return
+        for key in (
+            "api_base",
+            "fast_model",
+            "timeout",
+            "reasoning_effort",
+            "exclude",
+            "sarif_output",
+            "evidence_sources",
+            "custom_tools",
+        ):
+            val = op_cfg.get(key)
+            if val is not None and val != "":
+                config_dict[key] = val
+        op_sb = op_cfg.get("sandbox")
+        if isinstance(op_sb, dict):
+            op_sb_type = str(op_sb.get("type") or "").strip()
+            op_sb_norm = "static-only" if op_sb_type in ("static", "static-only") else op_sb_type
+            if op_sb_norm == final_sandbox_type and isinstance(op_sb.get("options"), dict) and op_sb["options"]:
+                config_dict.setdefault("sandbox", {})["options"] = dict(op_sb["options"])
 
     def detect_domain_archetype(self, objective: str, astm: Optional[dict] = None) -> str:
         """Selects a workflow family from the objective, falling back to repo evidence.
@@ -564,8 +622,15 @@ class ResearchGraphSynthesizer:
         #                 shape the graph's topology but cannot buy itself a guest to
         #                 run in.
         sandbox_clamp: Optional[dict] = None
-        if sandbox_type:
-            final_sandbox_type = "static-only" if sandbox_type in ("static-only", "static") else sandbox_type
+        op_sb_cfg = (getattr(self, "_operator_config", None) or {}).get("sandbox")
+        op_sb_type = (
+            str(op_sb_cfg.get("type") or "").strip()
+            if isinstance(op_sb_cfg, dict)
+            else ""
+        )
+        effective_explicit_sb = sandbox_type or op_sb_type or None
+        if effective_explicit_sb:
+            final_sandbox_type = "static-only" if effective_explicit_sb in ("static-only", "static") else effective_explicit_sb
         else:
             requested = cfg_archetype.get("sandbox_type", "static-only")
             if archetype_source == "repository":
@@ -800,13 +865,15 @@ class ResearchGraphSynthesizer:
             metadata["sandbox_clamp"] = sandbox_clamp
 
 
+        cfg_out: Dict[str, Any] = {
+            "db_path": self.db_path,
+            "default_model": self.default_model,
+            "sandbox": {"type": final_sandbox_type},
+        }
+        self._apply_operator_config_defaults(cfg_out, final_sandbox_type)
         spec_dict = {
             "name": f"workflow_{domain_slug}",
-            "config": {
-                "db_path": self.db_path,
-                "default_model": self.default_model,
-                "sandbox": {"type": final_sandbox_type},
-            },
+            "config": cfg_out,
             "nodes": nodes,
             "edges": edges,
             "evolution_metadata": metadata,
@@ -867,8 +934,15 @@ class ResearchGraphSynthesizer:
             chosen_model = self.default_model
 
         # Gate 4: Sandbox Policy Gate (A3: LLM choice cannot escalate execution backend)
-        if sandbox_type:
-            final_sandbox = "static-only" if sandbox_type in ("static-only", "static") else sandbox_type
+        op_sb_cfg = (getattr(self, "_operator_config", None) or {}).get("sandbox")
+        op_sb_type = (
+            str(op_sb_cfg.get("type") or "").strip()
+            if isinstance(op_sb_cfg, dict)
+            else ""
+        )
+        effective_explicit_sb = sandbox_type or op_sb_type or None
+        if effective_explicit_sb:
+            final_sandbox = "static-only" if effective_explicit_sb in ("static-only", "static") else effective_explicit_sb
         else:
             final_sandbox = cfg_archetype.get("sandbox_type", "static-only")
             if final_sandbox == "remote":
@@ -897,6 +971,7 @@ class ResearchGraphSynthesizer:
             "retry_attempts": retry_attempts,
             "seed_prompt": seed_prompt,
         }
+        self._apply_operator_config_defaults(config_dict, final_sandbox)
 
         # Gate 1 & 2: Node Sanitization & Whitelisting
         raw_nodes = raw_dict.get("nodes", [])
@@ -1141,7 +1216,13 @@ class ResearchGraphSynthesizer:
                         sanitized_edges.append({"from": from_id, "to": to_id})
                 elif from_node["type"] == "classifier":
                     if isinstance(route, list):
-                        route = [str(r) for r in route if str(r) != "__DEFAULT__"] or "__DEFAULT__"
+                        str_routes = [str(r) for r in route]
+                        if "__DEFAULT__" in str_routes:
+                            raise ValueError(
+                                f"Edge from classifier '{from_id}' to '{to_id}' cannot combine "
+                                "'__DEFAULT__' in a route list."
+                            )
+                        route = str_routes or "__DEFAULT__"
                         if isinstance(route, list) and len(route) == 1:
                             route = route[0]
                     elif route is None:
@@ -1334,7 +1415,11 @@ class ResearchGraphSynthesizer:
         }
 
         spec_obj = WorkflowSpec.model_validate(spec_dict)
-        validate_workflow_topology(spec_obj, strict_synthesis=strict_synthesis)
+        validate_workflow_topology(
+            spec_obj,
+            strict_synthesis=True,
+            require_promotion_gate=strict_synthesis,
+        )
         return spec_obj
 
     def synthesize_with_llm(
@@ -1361,17 +1446,22 @@ class ResearchGraphSynthesizer:
             # completion call (and hermetic environments generally) get to reach
             # the mock instead of dying on eager env validation. Every OTHER
             # kwargs failure (bad model, bad timeout) still fails here, loudly.
+            op_cfg = getattr(self, "_operator_config", None) or {}
+            op_api_base = str(op_cfg.get("api_base") or "").strip() or None
+            eff_timeout = timeout or op_cfg.get("timeout") or 60.0
             try:
                 _, llm_kwargs = get_llm_kwargs(
                     chosen_model,
                     DEFAULT_MODEL,
-                    api_base=None,
-                    timeout=timeout or 60.0,
+                    api_base=op_api_base,
+                    timeout=eff_timeout,
                 )
             except ValueError as exc:
                 if "VERTEXAI_PROJECT" not in str(exc) and "GOOGLE_CLOUD_PROJECT" not in str(exc):
                     raise
-                llm_kwargs = {"timeout": timeout or 60.0}
+                llm_kwargs = {"timeout": eff_timeout}
+                if op_api_base:
+                    llm_kwargs["api_base"] = op_api_base
 
             user_prompt = (
                 f'Synthesize an optimal Google ADK workflow specification for the following security audit objective:\n\n'

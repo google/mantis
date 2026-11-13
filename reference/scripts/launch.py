@@ -605,14 +605,14 @@ def run_launch(
     survey_astm = None
     if objective:
         base_budget = BudgetConfig()
-        if workflow_path:
-            try:
-                base_wf = load_workflow_dict(find_workflow_json(workflow_path))
-                raw_b = base_wf.get("budget") or base_wf.get("config", {}).get("budget")
-                if raw_b and isinstance(raw_b, dict):
-                    base_budget = BudgetConfig.from_dict(raw_b)
-            except Exception:
-                pass
+        base_wf: dict = {}
+        try:
+            base_wf = load_workflow_dict(find_workflow_json(workflow_path), load_local=True)
+            raw_b = base_wf.get("budget") or base_wf.get("config", {}).get("budget")
+            if raw_b and isinstance(raw_b, dict):
+                base_budget = BudgetConfig.from_dict(raw_b)
+        except Exception:
+            base_wf = {}
 
         synth_budget = BudgetConfig(
             max_wall_clock_seconds=cli_budget_overrides.get("max_wall_clock_seconds", base_budget.max_wall_clock_seconds),
@@ -626,14 +626,16 @@ def run_launch(
         mode_str = "LLM-driven research graph synthesis" if synthesize_llm else "deterministic archetype"
         print(f"✨ Synthesizing targeted research graph for objective: '{objective}' (mode: {mode_str})...")
         synthesizer = ResearchGraphSynthesizer(
-            default_model=model or "vertex_ai/gemini-3.8-flash",
-            db_path=db_path or "knowledge.db",
+            default_model=model,
+            db_path=db_path,
+            workflow_path=workflow_path or "",
+            load_local=True,
+            operator_config=base_wf.get("config") if isinstance(base_wf.get("config"), dict) else None,
         )
         effective_sandbox = sandbox
         if not effective_sandbox:
             try:
-                base_wf_dict = load_workflow_dict(find_workflow_json(workflow_path))
-                effective_sandbox = base_wf_dict.get("config", {}).get("sandbox", {}).get("type")
+                effective_sandbox = (base_wf.get("config") or {}).get("sandbox", {}).get("type")
             except Exception:
                 effective_sandbox = "static-only"
         effective_sandbox = effective_sandbox or "static-only"

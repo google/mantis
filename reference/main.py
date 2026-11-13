@@ -191,6 +191,14 @@ async def execute_sub_task(
                 budget_controller=budget_controller,
                 run_ctx=_ctx_for_context,
             )
+            if (
+                _ctx_for_context is not None
+                and int(getattr(_ctx_for_context, "pre_pause_llm_calls", 0) or 0) > 0
+                and getattr(_SPEND_REPORT.get("controller"), "run_id", None) == run_id
+            ):
+                _SPEND_REPORT["prior_llm_calls"] = int(_SPEND_REPORT.get("prior_llm_calls") or 0) + int(
+                    _ctx_for_context.pre_pause_llm_calls
+                )
         except Exception as exc:
             print(f"[RESUME METRICS WARNING] {filepath}: {exc}", file=sys.stderr)
         new_message = None
@@ -279,6 +287,7 @@ def _rehydrate_session_metrics(
     if run_ctx is not None:
         run_ctx.resumed_mid_invocation = True
         run_ctx.pre_pause_tokens = 0
+        run_ctx.pre_pause_llm_calls = 0
     events = list(getattr(existing_session, "events", None) or [])
     if not events:
         return
@@ -314,12 +323,15 @@ def _rehydrate_session_metrics(
     discount = budget_controller.config.cache_discount if budget_controller is not None else 0.1
     prior_reads = 0
     prior_tokens = 0
+    prior_llm_calls = 0
     for ev in active_events:
         if getattr(ev, "partial", False):
             continue
         usage = getattr(ev, "usage_metadata", None)
         if usage and getattr(usage, "total_token_count", None):
             total_t = max(0, int(usage.total_token_count or 0))
+            if total_t > 0:
+                prior_llm_calls += 1
             cached_t = max(0, min(int(getattr(usage, "cached_content_token_count", 0) or 0), total_t))
             prior_tokens += max(0, int((total_t - cached_t) + cached_t * discount))
         node_info = getattr(ev, "node_info", None)
@@ -349,6 +361,7 @@ def _rehydrate_session_metrics(
         budget_controller.audit_code_reads += prior_reads
     if run_ctx is not None:
         run_ctx.pre_pause_tokens = prior_tokens
+        run_ctx.pre_pause_llm_calls = prior_llm_calls
 
 
 def _rehydrate_campaign_resume_state(
@@ -1660,6 +1673,9 @@ def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
                   "cache_discount": None, "llm_calls": 0, "graph_steps": 0,
                   "elapsed_seconds": 0.0, "max_tokens": None, "max_llm_calls": None,
                   "pause_trigger": ""}
+    prior_calls = int(_SPEND_REPORT.get("prior_llm_calls") or 0)
+    if prior_calls > 0:
+        report["llm_calls"] = int(report.get("llm_calls") or 0) + prior_calls
     report["exit_code"] = exit_code
     report["nodes"] = list(_SPEND_REPORT.get("nodes") or [])
     report["campaigns"] = list((_SPEND_REPORT.get("campaigns") or {}).values())
@@ -1680,6 +1696,35 @@ def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
     except Exception as exc:
         print(f"[SPEND REPORT WARNING] could not write {path}: {exc}", file=sys.stderr)
         return False
+
+
+def _count_unique_active_findings(active_findings: list[dict]) -> int:
+    """Counts active findings deduplicated by `lineage_id` (or `signature` / `id`) across `--passes N`."""
+    seen: set[str] = set()
+    for idx, f in enumerate(active_findings or []):
+        if not isinstance(f, dict):
+            continue
+        key = (
+            str(f.get("lineage_id") or "").strip()
+            or str(f.get("signature") or "").strip()
+            or (f"id:{f['id']}" if f.get("id") is not None else f"row:{idx}")
+        )
+        seen.add(key)
+    return len(seen)
+
+
+def _resolve_effective_parallel(parallel: Optional[int], sandbox_type: str) -> int:
+    """Clamps `--parallel > 1` to `1` on shared `remote` sandbox targets."""
+    requested = max(1, int(parallel or 1))
+    if requested > 1 and str(sandbox_type or "").strip().lower() == "remote":
+        print(
+            f"[REMOTE SANDBOX] Clamping --parallel {requested} -> 1: "
+            "RemoteTargetEnvironment shares a single live target workdir/service; "
+            "concurrent campaigns would clobber patches and reset_cmd state.",
+            file=sys.stderr,
+        )
+        return 1
+    return requested
 
 
 def _confirm_work_plan(
@@ -3458,7 +3503,11 @@ async def pipeline(
             db_path,
             run_id,
             run_model,
-            metadata={"target_root": _run_target_anchor, "target": _run_exact_target},
+            metadata={
+                "target_root": _run_target_anchor,
+                "target": _run_exact_target,
+                "finalized": False,
+            },
         )
     except Exception as exc:
         print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
@@ -3516,6 +3565,15 @@ async def pipeline(
     # Kept where the process exit path can reach it: --spend-report writes
     # this controller's totals however the run ends.
     _SPEND_REPORT["controller"] = budget_ctrl
+    if resume_run_id:
+        try:
+            from core.cost import prior_run_llm_calls
+
+            _SPEND_REPORT["prior_llm_calls"] = prior_run_llm_calls(db_path, run_id)
+        except Exception:
+            _SPEND_REPORT["prior_llm_calls"] = 0
+    else:
+        _SPEND_REPORT["prior_llm_calls"] = 0
 
     # Target isolation: host target is treated as strictly read-only.
     # Mutations occur only in isolated guest sandboxes or under workspace/.
@@ -3621,6 +3679,12 @@ async def pipeline(
     # the resolver printed it, and a run that scans nothing must not confirm
     # a work plan, open campaigns, or write an empty report.
     if scan_mode == SCAN_MODE_CHANGED and not targets_to_scan:
+        try:
+            from core.database import mark_run_finalized
+
+            mark_run_finalized(db_path, run_id, finalized=True)
+        except Exception:
+            pass
         return 0
     try:
         from core.cost import record_run_scan_mode
@@ -4051,6 +4115,12 @@ async def pipeline(
                 file=sys.stderr,
             )
             if not remaining:
+                try:
+                    from core.database import mark_run_finalized
+
+                    mark_run_finalized(db_path, run_id, finalized=True)
+                except Exception:
+                    pass
                 print("Nothing left to scan for this run. To scan again, start a new run.")
                 return 0
             targets_to_scan = remaining
@@ -4399,7 +4469,9 @@ async def pipeline(
         session_service=session_service
     )
 
-    worker_count = max(1, int(parallel or 1))
+    worker_count = _resolve_effective_parallel(
+        parallel, (config.get("sandbox") or {}).get("type", "")
+    )
     multi_campaign_run = len(campaign_groups) > 1
     op_focus_block, seed_report_block = _build_operator_steering_blocks(focus, seed_report)
     base_ctx = RunContext(
@@ -4699,6 +4771,9 @@ async def pipeline(
                 pre_pause_tokens = int(getattr(branch_ctx, "pre_pause_tokens", 0) or 0)
                 if pre_pause_tokens > 0:
                     tokens_before -= pre_pause_tokens
+                pre_pause_llm_calls = int(getattr(branch_ctx, "pre_pause_llm_calls", 0) or 0)
+                if pre_pause_llm_calls > 0:
+                    llm_calls_before -= pre_pause_llm_calls
                 campaign_tokens = budget_ctrl.accumulated_tokens - tokens_before
                 campaign_llm_calls = budget_ctrl.llm_calls - llm_calls_before
                 code_reads = budget_ctrl.audit_code_reads - reads_before
@@ -5164,7 +5239,11 @@ async def pipeline(
     try:
         from core.budget import render_spend_summary
         run_controller = _SPEND_REPORT.get("controller") or budget_ctrl
-        for i, line in enumerate(render_spend_summary(run_controller.spend_snapshot())):
+        snap_for_summary = dict(run_controller.spend_snapshot())
+        prior_calls = int(_SPEND_REPORT.get("prior_llm_calls") or 0)
+        if prior_calls > 0:
+            snap_for_summary["llm_calls"] = int(snap_for_summary.get("llm_calls") or 0) + prior_calls
+        for i, line in enumerate(render_spend_summary(snap_for_summary)):
             print(("\n🧮 Spend: " if i == 0 else "   ") + line)
     except Exception as exc:
         print(f"[SPEND SUMMARY WARNING] {exc}", file=sys.stderr)
@@ -5176,7 +5255,8 @@ async def pipeline(
         print(f"\n💾 {render_sessions_store_note(store)}")
     except Exception as exc:
         print(f"[SESSION STORE WARNING] {exc}", file=sys.stderr)
-    print(f"\n📊 Summary: {len(active_findings)} active / {len(findings)} total vulnerability finding(s) recorded.")
+    unique_active_count = _count_unique_active_findings(active_findings)
+    print(f"\n📊 Summary: {unique_active_count} active / {len(findings)} total vulnerability finding(s) recorded.")
     for f in findings:
         lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""
         st = f.get("status") or ""
@@ -5290,14 +5370,20 @@ async def pipeline(
     if failures > 0:
         print(f"\n⚠️ Pipeline completed with {failures} failure(s).")
         return 1
-    elif len(findings) == 0:
+    try:
+        from core.database import mark_run_finalized
+
+        mark_run_finalized(db_path, run_id, finalized=True)
+    except Exception:
+        pass
+    if len(findings) == 0:
         print(f"\nℹ️ Pipeline Execution Completed: No vulnerability findings recorded.")
         return 0
-    elif len(active_findings) == 0:
+    elif unique_active_count == 0:
         print(f"\nℹ️ Pipeline Execution Completed: No active vulnerability findings recorded ({len(findings)} suppressed/merged).")
         return 0
     else:
-        print(f"\n🎉 Pipeline Execution Completed: Processed {len(active_findings)} active vulnerability finding(s).")
+        print(f"\n🎉 Pipeline Execution Completed: Processed {unique_active_count} active vulnerability finding(s).")
         return 0
 
 

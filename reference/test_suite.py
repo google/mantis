@@ -1156,7 +1156,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--shielded-integrity-monitoring", create_argv)
         self.assertIn("--metadata=disable-legacy-endpoints=TRUE,block-project-ssh-keys=TRUE", create_argv)
         self.assertNotIn("--maintenance-policy=TERMINATE", create_argv)
-        self.assertIn("--max-run-duration=30m", create_argv)
+        self.assertIn("--max-run-duration=2h", create_argv)
         self.assertIn("--instance-termination-action=DELETE", create_argv)
         self.assertIn("--labels=mantis-sandbox=true,created-by=mantis", create_argv)
 

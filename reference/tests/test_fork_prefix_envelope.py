@@ -566,11 +566,15 @@ class TestForkPrefixEnvelope(unittest.IsolatedAsyncioTestCase):
         )
         agents = _iter_workflow_agents(workflow)
 
-        # Static-only skip: neither history nor reproducer made any LLM calls,
-        # and reproducer updated session.state["verdict"] to "failed_repro" (clearing critic's stale "viable")!
+        # Static-only skip: neither history nor reproducer made any LLM calls.
+        # The reproducer's "failed_repro" verdict replaced critic's stale "viable",
+        # so repro_classifier routed to the fallback (no chainer/patcher) and then
+        # consumed the single-use state["verdict"].
         self.assertNotIn("history", rec.requests_by_stage)
         self.assertNotIn("reproducer", rec.requests_by_stage)
-        self.assertEqual(json.loads(final_sess.state["verdict"])["route"], "failed_repro")
+        self.assertNotIn("chainer", rec.requests_by_stage)
+        self.assertNotIn("patcher", rec.requests_by_stage)
+        self.assertIsNone(final_sess.state.get("verdict"))
 
         # Coverage credit: explorer read routes/login.py + routes/admin.py while researcher made 0 reads
         self.assertEqual(ctrl.audit_code_reads, 2)
@@ -712,7 +716,9 @@ class TestForkPrefixEnvelope(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("history", rec.requests_by_stage)
         self.assertNotIn("reproducer", rec.requests_by_stage)
-        self.assertEqual(json.loads(final_sess.state["verdict"])["route"], "failed_repro")
+        self.assertNotIn("chainer", rec.requests_by_stage)
+        self.assertNotIn("patcher", rec.requests_by_stage)
+        self.assertIsNone(final_sess.state.get("verdict"))
 
         # Coverage credit: architect + planner read routes/login.py + routes/admin.py in stem;
         # researcher made 0 reads of its own yet earns exact coverage credit (2)!
@@ -1133,7 +1139,9 @@ class TestForkPrefixEnvelope(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(ctrl.audit_code_reads, expected_reads, wf_name)
             self.assertTrue(should_credit_coverage(failed, ctrl.audit_code_reads), wf_name)
-            self.assertEqual(json.loads(final_sess.state["verdict"])["route"], "failed_repro", wf_name)
+            self.assertNotIn("chainer", rec.requests_by_stage, wf_name)
+            self.assertNotIn("patcher", rec.requests_by_stage, wf_name)
+            self.assertIsNone(final_sess.state.get("verdict"), wf_name)
 
         # Negative check: workspace-only reads in stem NEVER earn coverage credit (fail-closed)
         ws_events_contents = [

@@ -250,6 +250,8 @@ class RemoteTargetEnvironment(BaseEnvironment):
         self._started = False
         self.is_initialized = False
         self._lock = asyncio.Lock()
+        self._target_mutated = False
+        self._mutated_guest_paths: set[str] = set()
 
     @property
     def working_dir(self) -> Path:
@@ -366,8 +368,31 @@ class RemoteTargetEnvironment(BaseEnvironment):
             f"Path '{path}' escapes the remote sandbox workspace '{self._workdir_posix}'."
         )
 
+    def _rel_workdir_key(self, path: Union[Path, str]) -> Optional[str]:
+        try:
+            resolved = self._resolve_guest_path(path)
+        except Exception:
+            return None
+        rel = posixpath.relpath(resolved, self._workdir_posix)
+        if not rel or rel in (".", "..") or rel.startswith("../"):
+            return None
+        return rel
+
+    @staticmethod
+    def _is_target_source_relpath(rel: Optional[str]) -> bool:
+        if not rel:
+            return False
+        if rel == "workspace" or rel.startswith("workspace/"):
+            return False
+        base = posixpath.basename(rel)
+        if base.startswith((".mantis", "sentinel_")):
+            return False
+        return True
+
     def _run_reset_sync(self, *, strict: bool) -> None:
+        did_reset = False
         if self.reset_argv:
+            did_reset = True
             res = run_bounded_subprocess(
                 self.reset_argv,
                 timeout=self.timeout,
@@ -380,6 +405,7 @@ class RemoteTargetEnvironment(BaseEnvironment):
                     f"Remote sandbox reset_argv failed (exit={res.returncode}): {err}"
                 )
         if self.reset_cmd:
+            did_reset = True
             res = run_bounded_subprocess(
                 self._build_transport_argv(self.reset_cmd),
                 timeout=self.timeout,
@@ -391,6 +417,20 @@ class RemoteTargetEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     f"Remote sandbox reset_cmd failed (exit={res.returncode}): {err}"
                 )
+        if did_reset and getattr(self, "_started", False) and self.rebuild_cmd:
+            rb_res = run_bounded_subprocess(
+                self._build_transport_argv(self.rebuild_cmd, with_stdin=False),
+                timeout=self.timeout,
+                max_stdout_bytes=_MAX_EXEC_CAPTURE_BYTES,
+                max_stderr_bytes=_MAX_EXEC_CAPTURE_BYTES,
+            )
+            if strict and (rb_res.timed_out or rb_res.returncode != 0):
+                err = rb_res.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(
+                    f"Remote sandbox rebuild_cmd after reset failed (exit={rb_res.returncode}): {err}"
+                )
+        self._mutated_guest_paths.clear()
+        self._target_mutated = False
 
     async def preflight(self) -> None:
         """Validates transport binary availability and optional remote target healthcheck."""
@@ -478,7 +518,11 @@ class RemoteTargetEnvironment(BaseEnvironment):
         await self._ensure()
 
     async def read_file(self, path: Union[Path, str]) -> bytes:
-        """Static-plane read: strictly reads from the local read-only target checkout (INV-4)."""
+        """Static-plane read with read-your-writes overlay for guest-mutated target paths (INV-4)."""
+        if getattr(self, "_started", False) and getattr(self, "_mutated_guest_paths", None):
+            rel_key = self._rel_workdir_key(path)
+            if rel_key and rel_key in self._mutated_guest_paths:
+                return await self.read_guest_file(path)
         return await self._static_env.read_file(Path(path))
 
     async def list_files(self, directory: str = "") -> List[str]:
@@ -572,6 +616,60 @@ class RemoteTargetEnvironment(BaseEnvironment):
                 raise RuntimeError(f"Failed to write file '{path}' on remote target: {stderr}")
 
         await asyncio.to_thread(_write)
+        rel_key = self._rel_workdir_key(path)
+        if self._is_target_source_relpath(rel_key):
+            self._target_mutated = True
+            self._mutated_guest_paths.add(str(rel_key))
+
+    async def _remove_guest_file(self, path: Union[Path, str]) -> None:
+        resolved_posix = self._resolve_guest_path(path)
+        qdest = shlex.quote(resolved_posix)
+        argv = self._build_transport_argv(f"rm -f {qdest}", with_stdin=False)
+        await asyncio.to_thread(
+            run_bounded_subprocess,
+            argv,
+            timeout=self.timeout,
+            max_stdout_bytes=65536,
+            max_stderr_bytes=65536,
+            mock_text=False,
+        )
+
+    async def write_file_and_rebuild(
+        self, path: Union[Path, str], content: Union[str, bytes]
+    ) -> tuple[int, str]:
+        """Writes a file on the remote target, runs ``rebuild_cmd``, and rolls back on rebuild failure."""
+        await self._ensure()
+        rel_key = self._rel_workdir_key(path)
+        was_tracked = bool(rel_key and rel_key in self._mutated_guest_paths)
+        was_mutated = bool(self._target_mutated)
+        had_prior = False
+        prior_bytes = b""
+        try:
+            prior_bytes = await self.read_guest_file(path)
+            had_prior = True
+        except FileNotFoundError:
+            had_prior = False
+
+        await self.write_file(path, content)
+        if not self.rebuild_cmd:
+            return 0, ""
+
+        rb_rc, rb_out = await self.run_rebuild()
+        if rb_rc != 0:
+            try:
+                if had_prior:
+                    await self.write_file(path, prior_bytes)
+                else:
+                    await self._remove_guest_file(path)
+                if rel_key and not was_tracked:
+                    self._mutated_guest_paths.discard(rel_key)
+                self._target_mutated = was_mutated
+                await self.run_rebuild()
+            except Exception as rb_exc:
+                logger.warning("Remote write_file rollback encountered error: %s", rb_exc)
+            rolled_msg = f"{rb_out}\n[ROLLED BACK TO PRIOR FILE STATE]".strip()
+            return rb_rc, rolled_msg
+        return 0, rb_out
 
     @staticmethod
     def _clip_newest_telemetry(text: str, limit: int) -> str:
@@ -796,6 +894,16 @@ class RemoteTargetEnvironment(BaseEnvironment):
 
         if rc != 0:
             return f"exit={rc}\n{truncate_with_marker(out, MAX_OUTPUT, what='patch output')}"
+
+        self._target_mutated = True
+        for line in diff.splitlines():
+            if line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
+                raw_hdr = line[4:].split("\t", 1)[0].strip()
+                if raw_hdr.startswith(("a/", "b/")):
+                    raw_hdr = raw_hdr[2:]
+                rel_key = self._rel_workdir_key(raw_hdr)
+                if self._is_target_source_relpath(rel_key):
+                    self._mutated_guest_paths.add(str(rel_key))
 
         if self.rebuild_cmd:
             rb_rc, rb_out = await self.run_rebuild()
