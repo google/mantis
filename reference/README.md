@@ -6,25 +6,29 @@ top of the **Agent Development Kit (ADK)** using the full suite of canonical
 
 ## Getting Started
 
-Mantis requires **Python 3.12 or newer**. First, install python3-venv such as
-with `sudo apt install python3-venv`, then run the install script. Mantis comes
-with automated configuration and launcher tools (`mantis-configure` and
+Mantis requires **Python 3.12 – 3.14** (`sudo apt install python3-venv` on
+Debian/Ubuntu) on Linux, WSL2, or macOS (native Windows is unsupported). Mantis
+comes with automated configuration and launcher tools (`mantis-configure` and
 `mantis-launch`):
 
 ```bash
 cd reference && ./install.sh
 
-# 0. Authenticate Google Cloud Application Default Credentials (ADC) if using Vertex AI
-gcloud auth application-default login
+# 0. Authenticate an LLM provider (pick one):
+gcloud auth application-default login        # Vertex AI ADC
+# or: export GEMINI_API_KEY=...              # Gemini API
+# or: see https://docs.litellm.ai/docs/providers for other providers / --api-base
 
 # 1. Fast Configuration & Capability Auto-Detection (or --interactive wizard)
-python3 scripts/configure.py --auto
+.venv/bin/python3 scripts/configure.py --auto
 
 # 2. Fast Preflight Validation (~1s) & Live Reachability Probe
-python3 scripts/configure.py --test --probe
+.venv/bin/python3 scripts/configure.py --test --probe
 
-# 3. Launch Vulnerability Review Campaign (file or repository)
-./run.sh path/to/code            # a file or a directory
+# 3. Launch Vulnerability Review Campaign (file or repository; defaults to --depth 30)
+./run.sh path/to/code            # balanced full-stack + firmware/RTL scan
+./run.sh path/to/code --depth 10 # fast triage
+./run.sh path/to/code --depth 100 # exhaustive multi-pass audit
 ```
 
 ### Local Configuration Overlay (`workflow.local.json`)
@@ -38,9 +42,9 @@ Mantis uses a layered configuration pattern:
   configurations). When present, it automatically merges on top of
   `workflow.json`.
 
-When you run `./run.sh` or `scripts/configure.py --auto`, Mantis auto-heals
-unconfigured placeholders and writes the resolved settings into
-`workflow.local.json`. This ensures your `git status` remains clean after
+When you run `./run.sh` or `.venv/bin/python3 scripts/configure.py --auto`,
+Mantis auto-heals unconfigured placeholders and writes the resolved settings
+into `workflow.local.json`. This ensures your `git status` remains clean after
 running campaigns. To opt out of auto-healing, pass `--no-auto-configure`. To
 explicitly save changes to the base tracked `workflow.json`, use
 `--save-tracked` (or `--global`).
@@ -50,7 +54,7 @@ You can customize the sandbox execution mechanism (`static-only`, `gvisor`,
 
 ```bash
 # Switch to Static-only (zero host virtualization requirements)
-python3 scripts/configure.py --sandbox static-only
+.venv/bin/python3 scripts/configure.py --sandbox static-only
 
 # Or pass runtime overrides directly to launch:
 ./run.sh path/to/code --sandbox static-only --model gemini-3.8-flash
@@ -60,8 +64,8 @@ Once you have run it you can add the mantis-advise skill to your favorite coding
 agent and use that while developing your code to have your coding agent attempt
 to create fewer vulnerabilities. To try it manually you can run the script:
 
-```
-python3 scripts/advise.py --file path/to/file.py   # query accumulated knowledge
+```bash
+.venv/bin/python3 scripts/advise.py --file path/to/file.py   # query accumulated knowledge
 ```
 
 ### Secure Development Loop (MCP Server)
@@ -242,6 +246,54 @@ line always names which of the two it is.
 The seed is `core.cost.DEFAULT_CAMPAIGN_TOKENS`. It is an assumption about how
 many turns a campaign takes, not a measurement, and is the number to tune if
 estimates are consistently wrong for your workflow.
+
+## Audit Depth
+
+`--depth N` (default **`30`**) maps a single continuous `1..100` slider onto the
+levers that govern vulnerability recall without relaxing existing budget
+guardrails (`--token-budget`, `--max-time`, `--max-steps`):
+
+| `--depth` | Tier         | Active File Coverage      | Reasoning Effort      | Passes                                 | Typical Use                                                                                         |
+| --------- | ------------ | ------------------------- | --------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `1–15`    | `quick`      | `15%–30%`                 | `low`                 | `1`                                    | Fast triage for Critical/High bugs (single campaign on typical repos at `1–10`).                    |
+| `16–45`   | `standard`   | `31%–62%` (`45%` at `30`) | `low` → `medium`      | `1`                                    | Balanced default (`30`): risk-ranked batches across full-stack, firmware/RTL, IaC, and custom DSLs. |
+| `46–74`   | `thorough`   | `63%–94%`                 | `high`                | `1`                                    | Deep review across all vulnerability classes, smaller per-campaign batches, higher checklist caps.  |
+| `75–89`   | `deep`       | `95%–100%`                | `high`                | `2`                                    | Near-complete coverage with two independent orthogonal passes.                                      |
+| `90–100`  | `exhaustive` | `100%` (+ tests)          | `max` (model-clamped) | `2` (`3` on small targets at `95–100`) | Exhaustive micro-batched audit across every active file and security-relevant asset.                |
+
+```bash
+./run.sh /path/to/repo              # default --depth 30
+./run.sh /path/to/repo --depth 10   # quick triage
+./run.sh /path/to/repo --depth 65   # thorough single-pass review
+./run.sh /path/to/repo --depth 100  # exhaustive multi-pass audit
+```
+
+Key guarantees of `--depth`:
+
+- **Explicit overrides always win**: passing `--scan-mode`, `--passes`,
+  `--reasoning-effort`, `--token-budget` / `--max-tokens`, `--max-time`, or
+  `--max-slices` overrides the corresponding depth-derived default.
+- **Hard budget guardrails stay intact**: `--depth 100` never raises or bypasses
+  wall-clock or token ceilings; if a deep scan hits a ceiling it pauses cleanly
+  and resumes via `--resume`.
+- **Blocklist-default, cross-domain file selection**: only pure styling, locale,
+  and binary/media/archive noise is excluded from primary risk batches. Active
+  code, firmware/RTL (`.v`, `.sv`, `.vhd`, `.vhdl`, embedded/eBPF), Smart
+  Contracts/ZK, CI/CD workflows, mobile, AI/ML pipelines, desktop/extensions,
+  IaC/policies, and unknown text/DSL files all remain eligible at every depth.
+- **INV-2 independence preserved**: depth-derived hunting directives are
+  injected into hunting stages only — never into `reviewer` or `critic`.
+
+### Repository Documentation & Threat-Model Discovery
+
+On directory scans, Mantis performs a symlink-safe, bounded discovery of
+existing repository documentation (`README.md`, `SECURITY.md`,
+`.github/SECURITY.md`, `docs/THREAT_MODEL.md`, architecture/design specs) and
+provides an inventory to `architect` and `threat_modeler` strictly as untrusted
+`TIER_INTENT` context. Agents use these docs to understand system purpose, trust
+boundaries, and stated security invariants — and verify those claims skeptically
+against the actual implementation. Documentation context is withheld from
+independent verifier/judge stages to preserve INV-2.
 
 ## Scan Modes
 

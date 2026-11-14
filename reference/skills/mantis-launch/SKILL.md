@@ -52,6 +52,11 @@ target repositories.
   - `--timeout`: LLM request timeout in seconds.
   - `--db` / `-d`: Custom path to SQLite knowledge database (default:
     `knowledge.db`).
+  - `--depth`: Continuous audit depth from `1` (fast shallow triage) to `100`
+    (exhaustive full-stack + firmware/RTL coverage with multi-pass deep
+    reasoning). Defaults to `30` when omitted. Explicit flags (`--scan-mode`,
+    `--passes`, `--reasoning-effort`, `--token-budget`, `--max-time`) always
+    take precedence, and existing budget guardrails remain enforced.
   - `--scan-mode`: Scan scope strategy (`auto`, `whole`, `file-by-file`,
     `cross-functional`, `changed`). Use `changed` (without `--resume`) on the
     same `knowledge.db` to scan newly added/edited files and verify whether
@@ -92,8 +97,12 @@ Before starting a security campaign, `mantis-launch`:
 # Scan a specific file
 "$MANTIS_HOME/reference/run.sh" src/server/auth.py
 
-# Scan an entire repository
+# Scan an entire repository (defaults to --depth 30)
 "$MANTIS_HOME/reference/run.sh" .
+
+# Dial scan depth down for quick triage or up for exhaustive multi-pass coverage
+"$MANTIS_HOME/reference/run.sh" . --depth 10
+"$MANTIS_HOME/reference/run.sh" . --depth 100
 ```
 
 ### 2. Launch with Static Analysis Only (Zero Sandbox Requirements)
