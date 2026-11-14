@@ -264,7 +264,7 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
         except OSError:
             pass
 
-    if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and clean_path:
+    if _is_single_file_campaign(ctx) and ctx.jail_dir and clean_path:
         # A single-file campaign reads its one file. The guest holds the
         # whole tree (a PoC needs the module around the file), and it
         # resolves paths against ITS workdir: "../../../workspace/x" climbs
@@ -665,6 +665,18 @@ def _find_matching_jail_files(jail_root: str, suffix: str, max_entries: int = 10
     return matches
 
 
+def _is_single_file_campaign(ctx: Any) -> bool:
+    """True only for true single-file campaigns, never multi-file cross-functional batches."""
+    if ctx is None or not getattr(ctx, "target_file", "") or not os.path.isfile(ctx.target_file):
+        return False
+    group = getattr(ctx, "group_targets", ()) or ()
+    if len(group) > 1:
+        return False
+    if getattr(ctx, "scan_mode", "") == "cross-functional":
+        return False
+    return True
+
+
 def _resolve_citation_checked(
     jail_root: str,
     rel_path: str,
@@ -1045,6 +1057,7 @@ def _citation_problems(
     target_file: str = "",
     path_root: str = "",
     workdir: str = "/workspace",
+    allow_multi_file: bool = False,
 ) -> "list[str]":
     """Collects provably false citations across findings. Never raises."""
     problems: "list[str]" = []
@@ -1082,7 +1095,7 @@ def _citation_problems(
     # the verifier may open or speak about.
     single_target = ""
     try:
-        if target_file and os.path.isfile(target_file):
+        if target_file and os.path.isfile(target_file) and not allow_multi_file:
             single_target = os.path.realpath(target_file)
     except OSError:
         single_target = ""
@@ -1303,10 +1316,10 @@ def report_findings(report: ReportedFindingsBatch) -> str:
         single_target_rel = ""
         single_real = ""
         effective_root = jail_real_dir
+        is_single_file = _is_single_file_campaign(ctx)
         if (
             jail_real_dir
-            and ctx.target_file
-            and os.path.isfile(ctx.target_file)
+            and is_single_file
             and getattr(ctx, "active_node", "") not in _RUN_WIDE_FINDINGS_NODES
         ):
             raw_path_root = getattr(ctx, "path_root", "") or ""
@@ -1358,6 +1371,7 @@ def report_findings(report: ReportedFindingsBatch) -> str:
                         ctx.target_file or "",
                         getattr(ctx, "path_root", "") or "",
                         workdir=workdir,
+                        allow_multi_file=not is_single_file,
                     )
                     if cit_probs:
                         only_missing_fp = False
@@ -1938,7 +1952,7 @@ async def list_files(directory: str = "") -> str:
     # find_callers, find_callees, get_function_boundary). Listing the tree a
     # directory at a time is how an architect spent two hundred tool calls
     # mapping a repository it was asked about one file of.
-    if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and os.path.isdir(ctx.jail_dir):
+    if _is_single_file_campaign(ctx) and ctx.jail_dir and os.path.isdir(ctx.jail_dir):
         jail_real = os.path.realpath(ctx.jail_dir)
         own_dir = os.path.dirname(os.path.realpath(ctx.target_file))
         try:
@@ -1951,6 +1965,43 @@ async def list_files(directory: str = "") -> str:
         return (_bounded_listing(sorted(rels), rel_dir if rel_dir != "." else "")
                 + "\nNOTE: single-file campaign: this is the scanned file's own directory. The rest of the "
                 "tree is reachable through find_symbol, find_callers, find_callees and get_function_boundary.")
+
+    # Multi-file batch campaigns in cross-functional mode default an empty
+    # list_files("") call to their assigned batch file list (except during
+    # repo-wide shared-prefix architect/threat_modeler stages), while passing
+    # "." or a subdirectory path still lists the broader repository.
+    if (
+        directory.strip() == ""
+        and getattr(ctx, "scan_mode", "") == "cross-functional"
+        and len(getattr(ctx, "group_targets", ()) or ()) > 1
+        and ctx.jail_dir
+        and os.path.isdir(ctx.jail_dir)
+        and all(os.path.isfile(str(p)) for p in (getattr(ctx, "group_targets", ()) or ()))
+    ):
+        from core.graph_loader import prefix_reuse_applies
+
+        if not (
+            getattr(ctx, "active_node", "") in ("architect", "threat_modeler")
+            and prefix_reuse_applies(
+                getattr(ctx, "scan_mode", ""),
+                getattr(ctx, "jail_dir", ""),
+                getattr(ctx, "path_root", ""),
+                getattr(ctx, "target_file", ""),
+            )
+        ):
+            jail_real = os.path.realpath(ctx.jail_dir)
+            batch_rels: list[str] = []
+            for p in getattr(ctx, "group_targets", ()) or ():
+                p_real = os.path.realpath(str(p))
+                if p_real.startswith(jail_real + os.sep):
+                    batch_rels.append(os.path.relpath(p_real, jail_real).replace(os.sep, "/"))
+            batch_rels = [p for p in _without_excluded(ctx, batch_rels) if not _is_protected_rel_path(p)]
+            if batch_rels:
+                return (
+                    _bounded_listing(sorted(set(batch_rels)), "")
+                    + f"\nNOTE: batch campaign scope ({len(set(batch_rels))} assigned file(s)). "
+                    "Pass '.' or a subdirectory path to inspect other files in the repository."
+                )
 
     # Directory-slice campaigns in cross-functional mode default an empty
     # list_files("") call to their assigned slice directory rather than dumping

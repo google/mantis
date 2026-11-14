@@ -376,13 +376,17 @@ async def get_function_boundary(filepath: str, line: int) -> str:
             except OSError:
                 pass
         if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and resolved:
-            req_target = os.path.realpath(os.path.join(ctx.jail_dir, resolved))
-            real_target = os.path.realpath(ctx.target_file)
-            if os.path.exists(req_target) and req_target != real_target:
-                return (
-                    "Error: Permission denied. Single-file scans may only read "
-                    f"the scanned file '{os.path.basename(real_target)}'."
-                )
+            if (
+                len(getattr(ctx, "group_targets", ()) or ()) <= 1
+                and getattr(ctx, "scan_mode", "") != "cross-functional"
+            ):
+                req_target = os.path.realpath(os.path.join(ctx.jail_dir, resolved))
+                real_target = os.path.realpath(ctx.target_file)
+                if os.path.exists(req_target) and req_target != real_target:
+                    return (
+                        "Error: Permission denied. Single-file scans may only read "
+                        f"the scanned file '{os.path.basename(real_target)}'."
+                    )
 
         header = (
             f"{res.get('qualified_name') or ''} [{res.get('kind')}] "

@@ -126,6 +126,13 @@ class RunContext:
     # is CP-4 fenced untrusted bug-report evidence to hunt variants of.
     operator_focus: str = ""
     seed_report_block: str = ""
+    # Continuous audit depth (`1..100`, default `30`) and its operator-authored
+    # hunting-stage directive (injected into HUNTING_STAGES only, preserving INV-2).
+    depth: int = 30
+    depth_directive: str = ""
+    # Lazily discovered `TIER_INTENT` repository documentation inventory surfaced
+    # only to `architect` and `threat_modeler` on non-single-file scans (INV-2).
+    repo_docs_inventory: Optional[str] = None
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

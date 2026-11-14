@@ -652,7 +652,11 @@ def _is_in_scope_code_read(
         return True
     try:
         jail_real = os.path.realpath(ctx.jail_dir).rstrip("/")
-        if os.path.isfile(ctx.target_file):
+        if (
+            os.path.isfile(ctx.target_file)
+            and len(getattr(ctx, "group_targets", ()) or ()) <= 1
+            and getattr(ctx, "scan_mode", "") != SCAN_MODE_CROSS_FUNCTIONAL
+        ):
             return True
         scope_roots = [
             os.path.realpath(str(p)).rstrip("/")
@@ -682,31 +686,53 @@ def _is_in_scope_code_read(
 def _render_slice_scope_directive(
     scan_item: str, group: dict, jail_dir: str
 ) -> str:
-    """Operator-authored scope directive anchoring a directory-slice campaign
-    to its assigned slice directory (or grouped slice directories)."""
+    """Operator-authored scope directive anchoring a directory-slice or
+    multi-file depth-batch campaign to its assigned targets."""
     if not scan_item or not jail_dir:
         return ""
     try:
         jail_real = os.path.realpath(str(jail_dir)).rstrip("/")
         targets = [str(t) for t in (group.get("targets") or [scan_item]) if t]
-        rels = []
+        dir_rels = []
+        file_rels = []
         for t in targets:
             t_real = os.path.realpath(t).rstrip("/")
-            if not os.path.isdir(t_real) or t_real == jail_real:
+            if t_real == jail_real:
                 continue
-            if t_real.startswith(jail_real + os.sep):
-                rels.append(os.path.relpath(t_real, jail_real).replace(os.sep, "/"))
-        if not rels:
-            return ""
-        shown = ", ".join(f"'{r}/'" for r in rels[:6])
-        primary = rels[0]
-        return (
-            f"\nAssigned Campaign Target Scope: {shown}. "
-            f"Focus your enumeration, planning, and source reads on {shown} first "
-            f"(list_files('') defaults to '{primary}/'). You may inspect callers or "
-            "callees outside this slice to verify cross-boundary dataflow, but "
-            f"coverage credit requires auditing source files inside {shown}."
-        )
+            if not t_real.startswith(jail_real + os.sep):
+                continue
+            rel = os.path.relpath(t_real, jail_real).replace(os.sep, "/")
+            if os.path.isdir(t_real):
+                dir_rels.append(rel)
+            elif os.path.isfile(t_real):
+                file_rels.append(rel)
+        if dir_rels:
+            shown = ", ".join(f"'{r}/'" for r in dir_rels[:6])
+            primary = dir_rels[0]
+            return (
+                f"\nAssigned Campaign Target Scope: {shown}. "
+                f"Focus your enumeration, planning, and source reads on {shown} first "
+                f"(list_files('') defaults to '{primary}/'). You may inspect callers or "
+                "callees outside this slice to verify cross-boundary dataflow, but "
+                f"coverage credit requires auditing source files inside {shown}."
+            )
+        if len(file_rels) > 1:
+            shown_files = file_rels[:40]
+            bullet_list = "\n".join(f"  - {r}" for r in shown_files)
+            extra = (
+                f"\n  - ... ({len(file_rels) - len(shown_files)} additional assigned file(s); call list_files('') for all)"
+                if len(file_rels) > len(shown_files)
+                else ""
+            )
+            return (
+                f"\nAssigned Campaign File Batch ({len(file_rels)} file(s)):\n"
+                f"{bullet_list}{extra}\n"
+                "Focus your planning, exploration, and vulnerability analysis on these "
+                "assigned batch files first (list_files('') lists this batch). You may "
+                "read helpers, middleware, sanitizers, or RTL submodules outside the batch "
+                "to trace cross-file dataflow, and report findings across all assigned files."
+            )
+        return ""
     except OSError:
         return ""
 
@@ -2015,6 +2041,83 @@ def resolve_scan_targets(
     if not surveyor_cfg.get("enabled", True) and mode in (SCAN_MODE_AUTO, SCAN_MODE_CROSS_FUNCTIONAL):
         return whole
 
+    if mode == SCAN_MODE_AUTO and config.get("depth") is not None:
+        # Preserve incremental partial-coverage `auto` sweeps when `--depth` was
+        # NOT explicitly passed and the spend ledger already has partial file
+        # coverage (`0 < len(uncovered) < len(discovered_files)`). Fresh repos,
+        # fully covered repos, and explicit `--depth N` runs use depth planning.
+        _partial_uncovered_sweep = False
+        if not config.get("_depth_explicit") and db_path and len(discovered_files) > threshold:
+            try:
+                from core.config import normalize_model_id
+                from core.cost import uncovered_files
+
+                _run_model = normalize_model_id(str(config.get("default_model") or ""))
+                _uncov = uncovered_files(
+                    db_path,
+                    discovered_files,
+                    model=_run_model,
+                    harness_fingerprint=str(config.get("harness_fingerprint") or ""),
+                    rescan_changed_harness=bool(config.get("rescan_changed_harness")),
+                )
+                if _uncov and len(_uncov) < len(discovered_files):
+                    _partial_uncovered_sweep = True
+            except Exception:
+                _partial_uncovered_sweep = False
+
+        if not _partial_uncovered_sweep:
+            # Depth-calibrated target planning (`--depth 1..100`, default `30`):
+            # keeps small targets and shallow quick scans (`1..10`) in a single
+            # whole-target campaign while partitioning larger targets into
+            # risk-ranked, subsystem-coherent full-stack + RTL file batches under
+            # `cross-functional` mode (preserving shared-prefix architect/threat-model
+            # reuse, deterministic batch checklists, and coverage ledger stamping).
+            from core.depth import (
+                count_active_security_files,
+                plan_depth_batches,
+                resolve_depth_profile,
+            )
+
+            try:
+                d_profile = resolve_depth_profile(config["depth"])
+            except Exception:
+                d_profile = resolve_depth_profile()
+
+            active_files = count_active_security_files(
+                target_path,
+                discovered_files,
+                include_tier2=d_profile.include_tier2_tests,
+            )
+            if active_files <= d_profile.whole_file_limit or d_profile.max_batches == 1:
+                return whole
+
+            astm = precomputed_astm
+            if astm is None:
+                try:
+                    astm = survey(target_path)
+                except Exception as exc:
+                    print(
+                        f"[SURVEYOR WARNING] Depth batch survey failed ({exc}); "
+                        "continuing with lexical risk ranking.",
+                        file=sys.stderr,
+                    )
+                    astm = None
+            batches = plan_depth_batches(target_path, discovered_files, d_profile, astm=astm)
+            if not batches:
+                return whole
+            covered = sum(len(b["targets"]) for b in batches)
+            if isinstance(scope_out, dict):
+                scope_out["depth_groups"] = batches
+                scope_out["depth_active_files"] = active_files
+                scope_out["depth_covered_files"] = covered
+            print(
+                f"[DEPTH {d_profile.depth}/100 ({d_profile.tier})] Planned {len(batches)} "
+                f"risk-ranked batch(es) covering {covered}/{max(active_files, covered)} "
+                f"active security file(s) (effort={d_profile.reasoning_effort}).",
+                file=sys.stderr,
+            )
+            return ([b["targets"][0] for b in batches], astm, SCAN_MODE_CROSS_FUNCTIONAL)
+
     if mode == SCAN_MODE_AUTO:
         # `auto` chooses whole-target when the repository fits in a single campaign.
         # Past that, the choice is driven by COVERAGE, which the spend ledger
@@ -3310,6 +3413,8 @@ async def pipeline(
     enable_replan: Optional[bool] = None,
     parallel: int = 1,
     passes: int = 1,
+    passes_explicit: bool = False,
+    depth: Optional[int] = None,
     parallel_ramp_seconds: float = 0.0,
     focus: str = "",
     seed_report_path: str = "",
@@ -3368,6 +3473,42 @@ async def pipeline(
     total_passes = max(1, int(passes or 1))
     if total_passes > 1:
         banner_resume_flags["--passes"] = total_passes
+
+    from core.depth import (
+        DEFAULT_DEPTH,
+        parse_depth,
+        render_depth_hunting_directive,
+        resolve_depth_profile,
+    )
+
+    if depth is not None:
+        try:
+            resolved_depth = parse_depth(depth)
+        except ValueError as exc:
+            print(f"Error: --depth: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        banner_resume_flags["--depth"] = resolved_depth
+    else:
+        resolved_depth = DEFAULT_DEPTH
+        # Check persisted workflow.local.json / workflow.json depth if any
+        for _cand_wf in (
+            str(Path(workflow_path).with_name("workflow.local.json")) if load_local else "",
+            workflow_path,
+        ):
+            if not _cand_wf or not os.path.isfile(_cand_wf):
+                continue
+            try:
+                with open(_cand_wf, "r", encoding="utf-8") as _wf_fh:
+                    _wf_cfg = (json.load(_wf_fh) or {}).get("config") or {}
+                if _wf_cfg.get("depth") is not None:
+                    resolved_depth = parse_depth(_wf_cfg["depth"])
+                    break
+            except Exception:
+                continue
+    depth_profile = resolve_depth_profile(resolved_depth)
+    effective_reasoning_effort = reasoning_effort_override
+    if not effective_reasoning_effort and depth_profile.reasoning_effort != "medium":
+        effective_reasoning_effort = depth_profile.reasoning_effort
     if no_memory:
         banner_resume_flags["--no-memory"] = True
     if intra_run_learning:
@@ -3422,7 +3563,7 @@ async def pipeline(
             sandbox_override=effective_sandbox_override,
             db_override=db_override,
             timeout_override=timeout_override,
-            reasoning_effort_override=reasoning_effort_override,
+            reasoning_effort_override=effective_reasoning_effort,
             load_local=effective_load_local,
         )
     except ConfigValidationError as e:
@@ -3709,6 +3850,7 @@ async def pipeline(
             return 1
         changed_files_override = listed
     scan_scope: dict = {}
+    config = {**config, "depth": resolved_depth, "_depth_explicit": depth is not None}
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
         target_path,
         config,
@@ -3727,11 +3869,27 @@ async def pipeline(
             saved_plan = load_run_plan(db_path, run_id, str(target_path))
         except Exception:
             saved_plan = None
+    if saved_plan and saved_plan.get("depth") is not None and depth is None:
+        try:
+            resolved_depth = parse_depth(saved_plan["depth"])
+            depth_profile = resolve_depth_profile(resolved_depth)
+            banner_resume_flags["--depth"] = resolved_depth
+        except ValueError:
+            pass
     if saved_plan and saved_plan.get("targets"):
         targets_to_scan = list(saved_plan["targets"])
-    if saved_plan and int(saved_plan.get("passes") or 1) > 1 and int(passes or 1) <= 1:
+    if saved_plan and int(saved_plan.get("passes") or 1) > 1 and not passes_explicit and int(passes or 1) <= 1:
         total_passes = int(saved_plan["passes"])
         banner_resume_flags["--passes"] = total_passes
+    elif not passes_explicit and int(passes or 1) <= 1:
+        depth_passes = (
+            depth_profile.small_target_passes
+            if scan_mode == SCAN_MODE_WHOLE and len(discovered_files) <= 15
+            else depth_profile.passes
+        )
+        if depth_passes > total_passes:
+            total_passes = depth_passes
+            banner_resume_flags["--passes"] = total_passes
     # `changed` / `uncovered` with nothing left is a complete answer, not an
     # empty plan: the resolver printed it, and a run that scans nothing must
     # not confirm a work plan, open campaigns, or write an empty report.
@@ -3875,6 +4033,7 @@ async def pipeline(
     # cannot gain a kwarg.
     _WORK_PLAN_DISCLOSURE["focus"] = str(focus or "")
     campaign_plan = {"available": False}
+    depth_groups = scan_scope.get("depth_groups") or []
     if resume_run_id and saved_plan is not None:
         saved_cp = saved_plan.get("campaign_plan")
         if isinstance(saved_cp, dict) and saved_cp.get("available"):
@@ -3888,6 +4047,8 @@ async def pipeline(
                     planner_llm = ResilientLiteLlm(**planner_kwargs)
             except Exception:
                 planner_llm = None
+    elif depth_groups:
+        plan_groups = _normalize_campaign_groups(depth_groups)
     elif scan_mode == SCAN_MODE_CROSS_FUNCTIONAL:
         planning_attempted = False
         try:
@@ -3999,6 +4160,7 @@ async def pipeline(
                 focus_files=focus_files if scan_mode == SCAN_MODE_CHANGED else None,
                 focus_groups=focus_groups if scan_mode == SCAN_MODE_CHANGED else None,
                 passes=total_passes,
+                depth=resolved_depth,
             )
         except Exception:
             pass
@@ -4083,7 +4245,14 @@ async def pipeline(
             targets_to_scan = [t for t in planned if _key(t) in remaining_target_keys]
             if plan_groups:
                 plan_groups = [
-                    {**g, "targets": [m for m in g["targets"] if _key(m) in remaining_target_keys]}
+                    g
+                    if (
+                        g.get("targets")
+                        and _key(g["targets"][0]) in remaining_target_keys
+                        and len(g["targets"]) > 1
+                        and not any(_key(m) in remaining_target_keys for m in g["targets"][1:])
+                    )
+                    else {**g, "targets": [m for m in g["targets"] if _key(m) in remaining_target_keys]}
                     for g in plan_groups
                 ]
                 plan_groups = [g for g in plan_groups if g["targets"]]
@@ -4184,7 +4353,14 @@ async def pipeline(
             if plan_groups:
                 kept = set(_key(t) for t in remaining)
                 plan_groups = [
-                    {**g, "targets": [m for m in g["targets"] if _key(m) in kept]}
+                    g
+                    if (
+                        g.get("targets")
+                        and _key(g["targets"][0]) in kept
+                        and len(g["targets"]) > 1
+                        and not any(_key(m) in kept for m in g["targets"][1:])
+                    )
+                    else {**g, "targets": [m for m in g["targets"] if _key(m) in kept]}
                     for g in plan_groups
                 ]
                 plan_groups = [g for g in plan_groups if g["targets"]]
@@ -4328,6 +4504,7 @@ async def pipeline(
                 campaign_plan=campaign_plan,
                 overwrite=True,
                 passes=total_passes,
+                depth=resolved_depth,
             )
         except Exception:
             pass
@@ -4553,8 +4730,14 @@ async def pipeline(
         freeze_memory_to_prior_runs=not bool(intra_run_learning),
         operator_focus=op_focus_block,
         seed_report_block=seed_report_block,
+        depth=resolved_depth,
     )
 
+    print(
+        f"\n🎚️ Audit depth: {depth_profile.depth}/100 ({depth_profile.tier}) — "
+        f"effort={effective_reasoning_effort or depth_profile.reasoning_effort}, "
+        f"passes={total_passes}, campaigns={len(campaign_groups)}"
+    )
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
 
     # A structured record of every stage's prose, tool calls and tool responses,
@@ -4675,6 +4858,13 @@ async def pipeline(
                 # Reaches every node through its instructions: the seed
                 # message below is seen by the first node only.
                 campaign_directive=effective_directive,
+                depth=resolved_depth,
+                depth_directive=render_depth_hunting_directive(
+                    depth_profile,
+                    pass_index=pass_idx,
+                    total_passes=total_passes,
+                    batch_file_count=len(group.get("targets") or ()),
+                ),
             )
             if resume_run_id:
                 _rehydrate_campaign_resume_state(

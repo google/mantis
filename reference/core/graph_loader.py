@@ -176,6 +176,7 @@ class GlobalConfig(_Base):
     api_base: Optional[str] = None
     timeout: Optional[float] = Field(default=None, gt=0)
     reasoning_effort: Optional[str] = None
+    depth: Optional[int] = Field(default=None, ge=1, le=100)
     retry_attempts: int = Field(default=3, ge=0)
     seed_prompt: str = Field(default=DEFAULT_SEED_PROMPT, max_length=_MAX_SEED_PROMPT_CHARS)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
@@ -2831,6 +2832,8 @@ CAMPAIGN_CONTEXT_MARKER = "[CAMPAIGN CONTEXT]"
 AUDIT_CHECKLIST_MARKER = "[DETERMINISTIC AUDIT CHECKLIST]"
 OPERATOR_FOCUS_MARKER = "[OPERATOR FOCUS]"
 OPERATOR_SEED_REPORT_MARKER = "[OPERATOR SEED REPORT]"
+DEPTH_DIRECTIVE_MARKER = "[DEPTH AUDIT PROFILE]"
+REPO_DOCS_DIRECTIVE_MARKER = "[REPOSITORY DOCUMENTATION INVENTORY"
 #: Characters of campaign context appended per node. Larger than the stage
 #: experience cap: the memory block alone lists every earlier finding here.
 MAX_CAMPAIGN_CONTEXT_CHARS = 8000
@@ -2846,6 +2849,10 @@ CHECKLIST_STAGES = ("planner", "explorer", "researcher")
 #: `reproducer`, `patcher`, `calibrator`) are deliberately excluded to preserve
 #: independent separation-of-duties neutrality (INV-2).
 HUNTING_STAGES = ("architect", "threat_modeler", "planner", "researcher", "explorer")
+#: Upstream understanding stages that receive the `TIER_INTENT` repository
+#: documentation & threat-model inventory (non-single-file scans only).
+#: Excluded from reviewer/critic/reproducer/patcher/calibrator (INV-2).
+REPO_DOCS_STAGES = ("architect", "threat_modeler")
 #: The stages that decide where to look. Matched by node id prefix, so
 #: `researcher_2` in a parallel archetype counts. The reproducer, patcher,
 #: calibrator, reflector and reporter work from this run's findings through
@@ -2867,6 +2874,11 @@ def _wants_audit_checklist(node_id: str) -> bool:
 def _wants_operator_steering(node_id: str) -> bool:
     nid = str(node_id or "")
     return any(nid == s or nid.startswith(s + "_") or nid.startswith(s + "-") for s in HUNTING_STAGES)
+
+
+def _wants_repo_docs(node_id: str) -> bool:
+    nid = str(node_id or "")
+    return any(nid == s or nid.startswith(s + "_") or nid.startswith(s + "-") for s in REPO_DOCS_STAGES)
 
 
 def _close_open_fence(text: str) -> str:
@@ -2895,6 +2907,7 @@ def _render_campaign_directive_blocks(
     wants_context = _wants_campaign_context(node_id)
     wants_checklist = _wants_audit_checklist(node_id)
     wants_steering = _wants_operator_steering(node_id)
+    wants_repo_docs = _wants_repo_docs(node_id)
     directive = str(getattr(ctx, "campaign_directive", "") or "")
     if (
         node_id in _PREFIX_REUSE_ARTIFACTS
@@ -2917,6 +2930,32 @@ def _render_campaign_directive_blocks(
     context = str(getattr(ctx, "campaign_context", "") or "") if wants_context else ""
     seed_block = str(getattr(ctx, "seed_report_block", "") or "") if wants_steering else ""
     op_focus = str(getattr(ctx, "operator_focus", "") or "") if wants_steering else ""
+    depth_dir = str(getattr(ctx, "depth_directive", "") or "") if wants_steering else ""
+    repo_docs = ""
+    if wants_repo_docs:
+        tf = str(getattr(ctx, "target_file", "") or "")
+        c_targets = tuple(getattr(ctx, "campaign_targets", ()) or ())
+        is_single_file = bool(
+            tf
+            and os.path.isfile(tf)
+            and not (getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL and len(c_targets) > 1)
+        )
+        if not is_single_file:
+            cached_docs = getattr(ctx, "repo_docs_inventory", None)
+            if cached_docs is None:
+                doc_root = (
+                    str(getattr(ctx, "path_root", "") or "")
+                    or str(getattr(ctx, "jail_dir", "") or "")
+                    or (tf if os.path.isdir(tf) else "")
+                )
+                if doc_root:
+                    from core.repo_docs import render_repo_docs_inventory
+
+                    cached_docs = render_repo_docs_inventory(doc_root)
+                else:
+                    cached_docs = ""
+                ctx.repo_docs_inventory = cached_docs
+            repo_docs = str(cached_docs or "")
     checklist = ""
     if wants_checklist:
         cached_cl = getattr(ctx, "audit_checklist", None)
@@ -2930,10 +2969,18 @@ def _render_campaign_directive_blocks(
             cached_cl = build_slice_audit_checklist(ctx)
             ctx.audit_checklist = cached_cl
         checklist = str(cached_cl or "")
-    if not directive and not context and not checklist and not seed_block and not op_focus:
+    if (
+        not directive
+        and not context
+        and not checklist
+        and not seed_block
+        and not op_focus
+        and not depth_dir
+        and not repo_docs
+    ):
         return []
     # Data before instruction: untrusted context / seed evidence come first, and
-    # the trusted operator focus last, so it is never enclosed by a fence.
+    # trusted operator instructions last, so they are never enclosed by a fence.
     blocks: list[str] = []
     if context and CAMPAIGN_CONTEXT_MARKER not in existing_text:
         block = f"\n\n{CAMPAIGN_CONTEXT_MARKER}{context}"
@@ -2944,11 +2991,15 @@ def _render_campaign_directive_blocks(
         blocks.append(_close_open_fence(f"\n\n{OPERATOR_SEED_REPORT_MARKER}{seed_block}"))
     if checklist and AUDIT_CHECKLIST_MARKER not in existing_text:
         blocks.append(_close_open_fence(checklist))
+    if repo_docs and REPO_DOCS_DIRECTIVE_MARKER not in existing_text:
+        blocks.append(f"\n\n{repo_docs}")
     if directive and CAMPAIGN_DIRECTIVE_MARKER not in existing_text:
         block = f"\n\n{CAMPAIGN_DIRECTIVE_MARKER}{directive}"
         if len(block) > MAX_CAMPAIGN_DIRECTIVE_CHARS:
             block = _close_open_fence(block[:MAX_CAMPAIGN_DIRECTIVE_CHARS]) + "\n[directive truncated]"
         blocks.append(block)
+    if depth_dir and DEPTH_DIRECTIVE_MARKER not in existing_text:
+        blocks.append(f"\n\n{DEPTH_DIRECTIVE_MARKER}\n{depth_dir}")
     if op_focus and OPERATOR_FOCUS_MARKER not in existing_text:
         blocks.append(f"\n\n{OPERATOR_FOCUS_MARKER}{op_focus}")
     return blocks
@@ -3050,7 +3101,11 @@ def _is_in_scope_stem_code_read(ctx: Any, tool_name: str, call_args: Any) -> boo
         return True
     try:
         jail_real = os.path.realpath(ctx.jail_dir).rstrip("/")
-        if os.path.isfile(ctx.target_file):
+        if (
+            os.path.isfile(ctx.target_file)
+            and len(getattr(ctx, "group_targets", ()) or ()) <= 1
+            and getattr(ctx, "scan_mode", "") != _SCAN_MODE_CROSS_FUNCTIONAL
+        ):
             return True
         scope_roots = [
             os.path.realpath(str(p)).rstrip("/")
@@ -3166,7 +3221,12 @@ def _make_single_file_stem_skip_before_agent_callback(node_id: str):
             if ctx is None or ctx.sandbox is None:
                 return None
             target = str(getattr(ctx, "target_file", "") or "")
-            if not target or not os.path.isfile(target):
+            if (
+                not target
+                or not os.path.isfile(target)
+                or len(getattr(ctx, "group_targets", ()) or ()) > 1
+                or getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL
+            ):
                 return None
             if not ctx.db_path or not ctx.run_id:
                 return None

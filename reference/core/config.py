@@ -4195,6 +4195,11 @@ def get_llm_kwargs(
         llm_kwargs["api_base"] = resolved_api_base
     if effort:
         clean_effort = str(effort).lower().strip()
+        if not is_claude_model(resolved_model) and clean_effort in ("xhigh", "max"):
+            # Non-Claude providers (e.g. Gemini) top out at "high"; clamp
+            # "xhigh"/"max" so high-depth profiles degrade gracefully instead
+            # of triggering UnsupportedParamsError.
+            clean_effort = "high"
         llm_kwargs["reasoning_effort"] = clean_effort
         if not is_claude_model(resolved_model) and (
             is_versioned_reasoning_model(resolved_model)

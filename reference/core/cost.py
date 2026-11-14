@@ -919,6 +919,7 @@ def record_run_plan(
     focus_groups: Optional[Sequence[dict]] = None,
     overwrite: bool = False,
     passes: Optional[int] = None,
+    depth: Optional[int] = None,
 ) -> bool:
     """Persists a run's initial planned targets and campaign groupings in
     `runs.metadata_json` (as relative paths under `target_root`) so `--resume`
@@ -935,6 +936,8 @@ def record_run_plan(
     payload: dict[str, Any] = {"targets": rel_targets}
     if passes is not None and int(passes) > 1:
         payload["passes"] = int(passes)
+    if depth is not None and not isinstance(depth, bool):
+        payload["depth"] = int(depth)
     if plan_groups:
         stored_groups = []
         for g in plan_groups:
@@ -1122,6 +1125,12 @@ def load_run_plan(db_path: str, run_id: str, target_root: str) -> Optional[dict]
             out["focus_groups"] = fgs
         if isinstance(raw_plan.get("passes"), int) and not isinstance(raw_plan.get("passes"), bool) and raw_plan["passes"] > 1:
             out["passes"] = int(raw_plan["passes"])
+        if (
+            isinstance(raw_plan.get("depth"), int)
+            and not isinstance(raw_plan.get("depth"), bool)
+            and 1 <= raw_plan["depth"] <= 100
+        ):
+            out["depth"] = int(raw_plan["depth"])
         return out
     except Exception:
         return None

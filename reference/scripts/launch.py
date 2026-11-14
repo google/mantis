@@ -81,6 +81,14 @@ class _LauncherArgumentParser(argparse.ArgumentParser):
         self.exit(64, f"{self.prog}: error: {message}\n")
 
 
+class _ExplicitPassesAction(argparse.Action):
+    """Records `--passes N` while tracking whether the flag was explicitly given."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_passes_explicit", True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _LauncherArgumentParser(
         description="Mantis Campaign Launcher: Automated Security Review Pipeline"
@@ -228,11 +236,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--passes",
         type=int,
         default=1,
+        action=_ExplicitPassesAction,
         help=(
             "Number of independent blind audit passes to run over each planned "
             "campaign slice (default: 1). With --passes N (N > 1), each pass "
             "runs in an isolated session without cross-pass coverage suppression "
             "and unions discovered findings into the consolidated run."
+        ),
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        metavar="1-100",
+        help=(
+            "Continuous audit depth from 1 (fast shallow triage) to 100 "
+            "(exhaustive full-stack + hardware/RTL coverage with multi-pass deep "
+            "reasoning). Defaults to 30 when omitted. Explicit flags (--scan-mode, "
+            "--passes, --reasoning-effort, --token-budget, --max-time) always take precedence."
         ),
     )
     parser.add_argument(
@@ -508,6 +529,8 @@ def run_launch(
     no_replan: bool = False,
     parallel: int = 1,
     passes: int = 1,
+    passes_explicit: bool = False,
+    depth: Optional[int] = None,
     parallel_ramp: float = 0.0,
     db_timeout: Optional[float] = None,
     focus: str = "",
@@ -542,6 +565,14 @@ def run_launch(
         os.environ["VERTEX_FLEX"] = "1"
     if max_input_tokens is not None and max_input_tokens > 0:
         os.environ["MANTIS_MAX_INPUT_TOKENS"] = str(int(max_input_tokens))
+
+    if depth is not None:
+        from core.depth import parse_depth
+        try:
+            depth = parse_depth(depth)
+        except ValueError as exc:
+            print(f"❌ Error: --depth: {exc}", file=sys.stderr)
+            return EXIT_USAGE
 
     # SECURITY (INV-4): component-wise symlink validation. A leaf-only is_symlink()
     # check is bypassed by a hostile checkout shipping an intermediate symlink
@@ -752,6 +783,8 @@ def run_launch(
         overrides["timeout"] = timeout
     if db_path:
         overrides["db_path"] = db_path
+    if depth is not None:
+        overrides["depth"] = depth
 
     if resume_run_id and scan_mode:
         from core.paths import resolve_db_path
@@ -815,9 +848,13 @@ def run_launch(
 
 
     if dry_run:
+        from core.depth import DEFAULT_DEPTH, resolve_depth_profile
+        _eff_depth = depth if depth is not None else (cfg.get("depth") or DEFAULT_DEPTH)
+        _dprof = resolve_depth_profile(_eff_depth)
         print("\n📋 Dry-Run Execution Plan:")
         print(f"  • Target:        {target_path}")
         print(f"  • Workflow:      {wf_file}")
+        print(f"  • Depth:         {_dprof.depth}/100 ({_dprof.tier}; effort={reasoning_effort or _dprof.reasoning_effort}, passes={passes if passes_explicit else _dprof.passes})")
         print(f"  • Sandbox:       {cfg.get('sandbox', {}).get('type', 'static-only')}")
         print(f"  • Model:         {model or cfg.get('default_model')}")
         print(f"  • Knowledge DB:  {db_path or cfg.get('db_path', 'knowledge.db')}")
@@ -887,6 +924,8 @@ def run_launch(
                 enable_replan=False if no_replan else None,
                 parallel=parallel,
                 passes=passes,
+                passes_explicit=passes_explicit,
+                depth=depth,
                 parallel_ramp_seconds=parallel_ramp,
                 db_timeout=db_timeout,
                 focus=focus,
@@ -981,6 +1020,12 @@ def main() -> int:
             parser.error(f"--max-input-tokens: {exc}")
     if args.passes is not None and int(args.passes) < 1:
         parser.error("--passes: must be >= 1")
+    if args.depth is not None:
+        from core.depth import parse_depth
+        try:
+            args.depth = parse_depth(args.depth)
+        except ValueError as exc:
+            parser.error(f"--depth: {exc}")
 
     # The spend report is written however the run ended -- a driver that
     # allotted this process a budget needs the number even when the process
@@ -1021,6 +1066,8 @@ def main() -> int:
             no_replan=args.no_replan,
             parallel=args.parallel,
             passes=args.passes,
+            passes_explicit=bool(getattr(args, "_passes_explicit", False)),
+            depth=args.depth,
             parallel_ramp=args.parallel_ramp,
             db_timeout=args.db_timeout,
             focus=args.focus,
