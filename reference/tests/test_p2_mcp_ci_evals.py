@@ -603,10 +603,10 @@ class TestP2McpCiEvals(unittest.TestCase):
     # 8. gap-degraded-structural-index-8: legitimately empty AST repos
     # ------------------------------------------------------------------
     def test_gap_degraded_structural_index_8_legitimately_empty_repo(self) -> None:
-        repo = Path(self.tmp) / "tf_repo"
+        repo = Path(self.tmp) / "yaml_repo"
         repo.mkdir()
-        (repo / "main.tf").write_text('resource "null_resource" "x" {}\n', encoding="utf-8")
-        state = mcp_server.MantisState(str(repo), home=str(Path(self.tmp) / "state_tf"))
+        (repo / "deploy.yaml").write_text("apiVersion: v1\nkind: ConfigMap\n", encoding="utf-8")
+        state = mcp_server.MantisState(str(repo), home=str(Path(self.tmp) / "state_yaml"))
         res = mcp_server.reindex(state)
         self.assertEqual(res["status"], "empty")
         self.assertEqual(res["total_files"], 0)
@@ -616,8 +616,8 @@ class TestP2McpCiEvals(unittest.TestCase):
         self.assertTrue(idx.is_legitimately_empty())
         self.assertTrue(pr_scan.index_is_repo_rooted(state))
 
-        record_spend(state.db_path, "run-tf", str(repo), "whole", tokens=20)
-        gate = mcp_server.check_change(state, files=["main.tf"])
+        record_spend(state.db_path, "run-yaml", str(repo), "whole", tokens=20)
+        gate = mcp_server.check_change(state, files=["deploy.yaml"])
         self.assertEqual(gate["verdict"], "PASS", gate)
         self.assertEqual(gate["coverage_gaps"], [])
 

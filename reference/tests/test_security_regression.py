@@ -5693,16 +5693,16 @@ class TestSurveyDisclosesWhatItCouldNotSee(unittest.TestCase):
         def builder(root: Path) -> None:
             self._build_recognized(root)
             for i in range(60):
-                self._write(root, f"web/page{i}.html", "<div>{{ user.name }}</div>\n")
+                self._write(root, f"web/page{i}.ftl", "<div>${user.name}</div>\n")
 
         cov = self._survey(builder)
         unopened = {item["ext"] for item in cov["unopened_languages"]}
         self.assertIn(
-            ".html", unopened,
+            ".ftl", unopened,
             f"Templates were never opened and never disclosed. Reported: {unopened}",
         )
         self.assertNotIn(
-            ".html",
+            ".ftl",
             {item["ext"] for item in cov["unrecognized_languages"]},
             "A file type that was never opened was reported as though it had been read "
             "and found uninteresting.",

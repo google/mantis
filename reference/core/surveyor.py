@@ -204,16 +204,52 @@ _CENSUS_MIN_SHARE = 0.02
 
 # --- Signal tables ------------------------------------------------------------------
 
-_UNSAFE_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".m", ".mm", ".s", ".asm"}
-_INTERPRETED_EXT = {".py", ".js", ".jsx", ".ts", ".tsx", ".rb", ".php", ".pl", ".sh", ".bash", ".lua"}
-_MEMORY_SAFE_EXT = {".rs", ".go", ".java", ".kt", ".swift", ".cs", ".scala", ".ml", ".hs", ".erl", ".ex"}
+_UNSAFE_EXT = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".m", ".mm", ".s", ".asm",
+    ".zig", ".cu", ".cuh", ".wgsl", ".hlsl", ".glsl", ".dts", ".dtsi", ".ld", ".lds",
+}
+_INTERPRETED_EXT = {
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts",
+    ".rb", ".php", ".pl", ".sh", ".bash", ".ps1", ".psm1", ".sql",
+    ".lua", ".vue", ".svelte", ".r", ".jl",
+}
+_MEMORY_SAFE_EXT = {
+    ".rs", ".go", ".java", ".kt", ".swift", ".cs", ".scala", ".sc",
+    ".ml", ".hs", ".erl", ".ex", ".exs", ".dart",
+    ".nim", ".cr", ".ada", ".adb", ".ads", ".groovy", ".clj", ".cljs", ".fs", ".fsx",
+}
+_RTL_EXT = {".v", ".vh", ".sv", ".svh", ".vhd", ".vhdl"}
+_CONTRACT_EXT = {".sol", ".vy", ".move", ".cairo", ".circom"}
+_TEMPLATE_CONFIG_EXT = {
+    ".html", ".htm", ".pug", ".ejs", ".hbs", ".jinja", ".jinja2",
+    ".tf", ".tfvars", ".hcl", ".bicep", ".rego", ".cedar",
+    ".xml", ".yml", ".yaml",
+}
 
-_SOURCE_EXT = _UNSAFE_EXT | _INTERPRETED_EXT | _MEMORY_SAFE_EXT
+_SOURCE_EXT = (
+    _UNSAFE_EXT
+    | _INTERPRETED_EXT
+    | _MEMORY_SAFE_EXT
+    | _RTL_EXT
+    | _CONTRACT_EXT
+    | _TEMPLATE_CONFIG_EXT
+)
 
-# Memory-unsafe code carries the classic corruption classes outright; interpreted code
-# trades those for injection and deserialization; memory-safe compiled code still has
-# logic flaws but a far smaller share of the historical CVE mass.
-_LANGUAGE_RISK = {"unsafe": 1.0, "interpreted": 0.6, "safe": 0.25, "other": 0.0}
+# Memory-unsafe code carries the classic corruption classes outright; hardware RTL
+# enforces root-of-trust/isolation boundaries directly in silicon; smart contracts
+# and ZK circuits guard immutable on-chain assets; interpreted code trades memory
+# corruption for injection and deserialization; templates/IaC/CI/policies carry
+# XSS and misconfiguration surfaces; memory-safe compiled code still has logic flaws
+# but a smaller share of historical CVE mass.
+_LANGUAGE_RISK = {
+    "unsafe": 1.0,
+    "rtl": 0.9,
+    "contract": 0.85,
+    "interpreted": 0.6,
+    "config_template": 0.45,
+    "safe": 0.25,
+    "other": 0.0,
+}
 
 # Attack-surface patterns. Weighted because "this file calls bind()" is far stronger
 # evidence of external reachability than "this file mentions argv".
@@ -232,22 +268,28 @@ _SURFACE_PATTERNS: tuple[tuple[re.Pattern, float, str], ...] = (
     (re.compile(r"\bmojo::|\bIPC_MESSAGE_|\bgrpc::|\bDBus[A-Z]|\bBinder\b|\bAIDL\b"), 2.5, "ipc_endpoint"),
     (re.compile(r"\b(?:setuid|seteuid|setgid|setresuid|setgroups)\s*\(|\bCAP_[A-Z_]{3,}"), 3.0, "privilege"),
     (re.compile(r"\b(?:memcpy|strcpy|strcat|sprintf|alloca|gets)\s*\("), 1.5, "unsafe_api"),
+    (re.compile(r"\bunsafe\s*\{|\b(?:std::mem::transmute|from_raw_parts(?:_mut)?|get_unchecked(?:_mut)?|ptrCast|alignCast|Marshal\.Copy)\b"), 2.5, "unsafe_api"),
     (re.compile(r"\b(?:getopt|getopt_long|ArgumentParser|OptionParser)\b"), 1.0, "cli_parser"),
     # --- Request-handling surface (the entry point for most web vulnerabilities) ---
     (re.compile(r"\breq\.(?:query|body|params|cookies|headers|files)\b"), 3.0, "request_handler"),
     (re.compile(r"\brequest\.(?:args|form|json|files|cookies|headers)\b"), 3.0, "request_handler"),
     (re.compile(r"@(?:app|bp|router)\.(?:route|get|post|put|delete|patch)\b"), 2.5, "request_handler"),
     (re.compile(r"\b(?:app|router)\.(?:get|post|put|delete|patch|use|all)\s*\("), 2.0, "request_handler"),
-    (re.compile(r"\b(?:RequestMapping|GetMapping|PostMapping|HttpServlet)\b"), 2.5, "request_handler"),
+    (re.compile(r"\b(?:RequestMapping|GetMapping|PostMapping|HttpServlet|HttpServletRequest|RestController)\b"), 2.5, "request_handler"),
+    (re.compile(r"\b(?:http\.HandleFunc|http\.ResponseWriter|gin\.Context|echo\.Context|fiber\.Ctx|mux\.Vars)\b"), 2.5, "request_handler"),
+    (re.compile(r"\[Http(?:Get|Post|Put|Delete|Patch)\b|\b(?:FromBody|FromQuery)\b|\$_(?:GET|POST|REQUEST|COOKIE|FILES)\b"), 2.5, "request_handler"),
     # --- Injection sinks ---
     (re.compile(r"\b(?:eval|execScript)\s*\(|\bnew\s+Function\s*\("), 3.0, "code_injection"),
     (re.compile(r"\bchild_process\b|\bexecSync\s*\(|\bspawnSync\s*\(|\bsubprocess\.(?:run|Popen|call)\b"), 3.0, "command_injection"),
     (re.compile(r"\bos\.system\s*\(|\bpopen\s*\(|\bshell\s*=\s*True\b"), 3.0, "command_injection"),
+    (re.compile(r"\b(?:exec\.Command(?:Context)?|Runtime\.getRuntime\(\)\.exec|ProcessBuilder|Process\.Start|shell_exec|passthru|proc_open|Invoke-Expression|Start-Process)\b"), 3.0, "command_injection"),
     (re.compile(r"\bsequelize\.query\s*\(|\.raw\s*\(|\bexecute\s*\(\s*[\"'`].*(?:SELECT|INSERT|UPDATE|DELETE)"), 3.0, "sql_injection"),
+    (re.compile(r"\b(?:createNativeQuery|FromSqlRaw|ExecuteSqlRaw|QueryContext|ExecContext|mysqli_query|pg_query|sp_executesql|EXECUTE\s+IMMEDIATE)\b"), 2.5, "sql_injection"),
     (re.compile(r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b.{0,40}(?:\+\s*\w+|\$\{|%s|\bformat\s*\()"), 2.5, "sql_injection"),
     # --- Deserialization / parsing ---
     (re.compile(r"\b(?:Deserialize|deserialize|Unmarshal|unmarshal|ParseFrom)\w*\s*\("), 2.0, "deserialization"),
     (re.compile(r"\bpickle\.loads?\b|\byaml\.load\s*\(|\bunserialize\s*\(|\bObjectInputStream\b"), 3.0, "deserialization"),
+    (re.compile(r"\b(?:BinaryFormatter|TypeNameHandling|Marshal\.load|YAML\.load|XStream|enableDefaultTyping)\b"), 3.0, "deserialization"),
     # --- Path handling / file surface ---
     (re.compile(r"\b(?:sendFile|readFileSync|createReadStream)\s*\(|\bfs\.(?:readFile|open|unlink)\b"), 2.0, "path_handling"),
     (re.compile(r"\bos\.path\.join\s*\(|\bopen\s*\(\s*(?:os\.path\.join|request|req)"), 1.5, "path_handling"),
@@ -255,9 +297,42 @@ _SURFACE_PATTERNS: tuple[tuple[re.Pattern, float, str], ...] = (
     (re.compile(r"\bjsonwebtoken\b|\bjwt\.(?:sign|verify|decode)\b|\bpassport\b|\bbcrypt\b"), 2.0, "authn"),
     (re.compile(r"\b(?:authorize|isAuthenticated|checkPermission|require_role|@login_required)\b"), 2.0, "authz"),
     # --- Outbound / SSRF ---
-    (re.compile(r"\baxios\.(?:get|post|request)\s*\(|\brequests\.(?:get|post)\s*\(|\burllib\.request\b"), 1.5, "outbound_request"),
+    (re.compile(r"\baxios\.(?:get|post|request)\s*\(|\brequests\.(?:get|post)\s*\(|\burllib\.request\b|\bhttp\.(?:Get|Post|NewRequest(?:WithContext)?)\s*\(|\bcurl_exec\s*\("), 1.5, "outbound_request"),
     # --- Crypto ---
     (re.compile(r"\bSSL_[a-z]|\bEVP_[A-Za-z]|\bRAND_bytes\b|\bcrypto::|\bcrypto\.create(?:Cipher|Hash|Hmac)"), 1.5, "crypto"),
+    # --- Frontend / DOM XSS & template sinks ---
+    (re.compile(r"\bbypassSecurityTrust(?:Html|Url|ResourceUrl|Script|Style)\s*\("), 3.0, "client_xss"),
+    (re.compile(r"\bdangerouslySetInnerHTML\b|\b(?:innerHTML|outerHTML)\s*=|\bdocument\.write\s*\(|\binsertAdjacentHTML\s*\("), 2.5, "client_xss"),
+    (re.compile(r"\bv-html\b|\[innerHTML\]|\{\{\{|\<%-|\bng-bind-html\b"), 2.5, "client_xss"),
+    (re.compile(r"\bwindow\.postMessage\s*\(|\baddEventListener\s*\(\s*['\"]message['\"]|\blocation\.(?:href|assign|replace)\b"), 2.0, "client_xss"),
+    # --- Client-side routing, auth & token storage ---
+    (re.compile(r"\bcanActivate\b|\bRouterModule\b|\blocalStorage\.(?:setItem|getItem)\s*\(|\bsessionStorage\.(?:setItem|getItem)\s*\(|\bdocument\.cookie\b"), 1.5, "client_routing_auth"),
+    # --- IaC / Cloud / K8s / IAM / Policy / XML / CORS misconfiguration ---
+    (re.compile(r"<!ENTITY|<!DOCTYPE|\bnoent\s*:\s*true\b|\bresolveExternals\b|\brejectUnauthorized\s*:\s*false\b|\bverify\s*=\s*False\b"), 2.5, "iac_misconfig"),
+    (re.compile(r"0\.0\.0\.0/0|\bprivileged\s*:\s*true\b|Access-Control-Allow-Origin[^\n]*\*|\bcors\s*\(\s*\)"), 2.0, "iac_misconfig"),
+    (re.compile(r"\b(?:hostNetwork|hostPID|hostIPC|allowPrivilegeEscalation|automountServiceAccountToken)\s*:\s*true\b|\brunAsUser\s*:\s*0\b|/var/run/docker\.sock\b|\bSYS_ADMIN\b"), 3.0, "iac_misconfig"),
+    (re.compile(r"[\"']Action[\"']\s*:\s*[\"']\*[\"']|[\"']Resource[\"']\s*:\s*[\"']\*[\"']|\bcluster-admin\b|\bdefault\s+allow\s*=\s*true\b|\bpermit\s*\(\s*principal\b"), 2.5, "iac_misconfig"),
+    # --- CI/CD & Supply Chain ---
+    (re.compile(r"\b(?:pull_request_target|workflow_run|write-all)\b|\$\{\{\s*github\.event\.(?:issue|pull_request|comment|head_commit|discussion|workflow_run)\."), 3.0, "cicd_supply_chain"),
+    (re.compile(r"(?:curl|wget)\s+[^\n|]*\|\s*(?:ba)?sh\b|\bid-token\s*:\s*write\b|\bcontents\s*:\s*write\b|\bself-hosted\b"), 2.5, "cicd_supply_chain"),
+    # --- Mobile (Android / iOS / Flutter / React Native) ---
+    (re.compile(r"\b(?:android:exported\s*=\s*[\"']true[\"']|usesCleartextTraffic|allowBackup\s*=\s*[\"']true[\"']|setJavaScriptEnabled|addJavascriptInterface|setAllowFileAccess|PendingIntent|ContentProvider|BroadcastReceiver)\b"), 2.5, "mobile_surface"),
+    (re.compile(r"\b(?:NSAllowsArbitraryLoads|WKWebView|UIWebView|evaluateJavaScript|SecItemAdd|kSecAttrAccessibleAlways|CFBundleURLSchemes|URLSessionDelegate)\b"), 2.5, "mobile_surface"),
+    # --- Smart Contracts / DeFi / ZK ---
+    (re.compile(r"\b(?:delegatecall|selfdestruct|tx\.origin|ecrecover|abi\.encodePacked|raw_call|create_minimal_proxy_to)\b|\.call\{value:|\bassembly\s*\{"), 3.0, "smart_contract"),
+    (re.compile(r"\b(?:pragma\s+solidity|pragma\s+circom)\b|\bcontract\s+\w+\s*(?:is|\{)|<--|<=="), 2.0, "smart_contract"),
+    # --- Firmware / Embedded / UEFI / eBPF ---
+    (re.compile(r"\b(?:SEC\s*\(\s*[\"'](?:kprobe|tracepoint|xdp|tc|lsm|socket)|bpf_probe_read|__iomem|ioremap|dma_alloc_coherent|EFI_BOOT_SERVICES|EFI_RUNTIME_SERVICES)\b"), 2.5, "firmware_embedded"),
+    # --- AI / ML / Agentic Pipelines ---
+    (re.compile(r"\b(?:torch\.load|joblib\.load|np\.load|numpy\.load|tf\.keras\.models\.load_model|keras\.models\.load_model)\s*\(|\btrust_remote_code\s*=\s*True\b|\bweights_only\s*=\s*False\b"), 3.0, "ai_ml_pipeline"),
+    (re.compile(r"\b(?:allow_dangerous_code\s*=\s*True|allow_dangerous_deserialization\s*=\s*True|PythonREPL|ShellTool|BashTool|mcp\.tool|call_tool)\b"), 2.5, "ai_ml_pipeline"),
+    # --- Desktop / Electron / Browser Extensions ---
+    (re.compile(r"\b(?:nodeIntegration\s*:\s*true|contextIsolation\s*:\s*false|webSecurity\s*:\s*false|allowRunningInsecureContent\s*:\s*true|enableRemoteModule\s*:\s*true|shell\.openExternal|ipcMain\.(?:on|handle)|chrome\.tabs\.executeScript|externally_connectable)\b"), 2.5, "desktop_extension"),
+    # --- Hardware / RTL security (Verilog, SystemVerilog, VHDL) ---
+    (re.compile(r"\b(?:csr_\w+|regwen\w*|priv_lvl\w*|mstatus|pmpcfg\w*|pmpaddr\w*|sec_lvl\w*|trustzone\w*|tzpc\w*|lock_reg\w*|wr_lock\w*|access_ctrl\w*)\b", re.IGNORECASE), 3.0, "rtl_privilege_csr"),
+    (re.compile(r"\b(?:jtag\w*|debug_en\w*|dbg_en\w*|dft_en\w*|scan_en\w*|lc_state\w*|life_cycle\w*|rma_en\w*|test_mode\w*|swd_\w+)\b", re.IGNORECASE), 3.0, "rtl_debug_lifecycle"),
+    (re.compile(r"\b(?:key_reg\w*|secret_key\w*|root_key\w*|aes_key\w*|otp_key\w*|keymgr\w*|zeroize\w*|key_clear\w*|sideload\w*|kmac\w*|trng\w*)\b", re.IGNORECASE), 2.5, "rtl_crypto_secret"),
+    (re.compile(r"\b(?:axi_\w+|axil_\w+|ahb_\w+|apb_\w+|tl_h2d\w*|tl_d2h\w*|dma_\w+|state_q\b|state_d\b|next_state\b|fsm_state\w*|full_case|parallel_case|translate_off)\b", re.IGNORECASE), 2.0, "rtl_bus_fsm"),
 )
 
 # Build manifests mark module boundaries. Matched by NAME only and read as text.
@@ -265,6 +340,8 @@ _BUILD_MANIFESTS = {
     "BUILD.gn", "BUILD.bazel", "BUILD", "CMakeLists.txt", "Makefile", "makefile",
     "pom.xml", "build.gradle", "build.gradle.kts", "package.json", "Cargo.toml",
     "go.mod", "setup.py", "pyproject.toml", "meson.build", "Kconfig", "configure.ac",
+    "Dockerfile", "Containerfile", "Chart.yaml", "AndroidManifest.xml", "Info.plist",
+    "pubspec.yaml", "Package.swift", "foundry.toml",
 }
 
 # Interface definition files mark TRUST boundaries, which is what the boundary signal is
@@ -281,7 +358,7 @@ _BUILD_MANIFESTS = {
 # top of the ranking.
 _INTERFACE_EXT = {
     ".mojom", ".proto", ".idl", ".aidl", ".thrift", ".graphql", ".gql", ".avsc",
-    ".capnp", ".fbs", ".ice", ".ridl",
+    ".capnp", ".fbs", ".ice", ".ridl", ".wit", ".yang",
 }
 _INTERFACE_NAME_RE = re.compile(r"(?:openapi|swagger|asyncapi)[\w.-]*\.(?:ya?ml|json)$", re.IGNORECASE)
 
@@ -312,6 +389,19 @@ _ARCHETYPE_BY_TAG = {
     "authn": "authentication_audit",
     "authz": "authorization_audit",
     "outbound_request": "ssrf_audit",
+    "client_xss": "client_xss_audit",
+    "client_routing_auth": "client_auth_routing_audit",
+    "iac_misconfig": "config_iac_audit",
+    "cicd_supply_chain": "cicd_supply_chain_audit",
+    "mobile_surface": "mobile_security_audit",
+    "smart_contract": "smart_contract_audit",
+    "firmware_embedded": "firmware_embedded_audit",
+    "ai_ml_pipeline": "ai_ml_security_audit",
+    "desktop_extension": "desktop_extension_audit",
+    "rtl_privilege_csr": "rtl_privilege_csr_audit",
+    "rtl_debug_lifecycle": "rtl_debug_lifecycle_audit",
+    "rtl_crypto_secret": "rtl_crypto_secret_audit",
+    "rtl_bus_fsm": "rtl_bus_fsm_audit",
 }
 
 # What to actually hunt in an area of each measured kind.
@@ -415,6 +505,81 @@ _AUDIT_FOCUS: Dict[str, str] = {
         "DNS rebinding and parser-disagreement bypasses of host allowlists, and metadata "
         "or loopback endpoints reachable from the requesting host."
     ),
+    "client_xss_audit": (
+        "Client-side DOM, template, and sanitizer bypasses. Untrusted URL/hash/query/"
+        "postMessage/API data flowing into innerHTML, Angular bypassSecurityTrust*, "
+        "React dangerouslySetInnerHTML, unescaped template tags, or open redirects."
+    ),
+    "client_auth_routing_audit": (
+        "Client-side access checks, route guards, and browser credential storage. "
+        "Admin/restricted views or actions enforced only in frontend routing, sensitive "
+        "tokens or secrets stored in localStorage/DOM, and missing server-side enforcement."
+    ),
+    "config_iac_audit": (
+        "Infrastructure, cloud IAM/RBAC, Kubernetes, policy-as-code (Rego/Cedar), XML, "
+        "TLS, and deployment misconfigurations. Permissive network CIDRs (0.0.0.0/0), "
+        "wildcard IAM/RBAC permissions, default-allow policies, privileged or host-namespace "
+        "containers, wildcard CORS with credentials, disabled TLS verification, XXE, and hardcoded secrets."
+    ),
+    "cicd_supply_chain_audit": (
+        "CI/CD workflows, build scripts, and software supply-chain trust boundaries. "
+        "Untrusted pull-request triggers (pull_request_target / workflow_run) executing "
+        "fork code or interpolating untrusted event fields into shell commands, over-broad "
+        "GITHUB_TOKEN / OIDC permissions, unpinned actions, and curl-pipe-shell execution."
+    ),
+    "mobile_security_audit": (
+        "Mobile application attack surfaces across Android, iOS, Flutter, and React Native. "
+        "Exported activities/services/providers/receivers without permission guards, unsafe "
+        "deep links and PendingIntents, WebView JS bridges and file-access settings, disabled "
+        "ATS/TLS pinning or cleartext traffic, and insecure Keychain/SharedPreferences storage."
+    ),
+    "smart_contract_audit": (
+        "On-chain smart contract and zero-knowledge circuit invariants. Reentrancy across "
+        "external calls before state updates, tx.origin authentication, unprotected "
+        "delegatecall/selfdestruct/initializers, signature replay and malleable ecrecover, "
+        "oracle/flash-loan manipulation, rounding/precision loss, and under-constrained ZK signals."
+    ),
+    "firmware_embedded_audit": (
+        "Firmware, bootloader, UEFI, driver, and eBPF security boundaries. Unvalidated "
+        "DMA/MMIO buffers, missing secure-boot or OTA signature verification, TOCTOU between "
+        "shared-memory checks and use, ring/privilege boundary escapes, and eBPF verifier/helper misuse."
+    ),
+    "ai_ml_security_audit": (
+        "AI/ML model loading, serialization, and agentic tool-execution boundaries. Unsafe "
+        "weight deserialization (pickle/torch.load/joblib/Keras lambda/trust_remote_code), "
+        "untrusted prompt or retrieval content flowing into code/shell/SQL/filesystem tools, "
+        "missing tool authorization or sandboxing, and cross-tenant RAG/memory leakage."
+    ),
+    "desktop_extension_audit": (
+        "Desktop (Electron/Tauri) and browser extension privilege boundaries. Disabled "
+        "contextIsolation or webSecurity, enabled nodeIntegration, unvalidated IPC/preload "
+        "bridges or shell.openExternal URLs, over-broad extension host permissions, and "
+        "untrusted web origins driving privileged native or extension APIs."
+    ),
+    "rtl_privilege_csr_audit": (
+        "Hardware CSR, privilege-level, and lock-bit enforcement. Missing regwen/lock "
+        "checks on security-critical register writes, privilege escalation across "
+        "M/S/U or Secure/Non-Secure domains, PMP/MPU boundary off-by-ones, and sticky "
+        "lock bits cleared by soft reset."
+    ),
+    "rtl_debug_lifecycle_audit": (
+        "Silicon debug, DFT, JTAG, and lifecycle state transitions. Debug/scan ports "
+        "reachable in production lifecycle states, missing authentication on RMA/unlock "
+        "paths, fault-injectable single-bit lifecycle encodings, and debug access to "
+        "secret memory."
+    ),
+    "rtl_crypto_secret_audit": (
+        "Hardware cryptographic engines, key registers, and secret lifecycle. Missing "
+        "zeroization on reset/error/completion, secret key leakage over readback/debug/"
+        "shared buses, sideload isolation gaps, predictable entropy, and non-constant-time "
+        "hardware paths."
+    ),
+    "rtl_bus_fsm_audit": (
+        "Hardware bus fabric isolation and finite-state-machine integrity. Missing "
+        "bus-master ID/security-attribute checks on AXI/TileLink/DMA transactions, "
+        "illegal or unguarded FSM state transitions, synthesis-vs-simulation mismatches "
+        "(full_case/parallel_case/translate_off), and unintended latches."
+    ),
     "general_appsec_audit": (
         "No single idiom dominated here, so work from the data rather than from a "
         "pattern: identify what crosses into this area from outside, and follow those "
@@ -445,8 +610,14 @@ def _slug(text: str) -> str:
 def _classify_extension(ext: str) -> str:
     if ext in _UNSAFE_EXT:
         return "unsafe"
+    if ext in _RTL_EXT:
+        return "rtl"
+    if ext in _CONTRACT_EXT:
+        return "contract"
     if ext in _INTERPRETED_EXT:
         return "interpreted"
+    if ext in _TEMPLATE_CONFIG_EXT:
+        return "config_template"
     if ext in _MEMORY_SAFE_EXT:
         return "safe"
     return "other"

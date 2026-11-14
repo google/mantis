@@ -64,7 +64,7 @@ from core.environments.staging import get_vetted_staging_files
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
-_EXTRACTOR_SCHEMA_VERSION = 2
+_EXTRACTOR_SCHEMA_VERSION = 4
 EXTRACTOR_NAME = "tree-sitter"
 STATE_DIRNAME = "structural_index"
 
@@ -99,9 +99,9 @@ _TIER2_TEST_SUFFIXES = (
     "test.java", "tests.java", "tests.cs",
 )
 _UNSUPPORTED_CODE_EXTS = frozenset({
-    ".scala", ".swift", ".sol", ".zig", ".ex", ".exs", ".lua",
-    ".sh", ".bash", ".pl", ".m", ".mm", ".dart", ".groovy",
-    ".clj", ".erl", ".hs", ".ml", ".vue", ".svelte",
+    ".pl", ".groovy", ".clj", ".cljs", ".erl", ".hs", ".ml",
+    ".vue", ".svelte", ".vy", ".cairo", ".move", ".circom",
+    ".nim", ".cr", ".ada", ".adb", ".ads", ".f90", ".r", ".jl",
 })
 
 
@@ -164,8 +164,8 @@ def _resolve_index_limits() -> Tuple[int, int]:
 
 _EXT_LANGUAGES = {
     ".py": "python",
-    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
-    ".ts": "typescript", ".tsx": "tsx",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".tsx": "tsx", ".mts": "typescript", ".cts": "typescript",
     ".java": "java",
     ".go": "go",
     ".rb": "ruby",
@@ -175,7 +175,29 @@ _EXT_LANGUAGES = {
     ".rs": "rust",
     ".kt": "kotlin", ".kts": "kotlin",
     ".cs": "csharp",
+    # Mobile & Apple/Flutter
+    ".swift": "swift",
+    ".m": "objc", ".mm": "objc",
+    ".dart": "dart",
+    # Smart contracts, systems & JVM/BEAM/embedded scripting
+    ".sol": "solidity",
+    ".zig": "zig",
+    ".scala": "scala", ".sc": "scala",
+    ".ex": "elixir", ".exs": "elixir",
+    ".lua": "lua",
+    # Shell, IaC, Policy-as-Code & SQL
+    ".sh": "bash", ".bash": "bash",
+    ".ps1": "powershell", ".psm1": "powershell",
+    ".tf": "hcl", ".tfvars": "hcl", ".hcl": "hcl",
+    ".rego": "rego",
+    ".sql": "sql",
+    # Hardware / RTL
+    ".v": "verilog", ".vh": "verilog",
+    ".sv": "systemverilog", ".svh": "systemverilog",
+    ".vhd": "vhdl", ".vhdl": "vhdl",
 }
+
+_RTL_LANGUAGES = frozenset({"verilog", "systemverilog", "vhdl"})
 
 # Function-like definition node types across the grammars above, mapped to
 # the symbol kind they produce. Anonymous forms (arrow functions, lambdas)
@@ -221,6 +243,33 @@ _DEF_KINDS = {
     "property_declaration": "property",    # csharp properties; php class fields
     "trait_declaration": "interface",      # php traits (mixin; kind matches rust trait_item)
     "module": "module",                    # ruby `module Foo ... end`
+    # Swift, Objective-C, Dart, Solidity, Scala, PowerShell, HCL, Rego, SQL
+    "protocol_declaration": "interface",   # swift `protocol Auth { ... }`
+    "protocol_function_declaration": "function",  # swift protocol method
+    "class_interface": "interface",        # objc `@interface Foo`
+    "class_implementation": "class",       # objc `@implementation Foo`
+    "function_signature": "function",      # dart functions & methods
+    "contract_declaration": "class",       # solidity `contract Vault`
+    "library_declaration": "module",       # solidity `library Math`
+    "modifier_definition": "function",     # solidity `modifier onlyOwner`
+    "constructor_definition": "method",    # solidity `constructor()`
+    "object_definition": "class",          # scala `object Main`
+    "trait_definition": "interface",       # scala `trait Service`
+    "function_statement": "function",      # powershell `function Invoke-Foo`
+    "rule": "function",                    # rego policy rules
+    "create_function": "function",         # sql `CREATE FUNCTION ...`
+    "create_procedure": "function",        # sql `CREATE PROCEDURE ...`
+    "create_table": "type",                # sql `CREATE TABLE ...`
+    "create_view": "type",                 # sql `CREATE VIEW ...`
+    # Hardware / RTL (Verilog, SystemVerilog, VHDL)
+    "module_declaration": "module",        # verilog / systemverilog `module foo (...)`
+    "package_declaration": "module",       # systemverilog `package foo;`
+    "task_declaration": "function",        # verilog / systemverilog `task foo(...)`
+    "entity_declaration": "module",        # vhdl `entity foo is ...`
+    "architecture_body": "module",         # vhdl `architecture rtl of foo is ...`
+    "function_body": "function",           # vhdl `function foo(...) ...`
+    "procedure_body": "function",          # vhdl `procedure foo(...) ...`
+    "process_statement": "function",       # vhdl named `p_fsm: process(...)`
 }
 
 # C/C++ type specifiers appear both at definitions (`struct Foo { ... };`) and
@@ -240,8 +289,8 @@ _FUNCTION_VALUE_TYPES = frozenset({
 })
 
 _CALL_TYPES = frozenset({
-    "call",                      # python, ruby
-    "call_expression",           # js/ts, go, c, cpp, rust, kotlin
+    "call",                      # python, ruby, elixir
+    "call_expression",           # js/ts, go, c, cpp, rust, kotlin, swift, objc, solidity, scala
     "method_invocation",         # java
     "invocation_expression",     # csharp
     "function_call_expression",  # php
@@ -249,12 +298,24 @@ _CALL_TYPES = frozenset({
     "object_creation_expression",  # java, csharp `new X()`
     "new_expression",            # js/ts `new X()`
     "macro_invocation",          # rust
+    "message_expression",        # objc `[receiver selector:arg]`
+    "function_call",             # lua
+    "command",                   # bash, powershell
+    "expr_call",                 # rego
+    "invocation",                # sql
+    # Hardware / RTL module hierarchy & function/task calls
+    "module_instantiation",      # verilog / systemverilog submodule instance
+    "tf_call",                   # verilog / systemverilog task/function call
+    "entity_instantiation",      # vhdl `entity work.foo`
+    "component_instantiation",   # vhdl `foo port map (...)`
 })
 
 _NAME_LEAF_TYPES = frozenset({
-    "identifier", "property_identifier", "field_identifier",
+    "identifier", "IDENTIFIER", "property_identifier", "field_identifier",
     "type_identifier", "constant", "name", "word",
-    "simple_identifier",  # kotlin: its grammar exposes no `name` field at all
+    "simple_identifier",  # kotlin, swift
+    "function_name",      # powershell
+    "command_name",       # bash, powershell
 })
 
 
@@ -307,8 +368,85 @@ def _ts_version() -> str:
         return "absent"
 
 
+_HCL_NAMED_BLOCKS = frozenset({
+    "resource", "data", "module", "provider", "variable", "output",
+})
+_ELIXIR_DEF_TARGETS = frozenset({
+    "defmodule", "def", "defp", "defmacro", "defmacrop",
+})
+
+
 def _node_name(node) -> str:
     """Best-effort symbol name for a definition node."""
+    if node.type == "constructor_definition":
+        return "constructor"
+    if node.type == "architecture_body":
+        arch_node = node.child_by_field_name("name")
+        entity_node = node.child_by_field_name("entity")
+        arch_name = ""
+        entity_name = ""
+        if arch_node is not None:
+            try:
+                arch_name = arch_node.text.decode("utf-8", errors="replace").strip()
+            except Exception:
+                arch_name = ""
+        if entity_node is not None:
+            try:
+                entity_name = entity_node.text.decode("utf-8", errors="replace").strip()
+            except Exception:
+                entity_name = ""
+        if entity_name and arch_name:
+            return f"{entity_name}.{arch_name}"
+        if arch_name:
+            return arch_name
+    if node.type == "Decl":
+        for child in node.named_children:
+            if child.type == "FnProto":
+                fn = child.child_by_field_name("function")
+                if fn is not None:
+                    try:
+                        return fn.text.decode("utf-8", errors="replace").strip()
+                    except Exception:
+                        return ""
+        return ""
+    if node.type == "block":
+        parts: List[str] = []
+        for child in node.named_children:
+            if child.type == "identifier" and not parts:
+                try:
+                    parts.append(child.text.decode("utf-8", errors="replace").strip())
+                except Exception:
+                    return ""
+            elif child.type == "string_lit":
+                try:
+                    txt = child.text.decode("utf-8", errors="replace").strip().strip('"\'')
+                except Exception:
+                    txt = ""
+                if txt:
+                    parts.append(txt)
+        if parts and parts[0] in _HCL_NAMED_BLOCKS:
+            return ".".join(parts)
+        return ""
+    if node.type == "rule":
+        for child in node.named_children:
+            if child.type == "rule_head":
+                for gchild in child.named_children:
+                    if gchild.type in ("var", "identifier"):
+                        try:
+                            return gchild.text.decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            return ""
+                try:
+                    return child.text.decode("utf-8", errors="replace").split("(", 1)[0].strip()
+                except Exception:
+                    return ""
+        return ""
+    if node.type in ("create_function", "create_procedure", "create_table", "create_view"):
+        for child in node.named_children:
+            if child.type == "object_reference":
+                leaf = _rightmost_name_leaf(child)
+                if leaf:
+                    return leaf
     named = node.child_by_field_name("name")
     if named is None:
         # C/C++ bury the identifier inside the declarator chain.
@@ -347,6 +485,40 @@ def _node_name(node) -> str:
                         break
             probe = nxt
             depth += 1
+    if named is None:
+        # Hardware / RTL wrapper nodes (Verilog, SystemVerilog, VHDL)
+        if node.type == "module_declaration":
+            for child in node.named_children:
+                if child.type in ("module_header", "module_ansi_header", "module_nonansi_header"):
+                    for gchild in child.named_children:
+                        if gchild.type in _NAME_LEAF_TYPES:
+                            named = gchild
+                            break
+                    if named is not None:
+                        break
+        elif node.type in ("function_declaration", "task_declaration"):
+            for child in node.named_children:
+                if child.type in ("function_body_declaration", "task_body_declaration"):
+                    for gchild in child.named_children:
+                        if gchild.type in _NAME_LEAF_TYPES:
+                            named = gchild
+                            break
+                        if gchild.type in ("function_identifier", "task_identifier"):
+                            leaf = _rightmost_name_leaf(gchild)
+                            if leaf:
+                                return leaf
+                    if named is not None:
+                        break
+        elif node.type == "process_statement":
+            for child in node.named_children:
+                if child.type == "label":
+                    for gchild in child.named_children:
+                        if gchild.type in _NAME_LEAF_TYPES:
+                            named = gchild
+                            break
+                    break
+            if named is None:
+                return ""
     if named is None:
         for child in node.named_children:
             if child.type in _NAME_LEAF_TYPES:
@@ -416,16 +588,31 @@ def _target_qualifier(target) -> str:
     """Immediate static receiver of a member/qualified call target, else ''."""
     if target is None or target.type in _NAME_LEAF_TYPES:
         return ""
+    # Unwrap single-child expression / solidity struct_expression wrappers
+    while target is not None and target.type in ("expression", "struct_expression"):
+        if target.type == "struct_expression":
+            nxt = target.child_by_field_name("type")
+            if nxt is None:
+                break
+            target = nxt
+        elif len(target.named_children) == 1:
+            target = target.named_children[0]
+        else:
+            break
+    if target is None or target.type in _NAME_LEAF_TYPES:
+        return ""
     children = target.named_children
     if len(children) < 2:
         return ""
     recv = children[0]
     prop = children[-1]
-    if prop.type not in _NAME_LEAF_TYPES:
+    if prop.type not in _NAME_LEAF_TYPES and target.type != "navigation_expression":
         return ""
     if recv.type in _CALL_TYPES or "subscript" in recv.type or "index" in recv.type:
         return ""
-    if recv.type in _NAME_LEAF_TYPES or recv.type in ("self", "this", "super"):
+    while recv is not None and recv.type == "expression" and len(recv.named_children) == 1:
+        recv = recv.named_children[0]
+    if recv.type in _NAME_LEAF_TYPES or recv.type in ("self", "this", "super", "alias"):
         try:
             return recv.text.decode("utf-8", errors="replace").strip()
         except Exception:
@@ -442,11 +629,101 @@ def _target_qualifier(target) -> str:
 
 def _callee_parts(call_node) -> Tuple[str, str]:
     """Returns (qualifier, callee_name) for a call AST node."""
-    for field in ("function", "name", "constructor", "type", "method"):
+    if call_node.type == "message_expression":
+        recv = call_node.child_by_field_name("receiver")
+        meth = call_node.child_by_field_name("method")
+        return (
+            _rightmost_name_leaf(recv) if recv is not None else "",
+            _rightmost_name_leaf(meth) if meth is not None else "",
+        )
+    if call_node.type == "expr_call":
+        fn = call_node.child_by_field_name("func_name")
+        if fn is not None:
+            try:
+                raw = fn.text.decode("utf-8", errors="replace").strip()
+            except Exception:
+                raw = ""
+            if "." in raw:
+                q, c = raw.rsplit(".", 1)
+                return q.rsplit(".", 1)[-1], c
+            return "", raw
+        return "", ""
+    if call_node.type == "SuffixExpr":
+        fn_node = call_node.child_by_field_name("variable_type_function")
+        if fn_node is not None:
+            return "", _rightmost_name_leaf(fn_node)
+        return "", ""
+    if call_node.type == "FieldOrFnCall":
+        fn_node = call_node.child_by_field_name("function_call")
+        if fn_node is None:
+            return "", ""
+        callee = _rightmost_name_leaf(fn_node)
+        prev = getattr(call_node, "prev_named_sibling", None)
+        qual = _rightmost_name_leaf(prev) if prev is not None else ""
+        return qual, callee
+    if call_node.type == "selector":
+        prev = getattr(call_node, "prev_named_sibling", None)
+        if prev is None:
+            return "", ""
+        if prev.type in _NAME_LEAF_TYPES:
+            return "", _rightmost_name_leaf(prev)
+        if prev.type == "selector":
+            callee = _rightmost_name_leaf(prev)
+            recv = getattr(prev, "prev_named_sibling", None)
+            qual = _rightmost_name_leaf(recv) if recv is not None else ""
+            return qual, callee
+        return "", ""
+    if call_node.type == "entity_instantiation":
+        for child in call_node.named_children:
+            if child.type == "selected_name":
+                parts = [
+                    ch.text.decode("utf-8", errors="replace").strip()
+                    for ch in child.named_children
+                    if ch.type in ("simple_name", "identifier")
+                ]
+                if len(parts) >= 2:
+                    qual = "" if parts[-2].lower() == "work" else parts[-2]
+                    return qual, parts[-1]
+                if parts:
+                    return "", parts[-1]
+            elif child.type in ("simple_name", "identifier"):
+                return "", child.text.decode("utf-8", errors="replace").strip()
+        return "", ""
+    if call_node.type == "component_instantiation":
+        for child in call_node.named_children:
+            if child.type in ("simple_name", "identifier"):
+                return "", child.text.decode("utf-8", errors="replace").strip()
+        return "", ""
+    for field in ("function", "name", "command_name", "constructor", "type", "method", "target"):
         target = call_node.child_by_field_name(field)
         if target is not None:
-            return _target_qualifier(target), _rightmost_name_leaf(target)
+            unwrapped = target
+            while unwrapped is not None and unwrapped.type in ("expression", "struct_expression"):
+                if unwrapped.type == "struct_expression":
+                    nxt = unwrapped.child_by_field_name("type")
+                    if nxt is None:
+                        break
+                    unwrapped = nxt
+                elif len(unwrapped.named_children) == 1:
+                    unwrapped = unwrapped.named_children[0]
+                else:
+                    break
+            if unwrapped is not None and unwrapped.type == "navigation_expression":
+                nav_t = unwrapped.child_by_field_name("target")
+                nav_s = unwrapped.child_by_field_name("suffix")
+                return (
+                    _rightmost_name_leaf(nav_t) if nav_t is not None else "",
+                    _rightmost_name_leaf(nav_s) if nav_s is not None else "",
+                )
+            return _target_qualifier(unwrapped), _rightmost_name_leaf(unwrapped)
     for child in call_node.named_children:
+        if child.type == "navigation_expression":
+            nav_t = child.child_by_field_name("target")
+            nav_s = child.child_by_field_name("suffix")
+            return (
+                _rightmost_name_leaf(nav_t) if nav_t is not None else "",
+                _rightmost_name_leaf(nav_s) if nav_s is not None else "",
+            )
         leaf = _rightmost_name_leaf(child)
         if leaf:
             return _target_qualifier(child), leaf
@@ -584,17 +861,77 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
     stack: List[Tuple[Any, List[Tuple[str, str]]]] = [
         (child, []) for child in reversed(tree.root_node.named_children)
     ]
+    dart_body_enclosing: Dict[Tuple[int, int], List[Tuple[str, str]]] = {}
     while stack:
         node, enclosing = stack.pop()
+        if language == "dart" and node.type == "function_body":
+            inherited = dart_body_enclosing.pop((node.start_byte, node.end_byte), None)
+            if inherited is not None:
+                enclosing = inherited
         kind = _DEF_KINDS.get(node.type)
+        # Guard language-specific node types against collisions across grammars.
+        if kind is not None and node.type == "function_body" and language != "vhdl":
+            kind = None
+        if kind is not None and node.type == "function_signature" and language != "dart":
+            kind = None
+        if kind is not None and node.type == "rule" and language != "rego":
+            kind = None
         if kind is not None and node.type in _BODY_REQUIRED and node.child_by_field_name("body") is None:
             kind = None  # forward declaration / type reference, not a definition
         if kind is None and node.type == "variable_declarator":
             value = node.child_by_field_name("value")
             if value is not None and value.type in _FUNCTION_VALUE_TYPES:
                 kind = "function"  # named `const f = () => ...` (js/ts)
+        if kind is None and language == "zig" and node.type == "Decl":
+            if any(ch.type == "FnProto" for ch in node.named_children):
+                kind = "function"
+        if kind is None and language == "hcl" and node.type == "block":
+            kind = "module"
+
+        # Elixir encodes `defmodule`/`def`/`defp`/`defmacro` as `call` nodes.
+        elixir_override_children: Optional[List[Any]] = None
+        elixir_name = ""
+        if kind is None and language == "elixir" and node.type == "call":
+            el_target = node.child_by_field_name("target")
+            if el_target is not None and el_target.type == "identifier":
+                try:
+                    kw = el_target.text.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    kw = ""
+                if kw in _ELIXIR_DEF_TARGETS:
+                    kind = "module" if kw == "defmodule" else "function"
+                    elixir_override_children = []
+                    for ch in node.named_children:
+                        if ch.type == "arguments":
+                            arg_kids = ch.named_children
+                            if arg_kids:
+                                first_arg = arg_kids[0]
+                                if kw == "defmodule":
+                                    try:
+                                        elixir_name = first_arg.text.decode("utf-8", errors="replace").strip()
+                                    except Exception:
+                                        elixir_name = ""
+                                elif first_arg.type == "call":
+                                    fn_t = first_arg.child_by_field_name("target")
+                                    elixir_name = _rightmost_name_leaf(fn_t) if fn_t is not None else ""
+                                elif first_arg.type in _NAME_LEAF_TYPES:
+                                    elixir_name = _rightmost_name_leaf(first_arg)
+                                # Keep inline `do:` keyword body while skipping signature call header
+                                elixir_override_children.extend(arg_kids[1:])
+                        elif ch.type != "identifier":
+                            elixir_override_children.append(ch)
+
+        is_call = node.type in _CALL_TYPES
+        if not is_call and language == "dart" and node.type == "selector":
+            is_call = any(ch.type == "argument_part" for ch in node.named_children)
+        if not is_call and language == "zig":
+            if node.type == "SuffixExpr":
+                is_call = any(ch.type == "FnCallArguments" for ch in node.named_children)
+            elif node.type == "FieldOrFnCall":
+                is_call = node.child_by_field_name("function_call") is not None
+
         if kind is not None:
-            name = _node_name(node)
+            name = elixir_name if elixir_name else _node_name(node)
             if name:
                 # Bounded: the prefix stops growing past MAX_NEST_DEPTH and
                 # the joined name is capped, so a pathological nesting depth
@@ -602,6 +939,17 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
                 prefix = [n for n, _ in enclosing[-MAX_NEST_DEPTH:]]
                 qualified = ".".join(prefix + [name])[-_MAX_QUALIFIED_CHARS:]
                 span_start_line, signature = _span_and_signature(node, source)
+                end_line = node.end_point[0] + 1
+                dart_body_sib = None
+                if language == "dart" and node.type == "function_signature":
+                    sib = getattr(node, "next_named_sibling", None)
+                    if sib is None:
+                        par = getattr(node, "parent", None)
+                        if par is not None and par.type == "method_signature":
+                            sib = getattr(par, "next_named_sibling", None)
+                    if sib is not None and sib.type == "function_body":
+                        dart_body_sib = sib
+                        end_line = sib.end_point[0] + 1
                 sid = _symbol_id(language, rel_path, qualified, span_start_line, signature)
                 symbols.append({
                     "symbol_id": sid,
@@ -610,7 +958,7 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
                     "language": language,
                     "file_path": rel_path,
                     "start_line": span_start_line,
-                    "end_line": node.end_point[0] + 1,
+                    "end_line": end_line,
                     "kind": kind,
                     "signature": signature,
                 })
@@ -620,7 +968,9 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
                     # Past the cap the innermost definition still owns the
                     # calls beneath it; only the prefix stops growing.
                     enclosing = enclosing[:-1] + [(name, sid)]
-        elif node.type in _CALL_TYPES:
+                if dart_body_sib is not None:
+                    dart_body_enclosing[(dart_body_sib.start_byte, dart_body_sib.end_byte)] = enclosing
+        elif is_call:
             qualifier, callee = _callee_parts(node)
             if callee:
                 caller_id = enclosing[-1][1] if enclosing else module_id
@@ -633,7 +983,12 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
                 if qualifier:
                     edge_entry["qualifier"] = qualifier
                 edges.append(edge_entry)
-        for child in reversed(node.named_children):
+        next_children = (
+            elixir_override_children
+            if elixir_override_children is not None
+            else node.named_children
+        )
+        for child in reversed(next_children):
             stack.append((child, enclosing))
 
     return {"file": rel_path, "language": language, "symbols": symbols, "edges": edges}
@@ -658,14 +1013,20 @@ _CONTROL_TYPES = frozenset({
     "expression_switch_statement", "type_switch_statement", "select_statement",
     # ruby
     "if", "unless", "while", "until", "for", "case", "rescue", "conditional",
-    # php (match_expression also rust)
+    # php (match_expression also rust, scala)
     "foreach_statement", "match_expression",
-    # rust
+    # rust, scala
     "if_expression", "while_expression", "loop_expression", "for_expression",
     # kotlin
     "when_expression", "do_while_statement", "catch_block",
-    # c / cpp / csharp share if/for/while/do/switch/conditional/catch above
+    # c / cpp / csharp / objc / dart / solidity / bash / powershell share if/for/while/do/switch/foreach/case above
     "for_range_loop",
+    # swift, lua, zig
+    "guard_statement", "repeat_statement",
+    "IfStatement", "ForStatement", "WhileStatement", "SwitchExpr",
+    # hardware / RTL (verilog, systemverilog, vhdl; vhdl if_statement shared above)
+    "conditional_statement", "case_statement", "loop_statement",
+    "for_generate_construct", "if_generate_construct",
 })
 
 
@@ -702,8 +1063,17 @@ def cognitive_complexity(source: bytes, language: str) -> Optional[Dict[str, int
             total += 1 + depth
             controls += 1
             child_depth = depth + 1
-        elif _DEF_KINDS.get(node.type) in ("function", "method"):
+        elif (
+            _DEF_KINDS.get(node.type) in ("function", "method")
+            and not (node.type == "function_body" and language != "vhdl")
+            and not (node.type == "function_signature" and language != "dart")
+            and not (node.type == "rule" and language != "rego")
+        ) or (language == "zig" and node.type == "FnProto"):
             functions += 1
+        elif language == "elixir" and node.type == "call":
+            el_t = node.child_by_field_name("target")
+            if el_t is not None and el_t.type == "identifier" and el_t.text in (b"def", b"defp"):
+                functions += 1
         for child in node.named_children:
             stack.append((child, child_depth))
     return {"complexity": total, "control_nodes": controls, "functions": functions}
@@ -1232,7 +1602,14 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
                      sym["file_path"], sym["start_line"], sym["end_line"], sym["kind"],
                      sym["signature"], EXTRACTOR_NAME),
                 )
-                if sym["kind"] in ("function", "method", "macro"):
+                if (
+                    sym["kind"] in ("function", "method", "macro")
+                    or (
+                        sym["language"] in _RTL_LANGUAGES
+                        and sym["kind"] == "module"
+                        and sym["name"] != "<module>"
+                    )
+                ):
                     conn.execute(
                         "INSERT OR REPLACE INTO function_boundaries VALUES (?, ?, ?, ?, ?, ?)",
                         (sym["symbol_id"], sym["file_path"], sym["start_line"],
