@@ -288,8 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
             "'uncovered' runs one campaign per uncovered source file regardless of repo size; "
             "'cross-functional' hunts composite defects across ranked subsystems; "
             "'changed' scans only new/edited files since last covered and verifies "
-            "prior findings touching them; 'auto' picks whole if small, else "
-            "file-by-file over uncovered files, else cross-functional. "
+            "prior findings touching them; 'auto' (default) uses --depth planning "
+            "(whole up to the depth whole-file limit, else risk-ranked cross-functional "
+            "batches rotating through uncovered/changed files on repeat runs). "
             "Defaults to the workflow config, or auto."
         ),
     )
@@ -856,7 +857,12 @@ def run_launch(
         print("\n📋 Dry-Run Execution Plan:")
         print(f"  • Target:        {target_path}")
         print(f"  • Workflow:      {wf_file}")
-        print(f"  • Depth:         {_dprof.depth}/100 ({_dprof.tier}; effort={reasoning_effort or _dprof.reasoning_effort}, passes={passes if passes_explicit else _dprof.passes})")
+        _dry_effort = (
+            reasoning_effort
+            or (os.environ.get("REASONING_EFFORT") or "").strip()
+            or _dprof.reasoning_effort
+        )
+        print(f"  • Depth:         {_dprof.depth}/100 ({_dprof.tier}; effort={_dry_effort}, passes={passes if passes_explicit else _dprof.passes})")
         print(f"  • Sandbox:       {cfg.get('sandbox', {}).get('type', 'static-only')}")
         print(f"  • Model:         {model or cfg.get('default_model')}")
         print(f"  • Knowledge DB:  {db_path or cfg.get('db_path', 'knowledge.db')}")

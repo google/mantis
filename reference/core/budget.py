@@ -693,7 +693,12 @@ class BudgetController:
         # ride in from the operator's command line but pass through config
         # handling, so they are quoted like every other token.
         for flag, value in (resume_flags or {}).items():
-            parts.append(f"{flag} {shlex.quote(str(value))}")
+            if value is False or value is None:
+                continue
+            if value is True:
+                parts.append(str(flag))
+            else:
+                parts.append(f"{flag} {shlex.quote(str(value))}")
         if workflow:
             parts.append(f"--workflow {shlex.quote(str(Path(workflow).resolve()))}")
         resume_cmd = " ".join(parts)

@@ -364,13 +364,15 @@ def _content_rows(conn: sqlite3.Connection, model: str = "", run_id: str = "") -
     ).fetchall()
 
 
-def _coverage_runs(db_path: str, model: str = "") -> tuple[dict, set]:
+def _coverage_runs(
+    db_path: str, model: str = "", min_depth: Optional[int] = None
+) -> tuple[dict, set]:
     """`(target -> run ids of completed campaigns over it, run ids that
-    recorded content)`, under the model rule of _completed_coverage. Lets a
-    reader tell a file that exists under a covered directory but was NOT
-    there when the covering campaign ran: that campaign recorded content
-    for its files and has none for this one. `({}, set())` when the ledger
-    has no table; raises when it cannot be read."""
+    recorded content)`, under the model and `min_depth` rules of
+    _completed_coverage. Lets a reader tell a file that exists under a covered
+    directory but was NOT there when the covering campaign ran: that campaign
+    recorded content for its files and has none for this one. `({}, set())`
+    when the ledger has no table; raises when it cannot be read."""
     if not db_path or not os.path.exists(db_path):
         return {}, set()
     conn = _connect(db_path)
@@ -398,10 +400,16 @@ def _coverage_runs(db_path: str, model: str = "") -> tuple[dict, set]:
     finally:
         conn.close()
     targets: dict = {}
+    depth_floor = int(min_depth) if min_depth is not None else None
     for target, metadata_json, run in rows:
         t = str(target or "").rstrip("/")
-        if t and run and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
-            targets.setdefault(t, set()).add(str(run))
+        if not (t and run and not _row_failed(metadata_json) and not _row_unexamined(metadata_json)):
+            continue
+        if depth_floor is not None:
+            row_depth = _row_depth(metadata_json)
+            if row_depth is not None and row_depth < depth_floor:
+                continue
+        targets.setdefault(t, set()).add(str(run))
     return targets, recorded
 
 
@@ -487,7 +495,28 @@ def _row_unexamined(metadata_json: Any) -> bool:
     return isinstance(meta, dict) and bool(meta.get("unexamined"))
 
 
-def _completed_coverage(db_path: str, model: str = "") -> Optional[dict]:
+def _row_depth(metadata_json: Any) -> Optional[int]:
+    """Extracts recorded audit depth (`1..100`) from a spend row's `metadata_json`,
+    or `None` for legacy/pre-depth rows (which count as full-depth covered under INV-6)."""
+    try:
+        meta = json.loads(metadata_json or "{}") if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("depth")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if 1 <= val <= 100 else None
+
+
+def _completed_coverage(
+    db_path: str, model: str = "", min_depth: Optional[int] = None
+) -> Optional[dict]:
     """Every target a completed campaign covered, mapped to the harness
     fingerprints of the rows that covered it (None for a row recorded before
     fingerprints existed, or imported from an export that did not carry one).
@@ -498,6 +527,11 @@ def _completed_coverage(db_path: str, model: str = "") -> Optional[dict]:
 
     With `model` given, only rows of that model and rows of no known model
     count, for the reasons uncovered_files gives.
+
+    With `min_depth` given, rows that recorded a lower depth (`depth < min_depth`)
+    are excluded so a shallow triage does not suppress a deeper scan. Rows with
+    no recorded depth (legacy / pre-depth / imported) keep counting as covered
+    at every `min_depth` (INV-6).
     """
     if not os.path.exists(db_path):
         return None
@@ -527,11 +561,149 @@ def _completed_coverage(db_path: str, model: str = "") -> Optional[dict]:
     finally:
         conn.close()
     targets: dict = {}
+    depth_floor = int(min_depth) if min_depth is not None else None
     for target, metadata_json, fingerprint in rows:
         t = str(target or "").rstrip("/")
-        if t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
-            targets.setdefault(t, set()).add(str(fingerprint) if fingerprint else None)
+        if not (t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json)):
+            continue
+        if depth_floor is not None:
+            row_depth = _row_depth(metadata_json)
+            if row_depth is not None and row_depth < depth_floor:
+                continue
+        targets.setdefault(t, set()).add(str(fingerprint) if fingerprint else None)
     return targets
+
+
+def _completed_coverage_depths(db_path: str, model: str = "") -> Optional[dict]:
+    """Maps every covered target to the set of recorded depths (`int | None`)
+    across non-failed, non-unexamined rows matching `model`."""
+    if not os.path.exists(db_path):
+        return None
+    conn = _connect(db_path)
+    try:
+        try:
+            has_runs = model and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
+            if has_runs:
+                rows = conn.execute(
+                    "SELECT s.target, s.metadata_json FROM campaign_spend s "
+                    "LEFT JOIN runs r ON r.run_id = s.run_id "
+                    "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                    (str(model),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend WHERE target IS NOT NULL"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return None
+            raise
+    finally:
+        conn.close()
+    targets: dict = {}
+    for target, metadata_json in rows:
+        t = str(target or "").rstrip("/")
+        if t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
+            targets.setdefault(t, set()).add(_row_depth(metadata_json))
+    return targets
+
+
+def covered_below_depth(
+    db_path: str,
+    files,
+    min_depth: int,
+    model: str = "",
+) -> Optional[dict]:
+    """Files in `files` that have completed coverage ONLY from scans recorded at
+    a depth strictly below `min_depth`, as `{"files": [...], "max_depth": int | None}`.
+
+    Rows with no recorded depth (legacy / pre-depth) count as full-depth covered
+    and are never reported here (INV-6). Returns None when no ledger is present
+    or it cannot be read. Never raises.
+    """
+    if not db_path:
+        return None
+    try:
+        target_depths = _completed_coverage_depths(db_path, model=model)
+        if target_depths is None:
+            return {"files": [], "max_depth": None}
+        floor = int(min_depth)
+        lower_files: list[str] = []
+        max_seen: Optional[int] = None
+        for f in files:
+            path = str(f)
+            depths = _covering_fingerprints(path, target_depths)
+            if not depths:
+                continue
+            if None in depths:
+                continue
+            int_depths = [d for d in depths if isinstance(d, int)]
+            if not int_depths:
+                continue
+            highest = max(int_depths)
+            if highest < floor:
+                lower_files.append(path)
+                if max_seen is None or highest > max_seen:
+                    max_seen = highest
+        return {"files": lower_files, "max_depth": max_seen}
+    except Exception:
+        return None
+
+
+def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
+    """True when at least one file in `files` is covered by a completed
+    `file-by-file` (or legacy `file-sweep`) campaign row for `model`.
+
+    Used by `resolve_scan_targets` so partial coverage from depth-planned
+    `cross-functional` batches never flips a subsequent default `auto` run
+    into an unfiltered per-file sweep over the rest of a large repository,
+    while genuine in-progress per-file sweeps still continue cleanly.
+    Never raises.
+    """
+    if not db_path or not files or not os.path.exists(db_path):
+        return False
+    try:
+        conn = _connect(db_path)
+        try:
+            try:
+                has_runs = model and conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+                ).fetchone()
+                if has_runs:
+                    rows = conn.execute(
+                        "SELECT s.target, s.metadata_json FROM campaign_spend s "
+                        "LEFT JOIN runs r ON r.run_id = s.run_id "
+                        "WHERE s.target IS NOT NULL "
+                        "AND s.scan_mode IN ('file-by-file', 'file-sweep') "
+                        "AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                        (str(model),),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT target, metadata_json FROM campaign_spend "
+                        "WHERE target IS NOT NULL "
+                        "AND scan_mode IN ('file-by-file', 'file-sweep')"
+                    ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return False
+                raise
+        finally:
+            conn.close()
+        sweep_targets: dict = {}
+        for target, metadata_json in rows:
+            t = str(target or "").rstrip("/")
+            if t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
+                sweep_targets.setdefault(t, set()).add(True)
+        if not sweep_targets:
+            return False
+        for f in files:
+            if _covering_fingerprints(str(f), sweep_targets):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _covering_fingerprints(path: str, targets: dict) -> Optional[set]:
@@ -580,6 +752,7 @@ def uncovered_files(
     harness_fingerprint: str = "",
     rescan_changed_harness: bool = False,
     rescan_changed_files: bool = True,
+    min_depth: Optional[int] = None,
 ) -> Optional[list]:
     """The subset of `files` no recorded campaign has ever covered.
 
@@ -637,11 +810,13 @@ def uncovered_files(
         return None  # No ledger to consult: coverage is unknowable.
     all_files = [str(f) for f in files]
     try:
-        targets = _completed_coverage(db_path, model)
+        targets = _completed_coverage(db_path, model, min_depth=min_depth)
         if targets is None:
             return all_files  # Ledger never written: genuine first run.
         covered_as = _covered_identities(db_path, model) if rescan_changed_files else {}
-        target_runs, recording_runs = _coverage_runs(db_path, model) if covered_as else ({}, set())
+        target_runs, recording_runs = (
+            _coverage_runs(db_path, model, min_depth=min_depth) if covered_as else ({}, set())
+        )
         current = str(harness_fingerprint or "")
         out = []
         for path in all_files:
@@ -919,6 +1094,7 @@ def record_run_plan(
     focus_groups: Optional[Sequence[dict]] = None,
     overwrite: bool = False,
     passes: Optional[int] = None,
+    passes_explicit: bool = False,
     depth: Optional[int] = None,
 ) -> bool:
     """Persists a run's initial planned targets and campaign groupings in
@@ -934,8 +1110,11 @@ def record_run_plan(
         return False
 
     payload: dict[str, Any] = {"targets": rel_targets}
-    if passes is not None and int(passes) > 1:
-        payload["passes"] = int(passes)
+    if passes is not None and not isinstance(passes, bool) and int(passes) >= 1:
+        if int(passes) > 1 or passes_explicit:
+            payload["passes"] = int(passes)
+            if passes_explicit:
+                payload["passes_explicit"] = True
     if depth is not None and not isinstance(depth, bool):
         payload["depth"] = int(depth)
     if plan_groups:
@@ -1123,8 +1302,14 @@ def load_run_plan(db_path: str, run_id: str, target_root: str) -> Optional[dict]
                 if pdir and pfiles:
                     fgs.append({"dir": pdir, "files": pfiles})
             out["focus_groups"] = fgs
-        if isinstance(raw_plan.get("passes"), int) and not isinstance(raw_plan.get("passes"), bool) and raw_plan["passes"] > 1:
+        if (
+            isinstance(raw_plan.get("passes"), int)
+            and not isinstance(raw_plan.get("passes"), bool)
+            and raw_plan["passes"] >= 1
+        ):
             out["passes"] = int(raw_plan["passes"])
+            if raw_plan.get("passes_explicit"):
+                out["passes_explicit"] = True
         if (
             isinstance(raw_plan.get("depth"), int)
             and not isinstance(raw_plan.get("depth"), bool)

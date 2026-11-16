@@ -58,9 +58,12 @@ target repositories.
     `--passes`, `--reasoning-effort`, `--token-budget`, `--max-time`) always
     take precedence, and existing budget guardrails remain enforced.
   - `--scan-mode`: Scan scope strategy (`auto`, `whole`, `file-by-file`,
-    `cross-functional`, `changed`). Use `changed` (without `--resume`) on the
-    same `knowledge.db` to scan newly added/edited files and verify whether
-    prior findings touching them are `still_present` or `fixed`.
+    `uncovered`, `cross-functional`, `changed`). `auto` (default) uses `--depth`
+    planning (whole up to the depth whole-file limit, else risk-ranked batches
+    rotating onto uncovered/changed files on repeat runs). Use `changed`
+    (without `--resume`) on the same `knowledge.db` to scan newly added/edited
+    files and verify whether prior findings touching them are `still_present` or
+    `fixed`.
   - `--resume [RUN_ID]`: Resume an interrupted or partially failed run (latest
     run for target when `RUN_ID` is omitted), inheriting its recorded scan mode.
     Cannot be combined with a different `--scan-mode`.

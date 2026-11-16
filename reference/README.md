@@ -232,10 +232,12 @@ Before any campaign runs, Mantis states what the token budget covers:
 
 The estimate **never withholds or caps a scan**. An explicitly requested mode
 runs exactly what was asked for; the line reports coverage so the number is
-visible in a CI log afterwards. The only place the estimate *chooses* anything
-is `scan_mode=auto`, which is already defined as the mode that decides on the
-operator's behalf — there it sizes the number of surveyed subsystems, and only
-ever downward from the configured `max_slices`.
+visible in a CI log afterwards. Under `scan_mode=auto`, the batch count comes
+from the active `--depth` profile (see [Audit Depth](#audit-depth)) and the run
+pauses cleanly at the budget ceiling with a `--resume` command. The
+`surveyor.max_slices` workflow setting applies only to explicit
+`--scan-mode cross-functional` (or legacy non-depth callers, where the cost
+estimate sizes surveyed subsystems downward from `max_slices`).
 
 Each completed campaign's actual cost is recorded to the `campaign_spend` table,
 and later estimates use that deployment's own observed mean in place of the
@@ -253,13 +255,13 @@ estimates are consistently wrong for your workflow.
 levers that govern vulnerability recall without relaxing existing budget
 guardrails (`--token-budget`, `--max-time`, `--max-steps`):
 
-| `--depth` | Tier         | Active File Coverage      | Reasoning Effort      | Passes                                 | Typical Use                                                                                         |
-| --------- | ------------ | ------------------------- | --------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `1–15`    | `quick`      | `15%–30%`                 | `low`                 | `1`                                    | Fast triage for Critical/High bugs (single campaign on typical repos at `1–10`).                    |
-| `16–45`   | `standard`   | `31%–62%` (`45%` at `30`) | `low` → `medium`      | `1`                                    | Balanced default (`30`): risk-ranked batches across full-stack, firmware/RTL, IaC, and custom DSLs. |
-| `46–74`   | `thorough`   | `63%–94%`                 | `high`                | `1`                                    | Deep review across all vulnerability classes, smaller per-campaign batches, higher checklist caps.  |
-| `75–89`   | `deep`       | `95%–100%`                | `high`                | `2`                                    | Near-complete coverage with two independent orthogonal passes.                                      |
-| `90–100`  | `exhaustive` | `100%` (+ tests)          | `max` (model-clamped) | `2` (`3` on small targets at `95–100`) | Exhaustive micro-batched audit across every active file and security-relevant asset.                |
+| `--depth` | Tier         | Active File Coverage (per run)                                               | Reasoning Effort      | Passes                                 | Typical Use                                                                                                                     |
+| --------- | ------------ | ---------------------------------------------------------------------------- | --------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `1–15`    | `quick`      | `15%–30%` (1 whole campaign up to 1,000 files at `1–10`, else 1 batch of 40) | `low`                 | `1`                                    | Fast triage for Critical/High bugs (single campaign on typical repos at `1–10`; bounded 40-file top-risk batch on large repos). |
+| `16–45`   | `standard`   | `31%–62%` (`45%` / up to 10 batches, ~220 files at `30`)                     | `low` → `medium`      | `1`                                    | Balanced default (`30`): whole up to 40 active files, else risk-ranked batches rotating automatically onto uncovered files.     |
+| `46–74`   | `thorough`   | `63%–94%` (up to 17–55 batches)                                              | `high`                | `1`                                    | Deep review across all vulnerability classes, smaller per-campaign batches, higher checklist caps.                              |
+| `75–89`   | `deep`       | `95%–100%` (up to 90 batches; uncapped at `86+`)                             | `high`                | `2`                                    | Near-complete coverage with two independent orthogonal passes.                                                                  |
+| `90–100`  | `exhaustive` | `100%` (+ tests, uncapped micro-batches)                                     | `max` (model-clamped) | `2` (`3` on small targets at `95–100`) | Exhaustive micro-batched audit across every active file and security-relevant asset.                                            |
 
 ```bash
 ./run.sh /path/to/repo              # default --depth 30
@@ -271,29 +273,39 @@ guardrails (`--token-budget`, `--max-time`, `--max-steps`):
 Key guarantees of `--depth`:
 
 - **Explicit overrides always win**: passing `--scan-mode`, `--passes`,
-  `--reasoning-effort`, `--token-budget` / `--max-tokens`, `--max-time`, or
-  `--max-slices` overrides the corresponding depth-derived default.
+  `--reasoning-effort`, `REASONING_EFFORT`, or `workflow.local.json`
+  `reasoning_effort` overrides the corresponding depth-derived default
+  (depth-derived effort applies to the shared `audit_stem` prefix group and
+  leaves non-stem per-node efforts intact).
 - **Hard budget guardrails stay intact**: `--depth 100` never raises or bypasses
-  wall-clock or token ceilings; if a deep scan hits a ceiling it pauses cleanly
-  and resumes via `--resume`.
+  wall-clock or token ceilings (`--token-budget` / `--max-tokens`,
+  `--max-time`); if a deep scan hits a ceiling it pauses cleanly and resumes via
+  `--resume`.
 - **Blocklist-default, cross-domain file selection**: only pure styling, locale,
   and binary/media/archive noise is excluded from primary risk batches. Active
   code, firmware/RTL (`.v`, `.sv`, `.vhd`, `.vhdl`, embedded/eBPF), Smart
   Contracts/ZK, CI/CD workflows, mobile, AI/ML pipelines, desktop/extensions,
   IaC/policies, and unknown text/DSL files all remain eligible at every depth.
-- **INV-2 independence preserved**: depth-derived hunting directives are
-  injected into hunting stages only — never into `reviewer` or `critic`.
+- **INV-2 verdict neutrality**: depth-derived hunting directives are addressed
+  to hunting stages only (never injected into `reviewer` or `critic` stage
+  openers). On the shared-prefix graph, forked judge stages inherit upstream
+  stem turns for KV-cache efficiency and carry an explicit prompt rule
+  forbidding verdicts grounded on upstream steering or documentation prose.
 
 ### Repository Documentation & Threat-Model Discovery
 
-On directory scans, Mantis performs a symlink-safe, bounded discovery of
-existing repository documentation (`README.md`, `SECURITY.md`,
-`.github/SECURITY.md`, `docs/THREAT_MODEL.md`, architecture/design specs) and
-provides an inventory to `architect` and `threat_modeler` strictly as untrusted
-`TIER_INTENT` context. Agents use these docs to understand system purpose, trust
-boundaries, and stated security invariants — and verify those claims skeptically
-against the actual implementation. Documentation context is withheld from
-independent verifier/judge stages to preserve INV-2.
+On directory scans (including depth-planned multi-file batches), Mantis performs
+a symlink-safe, bounded discovery of existing repository documentation
+(`README.md`, `SECURITY.md`, `.github/SECURITY.md`, `docs/THREAT_MODEL.md`,
+architecture/design specs) and addresses an inventory to `architect` and
+`threat_modeler` strictly as untrusted `TIER_INTENT` context. Agents use these
+docs to understand system purpose, trust boundaries, and stated security
+invariants — and verify those claims skeptically against the actual
+implementation. The inventory is never injected into judge stage openers;
+because forked judges replay the shared upstream stem (including any documents
+the stem read), `reviewer`, `critic`, and `reproducer` enforce an explicit rule
+that `TIER_INTENT` documentation prose may never ground a dismissal or failed
+reproduction (INV-2).
 
 ## Scan Modes
 
@@ -301,13 +313,14 @@ The scan modes answer different questions and are **complementary, not a quality
 ladder**. Their names describe *coverage* (how much of the tree is looked at)
 and *reach* (how much context one question spans), which vary independently.
 
-| Mode               | Coverage           | Reach        | What it is for                                                                                                                                                                                                                                                                                                                                                                              |
-| ------------------ | ------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `whole`            | one campaign       | whole target | Small targets that fit in a single listing.                                                                                                                                                                                                                                                                                                                                                 |
-| `file-by-file`     | every source file  | one file     | Localized defects: the bad `memcpy`, the unchecked index, the missing authz call. Nothing is skipped for being unglamorous. Cost scales with file count.                                                                                                                                                                                                                                    |
-| `cross-functional` | ranked subsystems  | many files   | Defects that span files, repositories or systems — invisible to a per-file pass by construction, because no single file contains the bug.                                                                                                                                                                                                                                                   |
-| `auto`             | —                  | —            | Whole target if it fits. Past that: `file-by-file` over every file no recorded campaign has covered — all files on a first scan, only the gap after a partial one — else `cross-functional`. An unreadable ledger counts as covered.                                                                                                                                                        |
-| `changed`          | new + edited files | whole target | The scan-fix-rescan loop: a campaign per directory holding files no completed scan has covered *in their present content* (small directories join their parent's; a changed file at the root is its own), each over the whole target with the rest of the tree readable for callers and routes, so `--parallel` applies. Campaign scopes never nest. Nothing changed means nothing to scan. |
+| Mode               | Coverage             | Reach           | What it is for                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------ | -------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `whole`            | one campaign         | whole target    | Small targets that fit in a single listing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `file-by-file`     | every source file    | one file        | Localized defects: the bad `memcpy`, the unchecked index, the missing authz call. Nothing is skipped for being unglamorous. Cost scales with file count.                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `uncovered`        | uncovered files only | one file        | Per-file sweep over only the files no completed campaign has covered yet (or covered only at a lower depth when an explicit `--depth N` is passed), regardless of repository size. Nothing uncovered means nothing to scan.                                                                                                                                                                                                                                                                                                                                                             |
+| `cross-functional` | ranked subsystems    | many files      | Defects that span files, repositories or systems — invisible to a per-file pass by construction, because no single file contains the bug. Uses `surveyor.max_slices` when requested explicitly.                                                                                                                                                                                                                                                                                                                                                                                         |
+| `auto`             | depth-planned        | whole / batches | Default mode driven by `--depth` (default `30`): runs one `whole` campaign up to the depth's whole-file limit (`40` active files at depth `30`, `1,000` at depth `1–10`), otherwise splits active security files into risk-ranked `cross-functional` batches up to the depth's coverage fraction and batch cap (at most `10` batches / ~`220` files per run at depth `30`), rotating automatically onto uncovered or changed active files on subsequent runs against the same database. Raise `--depth` or use `--scan-mode uncovered` / `file-by-file` to cover everything in one run. |
+| `changed`          | new + edited files   | whole target    | The scan-fix-rescan loop: a campaign per directory holding files no completed scan has covered *in their present content* (small directories join their parent's; a changed file at the root is its own), each over the whole target with the rest of the tree readable for callers and routes, so `--parallel` applies. Campaign scopes never nest. Nothing changed means nothing to scan.                                                                                                                                                                                             |
 
 ```bash
 # Ask one researcher about every file, then dedupe downstream.
@@ -333,12 +346,12 @@ The ledger records the content of every file a completed campaign examined, and
 compares disk state against the **most recently recorded** version per file (for
 the active model), so "covered" means covered *as it was last scanned*: editing
 a file — or reverting a fixed file back to an older commit — marks it changed
-and uncovered again in every mode that consults coverage (`auto` on a large tree
-re-examines it automatically; a small tree is rescanned whole as before, with a
-note naming `--scan-mode changed`). `--resume` is different on purpose: it
-continues a run on the code as it was and says when that code has moved. Files
-covered before content was recorded count as covered until they are scanned once
-more.
+and uncovered again in every mode that consults coverage (`auto` rotates edited
+and uncovered active files back into its depth batches; `--scan-mode changed`
+scopes strictly to edited/new files; `--scan-mode uncovered` sweeps uncovered
+files one per campaign). `--resume` is different on purpose: it continues a run
+on the code as it was and says when that code has moved. Files covered before
+content was recorded count as covered until they are scanned once more.
 
 ### Verifying fixes and the incremental loop (`--scan-mode changed`)
 
@@ -398,15 +411,16 @@ been edited since). `--dry-run` reports without writing, and `--exclude` takes
 the patterns the scans were given. A file edited since the commit is reported as
 changed by the next `changed` run, as it should be.
 
-Running `file-by-file` first gives a later `cross-functional` pass real evidence
-to plan from, and `auto` encodes exactly that workflow, file by file: it sweeps
-whatever the spend ledger has never seen covered (a first scan sweeps
-everything; scanning `repo` after a run over `repo/lib` sweeps everything except
-`lib`), and selects `cross-functional` once coverage is complete. Either may
-still be run alone with an explicit `--scan-mode`. Any plan of 50 campaigns or
-more asks for confirmation on an interactive terminal; the plan is printed
-either way, so a CI log records what the run committed to. The superseded
-spellings `file-sweep` and `slices` are still accepted.
+In default `auto` mode, Mantis uses depth-calibrated planning (`--depth 30` by
+default): small targets run as one `whole` campaign, larger targets run as
+risk-ranked `cross-functional` batches that rotate through uncovered and changed
+active files on repeat runs, and an in-progress `file-by-file` sweep continues
+over its remaining uncovered source files. Explicit `--scan-mode file-by-file`,
+`uncovered`, `cross-functional`, `whole`, or `changed` always takes precedence.
+Any plan of 50 campaigns or more asks for confirmation on an interactive
+terminal; the plan is printed either way, so a CI log records what the run
+committed to. The superseded spellings `file-sweep` and `slices` are still
+accepted.
 
 ### Leaving parts of the target out
 
@@ -455,10 +469,10 @@ The next run reads it back before it decides what to scan:
 
 Imported findings keep their lineage ids and statuses, so a re-scan matches what
 it already knows rather than reporting it again and a suppressed finding stays
-suppressed; coverage feeds `auto` mode, which sweeps only what has never been
-covered; and the threat model and architecture are found by the run's own tools,
-so the architect and threat modeler refine rather than rebuild. `.mantis/`
-itself is never a scan target.
+suppressed; coverage feeds `auto` depth-batch rotation and
+`--scan-mode uncovered`/`changed`; and the threat model and architecture are
+found by the run's own tools, so the architect and threat modeler refine rather
+than rebuild. `.mantis/` itself is never a scan target.
 
 Export is a deliberate step after a scan rather than something the scan does:
 the pipeline never writes into the target it audits. Import is explicit for the

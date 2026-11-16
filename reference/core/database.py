@@ -2600,14 +2600,27 @@ def read_findings(
         return rows
 
 def record_calibration(db_path: str, filepath: str, score: float, reasoning: str, run_id: str = ""):
-    """Record final per-file risk calibration score (0.1 - 10.0 scale) into the database."""
+    """Record final per-file risk calibration score (0.1 - 10.0 scale) into the database.
+
+    When multiple findings in the same file are calibrated during the same run,
+    retains the peak (highest) risk score for `(run_id, filepath)` so a lower-risk
+    finding calibrated later cannot overwrite a higher-risk file score.
+    """
     with _db(db_path) as conn:
         cursor = conn.cursor()
         cal_filepath = canonical_filepath(filepath, target_file=filepath)
+        new_score = float(score)
+        cursor.execute(
+            "SELECT score FROM risk_scores WHERE run_id IS ? AND filepath = ?",
+            (run_id, cal_filepath),
+        )
+        existing = cursor.fetchone()
+        if existing is not None and existing[0] is not None and float(existing[0]) > new_score:
+            return
         cursor.execute("""
             INSERT OR REPLACE INTO risk_scores (run_id, filepath, score, reasoning)
             VALUES (?, ?, ?, ?)
-        """, (run_id, cal_filepath, float(score), reasoning))
+        """, (run_id, cal_filepath, new_score, reasoning))
 
 def read_risk_scores(db_path: str, filepath: Optional[str] = None, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Read risk scores from the database, optionally filtered by filepath and run_id."""

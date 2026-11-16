@@ -130,7 +130,7 @@ path via `--db`):
 ./run.sh /path/to/repo --exclude vendor,testdata --exclude 'third_party/*'
 
 # Choose an explicit scan mode, or verify fixes incrementally after editing code
-./run.sh /path/to/repo --scan-mode file-by-file   # or whole, cross-functional, auto
+./run.sh /path/to/repo --scan-mode file-by-file   # or whole, uncovered, cross-functional, auto
 ./run.sh /path/to/repo --scan-mode changed        # new run after edits (omit --resume)
 
 # Resume an interrupted or budget-paused run on the same snapshot

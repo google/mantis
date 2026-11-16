@@ -24,8 +24,10 @@ onto every lever that governs vulnerability recall:
 3. Multi-pass orthogonal audit lenses (`1` pass through depth 74; `2` passes at
    75..100, and `3` passes on very small targets at 95..100).
 4. Deterministic checklist caps & explorer read discipline.
-5. Hunting-stage vulnerability-class & severity aperture (injected into hunting
-   stages only -- never reviewer/critic -- to preserve INV-2 independence).
+5. Hunting-stage vulnerability-class & severity aperture (addressed to hunting
+   stages only -- never injected into reviewer/critic openers; on the
+   shared-prefix graph forked judges inherit upstream turns under an explicit
+   verdict-neutrality rule preserving INV-2 independence).
 
 Explicit CLI overrides (`--scan-mode`, `--passes`, `--reasoning-effort`,
 `--token-budget`, `--max-time`, etc.) always take precedence over `--depth`.
@@ -219,8 +221,9 @@ def resolve_depth_profile(depth: int = DEFAULT_DEPTH) -> DepthProfile:
         coverage_fraction = 1.0
 
     # Single-campaign whole-target ceiling (countable active files):
-    # - Depth 1..10 stays a fast 1-campaign triage scan on typical repos.
-    # - Depth 30 keeps small repos (<=30 active files) in 1 whole campaign while
+    # - Depth 1..10 stays a fast 1-campaign triage scan on typical repos (<=1000
+    #   active files) and runs a single 40-file risk-ranked batch past that.
+    # - Depth 30 keeps small repos (<=40 active files) in 1 whole campaign while
     #   splitting medium/large repos into focused risk-ranked batches.
     # - Depth 80..100 shrinks whole_file_limit down to micro-batch size so even
     #   modest repos get undiluted per-batch attention.
@@ -233,11 +236,11 @@ def resolve_depth_profile(depth: int = DEFAULT_DEPTH) -> DepthProfile:
         target_batch_files = _lerp_int(d, 11, 20, 32, 26)
         max_batches = _lerp_int(d, 11, 20, 2, 5)
     elif d <= 40:
-        whole_file_limit = _lerp_int(d, 21, 40, 35, 22)
+        whole_file_limit = _lerp_int(d, 21, 40, 50, 28)
         target_batch_files = _lerp_int(d, 21, 40, 26, 18)
         max_batches = _lerp_int(d, 21, 40, 5, 16)
     elif d <= 70:
-        whole_file_limit = _lerp_int(d, 41, 70, 20, 12)
+        whole_file_limit = _lerp_int(d, 41, 70, 24, 12)
         target_batch_files = _lerp_int(d, 41, 70, 18, 12)
         max_batches = _lerp_int(d, 41, 70, 17, 55)
     elif d <= 85:
@@ -401,6 +404,8 @@ def plan_depth_batches(
     discovered_files: Sequence[str],
     profile: DepthProfile,
     astm: Optional[dict[str, Any]] = None,
+    *,
+    total_active_files: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """Builds deterministic, risk-ranked, subsystem-coherent file batches.
 
@@ -512,13 +517,21 @@ def plan_depth_batches(
     ranked_subsystems = sorted(by_subsys.keys(), key=lambda s: (-_subsys_rank(s)[0], s))
 
     # Split each subsystem into risk-ordered chunks of `batch_size`.
-    # On modest multi-subsystem repos (e.g. 30-100 active files), scale batch size
-    # down gracefully (`max(6, len(candidates) // 5)`) so a single bulky directory
+    # On modest multi-subsystem repos (e.g. 41-100 active files), scale batch size
+    # down gracefully (`max(6, budget_base // 5)`) so a single bulky directory
     # doesn't consume the entire coverage budget before sibling full-stack/RTL
     # subsystems are represented. Large repos (>=120 files) use `target_batch_files`.
+    # When rotating across uncovered subsets, `total_active_files` preserves the
+    # full-repo per-run budget so repeat runs finish in bounded passes rather than
+    # shrinking asymptotically.
+    budget_base = (
+        max(len(candidates), int(total_active_files))
+        if total_active_files is not None and int(total_active_files) > 0
+        else len(candidates)
+    )
     batch_size = max(
         1,
-        min(int(profile.target_batch_files), max(6, len(candidates) // 5)),
+        min(int(profile.target_batch_files), max(6, budget_base // 5)),
     )
     subsys_batches: dict[str, list[list[dict[str, Any]]]] = {}
     for subsys_name in ranked_subsystems:
@@ -573,7 +586,10 @@ def plan_depth_batches(
     target_file_budget = (
         len(candidates)
         if profile.coverage_fraction >= 0.999
-        else max(batch_size, int(math.ceil(len(candidates) * profile.coverage_fraction)))
+        else min(
+            len(candidates),
+            max(batch_size, int(math.ceil(budget_base * profile.coverage_fraction))),
+        )
     )
     selected_batches: list[list[dict[str, Any]]] = []
     covered_files = 0
@@ -605,8 +621,10 @@ def render_depth_hunting_directive(
 ) -> str:
     """Operator-authored hunting-stage directive calibrated to `profile`.
 
-    Delivered ONLY to hunting stages (`planner`, `explorer`, `researcher`),
-    never to `reviewer` or `critic` (INV-2 verification independence).
+    Addressed ONLY to hunting stages (`architect`, `threat_modeler`, `planner`,
+    `explorer`, `researcher`), never injected into `reviewer` or `critic` stage
+    instructions/openers. On the shared-prefix graph forked judges inherit
+    upstream turns under `INHERITED_STEM_NEUTRALITY_RULE` (INV-2).
     """
     lines: list[str] = [
         f"Audit Depth Profile: {profile.depth}/100 ({profile.tier})."
