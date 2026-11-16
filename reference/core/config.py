@@ -3658,6 +3658,10 @@ class ResilientLiteLlm(LiteLlm):
                 _rc = current_run_context.get()
                 if _rc is not None:
                     _rc.verdict_fallbacks = int(getattr(_rc, "verdict_fallbacks", 0) or 0) + 1
+                    if schema_name in ("ReviewVerdict", "ExtendedReviewVerdict"):
+                        _rc.reviewer_verdict_fallbacks = (
+                            int(getattr(_rc, "reviewer_verdict_fallbacks", 0) or 0) + 1
+                        )
             except Exception:
                 pass
 
@@ -3832,7 +3836,7 @@ class ResilientLiteLlm(LiteLlm):
                             and (
                                 (
                                     getattr(response, "error_code", None)
-                                    and str(getattr(response, "error_code", "")) not in ("SAFETY", "MAX_TOKENS")
+                                    and str(getattr(response, "error_code", "")) != "SAFETY"
                                 )
                                 or str(getattr(response, "finish_reason", "")).endswith("MALFORMED_FUNCTION_CALL")
                             )
@@ -3841,6 +3845,26 @@ class ResilientLiteLlm(LiteLlm):
                             schema_error_retried = True
                             retry_schema_turn = True
                             current_stream = False
+                            if str(getattr(response, "error_code", "")) == "MAX_TOKENS":
+                                schema_label = getattr(schema_cls, "__name__", "verdict")
+                                retry_req = active_request.model_copy()
+                                appended = list(getattr(active_request, "contents", None) or [])
+                                appended.append(
+                                    genai_types.Content(
+                                        role="user",
+                                        parts=[
+                                            genai_types.Part.from_text(
+                                                text=(
+                                                    f"Your previous turn hit the output token limit before completing "
+                                                    f"valid {schema_label} JSON. Emit a concise {schema_label} JSON "
+                                                    "object keeping each reason brief (one short sentence)."
+                                                )
+                                            )
+                                        ],
+                                    )
+                                )
+                                retry_req.contents = appended
+                                active_request = retry_req
                             break
                         if (
                             self._output_schema_override is not None
@@ -3858,13 +3882,50 @@ class ResilientLiteLlm(LiteLlm):
                                     for p in resp_parts
                                     if not getattr(p, "thought", False)
                                 )
-                                is_ok, _ = self._extract_valid_structured_json(resp_text, schema_cls)
-                                if not is_ok:
+                                is_ok, salvaged = self._extract_valid_structured_json(resp_text, schema_cls)
+                                missing_per_finding = False
+                                missing_ids: list[int] = []
+                                if is_ok and getattr(schema_cls, "__name__", "") == "ExtendedCriticVerdict":
+                                    try:
+                                        from core.context import current_run_context
+
+                                        rc_chk = current_run_context.get()
+                                        prom_ids = sorted(int(i) for i in (getattr(rc_chk, "promoted_finding_ids", None) or ()))
+                                        if len(prom_ids) > 1:
+                                            parsed_obj = json.loads(salvaged if salvaged is not None else resp_text)
+                                            fv_raw = parsed_obj.get("finding_verdicts") if isinstance(parsed_obj, dict) else None
+                                            if not fv_raw:
+                                                missing_per_finding = True
+                                                missing_ids = prom_ids
+                                    except Exception:
+                                        pass
+                                if not is_ok or missing_per_finding:
                                     meter_response_usage(response)
                                     invalid_json_retried = True
                                     retry_schema_turn = True
                                     current_stream = False
                                     schema_label = getattr(schema_cls, "__name__", "verdict")
+                                    if missing_per_finding:
+                                        reask_msg = (
+                                            f"Multiple reviewer-confirmed findings are in scope ({missing_ids}), "
+                                            "so a bare campaign-level verdict is ambiguous. Re-emit your "
+                                            f"{schema_label} JSON with a 'finding_verdicts' list containing one "
+                                            "entry per finding_id."
+                                        )
+                                    elif "{" in resp_text and '"route"' in resp_text:
+                                        reask_msg = (
+                                            f"Your response contained a near-miss {schema_label} JSON object that "
+                                            f"failed validation. Emit ONLY a valid raw JSON object conforming to "
+                                            f"{schema_label} (no markdown fences, no prose)."
+                                        )
+                                    else:
+                                        reask_msg = (
+                                            f"Your last turn was neither a tool call nor a valid {schema_label} "
+                                            f"verdict. If your analysis is complete, reply with ONLY the raw "
+                                            f"{schema_label} JSON object (no markdown fences, no prose). Otherwise "
+                                            "continue your verification with the next tool call through the "
+                                            "function-calling interface."
+                                        )
                                     retry_req = active_request.model_copy()
                                     appended = list(getattr(active_request, "contents", None) or [])
                                     if getattr(response, "content", None) is not None and resp_parts:
@@ -3872,15 +3933,7 @@ class ResilientLiteLlm(LiteLlm):
                                     appended.append(
                                         genai_types.Content(
                                             role="user",
-                                            parts=[
-                                                genai_types.Part.from_text(
-                                                    text=(
-                                                        f"Your response did not contain valid {schema_label} JSON. "
-                                                        f"Emit ONLY a raw JSON object conforming to {schema_label} "
-                                                        "(no markdown fences, no prose, and no tool calls)."
-                                                    )
-                                                )
-                                            ],
+                                            parts=[genai_types.Part.from_text(text=reask_msg)],
                                         )
                                     )
                                     retry_req.contents = appended

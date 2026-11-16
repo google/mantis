@@ -1299,7 +1299,11 @@ def report_findings(report: ReportedFindingsBatch) -> str:
                             f.line_numbers = extracted_lines
                         elif isinstance(f, dict):
                             f["line_numbers"] = extracted_lines
-                elif ctx.target_file and not os.path.isdir(ctx.target_file):
+                elif (
+                    ctx.target_file
+                    and not os.path.isdir(ctx.target_file)
+                    and _is_single_file_campaign(ctx)
+                ):
                     default_fp = os.path.relpath(ctx.target_file, ctx.jail_dir) if ctx.jail_dir else ctx.target_file
                     if hasattr(f, "filepath"):
                         f.filepath = default_fp

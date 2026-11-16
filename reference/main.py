@@ -917,7 +917,6 @@ async def _drive_campaign(
                     if node_key in pending_node_errors and (
                         getattr(event, "output", None) is not None
                         or route is not None
-                        or bool(getattr(getattr(event, "actions", None), "end_of_agent", False))
                         or bool(
                             getattr(getattr(event, "node_info", None), "message_as_output", False)
                             and getattr(event, "content", None)
@@ -5038,6 +5037,20 @@ async def pipeline(
                     and empty_ends > 0
                 ):
                     task_failed = True
+                finding_counts = _campaign_finding_counts(
+                    db_path, run_id, scan_item, pass_index=pass_idx if total_passes > 1 else None
+                )
+                rev_fallbacks = int(getattr(branch_ctx, "reviewer_verdict_fallbacks", 0) or 0)
+                unreviewed_reported = int(finding_counts.get("reported", 0) or 0)
+                if not task_failed and rev_fallbacks > 0 and unreviewed_reported > 0:
+                    task_failed = True
+                    print(
+                        f"\n[REVIEWER FALLBACK] '{scan_item}': reviewer emitted {rev_fallbacks} "
+                        f"synthesized fallback verdict(s) leaving {unreviewed_reported} candidate "
+                        "finding(s) unreviewed; marking campaign failed so findings are not silently "
+                        "dropped as a clean exit and --resume retries review.",
+                        file=sys.stderr,
+                    )
                 earned_coverage = should_credit_coverage(task_failed, code_reads)
                 # What this campaign actually cost. Recorded for completed campaigns
                 # only -- including failed ones, which still ran the graph and are a
@@ -5134,9 +5147,6 @@ async def pipeline(
                 # findings -> "confirmed"; all recorded findings dismissed ->
                 # "dismissal"; zero findings or failed campaign -> ""), never
                 # invented when no finding verdict exists.
-                finding_counts = _campaign_finding_counts(
-                    db_path, run_id, scan_item, pass_index=pass_idx if total_passes > 1 else None
-                )
                 from core.database import is_suppressed as _is_suppressed_status
 
                 open_findings_n = sum(

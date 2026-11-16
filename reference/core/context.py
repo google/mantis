@@ -109,6 +109,7 @@ class RunContext:
     promoted_finding_ids: Optional[set[int]] = None
     # Count of synthesized Fallback: verdict turns observed in this campaign.
     verdict_fallbacks: int = 0
+    reviewer_verdict_fallbacks: int = 0
     # Mid-invocation --resume accounting.
     pre_pause_tokens: int = 0
     pre_pause_llm_calls: int = 0

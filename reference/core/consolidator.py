@@ -167,14 +167,31 @@ def _tier1_exact_groups(
             if find(idi) == find(idj):
                 continue
             lj = lines_by_id[idj]
-            sim = _jaccard(toks_by_id[idi], toks_by_id[idj])
-            close_lines = _lines_close(li, lj)
             both_have_lines = bool(li and lj)
+            if not both_have_lines:
+                # Never merge deterministically without line citations; send
+                # line-less candidates to Tier 2 model adjudication instead.
+                continue
+
+            close_lines = _lines_close(li, lj)
+            if not close_lines:
+                continue
+
+            syms_i = syms_by_id[idi]
+            syms_j = syms_by_id[idj]
+            if syms_i and syms_j and not (syms_i & syms_j):
+                # Distinct enclosing/cited functions must never be auto-merged
+                # without model review, even when adjacent in the same file.
+                continue
+
+            q_sym_i = str(fi.get("qualified_symbol") or "").strip().lower()
+            q_sym_j = str(fj.get("qualified_symbol") or "").strip().lower()
+            if q_sym_i and q_sym_j and q_sym_i != q_sym_j:
+                continue
 
             if (sigi and sigi == sigs_by_id[idj]) or (lini and lini == lins_by_id[idj]):
-                if (not both_have_lines) or close_lines or sim >= 0.70:
-                    union(idi, idj)
-                    continue
+                union(idi, idj)
+                continue
 
             fpj = str(fj.get("filepath") or "").strip()
             if not fpi or fpi != fpj:
@@ -182,14 +199,12 @@ def _tier1_exact_groups(
             cwej = _norm_cwe(fj)
             if cwei and cwej and cwei != cwej:
                 continue
-            same_loc = close_lines or (
-                not both_have_lines
-                and bool(syms_by_id[idi] and (syms_by_id[idi] & syms_by_id[idj]))
-            )
-            if not same_loc:
-                continue
-            same_cwe_and_overlap = bool(cwei and cwei == cwej and sim >= 0.35)
-            if sim >= 0.70 or same_cwe_and_overlap:
+            sim = _jaccard(toks_by_id[idi], toks_by_id[idj])
+            same_symbol = bool(syms_i and (syms_i & syms_j)) or bool(q_sym_i and q_sym_i == q_sym_j)
+            exact_line_overlap = bool(li & lj)
+            if same_symbol and (sim >= 0.70 or (bool(cwei and cwei == cwej) and sim >= 0.50)):
+                union(idi, idj)
+            elif exact_line_overlap and not syms_i and not syms_j and sim >= 0.70:
                 union(idi, idj)
 
     buckets: Dict[int, List[Dict[str, Any]]] = {}
