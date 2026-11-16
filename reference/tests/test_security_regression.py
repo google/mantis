@@ -4233,12 +4233,12 @@ class TestSurveyorRankingQuality(unittest.TestCase):
         """
         from core.surveyor import survey
 
-        if os.environ.get("MANTIS_NEUTER_MATRIX"):
-            # The matrix reruns this whole module once per scenario; a 65s survey of a
-            # real checkout would dominate its runtime. No scenario neuters ranking
+        if os.environ.get("MANTIS_MUTATION_TEST"):
+            # Mutation runs evaluate this module across scenarios; a 65s survey of a
+            # real checkout would dominate runtime. No mutant targets ranking
             # quality, so nothing is lost. This still runs in an ordinary suite run --
             # it is not an opt-in that quietly never executes.
-            self.skipTest("Neuter matrix run; ELR smoke test is not a control pin.")
+            self.skipTest("Mutation test run; ELR smoke test is not a control pin.")
 
         chromium = Path.home() / "moss" / "chromium"
         if not (chromium / ".git").exists():
@@ -8108,35 +8108,30 @@ class TestEvidenceCarriesItsOwnAuthority(unittest.TestCase):
 
 
 class TestTheControlsThemselvesStillWork(unittest.TestCase):
-    """The neuter matrix is how we know the pins have teeth. Nothing checked that
-    the matrix itself still worked.
-
-    A neuter patches a literal string into a copy of the tree. When the code it
-    targets is reformatted -- a call broken across lines, a block indented into a new
-    `else:`, a keyword argument added two lines away -- the literal stops matching and
-    the scenario silently stops testing anything. Three had rotted this way, one of
-    them from a change made in the same session that added new scenarios.
-
-    Full matrix runtime is ~20 minutes, so in practice it is not run before every
-    commit, and `PATCH-FAILED` scrolls past unread when it is. These two checks cost
-    milliseconds and catch the rot at the point it is introduced.
+    """Security mutation testing proves the regression pins have teeth; these two
+    fast static checks ensure the mutation table itself never silently rots when
+    target code is reformatted, and never scores a SyntaxError as a killed mutant.
     """
 
-    def _scenarios(self):
+    def setUp(self):
+        if os.environ.get("MANTIS_MUTATION_TEST") == "1":
+            self.skipTest("Meta self-checks inspect the unmutated tree during unit-tests.")
+
+    def _mutants(self):
         import importlib.util
 
         ref = Path(__file__).resolve().parents[1]
-        path = ref / "scripts" / "neuter_matrix.py"
-        spec = importlib.util.spec_from_file_location("_neuter_matrix", path)
+        path = ref / "scripts" / "mutation_test.py"
+        spec = importlib.util.spec_from_file_location("_mutation_test", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.SCENARIOS, ref
+        return module.MUTANTS, ref
 
-    def test_every_neuter_still_finds_its_target(self):
-        """A scenario whose target text is gone tests nothing, and says so quietly."""
-        scenarios, ref = self._scenarios()
+    def test_every_mutant_still_finds_its_target(self):
+        """A mutant whose target text is gone tests nothing, and must fail loudly."""
+        mutants, ref = self._mutants()
         stale = []
-        for name, patches in scenarios.items():
+        for name, patches in mutants.items():
             for rel, old, _new in patches:
                 target = ref / rel
                 if not target.exists():
@@ -8145,23 +8140,17 @@ class TestTheControlsThemselvesStillWork(unittest.TestCase):
                     stale.append(f"{name}: pattern not found in {rel}")
         self.assertEqual(
             stale, [],
-            "neuter scenarios no longer match the code they are meant to break, so "
+            "security mutants no longer match the code they are meant to mutate, so "
             "they are silently testing nothing:\n  " + "\n  ".join(stale),
         )
 
-    def test_every_neuter_produces_code_that_still_parses(self):
-        """A neuter must break the ASSERTION, not the parser.
-
-        A scenario that yields a SyntaxError makes every test in the module fail, which
-        the matrix scores as WENT RED -- a potent-looking result from a scenario that
-        never exercised the defence at all. This is the strictly-worse cousin of a
-        stale scenario: it reports success while testing nothing.
-        """
+    def test_every_mutant_produces_code_that_still_parses(self):
+        """A mutant must break the behavioural assertion, never the Python parser."""
         import ast
 
-        scenarios, ref = self._scenarios()
+        mutants, ref = self._mutants()
         broken = []
-        for name, patches in scenarios.items():
+        for name, patches in mutants.items():
             for rel, old, new in patches:
                 if not rel.endswith(".py"):
                     continue
@@ -8177,8 +8166,8 @@ class TestTheControlsThemselvesStillWork(unittest.TestCase):
                     broken.append(f"{name} ({rel}): {exc}")
         self.assertEqual(
             broken, [],
-            "neuter scenarios produce unparseable Python, which fails every test for "
-            "the wrong reason and scores as potent:\n  " + "\n  ".join(broken),
+            "security mutants produce unparseable Python, which fails imports rather "
+            "than exercising the guard:\n  " + "\n  ".join(broken),
         )
 
 

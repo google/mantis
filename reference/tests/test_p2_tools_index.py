@@ -265,6 +265,10 @@ class TestP2GitBytesAndSubdirectoryTargets(unittest.IsolatedAsyncioTestCase):
         commit_env = dict(os.environ)
         commit_env["GIT_CONFIG_NOSYSTEM"] = "1"
         commit_env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        commit_env.setdefault("GIT_AUTHOR_NAME", "Mantis Test")
+        commit_env.setdefault("GIT_AUTHOR_EMAIL", "test@example.com")
+        commit_env.setdefault("GIT_COMMITTER_NAME", "Mantis Test")
+        commit_env.setdefault("GIT_COMMITTER_EMAIL", "test@example.com")
         new_head = subprocess.run(
             ["git", "-C", str(repo), "commit-tree", tree.decode(), "-p", parent.decode()],
             input=b"Fix caf\xe9 parser \xf6\xff\n",
