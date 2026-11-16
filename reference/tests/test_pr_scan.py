@@ -63,14 +63,25 @@ def _git(repo: Path, *args: str) -> str:
                           capture_output=True, text=True).stdout.strip()
 
 
-def make_pr_repo(tmp: str) -> tuple:
-    """A repository with a base commit and a head commit that edits app.py,
-    adds new.py and README.md, and deletes gone.py. Returns (repo, base_sha)."""
-    repo = Path(tmp) / "repo"
+_PR_REPO_TEMPLATE = None
+
+
+def _get_pr_repo_template() -> tuple:
+    """Builds the 2-commit base/head git fixture once per process so each test
+    copies it in <1ms instead of spawning 8 git subprocesses in setUp."""
+    global _PR_REPO_TEMPLATE
+    if _PR_REPO_TEMPLATE is not None and _PR_REPO_TEMPLATE[0].exists():
+        return _PR_REPO_TEMPLATE
+    import atexit
+
+    tmpl_root = tempfile.mkdtemp(prefix="mantis_pr_tmpl_")
+    atexit.register(shutil.rmtree, tmpl_root, True)
+    repo = Path(tmpl_root) / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "t@example.com")
     _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "commit.gpgsign", "false")
     (repo / "app.py").write_text(BASE_APP, encoding="utf-8")
     (repo / "gone.py").write_text("x = 1\n", encoding="utf-8")
     _git(repo, "add", "-A")
@@ -82,6 +93,16 @@ def make_pr_repo(tmp: str) -> tuple:
     (repo / "gone.py").unlink()
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "head")
+    _PR_REPO_TEMPLATE = (repo, base)
+    return _PR_REPO_TEMPLATE
+
+
+def make_pr_repo(tmp: str) -> tuple:
+    """A repository with a base commit and a head commit that edits app.py,
+    adds new.py and README.md, and deletes gone.py. Returns (repo, base_sha)."""
+    tmpl_repo, base = _get_pr_repo_template()
+    repo = Path(tmp) / "repo"
+    shutil.copytree(tmpl_repo, repo, symlinks=True)
     return repo, base
 
 
@@ -93,7 +114,7 @@ _FAKE_SCAN = """\
 import json, sys
 sys.path.insert(0, {ref_root!r})
 from core.cost import record_spend
-from core.database import record_run, write_findings
+from core.database import record_run
 argv = sys.argv[1:]
 # The real _scan_cmd puts --model on the command line; this stand-in replaces
 # _scan_cmd, so the model arrives through the template instead.
@@ -103,6 +124,7 @@ record_run({db!r}, run, model)
 record_spend({db!r}, run, {target!r}, "deep", tokens=5)
 finding = {finding!r}
 if finding:
+    from core.database import write_findings
     write_findings({db!r}, {target!r}, [finding], run_id=run, status="")
 if "--spend-report" in argv and not {no_report!r}:
     path = argv[argv.index("--spend-report") + 1]

@@ -50,6 +50,7 @@ from core.config import (
     ResilientLiteLlm,
     _HANDOFF_PLAIN_TEXT_TURN,
     _HandoffLiteLlm,
+    _is_discard_loopback_api_base,
     get_llm_kwargs,
     is_claude_model,
     resolve_model_id,
@@ -5364,13 +5365,16 @@ def load_workflow_from_json(
                 else adk.Agent
             )
             agent = agent_cls(**agent_kwargs)
+            fast_discard_retry = _is_discard_loopback_api_base(
+                effective_node_api_base or os.environ.get("LLM_API_BASE") or spec.config.api_base
+            )
             node_retry = (
                 RetryConfig(
                     max_attempts=spec.config.retry_attempts,
-                    initial_delay=5.0,
-                    max_delay=60.0,
+                    initial_delay=0.01 if fast_discard_retry else 5.0,
+                    max_delay=0.02 if fast_discard_retry else 60.0,
                     backoff_factor=2.0,
-                    jitter=0.5,
+                    jitter=0.0 if fast_discard_retry else 0.5,
                 )
                 if spec.config.retry_attempts > 1
                 else None

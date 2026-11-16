@@ -460,6 +460,18 @@ def _llm_retry_params() -> tuple[float, float, float, float, float]:
     return max_patience, initial_delay, max_delay, min_offset, backoff_factor
 
 
+_DISCARD_LOOPBACK_API_BASE_RE = re.compile(
+    r"^https?://(?:127\.0\.0\.1|localhost|\[::1\]):9(?:/|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_discard_loopback_api_base(api_base: Any) -> bool:
+    """True for RFC 863 loopback discard endpoints (`127.0.0.1:9` / `localhost:9`)
+    used by offline CLI tests to exercise planning without retry backoff sleeps."""
+    return bool(_DISCARD_LOOPBACK_API_BASE_RE.match(str(api_base or "").strip()))
+
+
 _VERSIONED_REASONING_FAMILY_RE = re.compile(
     r"(?:^|[/:_-])(?:"
     r"gemini-(?:2\.5|3(?:\.\d+|[-_]|$))"
@@ -2767,6 +2779,8 @@ class ResilientLiteLLMClient(LiteLLMClient):
             return self._astream_with_retry(model, messages, tools, kwargs)
 
         max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
+        if _is_discard_loopback_api_base(kwargs.get("api_base")):
+            max_patience = 0.0
 
         start_time = time.time()
         attempt = 0
@@ -2909,6 +2923,8 @@ class ResilientLiteLLMClient(LiteLLMClient):
         import litellm
 
         max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
+        if _is_discard_loopback_api_base(kwargs.get("api_base")):
+            max_patience = 0.0
 
         start_time = time.time()
         attempt = 0
@@ -2995,6 +3011,8 @@ class ResilientLiteLLMClient(LiteLLMClient):
             return self._stream_with_retry(model, messages, tools, kwargs)
 
         max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
+        if _is_discard_loopback_api_base(kwargs.get("api_base")):
+            max_patience = 0.0
 
         start_time = time.time()
         attempt = 0
@@ -3064,6 +3082,8 @@ class ResilientLiteLLMClient(LiteLLMClient):
         import litellm
 
         max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
+        if _is_discard_loopback_api_base(kwargs.get("api_base")):
+            max_patience = 0.0
 
         start_time = time.time()
         attempt = 0
@@ -4246,6 +4266,9 @@ def get_llm_kwargs(
     llm_kwargs = {"model": resolved_model}
     if resolved_api_base:
         llm_kwargs["api_base"] = resolved_api_base
+        if _is_discard_loopback_api_base(resolved_api_base):
+            llm_kwargs.setdefault("max_retries", 0)
+            llm_kwargs.setdefault("num_retries", 0)
     if effort:
         clean_effort = str(effort).lower().strip()
         if not is_claude_model(resolved_model) and clean_effort in ("xhigh", "max"):
