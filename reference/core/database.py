@@ -800,6 +800,10 @@ def extract_target_symbol(title: str = "", description: str = "", code_paths: Op
     if desc_fn:
         return desc_fn.group(1).lower()
 
+    desc_call = re.search(r"\b([a-zA-Z_][a-zA-Z0-9_]+)\(\)", description)
+    if desc_call:
+        return desc_call.group(1).lower()
+
     # 6. Check code_paths
     if code_paths and isinstance(code_paths, list):
         for cp in code_paths:
@@ -1593,6 +1597,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             grounded_symbol = ground_symbol_in_catalog(db_path, finding_filepath, line_numbers)
             if grounded_symbol:
                 target_symbol = grounded_symbol
+            if grounded_symbol and target_symbol == grounded_symbol:
                 _, qualified_symbol, grounded_start_line = ground_symbol_in_catalog(
                     db_path, finding_filepath, line_numbers, return_details=True
                 )

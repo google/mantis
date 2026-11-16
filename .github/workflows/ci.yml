@@ -71,6 +71,7 @@ jobs:
         env:
           MANTIS_CI_STRICT_DEPS: "1"
           PYTHONSAFEPATH: "1"
+          GOOGLE_CLOUD_PROJECT: "ci-offline-project"
           NO_PROXY: "127.0.0.1,localhost"
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
           LITELLM_MODE: PRODUCTION
@@ -100,6 +101,7 @@ jobs:
         working-directory: reference
         env:
           PYTHONSAFEPATH: "1"
+          GOOGLE_CLOUD_PROJECT: "ci-offline-project"
           NO_PROXY: "127.0.0.1,localhost"
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
           LITELLM_MODE: PRODUCTION
