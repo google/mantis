@@ -40,7 +40,7 @@ R4 + P4-sentinel -- Recall target scoping at path-component boundaries
        code was not 127.
 
 Run with:
-    GOOGLE_CLOUD_PROJECT=your-project MANTIS_NEUTER_MATRIX=1 PYTHONPATH=reference \
+    GOOGLE_CLOUD_PROJECT=your-project MANTIS_MUTATION_TEST=1 PYTHONPATH=reference \
         reference/.venv/bin/python3 -m unittest reference.tests.test_verdicts_recall_sentinel
 
 No network, no real LLM calls: everything is driven through classifier
