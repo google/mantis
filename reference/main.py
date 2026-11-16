@@ -1913,6 +1913,23 @@ def _is_countable_source_file(filepath: str) -> bool:
     return ext not in _NON_COUNTABLE_DOC_LOCK_EXTS
 
 
+def _is_sweep_source_file(filepath: str, target_root: Path) -> bool:
+    """True when `filepath` is security-relevant source/config/DSL rather than
+    prose docs, lockfiles, styling, locale, or binary noise (shared with depth
+    batch planning)."""
+    from core.depth import _file_security_priority
+
+    fp_str = str(filepath or "")
+    try:
+        root_real = os.path.realpath(str(target_root)).rstrip("/")
+        rel = os.path.relpath(os.path.realpath(fp_str), root_real).replace(os.sep, "/")
+        if rel.startswith(".."):
+            rel = os.path.basename(fp_str)
+    except ValueError:
+        rel = os.path.basename(fp_str)
+    return _file_security_priority(rel) is not None
+
+
 def _risk_order_file_sweep_targets(
     files: list[str],
     target_root: str | Path,
@@ -1997,10 +2014,15 @@ def resolve_scan_targets(
     The caller that surveyed first passes its result in.
 
     Mode selection is explicit via `config["scan_mode"]`; see the constants above for
-    what each one is FOR. `auto` deliberately preserves the historical behaviour --
-    whole-target for anything that fits in one listing, slices past that -- because
-    switching a repository to a per-file sweep multiplies its cost by the file count and
-    is not a decision to make on the operator's behalf.
+    what each one is FOR. In `auto` mode with `config["depth"]` set (the pipeline
+    default, `--depth 30`), small repositories up to the depth profile's
+    `whole_file_limit` run as one `whole` campaign; larger repositories run as
+    risk-ranked, subsystem-coherent `cross-functional` file batches capped by the
+    depth profile (`coverage_fraction` and `max_batches`), rotating automatically
+    onto uncovered or changed active files on subsequent runs against the same
+    ledger. Only when the ledger records an in-progress `file-by-file` sweep for
+    this target (or when a direct caller invokes `auto` without `config["depth"]`
+    on a large tree) does `auto` fall through to a source-filtered per-file sweep.
 
     Never raises. Every failure path falls back to the whole target: reconnaissance that
     cannot run must not cost the operator the scan.
@@ -2041,36 +2063,47 @@ def resolve_scan_targets(
         return whole
 
     if mode == SCAN_MODE_AUTO and config.get("depth") is not None:
-        # Preserve incremental partial-coverage `auto` sweeps when `--depth` was
-        # NOT explicitly passed and the spend ledger already has partial file
-        # coverage (`0 < len(uncovered) < len(discovered_files)`). Fresh repos,
-        # fully covered repos, and explicit `--depth N` runs use depth planning.
+        # Preserve an in-progress per-file sweep ONLY when the spend ledger
+        # already holds completed `file-by-file` coverage on this target with
+        # remaining uncovered source files. Partial coverage left by depth-
+        # planned `cross-functional` batches never flips a later `auto` run
+        # into a per-file sweep (and omitted `--depth`, explicit `--depth`, and
+        # `workflow.json` depth all follow the exact same rule).
         _partial_uncovered_sweep = False
-        if not config.get("_depth_explicit") and db_path and len(discovered_files) > threshold:
+        countable_all = sum(1 for f in discovered_files if _is_countable_source_file(f))
+        exceeds_threshold = (
+            countable_all > threshold
+            if countable_all > 0
+            else len(discovered_files) > threshold
+        )
+        if db_path and exceeds_threshold:
             try:
                 from core.config import normalize_model_id
-                from core.cost import uncovered_files
+                from core.cost import has_active_file_sweep, uncovered_files
 
                 _run_model = normalize_model_id(str(config.get("default_model") or ""))
-                _uncov = uncovered_files(
-                    db_path,
-                    discovered_files,
-                    model=_run_model,
-                    harness_fingerprint=str(config.get("harness_fingerprint") or ""),
-                    rescan_changed_harness=bool(config.get("rescan_changed_harness")),
-                )
-                if _uncov and len(_uncov) < len(discovered_files):
-                    _partial_uncovered_sweep = True
+                if has_active_file_sweep(db_path, discovered_files, model=_run_model):
+                    _uncov = uncovered_files(
+                        db_path,
+                        discovered_files,
+                        model=_run_model,
+                        harness_fingerprint=str(config.get("harness_fingerprint") or ""),
+                        rescan_changed_harness=bool(config.get("rescan_changed_harness")),
+                    )
+                    if _uncov and len(_uncov) < len(discovered_files):
+                        _uncov_src = [f for f in _uncov if _is_sweep_source_file(f, target_path)]
+                        if _uncov_src:
+                            _partial_uncovered_sweep = True
             except Exception:
                 _partial_uncovered_sweep = False
 
         if not _partial_uncovered_sweep:
             # Depth-calibrated target planning (`--depth 1..100`, default `30`):
-            # keeps small targets and shallow quick scans (`1..10`) in a single
+            # keeps small targets (<= whole_file_limit active files) in a single
             # whole-target campaign while partitioning larger targets into
             # risk-ranked, subsystem-coherent full-stack + RTL file batches under
-            # `cross-functional` mode (preserving shared-prefix architect/threat-model
-            # reuse, deterministic batch checklists, and coverage ledger stamping).
+            # `cross-functional` mode, rotating across uncovered/changed active
+            # files on subsequent runs against the same ledger.
             from core.depth import (
                 count_active_security_files,
                 plan_depth_batches,
@@ -2087,8 +2120,61 @@ def resolve_scan_targets(
                 discovered_files,
                 include_tier2=d_profile.include_tier2_tests,
             )
-            if active_files <= d_profile.whole_file_limit or d_profile.max_batches == 1:
+            if active_files <= d_profile.whole_file_limit:
                 return whole
+
+            # Rotate automatically across uncovered/changed files at this depth
+            # when a readable ledger shows partial coverage.
+            batch_pool: list[str] = list(discovered_files)
+            rotating = False
+            uncovered_active = active_files
+            all_covered_at_depth = False
+            if db_path:
+                try:
+                    from core.config import normalize_model_id
+                    from core.cost import harness_mismatches, uncovered_files
+
+                    _run_model = normalize_model_id(str(config.get("default_model") or ""))
+                    _harness_fp = str(config.get("harness_fingerprint") or "")
+                    _rescan_changed = bool(config.get("rescan_changed_harness"))
+                    _depth_uncov = uncovered_files(
+                        db_path,
+                        discovered_files,
+                        model=_run_model,
+                        harness_fingerprint=_harness_fp,
+                        rescan_changed_harness=_rescan_changed,
+                        min_depth=d_profile.depth,
+                    )
+                    _stale = harness_mismatches(
+                        db_path,
+                        discovered_files,
+                        model=_run_model,
+                        harness_fingerprint=_harness_fp,
+                    )
+                    if _stale and _stale.get("files"):
+                        print(
+                            _changed_harness_notice(
+                                len(_stale["files"]),
+                                _stale.get("fingerprints") or {},
+                                _harness_fp,
+                                _rescan_changed,
+                            ),
+                            file=sys.stderr,
+                        )
+                    if _depth_uncov is not None:
+                        _uncov_active = count_active_security_files(
+                            target_path,
+                            _depth_uncov,
+                            include_tier2=d_profile.include_tier2_tests,
+                        )
+                        if 0 < _uncov_active < active_files:
+                            batch_pool = list(_depth_uncov)
+                            uncovered_active = _uncov_active
+                            rotating = True
+                        elif _uncov_active == 0 and active_files > 0:
+                            all_covered_at_depth = True
+                except Exception as exc:
+                    print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
 
             astm = precomputed_astm
             if astm is None:
@@ -2101,7 +2187,16 @@ def resolve_scan_targets(
                         file=sys.stderr,
                     )
                     astm = None
-            batches = plan_depth_batches(target_path, discovered_files, d_profile, astm=astm)
+            batches = plan_depth_batches(
+                target_path,
+                batch_pool,
+                d_profile,
+                astm=astm,
+                total_active_files=active_files if rotating else None,
+            )
+            if not batches and rotating:
+                rotating = False
+                batches = plan_depth_batches(target_path, discovered_files, d_profile, astm=astm)
             if not batches:
                 return whole
             covered = sum(len(b["targets"]) for b in batches)
@@ -2109,12 +2204,32 @@ def resolve_scan_targets(
                 scope_out["depth_groups"] = batches
                 scope_out["depth_active_files"] = active_files
                 scope_out["depth_covered_files"] = covered
-            print(
-                f"[DEPTH {d_profile.depth}/100 ({d_profile.tier})] Planned {len(batches)} "
-                f"risk-ranked batch(es) covering {covered}/{max(active_files, covered)} "
-                f"active security file(s) (effort={d_profile.reasoning_effort}).",
-                file=sys.stderr,
-            )
+                scope_out["depth_rotated"] = rotating
+                if rotating:
+                    scope_out["depth_uncovered_active_files"] = uncovered_active
+            if rotating:
+                print(
+                    f"[DEPTH {d_profile.depth}/100 ({d_profile.tier})] Rotating onto "
+                    f"{covered}/{max(uncovered_active, covered)} uncovered active security file(s) "
+                    f"({active_files} total active) across {len(batches)} risk-ranked batch(es) "
+                    f"(effort={d_profile.reasoning_effort}).",
+                    file=sys.stderr,
+                )
+            elif all_covered_at_depth:
+                print(
+                    f"[DEPTH {d_profile.depth}/100 ({d_profile.tier})] All {active_files} active "
+                    f"security file(s) already covered at depth >= {d_profile.depth}; re-planning "
+                    f"{len(batches)} risk-ranked batch(es) covering {covered}/{max(active_files, covered)} "
+                    f"file(s) (effort={d_profile.reasoning_effort}).",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[DEPTH {d_profile.depth}/100 ({d_profile.tier})] Planned {len(batches)} "
+                    f"risk-ranked batch(es) covering {covered}/{max(active_files, covered)} "
+                    f"active security file(s) (effort={d_profile.reasoning_effort}).",
+                    file=sys.stderr,
+                )
             return ([b["targets"][0] for b in batches], astm, SCAN_MODE_CROSS_FUNCTIONAL)
 
     if mode == SCAN_MODE_AUTO:
@@ -2210,17 +2325,28 @@ def resolve_scan_targets(
             except Exception as exc:
                 print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
             if uncovered:
+                sweep_targets = [f for f in uncovered if _is_sweep_source_file(f, target_path)]
+                skipped_noise = len(uncovered) - len(sweep_targets)
+            else:
+                sweep_targets = []
+                skipped_noise = 0
+            if sweep_targets:
                 mode = SCAN_MODE_FILE_BY_FILE
+                noise_note = (
+                    f" (excluding {skipped_noise} non-source doc/lock/asset file(s))"
+                    if skipped_noise > 0
+                    else ""
+                )
                 print(
-                    f"{len(uncovered)} of {len(discovered_files)} source files have "
-                    f"never been covered by a recorded campaign: defaulting to "
+                    f"{len(sweep_targets)} of {len(discovered_files)} source files have "
+                    f"never been covered by a recorded campaign{noise_note}: defaulting to "
                     f"{SCAN_MODE_FILE_BY_FILE} over the uncovered files -- "
-                    f"{len(uncovered)} campaigns, one per file. Once every file has "
+                    f"{len(sweep_targets)} campaigns, one per file. Once every file has "
                     f"history, auto selects {SCAN_MODE_CROSS_FUNCTIONAL}, which "
                     f"plans from it. Pass --scan-mode to override.",
                     file=sys.stderr,
                 )
-                discovered_files = list(uncovered)
+                discovered_files = list(sweep_targets)
             else:
                 mode = SCAN_MODE_CROSS_FUNCTIONAL
                 # Size the slice count to the budget instead of the fixed default.
@@ -2400,9 +2526,20 @@ def resolve_scan_targets(
             all_files = list(discovered_files)
             return all_files, None, SCAN_MODE_FILE_BY_FILE
         uncovered_list: Optional[list] = None
+        lower_depth_info: Optional[dict] = None
+        explicit_min_depth: Optional[int] = None
+        target_depth_for_notice: Optional[int] = None
+        if config.get("depth") is not None and not isinstance(config.get("depth"), bool):
+            try:
+                target_depth_for_notice = int(config["depth"])
+                if config.get("_depth_explicit"):
+                    explicit_min_depth = target_depth_for_notice
+            except (TypeError, ValueError):
+                target_depth_for_notice = None
+                explicit_min_depth = None
         try:
             from core.config import normalize_model_id
-            from core.cost import uncovered_files
+            from core.cost import covered_below_depth, uncovered_files
 
             run_model = normalize_model_id(str(config.get("default_model") or ""))
             harness_fp = str(config.get("harness_fingerprint") or "")
@@ -2412,7 +2549,15 @@ def resolve_scan_targets(
                 model=run_model,
                 harness_fingerprint=harness_fp,
                 rescan_changed_harness=bool(config.get("rescan_changed_harness")),
+                min_depth=explicit_min_depth,
             )
+            if target_depth_for_notice is not None:
+                lower_depth_info = covered_below_depth(
+                    db_path,
+                    discovered_files,
+                    min_depth=target_depth_for_notice,
+                    model=run_model,
+                )
         except Exception as exc:
             print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
             uncovered_list = None
@@ -2423,20 +2568,40 @@ def resolve_scan_targets(
                 file=sys.stderr,
             )
             return whole
+        n_lower_depth = len((lower_depth_info or {}).get("files") or [])
+        lower_max_d = (lower_depth_info or {}).get("max_depth")
         if not uncovered_list:
             print(
                 f"Scan mode {SCAN_MODE_UNCOVERED}: every one of {len(discovered_files)} source "
                 "file(s) has already been covered; nothing to scan.",
                 file=sys.stderr,
             )
+            if n_lower_depth > 0 and target_depth_for_notice is not None:
+                print(
+                    f"Note: {n_lower_depth} covered file(s) were only scanned at a lower depth "
+                    f"(max recorded depth {lower_max_d} < {target_depth_for_notice}); pass "
+                    f"--depth {target_depth_for_notice} (or higher) with --scan-mode "
+                    f"{SCAN_MODE_UNCOVERED} to re-examine them.",
+                    file=sys.stderr,
+                )
             if scope_out is not None:
                 scope_out["nothing_uncovered"] = True
             return [], None, SCAN_MODE_UNCOVERED
+        depth_detail = ""
+        if explicit_min_depth is not None and n_lower_depth > 0:
+            depth_detail = f" (including {n_lower_depth} previously scanned only at depth < {explicit_min_depth})"
         print(
             f"Scan mode {SCAN_MODE_UNCOVERED}: {len(uncovered_list)} of {len(discovered_files)} "
-            "source file(s) uncovered; running one campaign per uncovered file.",
+            f"source file(s) uncovered{depth_detail}; running one campaign per uncovered file.",
             file=sys.stderr,
         )
+        if explicit_min_depth is None and n_lower_depth > 0 and target_depth_for_notice is not None:
+            print(
+                f"Note: {n_lower_depth} additional covered file(s) were only scanned at a lower depth "
+                f"(max recorded depth {lower_max_d} < {target_depth_for_notice}); pass "
+                f"--depth {target_depth_for_notice} to include them.",
+                file=sys.stderr,
+            )
         return list(uncovered_list), None, SCAN_MODE_FILE_BY_FILE
 
     if mode == SCAN_MODE_FILE_BY_FILE:
@@ -3178,6 +3343,7 @@ def _stamp_member_coverage(
     scan_mode: str,
     harness_fingerprint: str = "",
     pass_index: int = 1,
+    depth: Optional[int] = None,
 ) -> int:
     """Coverage stamps for the members a multi-target campaign spanned beyond
     its primary.
@@ -3197,6 +3363,8 @@ def _stamp_member_coverage(
         meta: dict[str, Any] = {"member_of": scan_item}
         if int(pass_index or 1) > 1:
             meta["pass_index"] = int(pass_index)
+        if depth is not None and not isinstance(depth, bool):
+            meta["depth"] = int(depth)
         for member in (group.get("targets") or [])[1:]:
             # record_spend never raises -- it reports failure by returning
             # False -- so the stamped count must come from its return value.
@@ -3470,7 +3638,7 @@ async def pipeline(
     if max_input_tokens is not None and max_input_tokens > 0:
         banner_resume_flags["--max-input-tokens"] = max_input_tokens
     total_passes = max(1, int(passes or 1))
-    if total_passes > 1:
+    if total_passes > 1 or passes_explicit:
         banner_resume_flags["--passes"] = total_passes
 
     from core.depth import (
@@ -3505,9 +3673,11 @@ async def pipeline(
             except Exception:
                 continue
     depth_profile = resolve_depth_profile(resolved_depth)
-    effective_reasoning_effort = reasoning_effort_override
-    if not effective_reasoning_effort and depth_profile.reasoning_effort != "medium":
-        effective_reasoning_effort = depth_profile.reasoning_effort
+    depth_reasoning_effort = (
+        depth_profile.reasoning_effort
+        if depth_profile.reasoning_effort != "medium"
+        else None
+    )
     if no_memory:
         banner_resume_flags["--no-memory"] = True
     if intra_run_learning:
@@ -3562,8 +3732,9 @@ async def pipeline(
             sandbox_override=effective_sandbox_override,
             db_override=db_override,
             timeout_override=timeout_override,
-            reasoning_effort_override=effective_reasoning_effort,
+            reasoning_effort_override=reasoning_effort_override,
             load_local=effective_load_local,
+            depth_reasoning_effort=depth_reasoning_effort,
         )
     except ConfigValidationError as e:
         print(f"Configuration Error: {e}", file=sys.stderr)
@@ -3848,6 +4019,55 @@ async def pipeline(
                   file=sys.stderr)
             return 1
         changed_files_override = listed
+    saved_plan = None
+    if resume_run_id:
+        try:
+            from core.cost import load_run_plan
+
+            saved_plan = load_run_plan(db_path, run_id, str(target_path))
+        except Exception:
+            saved_plan = None
+    if saved_plan and saved_plan.get("depth") is not None:
+        if depth is None:
+            try:
+                restored_depth = parse_depth(saved_plan["depth"])
+                resolved_depth = restored_depth
+                depth_profile = resolve_depth_profile(resolved_depth)
+                banner_resume_flags["--depth"] = resolved_depth
+                new_depth_effort = (
+                    depth_profile.reasoning_effort
+                    if depth_profile.reasoning_effort != "medium"
+                    else None
+                )
+                if new_depth_effort != depth_reasoning_effort:
+                    depth_reasoning_effort = new_depth_effort
+                    workflow, reloaded_cfg = load_workflow_from_json(
+                        workflow_path,
+                        model_override=model_override,
+                        api_base_override=api_base_override,
+                        sandbox_override=effective_sandbox_override,
+                        db_override=db_override,
+                        timeout_override=timeout_override,
+                        reasoning_effort_override=reasoning_effort_override,
+                        load_local=effective_load_local,
+                        depth_reasoning_effort=depth_reasoning_effort,
+                    )
+                    reloaded_cfg["db_path"] = db_path
+                    reloaded_cfg["rescan_changed_harness"] = bool(rescan_changed_harness)
+                    if exclude:
+                        reloaded_cfg["exclude"] = list(exclude)
+                    if config.get("scan_mode"):
+                        reloaded_cfg["scan_mode"] = config["scan_mode"]
+                    config = reloaded_cfg
+                    harness_fingerprint = str(config.get("harness_fingerprint") or "")
+            except (ValueError, ConfigValidationError):
+                pass
+        elif int(saved_plan["depth"]) != int(resolved_depth):
+            print(
+                f"[RESUME] Applying explicit --depth {resolved_depth} over recorded depth "
+                f"{saved_plan['depth']} on the saved scan plan.",
+                file=sys.stderr,
+            )
     scan_scope: dict = {}
     config = {**config, "depth": resolved_depth, "_depth_explicit": depth is not None}
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
@@ -3860,26 +4080,12 @@ async def pipeline(
         scope_out=scan_scope,
         changed_files_override=changed_files_override,
     )
-    saved_plan = None
-    if resume_run_id:
-        try:
-            from core.cost import load_run_plan
-
-            saved_plan = load_run_plan(db_path, run_id, str(target_path))
-        except Exception:
-            saved_plan = None
-    if saved_plan and saved_plan.get("depth") is not None and depth is None:
-        try:
-            resolved_depth = parse_depth(saved_plan["depth"])
-            depth_profile = resolve_depth_profile(resolved_depth)
-            banner_resume_flags["--depth"] = resolved_depth
-        except ValueError:
-            pass
     if saved_plan and saved_plan.get("targets"):
         targets_to_scan = list(saved_plan["targets"])
-    if saved_plan and int(saved_plan.get("passes") or 1) > 1 and not passes_explicit and int(passes or 1) <= 1:
-        total_passes = int(saved_plan["passes"])
-        banner_resume_flags["--passes"] = total_passes
+    if saved_plan and saved_plan.get("passes") is not None and not passes_explicit and int(passes or 1) <= 1:
+        total_passes = max(1, int(saved_plan["passes"]))
+        if total_passes > 1 or saved_plan.get("passes_explicit"):
+            banner_resume_flags["--passes"] = total_passes
     elif not passes_explicit and int(passes or 1) <= 1:
         depth_passes = (
             depth_profile.small_target_passes
@@ -4159,6 +4365,7 @@ async def pipeline(
                 focus_files=focus_files if scan_mode == SCAN_MODE_CHANGED else None,
                 focus_groups=focus_groups if scan_mode == SCAN_MODE_CHANGED else None,
                 passes=total_passes,
+                passes_explicit=passes_explicit,
                 depth=resolved_depth,
             )
         except Exception:
@@ -4503,6 +4710,7 @@ async def pipeline(
                 campaign_plan=campaign_plan,
                 overwrite=True,
                 passes=total_passes,
+                passes_explicit=passes_explicit,
                 depth=resolved_depth,
             )
         except Exception:
@@ -4732,9 +4940,14 @@ async def pipeline(
         depth=resolved_depth,
     )
 
+    resolved_effort_display = (
+        config.get("_effective_stem_reasoning_effort")
+        or reasoning_effort_override
+        or depth_profile.reasoning_effort
+    )
     print(
         f"\n🎚️ Audit depth: {depth_profile.depth}/100 ({depth_profile.tier}) — "
-        f"effort={effective_reasoning_effort or depth_profile.reasoning_effort}, "
+        f"effort={resolved_effort_display}, "
         f"passes={total_passes}, campaigns={len(campaign_groups)}"
     )
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -5061,7 +5274,7 @@ async def pipeline(
                 try:
                     from core.cost import record_spend
 
-                    spend_meta: dict[str, Any] = {"failed": bool(task_failed)}
+                    spend_meta: dict[str, Any] = {"failed": bool(task_failed), "depth": int(resolved_depth)}
                     if not task_failed and not earned_coverage:
                         spend_meta["unexamined"] = True
                     if getattr(branch_ctx, "resumed_mid_invocation", False) and pre_pause_tokens == 0:
@@ -5123,6 +5336,7 @@ async def pipeline(
                             db_path, run_id, group, scan_item, scan_mode,
                             harness_fingerprint=harness_fingerprint,
                             pass_index=pass_idx,
+                            depth=resolved_depth,
                         )
                         # And as what content. Same gate as the stamps: a
                         # campaign that read nothing examined no version of
@@ -5374,6 +5588,7 @@ async def pipeline(
                 timeout_override=timeout_override,
                 reasoning_effort_override=reasoning_effort_override,
                 load_local=effective_load_local,
+                depth_reasoning_effort=depth_reasoning_effort,
             )
             worker_app = App(
                 name=APP_NAME,

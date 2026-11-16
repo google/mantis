@@ -24,9 +24,11 @@ Trust boundary (see `core/evidence.py`, `TIER_INTENT`):
 - All discovered documentation is untrusted human prose.
 - Only path metadata is surfaced in the inventory directive; content is read
   on demand through `read_file`, which wraps bytes in untrusted delimiters.
-- Surfaced ONLY to `architect` and `threat_modeler`, NEVER to verification or
-  verdict stages (`reviewer`, `critic`, `reproducer`, `patcher`, `calibrator`)
-  so hostile or outdated documentation can never bias verification (INV-2).
+- Addressed ONLY to `architect` and `threat_modeler` (never injected into
+  verification/judge stage system instructions or stage openers). On the
+  shared-prefix graph, forked judges inherit upstream stem turns (including
+  any documents the stem read) and carry `INHERITED_STEM_NEUTRALITY_RULE`
+  forbidding dismissal based on documentation prose (INV-2).
 """
 
 from __future__ import annotations

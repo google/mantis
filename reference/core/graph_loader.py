@@ -31,6 +31,7 @@ from google.adk.agents.context import Context
 from google.genai import types
 from core.prompts import (
     ARCHITECT_PREFIX_STEM_ADDENDUM,
+    INHERITED_STEM_NEUTRALITY_RULE,
     PLANNER_PREFIX_STEM_ADDENDUM,
     PREFIX_FORKED_STAGE_ADDENDUM,
     PREFIX_GROUP_BASE_INSTRUCTION,
@@ -2877,14 +2878,17 @@ MAX_CAMPAIGN_DIRECTIVE_CHARS = 12000
 #: planning and vulnerability discovery cover indexed sinks systematically
 #: without biasing independent downstream review/critic stages.
 CHECKLIST_STAGES = ("planner", "explorer", "researcher")
-#: Hunting stages that receive operator `--focus` and `--seed-report` across
-#: all scan modes. Verification/judge stages (`reviewer`, `critic`,
-#: `reproducer`, `patcher`, `calibrator`) are deliberately excluded to preserve
-#: independent separation-of-duties neutrality (INV-2).
+#: Hunting stages addressed by operator `--focus`, `--seed-report`, and
+#: `--depth` directives across all scan modes. Never injected into verification
+#: or judge stage instructions/openers (`reviewer`, `critic`, `reproducer`,
+#: `patcher`, `calibrator`); on the shared-prefix graph forked judges inherit
+#: upstream stem turns under `INHERITED_STEM_NEUTRALITY_RULE` (INV-2).
 HUNTING_STAGES = ("architect", "threat_modeler", "planner", "researcher", "explorer")
-#: Upstream understanding stages that receive the `TIER_INTENT` repository
-#: documentation & threat-model inventory (non-single-file scans only).
-#: Excluded from reviewer/critic/reproducer/patcher/calibrator (INV-2).
+#: Upstream understanding stages addressed by the `TIER_INTENT` repository
+#: documentation & threat-model inventory (non-single-file scans only). Never
+#: injected into judge stage instructions/openers; on the shared-prefix graph
+#: forked judges see upstream stem turns (including docs the stem read) under
+#: `INHERITED_STEM_NEUTRALITY_RULE` (INV-2).
 REPO_DOCS_STAGES = ("architect", "threat_modeler")
 #: The stages that decide where to look. Matched by node id prefix, so
 #: `researcher_2` in a parallel archetype counts. The reproducer, patcher,
@@ -2966,16 +2970,12 @@ def _render_campaign_directive_blocks(
     depth_dir = str(getattr(ctx, "depth_directive", "") or "") if wants_steering else ""
     repo_docs = ""
     if wants_repo_docs:
-        tf = str(getattr(ctx, "target_file", "") or "")
-        c_targets = tuple(getattr(ctx, "campaign_targets", ()) or ())
-        is_single_file = bool(
-            tf
-            and os.path.isfile(tf)
-            and not (getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL and len(c_targets) > 1)
-        )
-        if not is_single_file:
+        from tools.research_tools import _is_single_file_campaign
+
+        if not _is_single_file_campaign(ctx):
             cached_docs = getattr(ctx, "repo_docs_inventory", None)
             if cached_docs is None:
+                tf = str(getattr(ctx, "target_file", "") or "")
                 doc_root = (
                     str(getattr(ctx, "path_root", "") or "")
                     or str(getattr(ctx, "jail_dir", "") or "")
@@ -4668,6 +4668,7 @@ def load_workflow_from_json(
     timeout_override: Optional[float] = None,
     reasoning_effort_override: Optional[str] = None,
     load_local: bool = True,
+    depth_reasoning_effort: Optional[str] = None,
 ) -> tuple[Workflow, dict]:
     raw_json, base_dir = load_raw_workflow_with_overlay(json_path, load_local=load_local)
     overlay_meta = raw_json.pop("_overlay_meta", {}) if isinstance(raw_json, dict) else {}
@@ -4809,6 +4810,14 @@ def load_workflow_from_json(
                         bucket.append(t_name)
     for pg_name, t_list in list(prefix_group_tool_names.items()):
         prefix_group_tool_names[pg_name] = sorted(t_list)
+    # Operator-wide reasoning effort precedence:
+    # CLI `--reasoning-effort` > env `REASONING_EFFORT` > `workflow.local.json`
+    # > depth-derived effort (applied uniformly to prefix_group stems) > per-node.
+    global_effort_override = (
+        reasoning_effort_override
+        or (os.environ.get("REASONING_EFFORT") or "").strip()
+        or overlay_meta.get("local_reasoning_effort")
+    )
     for pg_name, pg_members in prefix_group_nodes.items():
         member_ids = {m.id for m in pg_members}
         root_member = next(
@@ -4816,7 +4825,9 @@ def load_workflow_from_json(
             pg_members[0],
         )
         prefix_group_reasoning_effort[pg_name] = (
-            root_member.reasoning_effort or spec.config.reasoning_effort
+            depth_reasoning_effort
+            or root_member.reasoning_effort
+            or spec.config.reasoning_effort
         )
 
     # Material for the harness fingerprint (compute_harness_fingerprint):
@@ -4889,7 +4900,7 @@ def load_workflow_from_json(
             if node_pg and node_pg in prefix_group_reasoning_effort:
                 pg_effort = prefix_group_reasoning_effort[node_pg]
                 node_eff = node_cfg.reasoning_effort or spec.config.reasoning_effort
-                if node_eff != pg_effort:
+                if node_eff != pg_effort and not depth_reasoning_effort and not global_effort_override:
                     print(
                         f"[graph_loader] node '{node_id}' in prefix_group '{node_pg}': "
                         f"normalizing reasoning_effort '{node_eff}' -> '{pg_effort}' to preserve "
@@ -4909,14 +4920,10 @@ def load_workflow_from_json(
             )
             # Operator-wide reasoning effort (CLI `--reasoning-effort`, env
             # `REASONING_EFFORT`, or `workflow.local.json`) applies to EVERY node
-            # uniformly, so it beats per-node values without breaking
-            # prefix_group KV-cache parity. Otherwise the prefix_group-normalized
-            # effort (or the node's own) is used.
-            global_effort_override = (
-                reasoning_effort_override
-                or (os.environ.get("REASONING_EFFORT") or "").strip()
-                or overlay_meta.get("local_reasoning_effort")
-            )
+            # uniformly, so it beats depth-derived and per-node values without
+            # breaking prefix_group KV-cache parity. Otherwise the
+            # prefix_group-normalized (depth-aware) effort or the node's own
+            # workflow.json effort is used.
             effective_node_effort = global_effort_override or effective_reasoning_effort
             llm_kwargs_resolver = functools.partial(
                 get_llm_kwargs,
@@ -5079,6 +5086,17 @@ def load_workflow_from_json(
                     instruction = f"{instruction.rstrip()}\n{PLANNER_PREFIX_STEM_ADDENDUM}"
                 if node_cfg.fork_from:
                     instruction = f"{instruction.rstrip()}\n{PREFIX_FORKED_STAGE_ADDENDUM}"
+
+            if (
+                is_prefix_group
+                and node_cfg.fork_from
+                and (
+                    node_id in {"reviewer", "critic", "reproducer"}
+                    or node_cfg.output_schema in {"ReviewVerdict", "CriticVerdict", "ReproVerdict"}
+                )
+                and INHERITED_STEM_NEUTRALITY_RULE.strip() not in instruction
+            ):
+                instruction = f"{instruction.rstrip()}\n{INHERITED_STEM_NEUTRALITY_RULE.strip()}"
 
             if schema_cls:
                 if is_prefix_group:
@@ -5512,6 +5530,17 @@ def load_workflow_from_json(
         cfg["_cli_reasoning_effort"] = reasoning_effort_override
     if overlay_meta.get("local_reasoning_effort"):
         cfg["_local_reasoning_effort"] = overlay_meta["local_reasoning_effort"]
+    stem_pg_effort = (
+        prefix_group_reasoning_effort.get("audit_stem")
+        or next(iter(prefix_group_reasoning_effort.values()), None)
+    )
+    cfg["_effective_stem_reasoning_effort"] = (
+        global_effort_override
+        or stem_pg_effort
+        or depth_reasoning_effort
+        or spec.config.reasoning_effort
+        or "medium"
+    )
     if spec.budget:
         cfg["budget"] = spec.budget
     elif "budget" in raw_json and isinstance(raw_json["budget"], dict):

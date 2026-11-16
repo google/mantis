@@ -128,11 +128,15 @@ class RunContext:
     operator_focus: str = ""
     seed_report_block: str = ""
     # Continuous audit depth (`1..100`, default `30`) and its operator-authored
-    # hunting-stage directive (injected into HUNTING_STAGES only, preserving INV-2).
+    # hunting-stage directive (addressed to HUNTING_STAGES only; on the
+    # shared-prefix graph forked judges inherit upstream turns under
+    # `INHERITED_STEM_NEUTRALITY_RULE`).
     depth: int = 30
     depth_directive: str = ""
-    # Lazily discovered `TIER_INTENT` repository documentation inventory surfaced
-    # only to `architect` and `threat_modeler` on non-single-file scans (INV-2).
+    # Lazily discovered `TIER_INTENT` repository documentation inventory
+    # addressed only to `architect` and `threat_modeler` on non-single-file
+    # scans (never injected into judge stage openers; forked judges see
+    # upstream stem turns under `INHERITED_STEM_NEUTRALITY_RULE`).
     repo_docs_inventory: Optional[str] = None
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
