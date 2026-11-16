@@ -8122,6 +8122,10 @@ class TestTheControlsThemselvesStillWork(unittest.TestCase):
     milliseconds and catch the rot at the point it is introduced.
     """
 
+    def setUp(self):
+        if os.environ.get("MANTIS_NEUTER_MATRIX") == "1":
+            self.skipTest("Meta self-checks inspect the unpatched tree during unit-tests.")
+
     def _scenarios(self):
         import importlib.util
 

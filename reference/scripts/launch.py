@@ -815,6 +815,8 @@ def run_launch(
                 probe_llm=probe_llm,
                 persist_overrides=save_config,
             )
+        elif overrides:
+            cfg = update_workflow_config(wf_file, overrides, save=False).get("config", cfg)
     elif overrides:
         cfg = update_workflow_config(wf_file, overrides, save=False).get("config", cfg)
 

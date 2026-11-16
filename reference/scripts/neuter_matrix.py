@@ -1414,6 +1414,46 @@ SCENARIOS = {
 
 
 
+_ALL_MATRIX_SUITES = (
+    "tests.test_security_regression",
+    "tests.test_symbol_grounding",
+    "tests.test_structural_index",
+    "tests.test_chains_groups",
+    "tests.test_verdicts_recall_sentinel",
+    "tests.test_budget_planner",
+    "tests.test_campaign_scoping",
+    "tests.test_prefix_reuse",
+)
+
+
+def _prioritized_suites(name: str, patches: list) -> tuple[list[str], list[str]]:
+    """Splits `_ALL_MATRIX_SUITES` into `(likely_fast_suites, fallback_suites)`
+    so most scenarios fail in <2s without importing all 8 modules up front,
+    while every scenario still runs all 8 suites before ever reporting green."""
+    files = {_normalize_to_ref_rel(p[0]) for p in patches}
+    primary: list[str] = []
+    if name.startswith("prefix_reuse"):
+        primary.append("tests.test_prefix_reuse")
+    elif "symbol_grounding" in name:
+        primary.append("tests.test_symbol_grounding")
+    elif name.startswith("structural_") or files & {"core/structural_index.py", "tools/structural_tools.py"}:
+        primary.append("tests.test_structural_index")
+    elif name.startswith(("verdict_revert_", "stamp_revert_", "recall_", "sentinel_")):
+        primary.append("tests.test_verdicts_recall_sentinel")
+    elif name.startswith(("chain_", "group_", "coverage_revert_member_stamping")) or "core/chains.py" in files:
+        primary.append("tests.test_chains_groups")
+    elif name.startswith(("scoping_", "campaign_scoping_")):
+        primary.append("tests.test_campaign_scoping")
+    elif name.startswith(("replan_", "budget_scope_", "planner_gate_")):
+        primary.append("tests.test_budget_planner")
+    else:
+        primary.append("tests.test_security_regression")
+    seen: set[str] = set()
+    first = [s for s in primary if not (s in seen or seen.add(s))]
+    rest = [s for s in _ALL_MATRIX_SUITES if s not in seen]
+    return first, rest
+
+
 def _default_jobs() -> int:
     return min(8, max(1, os.cpu_count() or 4))
 
@@ -1462,48 +1502,39 @@ def _evaluate_scenario(item: tuple[int, int, str, list]) -> tuple[str, str, str]
                 if host not in parts:
                     parts.append(host)
             matrix_env[key] = ",".join(parts)
-        proc = subprocess.run(
-            [
-                PY, "-m", "unittest",
-                "tests.test_security_regression",
-                "tests.test_budget_planner",
-                "tests.test_verdicts_recall_sentinel",
-                "tests.test_chains_groups",
-                "tests.test_campaign_scoping",
-                "tests.test_structural_index",
-                "tests.test_symbol_grounding",
-                "tests.test_prefix_reuse",
-                "-v",
-            ],
-            cwd=dst, capture_output=True, text=True, env=matrix_env,
-        )
-        combined = proc.stdout + proc.stderr
-        if "unittest.loader._FailedTest" in combined:
-            return (
-                name,
-                "IMPORT-ERROR (BAD): test loader failed inside patched copy",
-                f"  [{idx}/{total}] {name:35s} -> IMPORT-ERROR (BAD)",
-            )
-        failed = re.findall(r"^(?:FAIL|ERROR): (\S+)", combined, re.M)
 
-        # The matrix's own self-checks read the PATCHED tree, so they fail for every
-        # scenario by construction and are not evidence that anything depends on the
-        # code a scenario removed. A scenario tripping ONLY those has no behavioural
-        # pin: it proves the patch applied, nothing more. Scored separately, because
-        # otherwise a hollow scenario is indistinguishable from a well-pinned one --
-        # which is exactly how four were nearly shipped in the run that prompted this.
-        behavioural = sorted({
-            f for f in set(failed)
-            if not f.endswith("test_every_neuter_still_finds_its_target")
-            and not f.endswith("test_every_neuter_produces_code_that_still_parses")
-        })
-        if proc.returncode != 0 and behavioural:
-            return (
-                name,
-                "WENT RED: " + ", ".join(behavioural),
-                f"  [{idx}/{total}] {name:35s} -> WENT RED ({len(behavioural)} failure(s))",
+        first_suites, rest_suites = _prioritized_suites(name, patches)
+        self_only_seen = False
+        for batch in (first_suites, rest_suites):
+            if not batch:
+                continue
+            proc = subprocess.run(
+                [PY, "-m", "unittest", "-f", *batch, "-v"],
+                cwd=dst, capture_output=True, text=True, env=matrix_env,
             )
-        if proc.returncode != 0:
+            combined = proc.stdout + proc.stderr
+            if "unittest.loader._FailedTest" in combined:
+                return (
+                    name,
+                    "IMPORT-ERROR (BAD): test loader failed inside patched copy",
+                    f"  [{idx}/{total}] {name:35s} -> IMPORT-ERROR (BAD)",
+                )
+            failed = re.findall(r"^(?:FAIL|ERROR): (\S+)", combined, re.M)
+            behavioural = sorted({
+                f for f in set(failed)
+                if not f.endswith("test_every_neuter_still_finds_its_target")
+                and not f.endswith("test_every_neuter_produces_code_that_still_parses")
+            })
+            if proc.returncode != 0 and behavioural:
+                return (
+                    name,
+                    "WENT RED: " + ", ".join(behavioural),
+                    f"  [{idx}/{total}] {name:35s} -> WENT RED ({len(behavioural)} failure(s))",
+                )
+            if proc.returncode != 0:
+                self_only_seen = True
+
+        if self_only_seen:
             return (
                 name,
                 "SELF-CHECK ONLY (BAD): no test depends on this code",
@@ -1518,8 +1549,83 @@ def _evaluate_scenario(item: tuple[int, int, str, list]) -> tuple[str, str, str]
         shutil.rmtree(work, ignore_errors=True)
 
 
+_MATRIX_PIN_TEST_FILES = frozenset({
+    "tests/test_security_regression.py",
+    "tests/test_budget_planner.py",
+    "tests/test_verdicts_recall_sentinel.py",
+    "tests/test_chains_groups.py",
+    "tests/test_campaign_scoping.py",
+    "tests/test_structural_index.py",
+    "tests/test_symbol_grounding.py",
+    "tests/test_prefix_reuse.py",
+})
+
+
+def _normalize_to_ref_rel(raw_path: str) -> str:
+    norm = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+    if norm.startswith("reference/"):
+        return norm[len("reference/"):]
+    return norm
+
+
+def scenarios_for_changed_files(
+    changed_paths: list[str] | tuple[str, ...],
+    scenarios: dict | None = None,
+) -> tuple[list[str] | None, str]:
+    """Maps changed repository paths to affected scenario names.
+
+    Returns `(scenario_names, reason)`. Returns `(None, reason)` when the full
+    matrix should run (for example when `scripts/neuter_matrix.py` or one of the
+    matrix's pinned behavioural test modules was modified).
+    """
+    table = SCENARIOS if scenarios is None else scenarios
+    ref_paths = {
+        _normalize_to_ref_rel(p)
+        for p in changed_paths
+        if str(p or "").strip()
+    }
+    if not ref_paths:
+        return ([], "0 files changed")
+    if "scripts/neuter_matrix.py" in ref_paths:
+        return (None, "scripts/neuter_matrix.py modified; running full matrix")
+    touched_pins = sorted(ref_paths & _MATRIX_PIN_TEST_FILES)
+    if touched_pins:
+        return (
+            None,
+            f"pinned security test module(s) modified ({', '.join(touched_pins)}); running full matrix",
+        )
+    matched = [
+        name
+        for name, patches in table.items()
+        if any(_normalize_to_ref_rel(p[0]) in ref_paths for p in patches)
+    ]
+    return (
+        matched,
+        f"{len(matched)} scenario(s) target {len(ref_paths)} changed path(s)",
+    )
+
+
+def _git_changed_files(base_ref: str) -> list[str] | None:
+    """Returns repo-relative paths changed in `base_ref...HEAD`, or None on git error."""
+    repo_root = REF.parent
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "diff", "--name-only", f"{base_ref}...HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+
+
 def run_matrix(only_scenarios=None, *, jobs: int | None = None):
-    selected = {k: v for k, v in SCENARIOS.items() if not only_scenarios or k in only_scenarios}
+    if only_scenarios is not None and len(only_scenarios) == 0:
+        print(
+            "Neuter Matrix: 0 scenarios target the changed files "
+            "(static target & AST checks enforced by unit-tests)."
+        )
+        return True
+    selected = {k: v for k, v in SCENARIOS.items() if only_scenarios is None or k in only_scenarios}
     total = len(selected)
     workers = _default_jobs() if jobs is None else max(1, int(jobs))
     workers = min(workers, max(1, total))
@@ -1595,6 +1701,14 @@ def _parse_args(argv: list[str] | None = None):
         help="optional regex filter matching scenario names or patched file paths",
     )
     parser.add_argument(
+        "--changed-from", default="",
+        help="optional base git ref (e.g. PR base SHA); runs only scenarios targeting files changed in <ref>...HEAD (empty runs full matrix)",
+    )
+    parser.add_argument(
+        "--changed-files", nargs="*", default=None,
+        help="optional explicit list of changed repository or reference-relative file paths",
+    )
+    parser.add_argument(
         "scenarios", nargs="*",
         help="optional subset of scenario names to evaluate",
     )
@@ -1603,7 +1717,29 @@ def _parse_args(argv: list[str] | None = None):
 
 if __name__ == "__main__":
     cli_args = _parse_args()
-    selected = list(cli_args.scenarios) if cli_args.scenarios else None
+    selected: list[str] | None = list(cli_args.scenarios) if cli_args.scenarios else None
+
+    changed_ref = str(cli_args.changed_from or "").strip()
+    if cli_args.changed_files is not None:
+        scoped, reason = scenarios_for_changed_files(cli_args.changed_files)
+        print(f"Neuter Matrix scope (--changed-files): {reason}", flush=True)
+        if scoped is not None:
+            selected = [s for s in selected if s in scoped] if selected is not None else scoped
+    elif changed_ref:
+        diff_files = _git_changed_files(changed_ref)
+        if diff_files is None:
+            print(
+                f"Neuter Matrix warning: could not diff '{changed_ref}...HEAD'; "
+                "falling back to full matrix.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            scoped, reason = scenarios_for_changed_files(diff_files)
+            print(f"Neuter Matrix scope ({changed_ref[:12]}...HEAD): {reason}", flush=True)
+            if scoped is not None:
+                selected = [s for s in selected if s in scoped] if selected is not None else scoped
+
     if cli_args.filter:
         import re as _re
 
