@@ -3199,6 +3199,8 @@ def _count_inherited_in_scope_code_reads(ctx: Any, contents: Sequence[Any]) -> i
                     continue
                 raw_resp = getattr(fn_resp, "response", {})
                 if isinstance(raw_resp, dict):
+                    if raw_resp.get("error"):
+                        continue
                     resp_text = str(
                         raw_resp.get("response")
                         or raw_resp.get("result")
