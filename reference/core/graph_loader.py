@@ -300,6 +300,14 @@ def _persist_dismissal_verdict(node_id: str, route, verdict) -> None:
         if promoted is not None:
             if not promoted:
                 return
+            if "critic" in node_id and len(promoted) > 1:
+                print(
+                    f"[{node_id}] refusing to apply bare campaign-level '{route}' dismissal across "
+                    f"{len(promoted)} reviewer-confirmed findings ({sorted(int(i) for i in promoted)}); "
+                    "leaving confirmed findings intact.",
+                    file=sys.stderr,
+                )
+                return
             update_status(
                 rc.db_path,
                 rc.target_file,
@@ -542,6 +550,14 @@ def _persist_finding_promotions(
         note = f"[{node_id}] {reason}" if reason else ""
         if prior_promoted is not None:
             if not prior_promoted:
+                return
+            if "critic" in node_id and len(prior_promoted) > 1:
+                print(
+                    f"[{node_id}] refusing to apply bare campaign-level '{route}' promotion across "
+                    f"{len(prior_promoted)} reviewer-confirmed findings ({sorted(int(i) for i in prior_promoted)}); "
+                    "leaving confirmed findings intact.",
+                    file=sys.stderr,
+                )
                 return
             update_status(
                 rc.db_path,
@@ -933,8 +949,24 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
             # routes are deliberately undeclared in workflow.json (they fall through
             # DEFAULT_ROUTE to the calibrator), so a declared-routes-only hook would
             # never see them -- which is precisely how they went unrecorded before.
+            # When the critic omits finding_verdicts with >1 reviewer-confirmed
+            # findings in scope, refuse to apply the bare verdict to all of them
+            # and route directly to calibrator with their confirmed status intact.
+            ambiguous_critic_batch = False
+            if "critic" in node_id:
+                try:
+                    from core.context import current_run_context
+
+                    rc_cls = current_run_context.get()
+                    prom = getattr(rc_cls, "promoted_finding_ids", None)
+                    if prom is not None and len(prom) > 1:
+                        ambiguous_critic_batch = True
+                except Exception:
+                    pass
             _persist_dismissal_verdict(node_id, route, verdict)
             _persist_finding_promotions(node_id, [], route, verdict)
+            if ambiguous_critic_batch:
+                route = DEFAULT_ROUTE
 
         state_out = {state_key: visits, "verdict": None}
 

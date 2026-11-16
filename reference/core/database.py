@@ -430,6 +430,7 @@ def _widen_findings_uniqueness_for_passes(cursor) -> None:
             target_symbol TEXT DEFAULT NULL,
             symbol_source TEXT DEFAULT NULL,
             prose_signature TEXT DEFAULT NULL,
+            qualified_symbol TEXT DEFAULT NULL,
             UNIQUE(filepath, title, description, line_numbers, run_id, pass_index)
         )
     """)
@@ -439,7 +440,8 @@ def _widen_findings_uniqueness_for_passes(cursor) -> None:
             remediation, status, mantis_risk_score, impact_score, likelihood_score,
             priority, signature, lineage_id, cwe, triage_reasoning, patch_diff,
             patch_status, rca_summary, embedding, code_paths, campaign,
-            pass_index, merged_into_id, target_symbol, symbol_source, prose_signature
+            pass_index, merged_into_id, target_symbol, symbol_source, prose_signature,
+            qualified_symbol
         )
         SELECT
             id, run_id, timestamp, filepath, title, severity, description,
@@ -447,7 +449,8 @@ def _widen_findings_uniqueness_for_passes(cursor) -> None:
             remediation, COALESCE(status, 'reported'), mantis_risk_score, impact_score, likelihood_score,
             priority, signature, lineage_id, cwe, triage_reasoning, patch_diff,
             patch_status, rca_summary, embedding, COALESCE(code_paths, '[]'), campaign,
-            COALESCE(pass_index, 1), merged_into_id, target_symbol, symbol_source, prose_signature
+            COALESCE(pass_index, 1), merged_into_id, target_symbol, symbol_source, prose_signature,
+            qualified_symbol
         FROM findings
     """)
     cursor.execute("DROP TABLE findings")
@@ -481,6 +484,8 @@ def _ensure_findings_additive_schema(cursor) -> None:
         cursor.execute("ALTER TABLE findings ADD COLUMN symbol_source TEXT DEFAULT NULL")
     if "prose_signature" not in existing_cols:
         cursor.execute("ALTER TABLE findings ADD COLUMN prose_signature TEXT DEFAULT NULL")
+    if "qualified_symbol" not in existing_cols:
+        cursor.execute("ALTER TABLE findings ADD COLUMN qualified_symbol TEXT DEFAULT NULL")
     _widen_findings_uniqueness_for_passes(cursor)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_filepath ON findings(filepath)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_lineage ON findings(lineage_id)")
@@ -556,6 +561,7 @@ def init_db(db_path: str):
                 target_symbol TEXT DEFAULT NULL,
                 symbol_source TEXT DEFAULT NULL,
                 prose_signature TEXT DEFAULT NULL,
+                qualified_symbol TEXT DEFAULT NULL,
                 UNIQUE(filepath, title, description, line_numbers, run_id, pass_index)
             )
         """)
@@ -834,7 +840,13 @@ def extract_target_symbol(title: str = "", description: str = "", code_paths: Op
     return ""
 
 
-def ground_symbol_in_catalog(db_path: str, filepath: str, line_numbers: str = "[]") -> str:
+def ground_symbol_in_catalog(
+    db_path: str,
+    filepath: str,
+    line_numbers: str = "[]",
+    *,
+    return_details: bool = False,
+) -> Any:
     """The enclosing catalog function for a finding's first cited line, or "".
 
     INV-3 lineage anchors on the target symbol, and `extract_target_symbol`
@@ -849,10 +861,14 @@ def ground_symbol_in_catalog(db_path: str, filepath: str, line_numbers: str = "[
     extractor yields when a well-written title backticks the function -- so
     grounding CONFIRMS the symbol for well-titled findings (signature unchanged
     against existing databases) and corrects it only where prose and code
-    disagree. Returns "" when the catalog, the file, the line, or an unambiguous
-    match is missing; the caller keeps the prose symbol, so a deployment without
-    an index behaves exactly as before (INV-6). Never raises.
+    disagree. When `return_details=True`, returns `(bare, qualified, start_line)`
+    so class/module-qualified methods (`UserView.get` vs `OrderView.get`) stay
+    distinct across signatures and lineages. Returns "" (or `("", "", None)`)
+    when the catalog, the file, the line, or an unambiguous match is missing;
+    the caller keeps the prose symbol, so a deployment without an index behaves
+    exactly as before (INV-6). Never raises.
     """
+    empty = ("", "", None) if return_details else ""
     try:
         if isinstance(line_numbers, str):
             lines = json.loads(line_numbers or "[]")
@@ -860,23 +876,28 @@ def ground_symbol_in_catalog(db_path: str, filepath: str, line_numbers: str = "[
             lines = list(line_numbers or [])
         lines = [int(x) for x in lines if isinstance(x, (int, float)) and not isinstance(x, bool)]
         if not lines or not str(filepath or "").strip():
-            return ""
+            return empty
 
         from core.paths import resolve_db_path
         from core.structural_index import StructuralIndex, state_dir_for_db
 
         index = StructuralIndex(state_dir_for_db(resolve_db_path(db_path)))
         if not index.available():
-            return ""
+            return empty
         found = index.enclosing_symbol(str(filepath), min(lines))
         if not found.get("found"):
-            return ""
-        qualified = str(found.get("qualified_name") or "").strip()
+            return empty
+        qualified = str(found.get("qualified_name") or "").strip().lower()
         if not qualified:
-            return ""
-        return qualified.rsplit(".", 1)[-1].lower()
+            return empty
+        bare = qualified.rsplit(".", 1)[-1]
+        if not return_details:
+            return bare
+        raw_start = found.get("start_line")
+        start_line = int(raw_start) if isinstance(raw_start, int) and not isinstance(raw_start, bool) else None
+        return (bare, qualified, start_line)
     except Exception:
-        return ""
+        return empty
 
 
 def compute_stable_signature(
@@ -963,7 +984,12 @@ def resolve_ancestor_lineage(
     active_root = str(kwargs.get("active_root") or "")
     roots_map = kwargs.get("roots_map")
     prose_sig = str(kwargs.get("prose_signature") or "").strip()
+    bare_sig = str(kwargs.get("bare_signature") or "").strip()
     incoming_sym_source = str(kwargs.get("symbol_source") or "").strip()
+    incoming_qualified = str(kwargs.get("qualified_symbol") or "").strip().lower()
+    incoming_start_line = kwargs.get("grounded_start_line")
+    current_run_id = str(kwargs.get("current_run_id") or "").strip()
+    current_pass_index = int(kwargs.get("current_pass_index") or 1)
 
     def _same_target(cand_run_id: Any) -> bool:
         if not active_root:
@@ -972,30 +998,89 @@ def resolve_ancestor_lineage(
             db_path, cand_run_id, active_root=active_root, roots_map=roots_map
         )
 
+    def _different_catalog_functions(
+        cand_sym: str,
+        cand_src: str,
+        cand_qual: str,
+        cand_run_id: Any,
+        cand_pass_idx: int,
+        cand_lines_raw: str,
+    ) -> bool:
+        if incoming_sym_source != "catalog" or cand_src != "catalog":
+            return False
+        if incoming_qualified and cand_qual and incoming_qualified != cand_qual:
+            return True
+        if norm_sym and cand_sym and norm_sym != cand_sym:
+            return True
+        if (
+            current_run_id
+            and str(cand_run_id or "") == current_run_id
+            and int(cand_pass_idx or 1) == current_pass_index
+            and incoming_start_line is not None
+            and db_path
+            and norm_fp
+        ):
+            _, _, cand_start = ground_symbol_in_catalog(
+                db_path, norm_fp, cand_lines_raw or "[]", return_details=True
+            )
+            if cand_start is not None and cand_start != incoming_start_line:
+                return True
+        return False
+
     # 1. Exact Stable Content Signature Match (< 1ms, 0 tokens)
-    if signature or prose_sig:
+    if signature or prose_sig or bare_sig:
         try:
             cursor.execute("""
-                SELECT lineage_id, run_id FROM findings
-                WHERE (signature = ? OR (? != '' AND prose_signature = ?) OR (? != '' AND signature = ?))
+                SELECT lineage_id, run_id, signature, target_symbol, symbol_source,
+                       qualified_symbol, COALESCE(pass_index, 1), line_numbers
+                FROM findings
+                WHERE (
+                    signature = ?
+                    OR (? != '' AND signature = ?)
+                    OR (? != '' AND prose_signature = ?)
+                    OR (? != '' AND signature = ?)
+                )
                   AND lineage_id IS NOT NULL AND lineage_id != ''
                 ORDER BY id DESC LIMIT 25
-            """, (signature, prose_sig, prose_sig, prose_sig, prose_sig))
+            """, (signature, bare_sig, bare_sig, prose_sig, prose_sig, prose_sig, prose_sig))
+            step1_rows = cursor.fetchall()
+            has_step1_ext = True
         except sqlite3.OperationalError:
             cursor.execute("""
                 SELECT lineage_id, run_id FROM findings
                 WHERE signature = ? AND lineage_id IS NOT NULL AND lineage_id != ''
                 ORDER BY id DESC LIMIT 25
             """, (signature,))
-        for row in cursor.fetchall():
-            if row and row[0] and _same_target(row[1]):
+            step1_rows = cursor.fetchall()
+            has_step1_ext = False
+        for row in step1_rows:
+            if not row or not row[0] or not _same_target(row[1]):
+                continue
+            if not has_step1_ext:
+                return str(row[0])
+            row_sig = str(row[2] or "").strip()
+            row_sym = str(row[3] or "").strip().lower()
+            row_src = str(row[4] or "").strip()
+            row_qual = str(row[5] or "").strip().lower()
+            row_pass = int(row[6] or 1)
+            row_lines = str(row[7] or "[]")
+            if _different_catalog_functions(
+                row_sym, row_src, row_qual, row[1], row_pass, row_lines
+            ):
+                continue
+            if signature and row_sig == signature:
+                return str(row[0])
+            if bare_sig and row_sig == bare_sig and not row_qual:
+                return str(row[0])
+            if prose_sig:
                 return str(row[0])
 
-    # 2. File + Normalized CWE + Grounded or Whole-Identifier Target Symbol Match
+    # 2. File + Normalized CWE + Grounded Target Symbol Match
     if norm_sym and norm_fp:
         try:
             cursor.execute("""
-                SELECT lineage_id, run_id, title, description, target_symbol, symbol_source
+                SELECT lineage_id, run_id, target_symbol, symbol_source,
+                       qualified_symbol, COALESCE(pass_index, 1), line_numbers
                 FROM findings
                 WHERE filepath = ?
                   AND (cwe = ? OR cwe = '')
@@ -1005,36 +1090,23 @@ def resolve_ancestor_lineage(
             cand_rows = cursor.fetchall()
             has_sym_cols = True
         except sqlite3.OperationalError:
-            cursor.execute("""
-                SELECT lineage_id, run_id, title, description
-                FROM findings
-                WHERE filepath = ?
-                  AND (cwe = ? OR cwe = '')
-                  AND lineage_id IS NOT NULL AND lineage_id != ''
-                ORDER BY id DESC LIMIT 50
-            """, (norm_fp, norm_cwe))
-            cand_rows = cursor.fetchall()
+            cand_rows = []
             has_sym_cols = False
 
-        ident_re = re.compile(
-            rf"(?<![A-Za-z0-9_]){re.escape(norm_sym)}(?![A-Za-z0-9_])",
-            re.IGNORECASE,
-        )
         for cand in cand_rows:
             if not cand or not cand[0] or not _same_target(cand[1]):
                 continue
-            cand_title = str(cand[2] or "")
-            cand_desc = str(cand[3] or "")
-            cand_sym = str(cand[4] or "").strip().lower() if has_sym_cols else ""
-            cand_src = str(cand[5] or "").strip() if has_sym_cols else ""
+            cand_sym = str(cand[2] or "").strip().lower() if has_sym_cols else ""
+            cand_src = str(cand[3] or "").strip() if has_sym_cols else ""
+            cand_qual = str(cand[4] or "").strip().lower() if has_sym_cols else ""
+            cand_pass = int(cand[5] or 1) if has_sym_cols else 1
+            cand_lines = str(cand[6] or "[]") if has_sym_cols else "[]"
 
-            if incoming_sym_source == "catalog" and cand_src == "catalog":
-                if cand_sym and cand_sym == norm_sym:
-                    return str(cand[0])
+            if _different_catalog_functions(
+                cand_sym, cand_src, cand_qual, cand[1], cand_pass, cand_lines
+            ):
                 continue
             if cand_sym and cand_sym == norm_sym:
-                return str(cand[0])
-            if norm_sym not in _GENERIC_HANDLER_STOPWORDS and ident_re.search(f"{cand_title} {cand_desc}"):
                 return str(cand[0])
 
     # 3. Strict Line Proximity Match on exact filepath if and only if symbol is empty
@@ -1515,26 +1587,50 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             # exists: the enclosing function at filepath:line is invariant to
             # prose, so a retitled re-report of the same defect keeps its
             # signature and lineage. "" keeps the prose extraction above.
+            grounded_symbol = ""
+            qualified_symbol = ""
+            grounded_start_line = None
             grounded_symbol = ground_symbol_in_catalog(db_path, finding_filepath, line_numbers)
             if grounded_symbol:
                 target_symbol = grounded_symbol
+                _, qualified_symbol, grounded_start_line = ground_symbol_in_catalog(
+                    db_path, finding_filepath, line_numbers, return_details=True
+                )
             symbol_source = "catalog" if grounded_symbol else ("prose" if target_symbol else None)
-            prose_signature = compute_stable_signature(
+            prose_signature = (
+                compute_stable_signature(
+                    filepath=finding_filepath,
+                    title=raw_title,
+                    cwe=canonical_cwe,
+                    symbol=prose_symbol,
+                    description=raw_desc,
+                )
+                if prose_symbol
+                else ""
+            )
+            bare_signature = compute_stable_signature(
                 filepath=finding_filepath,
                 title=raw_title,
                 cwe=canonical_cwe,
-                symbol=prose_symbol,
+                symbol=target_symbol,
                 description=raw_desc,
             )
 
-            # Compute or extract deterministic stable content signature
+            # Compute or extract deterministic stable content signature.
+            # Class/module-qualified catalog symbols disambiguate UserView.get vs
+            # OrderView.get while leaving top-level function signatures unchanged.
+            sig_symbol = (
+                qualified_symbol
+                if (qualified_symbol and "." in qualified_symbol)
+                else target_symbol
+            )
             signature = str(finding.get("signature") or "").strip() if trusted_identity else ""
             if not signature:
                 signature = compute_stable_signature(
                     filepath=finding_filepath,
                     title=raw_title,
                     cwe=canonical_cwe,
-                    symbol=target_symbol,
+                    symbol=sig_symbol,
                     description=raw_desc,
                 )
 
@@ -1576,7 +1672,12 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     active_root=eff_target_root,
                     roots_map=roots_map,
                     prose_signature=prose_signature,
+                    bare_signature=bare_signature,
                     symbol_source=symbol_source,
+                    qualified_symbol=qualified_symbol,
+                    grounded_start_line=grounded_start_line,
+                    current_run_id=run_id,
+                    current_pass_index=eff_pass_index,
                 )
 
             triage_reasoning = str(finding.get("reasoning") or finding.get("triage_reasoning") or finding.get("critic_reasoning") or "")
@@ -1605,14 +1706,51 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             else:
                 code_paths_str = "[]"
 
-            # Monotonic status protection during re-report (C3)
+            # Monotonic status protection during re-report (C3).
+            # Guarded against cross-location / cross-symbol collisions so two distinct
+            # findings in the same file never inherit each other's status at insert time.
             cursor.execute(
-                "SELECT id, status FROM findings WHERE run_id = ? AND COALESCE(pass_index, 1) = ? "
+                "SELECT id, status, line_numbers, qualified_symbol, target_symbol, symbol_source "
+                "FROM findings WHERE run_id = ? AND COALESCE(pass_index, 1) = ? "
                 "AND (signature = ? OR lineage_id = ?) "
-                "ORDER BY CASE WHEN LOWER(COALESCE(status, '')) = 'duplicate_merged' THEN 1 ELSE 0 END ASC, id DESC LIMIT 1",
+                "ORDER BY CASE WHEN LOWER(COALESCE(status, '')) = 'duplicate_merged' THEN 1 ELSE 0 END ASC, id DESC LIMIT 10",
                 (run_id, eff_pass_index, signature, lineage_id),
             )
-            existing_row = cursor.fetchone()
+            existing_row = None
+            try:
+                incoming_lines_parsed = [
+                    int(x) for x in (json.loads(line_numbers) if isinstance(line_numbers, str) else (line_numbers or []))
+                    if isinstance(x, (int, float)) and not isinstance(x, bool)
+                ]
+            except Exception:
+                incoming_lines_parsed = []
+            for cand_existing in cursor.fetchall():
+                if matched_id_row and cand_existing[0] == matched_id_row[0]:
+                    existing_row = cand_existing
+                    break
+                ex_qual = str(cand_existing[3] or "").strip().lower()
+                ex_sym = str(cand_existing[4] or "").strip().lower()
+                ex_src = str(cand_existing[5] or "").strip()
+                if symbol_source == "catalog" and ex_src == "catalog":
+                    if qualified_symbol and ex_qual and qualified_symbol != ex_qual:
+                        continue
+                    if target_symbol and ex_sym and target_symbol.lower() != ex_sym:
+                        continue
+                try:
+                    ex_lines = [
+                        int(x) for x in json.loads(str(cand_existing[2] or "[]"))
+                        if isinstance(x, (int, float)) and not isinstance(x, bool)
+                    ]
+                except Exception:
+                    ex_lines = []
+                if (
+                    incoming_lines_parsed
+                    and ex_lines
+                    and not any(abs(a - b) <= 8 for a in incoming_lines_parsed for b in ex_lines)
+                ):
+                    continue
+                existing_row = cand_existing
+                break
             if existing_row:
                 # Case-folded: a legacy row dismissed as FALSE_POSITIVE must not be
                 # resurrected to `reported` just because its case predates the fold.
@@ -1705,7 +1843,8 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                         priority = ?, signature = ?, lineage_id = ?, cwe = ?, triage_reasoning = ?, patch_diff = ?,
                         patch_status = ?, rca_summary = ?, code_paths = ?,
                         campaign = COALESCE(NULLIF(campaign, ''), ?),
-                        target_symbol = ?, symbol_source = ?, prose_signature = ?
+                        target_symbol = ?, symbol_source = ?, prose_signature = ?,
+                        qualified_symbol = ?
                     WHERE id = ?
                 """, (
                     finding_filepath,
@@ -1730,7 +1869,8 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     owner or None,
                     target_symbol or None,
                     symbol_source,
-                    prose_signature,
+                    prose_signature or None,
+                    qualified_symbol or None,
                     target_id,
                 ))
             else:
@@ -1746,9 +1886,9 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                         remediation, status, mantis_risk_score, impact_score, likelihood_score,
                         priority, signature, lineage_id, cwe, triage_reasoning, patch_diff, patch_status,
                         rca_summary, embedding, code_paths, campaign, pass_index,
-                        target_symbol, symbol_source, prose_signature
+                        target_symbol, symbol_source, prose_signature, qualified_symbol
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     run_id,
                     finding_filepath,
@@ -1775,7 +1915,8 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     eff_pass_index,
                     target_symbol or None,
                     symbol_source,
-                    prose_signature,
+                    prose_signature or None,
+                    qualified_symbol or None,
                 ))
 
 def update_finding_calibration(

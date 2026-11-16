@@ -72,10 +72,9 @@ jobs:
           MANTIS_CI_STRICT_DEPS: "1"
           PYTHONSAFEPATH: "1"
           NO_PROXY: "127.0.0.1,localhost"
-          no_proxy: "127.0.0.1,localhost"
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
           LITELLM_MODE: PRODUCTION
-        run: python -P -m unittest discover -s . -p "test*.py"
+        run: no_proxy="127.0.0.1,localhost" python -P -m unittest discover -s . -p "test*.py"
 
   neuter-matrix:
     runs-on: ubuntu-latest
@@ -102,7 +101,6 @@ jobs:
         env:
           PYTHONSAFEPATH: "1"
           NO_PROXY: "127.0.0.1,localhost"
-          no_proxy: "127.0.0.1,localhost"
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
           LITELLM_MODE: PRODUCTION
-        run: python -P scripts/neuter_matrix.py --jobs 4
+        run: no_proxy="127.0.0.1,localhost" python -P scripts/neuter_matrix.py --jobs 4

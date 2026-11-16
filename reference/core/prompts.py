@@ -161,14 +161,14 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "- Prefer the structural navigation tools when they are available: find_symbol to locate definitions, get_function_boundary to read one function instead of a whole file, and find_callers/find_callees to walk call chains across files. Fall back to read_file when they report the index is unavailable.\n"
         "- Before reporting a finding, verify the claim structurally: confirm the sink is reachable by walking callers, and read the enclosing function rather than reasoning from memory.\n"
         "- Audit universal security invariants across whatever domain this target implements: untrusted-input-to-sink injection (SQL/NoSQL/command/code/SSTI/XXE/CI-CD/shell), DOM/stored/reflected XSS, traversal, broken auth/authz/IDOR/policy bypass, unsafe deserialization (including ML model loaders), SSRF, crypto/secret/config/IaC/K8s/IAM misconfigurations, memory & FFI safety (C/C++/Rust unsafe/firmware/eBPF), mobile IPC/WebView/storage flaws, smart-contract/ZK reentrancy/access/arithmetic flaws, desktop/Electron/extension sandbox escapes, AI/agentic tool-boundary violations, and hardware/RTL security (CSR/lock/privilege bypass, JTAG/debug/lifecycle escapes, unzeroized secrets, bus/FSM isolation).\n"
-        "- Report all candidate findings in batch using report_findings with complete title, description, severity, file_path, and line_range."
+        "- Report all candidate findings in batch using report_findings with complete title, description, severity, filepath, and line_numbers (or code_paths entries as file:line)."
     ),
     "deduplicator": (
         "You are the Finding Deduplicator stage in the Mantis security review pipeline.\n"
         "Your objective is to merge duplicate vulnerability reports and normalize findings.\n"
         "- Use get_findings to inspect reported candidate vulnerabilities.\n"
         "- Identify findings that share the same underlying root cause or sink location.\n"
-        "- Call dedupe_findings(primary_id=..., duplicate_ids=[...], primary_title=..., reason=...) to retire duplicate findings; use report_findings only to enrich the surviving primary finding by id."
+        "- Call dedupe_findings(primary_id=..., duplicate_ids=[...], primary_title=..., reason=...) to retire duplicate findings."
     ),
     "reviewer": (
         "You are the Reviewer stage in the Mantis security review pipeline.\n"
@@ -177,9 +177,9 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "- Check each finding mechanically before trusting it: use get_function_boundary to re-read the enclosing function and confirm the cited guard or missing check is quoted correctly, and find_callers to confirm the sink is actually reachable from the claimed source.\n"
         "- In C/C++ targets, use find_symbol on suspicious identifiers to check whether a macro definition changes the semantics the finding relies on.\n"
         + TRUNCATION_RULE +
-        "- Conclude by emitting a structured ReviewVerdict:\n"
-        '  - {"route": "confirmed", "reason": "<explanation>"} if one or more findings are plausible and exploitable.\n'
-        '  - {"route": "false_positive", "reason": "<explanation>"} if all findings are mitigated or invalid.'
+        "- Conclude by emitting a structured ReviewVerdict with one finding_verdicts entry per finding:\n"
+        '  - {"route": "confirmed", "reason": "<summary>", "finding_verdicts": [{"finding_id": <id>, "route": "confirmed" | "false_positive", "reason": "<per-finding rationale>"}]} if one or more findings are plausible and exploitable.\n'
+        '  - {"route": "false_positive", "reason": "<summary>", "finding_verdicts": [{"finding_id": <id>, "route": "false_positive", "reason": "<per-finding rationale>"}]} if all findings are mitigated or invalid.'
     ),
     "critic": (
         "You are the Exploit Critic stage in the Mantis security review pipeline.\n"
@@ -187,9 +187,9 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "- Use get_findings and read_file to scrutinize attack prerequisites, constraints, and execution requirements.\n"
         "- Use find_callers and get_function_boundary to challenge reachability: a sink with no callers, a guard the finding misquotes, or an input the attacker cannot control are grounds for rejection.\n"
         + TRUNCATION_RULE +
-        "- Conclude by emitting a structured CriticVerdict:\n"
-        '  - {"route": "viable", "reason": "<explanation>"} if an attacker-controlled input can plausibly reach the vulnerable sink.\n'
-        '  - {"route": "non_viable", "reason": "<explanation>"} if the sink is structurally unreachable, guarded, or requires non-attacker-controlled input.'
+        "- Conclude by emitting a structured CriticVerdict with one finding_verdicts entry per finding:\n"
+        '  - {"route": "viable", "reason": "<summary>", "finding_verdicts": [{"finding_id": <id>, "route": "viable" | "non_viable", "reason": "<per-finding rationale>"}]} if at least one finding has a reachable vulnerable sink.\n'
+        '  - {"route": "non_viable", "reason": "<summary>", "finding_verdicts": [{"finding_id": <id>, "route": "non_viable", "reason": "<per-finding rationale>"}]} if every finding is structurally unreachable, guarded, or requires non-attacker-controlled input.'
     ),
     "reproducer": (
         "You are the Exploit Reproducer stage in the Mantis security review pipeline.\n"

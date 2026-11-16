@@ -70,7 +70,7 @@ class TestP2McpCiEvals(unittest.TestCase):
     """Covers every finding assigned to Phase-2 CL 5 (`p2-cl5`)."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="mantis_p2_cl5_")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="mantis_p2_cl5_"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     # ------------------------------------------------------------------
@@ -888,18 +888,48 @@ class TestP2McpCiEvals(unittest.TestCase):
         self.assertNotEqual(inst.returncode, 0)
         self.assertIn("Python 3.15.0", inst.stderr)
 
-        # run.sh invoked as `sh run.sh --dry-run .` from caller_dir must anchor `.` to caller_dir!
+        # run.sh invoked as `sh run.sh --dry-run .` from caller_dir must anchor `.` to caller_dir,
+        # hermetically without requiring an unversioned `reference/.venv` checkout in CI!
+        hermetic_ref = Path(self.tmp) / "hermetic_ref"
+        hermetic_ref.mkdir()
+        shutil.copy2(run_sh, hermetic_ref / "run.sh")
+        (hermetic_ref / "run.sh").chmod(0o755)
+        os.symlink(_REF_ROOT / "scripts", hermetic_ref / "scripts")
+        os.symlink(_REF_ROOT / "core", hermetic_ref / "core")
+        os.symlink(_REF_ROOT / "tools", hermetic_ref / "tools")
+        os.symlink(_REF_ROOT / "workflow.json", hermetic_ref / "workflow.json")
+
+        # Without .venv, run.sh must fail loudly with install instructions.
         caller_dir = Path(self.tmp) / "caller_repo"
         caller_dir.mkdir()
         (caller_dir / "hello.py").write_text("x = 1\n", encoding="utf-8")
+        no_venv = subprocess.run(
+            ["/bin/sh", str(hermetic_ref / "run.sh"), "--dry-run", "."],
+            cwd=str(caller_dir),
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(no_venv.returncode, 0)
+        self.assertIn("install.sh", no_venv.stdout + no_venv.stderr)
+
+        stub_venv_bin = hermetic_ref / ".venv" / "bin"
+        stub_venv_bin.mkdir(parents=True)
+        (stub_venv_bin / "activate").write_text("# stub activate\n", encoding="utf-8")
+        stub_py = stub_venv_bin / "python3"
+        stub_py.write_text(
+            f"#!/bin/sh\nPYTHONPATH={str(_REF_ROOT)!r} exec {str(Path(sys.executable))!r} \"$@\"\n",
+            encoding="utf-8",
+        )
+        stub_py.chmod(0o755)
+
         dry = subprocess.run(
-            ["/bin/sh", str(run_sh), "--no-auto-configure", "--sandbox", "static-only", "--dry-run", "."],
+            ["/bin/sh", str(hermetic_ref / "run.sh"), "--no-auto-configure", "--sandbox", "static-only", "--dry-run", "."],
             cwd=str(caller_dir),
             env={**os.environ, "GEMINI_API_KEY": "dummy", "MANTIS_MODEL": "gemini/gemini-3.8-flash"},
             capture_output=True,
             text=True,
         )
-        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(dry.returncode, 0, dry.stdout + "\n" + dry.stderr)
         self.assertIn(str(caller_dir.resolve()), dry.stdout)
 
         # SIGTERM sent to launch.py must flush --spend-report and exit 143.
