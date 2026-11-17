@@ -1171,15 +1171,18 @@ def report_findings(report: ReportedFindingsBatch) -> str:
         sanitized_findings = []
         merged_via_report = 0
         skipped_duplicates = 0
+        rejected_idless_dedupe = 0
         for f in findings:
             raw_st = str(
                 (getattr(f, "status", None) if hasattr(f, "status") else (f.get("status") if isinstance(f, dict) else ""))
                 or ""
             ).strip().upper()
-            raw_id = str(
-                (getattr(f, "id", None) if hasattr(f, "id") else (f.get("id") if isinstance(f, dict) else ""))
-                or ""
-            ).strip()
+            raw_id_val = (
+                getattr(f, "id", None)
+                if hasattr(f, "id")
+                else (f.get("id") if isinstance(f, dict) else None)
+            )
+            raw_id = "" if isinstance(raw_id_val, bool) else str(raw_id_val or "").strip()
             raw_dup_of = str(
                 (getattr(f, "duplicate_of", None) if hasattr(f, "duplicate_of") else (f.get("duplicate_of") if isinstance(f, dict) else ""))
                 or ""
@@ -1215,11 +1218,11 @@ def report_findings(report: ReportedFindingsBatch) -> str:
                     f.id = ""
                 elif isinstance(f, dict):
                     f.pop("id", None)
-            elif not raw_id or raw_id == "0" or (raw_id.lstrip("-").isdigit() and int(raw_id) <= 0):
-                if hasattr(f, "id"):
-                    f.id = ""
-                elif isinstance(f, dict):
-                    f.pop("id", None)
+            elif not (raw_id.isdigit() and int(raw_id) > 0):
+                # Defense in depth: a dedupe node must never insert a new
+                # finding without targeting an existing positive numeric id.
+                rejected_idless_dedupe += 1
+                continue
 
             sanitized_findings.append(f)
 
@@ -1231,11 +1234,19 @@ def report_findings(report: ReportedFindingsBatch) -> str:
             if skipped_duplicates
             else ""
         )
+        dedupe_id_note = (
+            f" Rejected {rejected_idless_dedupe} item(s) without an existing numeric 'id': "
+            "the deduplicator may only update an existing finding by id or merge duplicates "
+            "via dedupe_findings(primary_id=..., duplicate_ids=[...], primary_title=..., reason=...)."
+            if rejected_idless_dedupe
+            else ""
+        )
+        batch_notes = f"{dup_note}{dedupe_id_note}"
         if not findings:
             if merged_via_report > 0:
-                return f"SUCCESS: Deduplicated {merged_via_report} finding(s) in database.{dup_note}"
-            if skipped_duplicates:
-                return f"Error: No findings saved.{dup_note}"
+                return f"SUCCESS: Deduplicated {merged_via_report} finding(s) in database.{batch_notes}"
+            if rejected_idless_dedupe or skipped_duplicates:
+                return f"Error: No findings saved.{batch_notes}"
 
         sb = getattr(ctx, "sandbox", None)
         workdir = (
@@ -1429,12 +1440,12 @@ def report_findings(report: ReportedFindingsBatch) -> str:
             details_json = json.dumps(rejected_items, ensure_ascii=False)
             return (
                 f"PARTIAL SUCCESS: Saved {len(valid_findings)} finding(s) to database; "
-                f"rejected {len(rejected_items)} finding(s) due to invalid citations.{dup_note} "
+                f"rejected {len(rejected_items)} finding(s) due to invalid citations.{batch_notes} "
                 f"Rejected items: {details_json}. "
                 "Re-read the cited files with read_file or get_function_boundary and resubmit "
                 "ONLY the rejected finding(s) via report_findings (saved findings are already persisted)."
             )
-        return f"SUCCESS: Saved {len(valid_findings)} finding(s) to database.{dup_note}"
+        return f"SUCCESS: Saved {len(valid_findings)} finding(s) to database.{batch_notes}"
     except Exception as e:
         from pydantic import ValidationError
 
