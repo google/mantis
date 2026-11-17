@@ -71,7 +71,7 @@ STAGE_CONFIGS = {
     },
     'deduplicator': {
         'skill': 'mantis-dedupe',
-        'tools': ['read_file', 'write_file', 'list_files', 'get_findings', 'report_findings', 'dedupe_findings'],
+        'tools': ['read_file', 'write_file', 'list_files', 'get_findings', 'dedupe_findings'],
         'instruction': get_stage_prompt('deduplicator', 'mantis-dedupe'),
     },
     'reviewer': {

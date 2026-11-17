@@ -82,7 +82,7 @@
       "id": "deduplicator",
       "type": "agent",
       "reasoning_effort": "low",
-      "tools": ["read_file", "write_file", "list_files", "get_findings", "report_findings", "dedupe_findings"]
+      "tools": ["read_file", "write_file", "list_files", "get_findings", "dedupe_findings"]
     },
     {
       "id": "reviewer",

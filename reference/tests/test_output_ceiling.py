@@ -120,10 +120,12 @@ class PromptCacheMarkersTest(unittest.TestCase):
 
 
 class RequestTimeoutTest(unittest.TestCase):
-    """Streamed (the default), the timeout runs between chunks, so one value
-    serves every effort. Unstreamed, the whole thinking turn must arrive
-    inside it, and at the highest effort one turn has been measured past
-    five minutes, so it scales with effort. The operator's wins."""
+    """Streamed (the default) and unstreamed defaults scale with effort so
+    long-thinking models (including those that stay silent before emitting a
+    chunk) get generous bounds (600s medium / 900s high / 1800s xhigh & max),
+    while low-effort non-thinking models leave `timeout` unset in kwargs (and
+    streamed calls still apply the harness's 600s per-chunk fallback). The
+    operator's explicit timeout always wins."""
 
     def setUp(self):
         env = mock.patch.dict(os.environ, {"VERTEXAI_PROJECT": "p", "VERTEXAI_LOCATION": "global"}, clear=False)
@@ -136,21 +138,28 @@ class RequestTimeoutTest(unittest.TestCase):
         _, kw = get_llm_kwargs(model_id=model, reasoning_effort=effort)
         return kw.get("timeout")
 
-    def test_streamed_turns_share_one_per_chunk_timeout(self):
-        for effort in ("medium", "high", "max"):
-            self.assertEqual(default_request_timeout("vertex_ai/gemini-example", effort), 300.0, effort)
-        self.assertEqual(self._timeout("vertex_ai/claude-example", "max"), 300.0)
-        self.assertEqual(self._timeout("vertex_ai/claude-example", "low"), 300.0, "a thinking model at low effort too")
-        self.assertIsNone(self._timeout("vertex_ai/gemini-example", "low"), "a model that does not think keeps LiteLLM's")
+    def test_streamed_turns_use_generous_effort_scaled_per_chunk_timeouts(self):
+        self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "medium"), 600.0)
+        self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "high"), 900.0)
+        self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "xhigh"), 1800.0)
+        self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "max"), 1800.0)
+        self.assertEqual(self._timeout("vertex_ai/claude-example", "max"), 1800.0)
+        self.assertEqual(self._timeout("vertex_ai/claude-example", "high"), 900.0)
+        self.assertEqual(self._timeout("vertex_ai/claude-example", "low"), 600.0, "a thinking model at low effort too")
+        self.assertIsNone(
+            self._timeout("vertex_ai/gemini-example", "low"),
+            "low-effort non-thinking models leave kwargs timeout unset (streamed calls still apply the harness fallback)",
+        )
 
     def test_unstreamed_turns_scale_with_effort(self):
         with mock.patch.dict(os.environ, {"MANTIS_LLM_STREAM": "0"}):
             self.assertEqual(default_request_timeout("vertex_ai/claude-example", "max"), 1800.0)
+            self.assertEqual(default_request_timeout("vertex_ai/claude-example", "xhigh"), 1800.0)
             self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "high"), 900.0)
-            self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "medium"), 300.0)
+            self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "medium"), 600.0)
             self.assertEqual(self._timeout("vertex_ai/claude-example", "max"), 1800.0)
-            self.assertEqual(self._timeout("vertex_ai/claude-example", "low"), 300.0)
-            self.assertEqual(self._timeout("openai/glm-example", "low"), 300.0)
+            self.assertEqual(self._timeout("vertex_ai/claude-example", "low"), 600.0)
+            self.assertEqual(self._timeout("openai/glm-example", "low"), 600.0)
             self.assertIsNone(self._timeout("vertex_ai/gemini-example", "low"))
 
     def test_the_operator_s_timeout_wins(self):

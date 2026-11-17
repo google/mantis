@@ -354,6 +354,141 @@ class TestDedupeLineageAndConsolidation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(files, ["auth.py", "profile.py"])
         self.assertTrue(all(r["status"] == "reported" for r in all_rows))
 
+    def test_deduplicator_omits_report_findings_and_researcher_directive(self):
+        import json
+        from google.adk.models import LlmRequest
+        from core.config import ResilientLiteLlm
+        from core.synthesizer import WorkflowSynthesizer
+        from evals import stage_agents
+        from evals.deduplicator_agent import agent as dedupe_eval_agent
+
+        wf_data = json.loads((Path(_REF_ROOT) / "workflow.json").read_text(encoding="utf-8"))
+        dedupe_nodes = [n for n in wf_data["nodes"] if n.get("id") == "deduplicator"]
+        self.assertEqual(len(dedupe_nodes), 1)
+        self.assertIn("dedupe_findings", dedupe_nodes[0]["tools"])
+        self.assertNotIn("report_findings", dedupe_nodes[0]["tools"])
+
+        # Loaded ADK agent has no report_findings tool and receives no
+        # [STAGE DIRECTIVE - RESEARCHER] injection.
+        wf, _ = gl.load_workflow_from_json(str(Path(_REF_ROOT) / "workflow.json"), load_local=False)
+        dedupe_adk = None
+        for edge in wf.edges:
+            for n in (edge.from_node, edge.to_node):
+                ag = getattr(n, "agent", n)
+                if getattr(ag, "name", None) == "deduplicator":
+                    dedupe_adk = ag
+                    break
+        self.assertIsNotNone(dedupe_adk)
+        tool_names = [getattr(t, "__name__", getattr(t, "name", "")) for t in (dedupe_adk.tools or [])]
+        self.assertIn("dedupe_findings", tool_names)
+        self.assertNotIn("report_findings", tool_names)
+
+        req = LlmRequest()
+        req.tools_dict = {name: object() for name in tool_names if name}
+        ResilientLiteLlm._inject_stage_turn_reminder(req)
+        sys_inst = str(getattr(getattr(req, "config", None), "system_instruction", "") or "")
+        self.assertNotIn("[STAGE DIRECTIVE - RESEARCHER]", sys_inst)
+
+        # Eval definitions and synthesized workflows also omit report_findings.
+        self.assertNotIn("report_findings", stage_agents.STAGE_CONFIGS["deduplicator"]["tools"])
+        self.assertIn("dedupe_findings", stage_agents.STAGE_CONFIGS["deduplicator"]["tools"])
+
+        eval_agent = dedupe_eval_agent.build_deduplicator_agent()
+        eval_tool_names = [getattr(t, "__name__", getattr(t, "name", "")) for t in (eval_agent.tools or [])]
+        self.assertIn("dedupe_findings", eval_tool_names)
+        self.assertNotIn("report_findings", eval_tool_names)
+        self.assertNotIn("report_findings", str(eval_agent.instruction))
+
+        spec = WorkflowSynthesizer().synthesize_archetype("web api security audit", target_root=str(self.repo))
+        synth_dedupe = [n for n in spec.nodes if n.id == "dedupe"]
+        self.assertEqual(len(synth_dedupe), 1)
+        self.assertIn("dedupe_findings", synth_dedupe[0].tools)
+        self.assertNotIn("report_findings", synth_dedupe[0].tools)
+
+    def test_deduplicator_report_findings_rejects_idless_insert_defense_in_depth(self):
+        from core.schemas import ReportedFindingInput, ReportedFindingsBatch
+
+        write_findings(
+            self.db,
+            str(self.repo),
+            [
+                {
+                    "title": "Primary Auth SQLi",
+                    "severity": "HIGH",
+                    "description": "Initial description",
+                    "filepath": "auth.py",
+                    "line_numbers": [1],
+                }
+            ],
+            run_id="r_cl3",
+        )
+        initial_rows = read_findings(self.db, run_id="r_cl3")
+        self.assertEqual(len(initial_rows), 1)
+        primary_id = int(initial_rows[0]["id"])
+
+        self.rc.active_node = "deduplicator"
+
+        # 1. Lean schema payload (no `id` field at all) must be rejected without inserting a duplicate.
+        lean_batch = ReportedFindingsBatch(
+            findings=[
+                ReportedFindingInput(
+                    title="Enriched Primary Auth SQLi",
+                    severity="HIGH",
+                    description="Enriched description without id",
+                    filepath="auth.py",
+                    line_numbers=[1],
+                )
+            ]
+        )
+        res_lean = report_findings(lean_batch)
+        self.assertTrue(res_lean.startswith("Error:"), res_lean)
+        self.assertIn("dedupe_findings", res_lean)
+        self.assertEqual(len(read_findings(self.db, run_id="r_cl3")), 1)
+
+        # 2. Raw dicts with missing, zero, negative, boolean, or non-numeric ids are rejected.
+        for bad_id in (None, "", "0", 0, -1, True, "abc"):
+            item = {
+                "title": f"Bad id {bad_id!r} copy",
+                "severity": "HIGH",
+                "description": "Should never insert",
+                "filepath": "auth.py",
+                "line_numbers": [1],
+            }
+            if bad_id is not None:
+                item["id"] = bad_id
+            res_bad = report_findings({"findings": [item]})
+            self.assertTrue(res_bad.startswith("Error:"), f"bad_id={bad_id!r} -> {res_bad}")
+        self.assertEqual(len(read_findings(self.db, run_id="r_cl3")), 1)
+
+        # 3. Mixed batch: valid numeric id updates in place while id-less sibling is rejected.
+        res_mixed = report_findings(
+            {
+                "findings": [
+                    {
+                        "id": primary_id,
+                        "title": "Primary Auth SQLi (enriched)",
+                        "severity": "CRITICAL",
+                        "description": "Updated by explicit id",
+                        "filepath": "auth.py",
+                        "line_numbers": [1],
+                    },
+                    {
+                        "title": "Accidental Duplicate Copy",
+                        "severity": "HIGH",
+                        "description": "Missing id",
+                        "filepath": "auth.py",
+                        "line_numbers": [1],
+                    },
+                ]
+            }
+        )
+        self.assertIn("SUCCESS", res_mixed)
+        self.assertIn("Rejected 1 item(s) without an existing numeric 'id'", res_mixed)
+        final_rows = read_findings(self.db, run_id="r_cl3")
+        self.assertEqual(len(final_rows), 1)
+        self.assertEqual(int(final_rows[0]["id"]), primary_id)
+        self.assertEqual(final_rows[0]["title"], "Primary Auth SQLi (enriched)")
+
 
 class TestToolCrashSafetyAndResumableStampGuard(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

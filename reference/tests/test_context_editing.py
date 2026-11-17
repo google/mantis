@@ -263,12 +263,14 @@ class ClientSideEditingTest(unittest.TestCase):
         import core.graph_loader as gl
         return [c.parts[i].function_response for c, i, _ in gl._function_response_parts(req)]
 
-    def _callback(self, model=GEMINI, window=100_000):
+    def _callback(self, model=GEMINI, window=100_000, node_id="researcher", preserve_system_prefix=False):
         import core.graph_loader as gl
         patcher = patch.object(C, "resolve_context_limit", return_value=window)
         patcher.start()
         self.addCleanup(patcher.stop)
-        return gl._make_client_context_editing_before_model_callback("researcher", model=model)
+        return gl._make_client_context_editing_before_model_callback(
+            node_id, model=model, preserve_system_prefix=preserve_system_prefix
+        )
 
     def test_at_the_trigger_the_oldest_results_are_cleared_and_stay_cleared(self):
         import core.graph_loader as gl
@@ -317,6 +319,164 @@ class ClientSideEditingTest(unittest.TestCase):
         results = self._results(req)
         self.assertEqual([r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in results],
                          [True, True, False, False, False, False, False])
+
+    def test_parallel_unread_batch_is_never_cleared_on_first_appearance(self):
+        from google.adk.models import LlmRequest
+        from google.genai import types
+        import core.graph_loader as gl
+
+        # 100k window -> 50k trigger (150k chars), keep=5. One parallel batch of
+        # 8 results x 30k chars = 240k chars (~80k tokens), well over trigger.
+        cb = self._callback()
+        req = LlmRequest()
+        req.config.system_instruction = "be careful"
+        req.contents = [
+            types.Content(role="user", parts=[types.Part.from_text(text="go")]),
+            types.Content(role="model", parts=[
+                types.Part(function_call=types.FunctionCall(name="read_file", id=f"b{i}", args={"i": i}))
+                for i in range(8)
+            ]),
+            types.Content(role="user", parts=[
+                types.Part(function_response=types.FunctionResponse(
+                    name="read_file", id=f"b{i}", response={"result": f"b{i}:" + "x" * 30_000}
+                ))
+                for i in range(8)
+            ]),
+        ]
+        asyncio.run(cb(callback_context=None, llm_request=req))
+        results = self._results(req)
+        self.assertEqual(len(results), 8)
+        self.assertTrue(
+            all(r.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in results),
+            "none of the 8 unread results in the current parallel batch may be cleared",
+        )
+        self.assertEqual(self.ctx.node_context["researcher"].get(gl.NODE_CONTEXT_CLEARED_KEY, 0), 0)
+
+        # Also verify split consecutive user Contents (no intervening model turn)
+        # protect the entire unread batch.
+        req_split = LlmRequest()
+        req_split.config.system_instruction = "be careful"
+        req_split.contents = [
+            types.Content(role="user", parts=[types.Part.from_text(text="go")]),
+            types.Content(role="model", parts=[
+                types.Part(function_call=types.FunctionCall(name="read_file", id=f"s{i}", args={"i": i}))
+                for i in range(8)
+            ]),
+        ] + [
+            types.Content(role="user", parts=[
+                types.Part(function_response=types.FunctionResponse(
+                    name="read_file", id=f"s{i}", response={"result": f"s{i}:" + "x" * 30_000}
+                ))
+            ])
+            for i in range(8)
+        ]
+        asyncio.run(cb(callback_context=None, llm_request=req_split))
+        self.assertTrue(
+            all(r.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in self._results(req_split)),
+            "consecutive trailing user function_response messages must all stay intact",
+        )
+
+    def test_forked_stage_over_trigger_keeps_unread_batch_then_clears_after_model_turn(self):
+        from google.adk.models import LlmRequest
+        from google.genai import types
+        import core.graph_loader as gl
+        from core.prompts import PREFIX_GROUP_BASE_INSTRUCTION
+
+        self.assertIn(gl.CLEARED_TOOL_RESULT_TEXT, PREFIX_GROUP_BASE_INSTRUCTION)
+
+        # Forked stage whose inherited stem alone exceeds the 50k-token trigger
+        # (150k chars), followed by an 8-result parallel batch on turn 1.
+        cb = self._callback(node_id="threat_modeler", preserve_system_prefix=True)
+
+        def _build_forked(include_second_turn: bool) -> LlmRequest:
+            req = LlmRequest()
+            req.config.system_instruction = PREFIX_GROUP_BASE_INSTRUCTION
+            req.contents = [
+                types.Content(role="user", parts=[types.Part.from_text(text="architect start")]),
+                types.Content(role="model", parts=[
+                    types.Part(function_call=types.FunctionCall(name="read_file", id="inh0", args={}))
+                ]),
+                types.Content(role="user", parts=[
+                    types.Part(function_response=types.FunctionResponse(
+                        name="read_file", id="inh0", response={"result": "stem:" + "s" * 180_000}
+                    ))
+                ]),
+                types.Content(role="model", parts=[types.Part.from_text(text="architect done")]),
+                types.Content(role="user", parts=[
+                    types.Part.from_text(text=f"{gl.ACTIVE_STAGE_HEADER_PREFIX}threat_modeler]\nGo.")
+                ]),
+                types.Content(role="model", parts=[
+                    types.Part(function_call=types.FunctionCall(name="read_file", id=f"t1_{i}", args={"i": i}))
+                    for i in range(8)
+                ]),
+                types.Content(role="user", parts=[
+                    types.Part(function_response=types.FunctionResponse(
+                        name="read_file", id=f"t1_{i}", response={"result": f"t1_{i}:" + "y" * 20_000}
+                    ))
+                    for i in range(8)
+                ]),
+            ]
+            if include_second_turn:
+                req.contents.extend([
+                    types.Content(role="model", parts=[
+                        types.Part(function_call=types.FunctionCall(name="read_file", id=f"t2_{i}", args={"i": i}))
+                        for i in range(2)
+                    ]),
+                    types.Content(role="user", parts=[
+                        types.Part(function_response=types.FunctionResponse(
+                            name="read_file", id=f"t2_{i}", response={"result": f"t2_{i}:" + "z" * 20_000}
+                        ))
+                        for i in range(2)
+                    ]),
+                ])
+            return req
+
+        # Turn 1: inherited stem is already over trigger, yet all 8 unread own
+        # results (and the inherited stem result) remain intact.
+        req1 = _build_forked(include_second_turn=False)
+        asyncio.run(cb(callback_context=None, llm_request=req1))
+        res1 = self._results(req1)
+        self.assertEqual(len(res1), 9)
+        self.assertTrue(all(r.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in res1))
+        self.assertEqual(req1.config.system_instruction, PREFIX_GROUP_BASE_INSTRUCTION)
+        self.assertEqual(self.ctx.node_context["threat_modeler"].get(gl.NODE_CONTEXT_CLEARED_KEY, 0), 0)
+
+        # Turn 2: after the model read the 8 results and made 2 more calls, the
+        # oldest 5 own results (t1_0..t1_4) are cleared, keeping the newest 5
+        # (t1_5..t1_7 + t2_0..t2_1) and leaving the inherited stem untouched.
+        req2 = _build_forked(include_second_turn=True)
+        asyncio.run(cb(callback_context=None, llm_request=req2))
+        res2 = self._results(req2)
+        self.assertEqual(len(res2), 11)
+        self.assertNotEqual(res2[0].response, {"result": gl.CLEARED_TOOL_RESULT_TEXT}, "inherited stem stays protected")
+        own_cleared = [r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in res2[1:]]
+        self.assertEqual(own_cleared, [True, True, True, True, True, False, False, False, False, False])
+        self.assertEqual(self.ctx.node_context["threat_modeler"][gl.NODE_CONTEXT_CLEARED_KEY], 5)
+
+        # Turn 3: adding a new 8-result unread batch stays monotonic (the 5
+        # previously cleared stay cleared; read results t1_5..t2_1 may clear;
+        # all 8 newly unread results stay intact).
+        req3 = _build_forked(include_second_turn=True)
+        req3.contents.extend([
+            types.Content(role="model", parts=[
+                types.Part(function_call=types.FunctionCall(name="read_file", id=f"t3_{i}", args={"i": i}))
+                for i in range(8)
+            ]),
+            types.Content(role="user", parts=[
+                types.Part(function_response=types.FunctionResponse(
+                    name="read_file", id=f"t3_{i}", response={"result": f"t3_{i}:" + "w" * 20_000}
+                ))
+                for i in range(8)
+            ]),
+        ])
+        asyncio.run(cb(callback_context=None, llm_request=req3))
+        res3 = self._results(req3)
+        self.assertEqual(len(res3), 19)
+        self.assertNotEqual(res3[0].response, {"result": gl.CLEARED_TOOL_RESULT_TEXT})
+        own_cleared3 = [r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in res3[1:]]
+        self.assertTrue(all(own_cleared3[:5]), "already-cleared prefix must stay cleared monotonically")
+        self.assertTrue(all(not c for c in own_cleared3[-8:]), "new 8-result unread batch must stay intact")
+        self.assertGreaterEqual(self.ctx.node_context["threat_modeler"][gl.NODE_CONTEXT_CLEARED_KEY], 5)
 
     def test_a_fresh_attempt_does_not_inherit_a_larger_count(self):
         import core.graph_loader as gl
