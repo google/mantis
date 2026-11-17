@@ -2586,6 +2586,30 @@ def _count_protected_inherited_tool_responses(llm_request: Any, node_id: str) ->
     return count if found_marker else 0
 
 
+def _count_trailing_unread_tool_responses(
+    llm_request: Any, own_response_count: int
+) -> int:
+    """Counts own `function_response` parts after the last `role='model'` turn.
+
+    Every `function_response` appearing after the final `role='model'` turn is
+    part of the current tool-result batch that the model has not yet seen
+    (whether packed into one `Content` or split across consecutive `user`
+    turns). Keeping at least this many results guarantees client-side context
+    editing never blanks unread results from a parallel batch on first
+    appearance.
+    """
+    if own_response_count <= 0:
+        return 0
+    count = 0
+    for content in reversed(getattr(llm_request, "contents", None) or ()):
+        if getattr(content, "role", "") == "model":
+            break
+        for part in getattr(content, "parts", None) or ():
+            if getattr(part, "function_response", None) is not None:
+                count += 1
+    return min(own_response_count, count)
+
+
 def _strip_claude_thoughts_up_to_last_cleared(
     llm_request: Any, last_cleared_content: Any
 ) -> None:
@@ -2634,7 +2658,9 @@ def _make_client_context_editing_before_model_callback(
     request clears exactly those (ADK rebuilds the request from the session
     on each call, so the clearing is re-applied, never persisted), and the
     count only grows -- at the trigger, by at least clear-at-least worth of
-    results, never into the newest `keep`. Between edits the request prefix
+    results, never into the newest `keep` or into the current unread
+    tool-result batch (trailing `function_response` parts after the last
+    `role='model'` turn). Between edits the request prefix
     is therefore stable, which is what implicit prompt caching needs; each
     edit costs one cache miss, as the provider's own edit does. Reset by a
     continuation, whose attempt starts with no tool results of its own.
@@ -2671,7 +2697,9 @@ def _make_client_context_editing_before_model_callback(
             else 0
         )
         responses = all_responses[protected:]
-        clearable = max(0, len(responses) - keep)
+        trailing_unread = _count_trailing_unread_tool_responses(llm_request, len(responses))
+        effective_keep = max(keep, trailing_unread)
+        clearable = max(0, len(responses) - effective_keep)
         cleared = min(max(0, int(slot.get(NODE_CONTEXT_CLEARED_KEY) or 0)), clearable)
         if not preserve_system_prefix and hasattr(llm_request, "append_instructions"):
             sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
@@ -2705,7 +2733,7 @@ def _make_client_context_editing_before_model_callback(
                 f"\n[CONTEXT EDITING] {node_id}: ~{estimated:,} tokens of working context at the "
                 f"{trigger:,}-token trigger; cleared {new_cleared - cleared} older tool result(s) "
                 f"(~{freed // NODE_CONTEXT_CHARS_PER_TOKEN:,} tokens), {new_cleared} of "
-                f"{len(responses)} now cleared, newest {keep} kept.",
+                f"{len(responses)} now cleared, newest {effective_keep} kept.",
                 file=sys.stderr,
             )
         elif slot.get(NODE_CONTEXT_CLEARED_KEY) != cleared:

@@ -36,7 +36,11 @@ PREFIX_GROUP_BASE_INSTRUCTION: Final[str] = (
     "- Your active stage role, permitted tool subset, and output contract are "
     "specified in the stage assignment user message (`[ACTIVE STAGE ASSIGNMENT: ...]`) "
     "that opens your turn sequence. Execute strictly that stage's objective and "
-    "invoke ONLY the tools listed as permitted for your active stage.\n\n"
+    "invoke ONLY the tools listed as permitted for your active stage.\n"
+    "- When working context grows large, older tool results may be replaced "
+    "with `[cleared by context editing]` while recent ones stay. Record what "
+    "you rely on through tools as you go (findings in the store, notes under "
+    "workspace/) rather than counting on re-reading an earlier tool result.\n\n"
     + UNTRUSTED_CODE_AUDIT_GUARD.strip()
 )
 
