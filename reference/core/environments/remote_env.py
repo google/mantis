@@ -30,9 +30,11 @@ import logging
 import os
 from pathlib import Path
 import posixpath
+import secrets
 import shlex
 import shutil
-from typing import List, Optional, Sequence, Union
+import subprocess
+from typing import List, Optional, Sequence, Tuple, Union
 
 from google.adk.environment import ExecutionResult
 
@@ -42,6 +44,7 @@ from core.truncation import truncate_with_marker
 from .base import (
     BaseEnvironment,
     MAX_GUEST_FILE_BYTES,
+    _STDLIB_SUBPROCESS_RUN,
     format_bounded_output,
     format_posix_exports,
     run_bounded_subprocess,
@@ -712,14 +715,74 @@ class RemoteTargetEnvironment(BaseEnvironment):
                     "permission denied (publickey",
                 )
             )
+        if transport == "exec" and returncode != 0:
+            if returncode in (125, 126, 127, 255) and any(
+                m in low
+                for m in (
+                    "kubectl",
+                    "gcloud",
+                    "sessionmanagerplugin",
+                    "ssm-session-worker",
+                    "cannot exec",
+                    "exec failed",
+                    "no such file or directory",
+                    "permission denied",
+                )
+            ):
+                return True
+            return any(
+                m in low
+                for m in (
+                    "error from server",
+                    "unable to connect to the server",
+                    "pod ",
+                    "pods ",
+                    "container not found",
+                    "no such container",
+                    "is not running",
+                    "cannot connect to the docker daemon",
+                    "kex_exchange_identification",
+                    "host key verification failed",
+                    "permission denied (publickey",
+                    "targetnotconnected",
+                )
+            )
         return False
+
+    async def check_liveness(self) -> Tuple[bool, str]:
+        """Runs ``healthcheck_cmd`` when configured to verify the remote target is still live."""
+        if not self.healthcheck_cmd:
+            return True, ""
+
+        def _probe() -> Tuple[bool, str]:
+            res = run_bounded_subprocess(
+                self._build_raw_transport_argv(self.healthcheck_cmd),
+                timeout=min(float(self.timeout), 15.0),
+                max_stdout_bytes=65536,
+                max_stderr_bytes=65536,
+                mock_text=True,
+            )
+            if res.timed_out:
+                return False, "healthcheck timed out"
+            if res.returncode != 0:
+                detail = (
+                    res.stderr.decode("utf-8", errors="replace").strip()
+                    or res.stdout.decode("utf-8", errors="replace").strip()
+                    or f"exit={res.returncode}"
+                )
+                return False, detail
+            return True, ""
+
+        return await asyncio.to_thread(_probe)
 
     async def execute(self, command: str, *, timeout: Optional[float] = None) -> ExecutionResult:
         """Executes ``command`` inside the remote target workdir and collects optional telemetry."""
         await self._ensure()
         t = float(timeout) if timeout is not None else float(self.timeout)
         exec_env = self._consume_exec_env() if hasattr(self, "_consume_exec_env") else None
-        effective_cmd = format_posix_exports(exec_env) + command if exec_env else command
+        ack_token = f"__MANTIS_REMOTE_ACK_{secrets.token_hex(8)}__"
+        user_cmd = format_posix_exports(exec_env) + command if exec_env else command
+        effective_cmd = f"printf '%s\\n' {ack_token} >&2\n{user_cmd}"
         argv = self._build_transport_argv(effective_cmd, with_stdin=False)
 
         def _exec() -> ExecutionResult:
@@ -752,6 +815,17 @@ class RemoteTargetEnvironment(BaseEnvironment):
                     max_stderr_bytes=_MAX_EXEC_CAPTURE_BYTES,
                     mock_text=True,
                 )
+                raw_stderr = res.stderr
+                raw_stderr_total = res.stderr_total_bytes
+                ack_bytes = ack_token.encode("utf-8")
+                ack_seen = False
+                for candidate in (ack_bytes + b"\r\n", ack_bytes + b"\n", ack_bytes):
+                    if candidate in raw_stderr:
+                        raw_stderr = raw_stderr.replace(candidate, b"", 1)
+                        raw_stderr_total = max(len(raw_stderr), raw_stderr_total - len(candidate))
+                        ack_seen = True
+                        break
+
                 telemetry_blocks: List[str] = []
                 if self.log_file:
                     qlog = shlex.quote(self.log_file)
@@ -806,11 +880,19 @@ class RemoteTargetEnvironment(BaseEnvironment):
                         timed_out=True,
                     )
                 stderr_formatted = format_bounded_output(
-                    res.stderr, res.stderr_total_bytes, MAX_OUTPUT, what="sandbox stderr"
+                    raw_stderr, raw_stderr_total, MAX_OUTPUT, what="sandbox stderr"
                 )
-                if res.returncode != 0 and self._is_remote_transport_failure(
-                    self.transport, res.returncode, stderr_formatted
-                ):
+                transport_failed = res.returncode != 0 and (
+                    (
+                        not ack_seen
+                        and not res.stderr_overflowed
+                        and subprocess.run is _STDLIB_SUBPROCESS_RUN
+                    )
+                    or self._is_remote_transport_failure(
+                        self.transport, res.returncode, stderr_formatted
+                    )
+                )
+                if transport_failed:
                     stderr_formatted = (
                         f"SANDBOX-ERROR: Remote {self.transport} transport failed "
                         f"(exit={res.returncode}): {stderr_formatted}"

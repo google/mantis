@@ -682,15 +682,23 @@ def stamp_finding_ids(rc, new_status: str) -> Optional[list[int]]:
     if status == "dynamic_confirmed":
         earned = [int(k) for k, v in evidence.items() if isinstance(v, dict) and v.get("reproduced")]
     else:
-        earned = [int(k) for k, v in evidence.items()
-                  if isinstance(v, dict) and v.get("reproduced") and v.get("reattacked")
-                  and not v.get("reattack_present")]
+        earned = [
+            int(k)
+            for k, v in evidence.items()
+            if isinstance(v, dict)
+            and v.get("reproduced")
+            and v.get("reattacked")
+            and not v.get("reattack_present")
+            and v.get("ran") is not False
+            and not v.get("last_reattack_inconclusive")
+        ]
     if earned:
         return sorted(set(earned))
     if status == "dynamic_confirmed" and getattr(rc, "sandbox_executed", False):
         rc_pass = int(getattr(rc, "pass_index", 1) or 1)
         open_ids = _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id, pass_index=rc_pass)
-        if len(open_ids) == 1:
+        recorded_keys = {str(k) for k in evidence}
+        if len(open_ids) == 1 and str(open_ids[0]) not in recorded_keys:
             return open_ids
     return []
 
@@ -1889,7 +1897,12 @@ def _stamp_active_node(node_id: str) -> Any:
 
         ctx = current_run_context.get()
         if ctx is not None:
+            prev = getattr(ctx, "active_node", "")
             ctx.active_node = node_id
+            if node_id == "patcher" and (
+                prev != "patcher" or getattr(ctx, "patch_applied", None) is None
+            ):
+                ctx.patch_applied = False
         return ctx
     except Exception:
         return None
@@ -3546,14 +3559,7 @@ def _make_prefix_group_before_model_callback(
     async def fork_before_model(callback_context: Any = None, llm_request: Any = None):
         if llm_request is None:
             return None
-        try:
-            from core.context import current_run_context
-
-            ctx = current_run_context.get()
-            if ctx is not None:
-                ctx.active_node = node_id
-        except Exception:
-            ctx = None
+        ctx = _stamp_active_node(node_id)
 
         session = getattr(callback_context, "session", None) if callback_context is not None else None
         if session is None and callback_context is not None:
