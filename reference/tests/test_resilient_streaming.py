@@ -25,12 +25,17 @@ The resilience boundary under test:
 - The sync completion() path mirrors the async path.
 """
 
+import asyncio
 import inspect
 import os
 import sys
+import time
+import types as pytypes
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import httpx
 
 _REF_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REF_ROOT not in sys.path:
@@ -40,10 +45,16 @@ import litellm
 
 import core.config as config_module
 from core.config import (
+    CONTINUATION_FINISH_REASON,
+    CONTINUATION_RAW_FINISH_FIELD,
+    CONTINUATION_TOKEN_FIELD,
     ContextBudgetExceededError,
     MantisAuthError,
     MantisStreamInterruptedError,
+    REQUEST_TIMEOUT_STREAMED,
+    ResilientLiteLlm,
     ResilientLiteLLMClient,
+    _resolve_stream_chunk_timeout,
 )
 
 # Keep retries fast and deterministic-ish: ~1ms delays, generous patience so
@@ -373,6 +384,364 @@ class TestResilientStreaming(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, sentinel)
         # Sync non-stream has always passed stream explicitly; it must stay False.
         self.assertIs(seen.get("stream"), False)
+
+
+class _SlowAsyncStream:
+    """Async stream with configurable per-chunk delays and teardown tracking."""
+
+    def __init__(self, chunks, delays=None, aclose_delay=0.0):
+        self._chunks = list(chunks)
+        self._delays = dict(delays or {})
+        self._index = 0
+        self._aclose_delay = aclose_delay
+        self.aclose_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        delay = self._delays.get(self._index, 0.0)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if self._index >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._index]
+        self._index += 1
+        return chunk
+
+    async def aclose(self):
+        self.aclose_calls += 1
+        if self._aclose_delay > 0:
+            await asyncio.sleep(self._aclose_delay)
+
+
+class _SeparateResponseWrapper:
+    """Response object whose __aiter__() returns a distinct stream iterator."""
+
+    def __init__(self, inner_iter):
+        self._inner = inner_iter
+        self.aclose_calls = 0
+
+    def __aiter__(self):
+        return self._inner
+
+    async def aclose(self):
+        self.aclose_calls += 1
+
+
+def _litellm_stream_chunk(text="", finish_reason=None, provider_specific_fields=None):
+    """Builds a minimal ModelResponseStream-compatible chunk for ADK/splicer tests."""
+    from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+
+    delta_kwargs = {"role": "assistant", "content": text or None}
+    if provider_specific_fields is not None:
+        delta_kwargs["provider_specific_fields"] = provider_specific_fields
+    return ModelResponseStream(
+        id="chatcmpl-test",
+        created=0,
+        model="vertex_ai/gemini-3.8-flash",
+        choices=[
+            StreamingChoices(
+                index=0,
+                delta=Delta(**delta_kwargs),
+                finish_reason=finish_reason,
+            )
+        ],
+    )
+
+
+class TestStreamedTimeout(unittest.IsolatedAsyncioTestCase):
+    """Harness-enforced per-chunk timeouts on streamed turns (provider-independent)."""
+
+    def setUp(self):
+        self.client = ResilientLiteLLMClient()
+        env_patch = patch.dict(os.environ, _FAST_RETRY_ENV)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
+    def test_resolve_stream_chunk_timeout_precedence_and_validation(self):
+        self.assertEqual(_resolve_stream_chunk_timeout({}), REQUEST_TIMEOUT_STREAMED)
+        self.assertEqual(_resolve_stream_chunk_timeout({"timeout": None}), REQUEST_TIMEOUT_STREAMED)
+        self.assertEqual(_resolve_stream_chunk_timeout({"timeout": 1200.0}), 1200.0)
+        self.assertEqual(_resolve_stream_chunk_timeout({"timeout": 42}), 42.0)
+        self.assertEqual(_resolve_stream_chunk_timeout({"timeout": "75.5"}), 75.5)
+        self.assertEqual(
+            _resolve_stream_chunk_timeout({"timeout": httpx.Timeout(30.0, read=123.0)}),
+            123.0,
+        )
+        for bad in (0, -5.0, False, True, float("nan"), float("inf"), "not-a-number"):
+            self.assertEqual(_resolve_stream_chunk_timeout({"timeout": bad}), REQUEST_TIMEOUT_STREAMED, repr(bad))
+
+    async def test_stall_before_first_chunk_times_out_closes_stream_and_retries(self):
+        stalled = _SlowAsyncStream(["never"], delays={0: 5.0})
+        healthy = _SlowAsyncStream(["ok-1", "ok-2"])
+        calls = {"n": 0}
+
+        async def fake_acompletion(**kw):
+            calls["n"] += 1
+            return stalled if calls["n"] == 1 else healthy
+
+        t0 = time.monotonic()
+        with patch.object(litellm, "acompletion", fake_acompletion):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=0.05,
+            )
+            got = await _collect(stream)
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(got, ["ok-1", "ok-2"])
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(stalled.aclose_calls, 1)
+        self.assertLess(elapsed, 2.0)
+
+    async def test_stall_during_stream_open_times_out_and_retries(self):
+        calls = {"n": 0}
+
+        async def fake_acompletion(**kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await asyncio.sleep(5.0)
+            return _SlowAsyncStream(["open-ok"])
+
+        t0 = time.monotonic()
+        with patch.object(litellm, "acompletion", fake_acompletion):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=0.05,
+            )
+            got = await _collect(stream)
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(got, ["open-ok"])
+        self.assertEqual(calls["n"], 2)
+        self.assertLess(elapsed, 2.0)
+
+    async def test_stall_between_chunks_closes_iter_and_response_and_raises_interrupted(self):
+        inner_iter = _SlowAsyncStream(["c0", "c1"], delays={1: 5.0})
+        wrapper = _SeparateResponseWrapper(inner_iter)
+        calls = {"n": 0}
+
+        async def fake_acompletion(**kw):
+            calls["n"] += 1
+            return wrapper
+
+        got = []
+        t0 = time.monotonic()
+        with patch.object(litellm, "acompletion", fake_acompletion):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=0.05,
+            )
+            with self.assertRaises(MantisStreamInterruptedError) as cm:
+                async for chunk in stream:
+                    got.append(chunk)
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(got, ["c0"])
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(cm.exception.chunks_yielded, 1)
+        self.assertIsInstance(cm.exception.original_exception, TimeoutError)
+        self.assertIn("waiting for the next chunk", str(cm.exception.original_exception))
+        self.assertEqual(inner_iter.aclose_calls, 1)
+        self.assertEqual(wrapper.aclose_calls, 1)
+        self.assertLess(elapsed, 2.0)
+
+    async def test_resilient_litellm_retries_whole_turn_on_midstream_chunk_timeout(self):
+        from google.adk.models.llm_request import LlmRequest
+        from google.genai import types as genai_types
+
+        stalled = _SlowAsyncStream(
+            [
+                _litellm_stream_chunk(text="partial "),
+                _litellm_stream_chunk(text="never arrives", finish_reason="stop"),
+            ],
+            delays={1: 5.0},
+        )
+        healthy = _SlowAsyncStream(
+            [
+                _litellm_stream_chunk(text="recovered "),
+                _litellm_stream_chunk(text="after stall", finish_reason="stop"),
+            ]
+        )
+        calls = {"n": 0}
+
+        async def fake_acompletion(**kw):
+            calls["n"] += 1
+            return stalled if calls["n"] == 1 else healthy
+
+        llm = ResilientLiteLlm(model="vertex_ai/gemini-3.8-flash", timeout=0.05)
+        req = LlmRequest(
+            model="vertex_ai/gemini-3.8-flash",
+            contents=[genai_types.Content(role="user", parts=[genai_types.Part.from_text(text="hi")])],
+        )
+
+        responses = []
+        with patch.object(litellm, "acompletion", fake_acompletion):
+            async for resp in llm.generate_content_async(req, stream=True):
+                responses.append(resp)
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(stalled.aclose_calls, 1)
+        finals = [r for r in responses if not getattr(r, "partial", False)]
+        self.assertTrue(finals)
+        final_text = "".join(
+            getattr(p, "text", "") or ""
+            for p in (getattr(getattr(finals[-1], "content", None), "parts", None) or [])
+        )
+        self.assertEqual(final_text, "recovered after stall")
+
+    async def test_per_chunk_timer_resets_each_chunk_for_long_streaming_turn(self):
+        # Total stream duration (~0.15s) exceeds the per-chunk timeout (0.09s),
+        # but every individual inter-chunk gap (0.03s) stays well under it.
+        slow_but_alive = _SlowAsyncStream(
+            ["t0", "t1", "t2", "t3", "t4"],
+            delays={0: 0.03, 1: 0.03, 2: 0.03, 3: 0.03, 4: 0.03},
+        )
+
+        async def fake_acompletion(**kw):
+            return slow_but_alive
+
+        with patch.object(litellm, "acompletion", fake_acompletion):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=0.09,
+            )
+            got = await _collect(stream)
+
+        self.assertEqual(got, ["t0", "t1", "t2", "t3", "t4"])
+
+    async def test_missing_timeout_enforces_harness_fallback_without_mutating_kwargs(self):
+        # Low-effort non-thinking nodes omit `timeout` from kwargs; the harness
+        # must still bound every streamed read via REQUEST_TIMEOUT_STREAMED.
+        stalled = _SlowAsyncStream(["never"], delays={0: 5.0})
+        seen_kwargs = []
+
+        async def fake_acompletion(**kw):
+            seen_kwargs.append(dict(kw))
+            return stalled
+
+        with patch.dict(os.environ, {"MANTIS_LLM_MAX_PATIENCE_SECONDS": "0.0"}), \
+                patch.object(config_module, "REQUEST_TIMEOUT_STREAMED", 0.05), \
+                patch.object(litellm, "acompletion", fake_acompletion):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-example",
+                messages=_MESSAGES,
+                stream=True,
+            )
+            with self.assertRaises(TimeoutError) as cm:
+                await _collect(stream)
+
+        self.assertIn("waiting for the first chunk", str(cm.exception))
+        self.assertEqual(stalled.aclose_calls, 1)
+        self.assertNotIn("timeout", seen_kwargs[0])
+
+    async def test_upstream_timeout_error_message_preserved_when_harness_timer_not_expired(self):
+        upstream = TimeoutError("provider gateway 504")
+
+        async def fake_acompletion_first(**kw):
+            return _FakeAsyncStream(["a"], fail_before_index=0, exc=upstream)
+
+        with patch.dict(os.environ, {"MANTIS_LLM_MAX_PATIENCE_SECONDS": "0.0"}), \
+                patch.object(litellm, "acompletion", fake_acompletion_first):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(TimeoutError) as cm:
+                await _collect(stream)
+        self.assertIs(cm.exception, upstream)
+
+        async def fake_acompletion_mid(**kw):
+            return _FakeAsyncStream(["a", "b"], fail_before_index=1, exc=upstream)
+
+        with patch.object(litellm, "acompletion", fake_acompletion_mid):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=30.0,
+            )
+            with self.assertRaises(MantisStreamInterruptedError) as cm_mid:
+                await _collect(stream)
+        self.assertIs(cm_mid.exception.original_exception, upstream)
+
+    async def test_continuation_segment_also_enforces_chunk_timeout(self):
+        seg1_chunk = pytypes.SimpleNamespace(
+            choices=[
+                pytypes.SimpleNamespace(
+                    delta=pytypes.SimpleNamespace(
+                        content="part1",
+                        provider_specific_fields={
+                            CONTINUATION_TOKEN_FIELD: "tok-seg-2",
+                            CONTINUATION_RAW_FINISH_FIELD: CONTINUATION_FINISH_REASON,
+                        },
+                    ),
+                    finish_reason="length",
+                )
+            ],
+            usage=None,
+        )
+        seg1 = _SlowAsyncStream([seg1_chunk])
+        seg2 = _SlowAsyncStream(["part2a", "part2b"], delays={1: 5.0})
+        calls = {"n": 0}
+
+        async def fake_acompletion(**kw):
+            calls["n"] += 1
+            return seg1 if calls["n"] == 1 else seg2
+
+        got = []
+        with patch.object(litellm, "acompletion", fake_acompletion):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=0.05,
+            )
+            with self.assertRaises(MantisStreamInterruptedError) as cm:
+                async for chunk in stream:
+                    got.append(chunk)
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(len(got), 2)
+        self.assertIsInstance(cm.exception.original_exception, TimeoutError)
+        self.assertEqual(seg2.aclose_calls, 1)
+
+    async def test_stuck_aclose_is_bounded_and_does_not_stall_retry(self):
+        stalled = _SlowAsyncStream(["never"], delays={0: 5.0}, aclose_delay=5.0)
+        healthy = _SlowAsyncStream(["recovered"])
+        calls = {"n": 0}
+
+        async def fake_acompletion(**kw):
+            calls["n"] += 1
+            return stalled if calls["n"] == 1 else healthy
+
+        t0 = time.monotonic()
+        with patch.object(config_module, "_STREAM_CLOSE_TIMEOUT_SECONDS", 0.05), \
+                patch.object(litellm, "acompletion", fake_acompletion):
+            stream = await self.client.acompletion(
+                model="vertex_ai/gemini-3.8-flash",
+                messages=_MESSAGES,
+                stream=True,
+                timeout=0.05,
+            )
+            got = await _collect(stream)
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(got, ["recovered"])
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(stalled.aclose_calls, 1)
+        self.assertLess(elapsed, 2.0)
 
 
 if __name__ == "__main__":
