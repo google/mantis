@@ -297,5 +297,364 @@ class PlannedEvalGraphTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("planner", result["tokens_by_stage"])
 
 
+class OversizedForkStemCeilingTest(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for p2-context-fork-interplay-1:
+    1. Oversized inherited stems of tool results are bounded deterministically to
+       STEM_CONTEXT_CEILING_SHARE of the ceiling so sibling stages share identical
+       bytes (preserving explicit/implicit caches) and have headroom to work.
+    2. When an inherited stem STILL exceeds the ceiling on Turn 1 (zero own turns),
+       continuations cannot shrink it, so the stage fails fast non-retryably
+       instead of burning 6 handoff calls and returning canned ceiling text as a
+       clean, coverage-credited campaign.
+    """
+
+    def setUp(self):
+        self.ctrl = BudgetController(
+            config=BudgetConfig(max_tokens=0, max_wall_clock_seconds=0), run_id="r_stem"
+        )
+        self.rc = RunContext(
+            jail_dir="/tmp",
+            db_path="",
+            target_file="a.py",
+            run_id="r_stem",
+            budget_controller=self.ctrl,
+            node_context={},
+        )
+        self.token = current_run_context.set(self.rc)
+
+    def tearDown(self):
+        current_run_context.reset(self.token)
+
+    @staticmethod
+    def _stem_tool_events(num_turns: int, result_chars: int, *, include_thoughts: bool = False):
+        events = [
+            _ev("user", "user", [types.Part.from_text(text="Initial Task Input: audit app")]),
+        ]
+        for i in range(num_turns):
+            model_parts = []
+            if include_thoughts:
+                model_parts.append(types.Part(text=f"thinking {i}", thought=True))
+            model_parts.append(
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="read_file", id=f"stem_{i}", args={"filepath": f"f{i}.py"}
+                    ),
+                    thought_signature=(f"sig_{i}".encode() if include_thoughts else None),
+                )
+            )
+            events.append(_ev("explorer", "model", model_parts))
+            events.append(
+                _ev(
+                    "explorer",
+                    "user",
+                    [
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name="read_file",
+                                id=f"stem_{i}",
+                                response={"result": f"file{i}:" + ("x" * result_chars)},
+                            )
+                        )
+                    ],
+                )
+            )
+        events.append(_ev("explorer", "model", [types.Part.from_text(text="Explorer map ready.")]))
+        return events
+
+    async def test_oversized_stem_tool_results_are_bounded_identically_across_siblings(self):
+        from unittest import mock
+
+        # 100k window -> 80k ceiling -> 40k stem budget (120k chars at 3 chars/token).
+        # 6 stem tool results x 40k chars = 240k chars (~80k tokens), right at ceiling.
+        events = self._stem_tool_events(6, 40_000)
+        cb_ctx = SimpleNamespace(
+            session=SimpleNamespace(events=events),
+            state={f"{gl.PREFIX_U_STATE_KEY_PREFIX}explorer": "[ACTIVE STAGE ASSIGNMENT: explorer]\nExplore."},
+        )
+
+        with mock.patch("core.config.resolve_context_limit", return_value=100_000), \
+             mock.patch("core.config.resolve_input_token_cap", return_value=None):
+            res_cb = gl._make_prefix_group_before_model_callback(
+                "researcher",
+                base_instruction="BASE",
+                stage_role_prompt="Find bugs.",
+                ancestor_chain=("explorer",),
+                parent_id="explorer",
+                preserve_signatures=True,
+                prefix_group="audit_stem",
+                enable_explicit_stem_cache=True,
+                model="vertex_ai/gemini-3.8-flash",
+            )
+            rev_cb = gl._make_prefix_group_before_model_callback(
+                "reviewer",
+                base_instruction="BASE",
+                stage_role_prompt="Review findings.",
+                ancestor_chain=("explorer",),
+                parent_id="explorer",
+                preserve_signatures=True,
+                prefix_group="audit_stem",
+                enable_explicit_stem_cache=True,
+                model="vertex_ai/gemini-3.8-flash",
+            )
+            ceil_cb = gl._make_node_context_ceiling_before_model_callback(
+                "researcher",
+                model="vertex_ai/gemini-3.8-flash",
+                has_schema=False,
+                preserve_system_prefix=True,
+            )
+
+            req_res = LlmRequest(contents=[types.Content(role="user", parts=[types.Part.from_text(text="go")])])
+            req_rev = LlmRequest(contents=[types.Content(role="user", parts=[types.Part.from_text(text="go")])])
+            await res_cb(callback_context=cb_ctx, llm_request=req_res)
+            await rev_cb(callback_context=cb_ctx, llm_request=req_rev)
+
+            # Researcher now fits well below the 80k ceiling and proceeds normally!
+            self.assertIsNone(await ceil_cb(callback_context=cb_ctx, llm_request=req_res))
+
+            # Verify oldest inherited tool results were cleared, newest kept, and
+            # session.events was NOT mutated.
+            res_frs = [c.parts[i].function_response for c, i, _ in gl._function_response_parts(req_res)]
+            cleared_flags = [fr.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for fr in res_frs]
+            self.assertEqual(cleared_flags, [True, True, True, True, False, False])
+            self.assertTrue(
+                all(
+                    p.function_response.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT}
+                    for ev in events
+                    for p in (ev.content.parts or [])
+                    if getattr(p, "function_response", None) is not None
+                ),
+                "session.events must remain untouched",
+            )
+
+            # Siblings share the EXACT byte-identical bounded stem & explicit cache slot key.
+            res_cache = getattr(req_res, "_mantis_stem_cache", None)
+            rev_cache = getattr(req_rev, "_mantis_stem_cache", None)
+            self.assertIsNotNone(res_cache)
+            self.assertEqual(res_cache, rev_cache)
+            stem_len = res_cache["stem_len"]
+            self.assertEqual(
+                [c.model_dump() for c in req_res.contents[:stem_len]],
+                [c.model_dump() for c in req_rev.contents[:stem_len]],
+                "sibling forked stages must receive byte-identical bounded stems",
+            )
+
+    def test_claude_stem_bounding_strips_thoughts_only_up_to_last_cleared(self):
+        events = self._stem_tool_events(4, 40_000, include_thoughts=True)
+        inherited = gl.forked_prefix_contents(
+            events,
+            ("explorer",),
+            state={f"{gl.PREFIX_U_STATE_KEY_PREFIX}explorer": "[ACTIVE STAGE ASSIGNMENT: explorer]"},
+            preserve_signatures=True,
+        )
+        # 100k window -> 80k ceiling -> 40k stem budget (120k chars).
+        # 4 x 40k = 160k chars -> oldest 2 cleared, newest 2 preserved.
+        bounded, cleared = gl._bound_inherited_stem(
+            inherited, limit_tokens=100_000, model="bedrock/anthropic.claude-sonnet-4-6"
+        )
+        self.assertEqual(cleared, 2)
+        frs = [c.parts[i].function_response for c, i, _ in gl._function_response_parts_from_contents(bounded)]
+        self.assertEqual([fr.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for fr in frs], [True, True, False, False])
+        model_turns = [c for c in bounded if c.role == "model" and any(p.function_call for p in c.parts)]
+        self.assertEqual(len(model_turns), 4)
+        # First 2 model turns (at or before cleared results) had thought + signature stripped.
+        for mt in model_turns[:2]:
+            self.assertFalse(any(getattr(p, "thought", False) for p in mt.parts))
+            self.assertTrue(all(getattr(p, "thought_signature", None) is None for p in mt.parts))
+        # Last 2 model turns (after cleared results) keep their thought + signature intact.
+        for mt in model_turns[2:]:
+            self.assertTrue(any(getattr(p, "thought", False) for p in mt.parts))
+            self.assertTrue(any(getattr(p, "thought_signature", None) is not None for p in mt.parts))
+
+    async def test_unrecoverable_oversized_fork_stem_fails_fast_without_continuations_or_clean_credit(self):
+        """End-to-end through ADK Runner + RetryConfig: a schema-less forked stage
+        whose inherited stem still exceeds the ceiling on Turn 1 must fail fast
+        non-retryably with ZERO handoff LLM calls and NEVER return canned
+        NODE_CONTEXT_CEILING_TEXT."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        from google import adk
+        from google.adk.apps.app import App
+        from google.adk.models.base_llm import BaseLlm
+        from google.adk.models.llm_response import LlmResponse
+        from google.adk.runners import Runner
+        from google.adk.sessions.in_memory_session_service import InMemorySessionService
+        from google.adk.workflow import Edge, RetryConfig, START, Workflow, node
+
+        stage_calls: list[str] = []
+        handoff_calls: list = []
+
+        class _StageLlm(BaseLlm):
+            @classmethod
+            def supported_models(cls):
+                return [".*"]
+
+            async def generate_content_async(self, llm_request, stream=False):
+                stage_calls.append(self.model)
+                yield LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text="unexpected")]))
+
+        class _HandoffLlm(BaseLlm):
+            @classmethod
+            def supported_models(cls):
+                return [".*"]
+
+            async def generate_content_async(self, llm_request, stream=False):
+                handoff_calls.append(llm_request)
+                yield LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text="handoff")]))
+
+        # Explorer produces non-tool-result prose (~1000 tokens = 3000 chars) that
+        # cannot be cleared by tool-result bounding against a 1000-token window
+        # (ceiling = 800 tokens = 2400 chars).
+        class _ExplorerLlm(BaseLlm):
+            @classmethod
+            def supported_models(cls):
+                return [".*"]
+
+            async def generate_content_async(self, llm_request, stream=False):
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text="prose " * 600)],
+                    )
+                )
+
+        retry = RetryConfig(max_attempts=2, initial_delay=0.01, max_delay=0.02, backoff_factor=1.0, jitter=0.0)
+        explorer_ag = adk.Agent(
+            name="explorer",
+            model=_ExplorerLlm(model="stage"),
+            instruction=gl.LiteralInstruction("BASE"),
+        )
+        researcher_ag = adk.Agent(
+            name="researcher",
+            model=_StageLlm(model="stage"),
+            instruction=gl.LiteralInstruction("BASE"),
+            before_model_callback=[
+                gl._make_prefix_group_before_model_callback(
+                    "researcher",
+                    base_instruction="BASE",
+                    stage_role_prompt="Find vulns.",
+                    ancestor_chain=("explorer",),
+                    parent_id="explorer",
+                    preserve_signatures=True,
+                    prefix_group="audit_stem",
+                    model="stage",
+                ),
+                gl._make_node_context_ceiling_before_model_callback(
+                    "researcher",
+                    model="stage",
+                    has_schema=False,
+                    llm_factory=lambda: _HandoffLlm(model="handoff"),
+                    preserve_system_prefix=True,
+                ),
+            ],
+        )
+        explorer_node = node(explorer_ag, name="explorer")
+        wf = Workflow(
+            name="wf_fork_ceil",
+            edges=[
+                Edge(from_node=START, to_node=explorer_node),
+                Edge(
+                    from_node=explorer_node,
+                    to_node=node(researcher_ag, name="researcher", retry_config=retry),
+                ),
+            ],
+        )
+        ss = InMemorySessionService()
+        runner = Runner(app=App(name="t_fork_ceil", root_agent=wf), session_service=ss)
+        await ss.create_session(app_name="t_fork_ceil", user_id="u", session_id="s")
+
+        texts: list[str] = []
+        stderr = io.StringIO()
+        with mock.patch("core.config.resolve_context_limit", return_value=1000), \
+             mock.patch("core.config.resolve_input_token_cap", return_value=None), \
+             contextlib.redirect_stderr(stderr), \
+             self.assertRaises(Exception) as caught:
+            async for ev in runner.run_async(
+                user_id="u",
+                session_id="s",
+                new_message=types.Content(role="user", parts=[types.Part.from_text(text="go")]),
+            ):
+                for p in (getattr(getattr(ev, "content", None), "parts", None) or ()):
+                    if p.text and ev.author == "researcher":
+                        texts.append(p.text)
+
+        self.assertIn("NodeContextExhausted", type(caught.exception).__name__ + str(caught.exception))
+        self.assertEqual(stage_calls, [], "oversized Turn-1 forked stage must never call stage model")
+        self.assertEqual(handoff_calls, [], "must skip _write_handoff when continuation cannot shrink stem")
+        self.assertEqual(self.rc.node_context["researcher"]["continuations"], 0, "must not burn continuations")
+        self.assertFalse(
+            any(gl.NODE_CONTEXT_CEILING_TEXT in t for t in texts),
+            "must never return canned ceiling text as a clean completion on Turn 1",
+        )
+        snap = self.ctrl.spend_snapshot()["context"]
+        self.assertEqual(snap["ceiling_failures"], 1)
+        self.assertEqual(snap["ceiling_ends"], 0)
+        self.assertIn("continuations cannot shrink the inherited stem", stderr.getvalue())
+
+    async def test_forked_stage_with_own_progress_still_continues_normally(self):
+        """Once a forked stage has taken at least one own model/tool turn, hitting
+        the ceiling triggers normal retryable continuation (not Turn-1 fail-fast)."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        req = LlmRequest(
+            contents=[
+                types.Content(role="user", parts=[types.Part.from_text(text="explorer start")]),
+                types.Content(role="model", parts=[types.Part.from_text(text="explorer done")]),
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=f"{gl.ACTIVE_STAGE_HEADER_PREFIX}researcher]\nGo.")],
+                ),
+                # Own progress in this attempt:
+                types.Content(
+                    role="model",
+                    parts=[types.Part(function_call=types.FunctionCall(name="read_file", id="own1", args={}))],
+                ),
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name="read_file", id="own1", response={"result": "z" * 260_000}
+                            )
+                        )
+                    ],
+                ),
+            ]
+        )
+        setattr(req, "_mantis_inherited_len", 3)
+        cb = gl._make_node_context_ceiling_before_model_callback(
+            "researcher", model="m", has_schema=False, preserve_system_prefix=True
+        )
+        with mock.patch("core.config.resolve_context_limit", return_value=100_000), \
+             mock.patch("core.config.resolve_input_token_cap", return_value=None), \
+             contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(gl.NodeContextExhausted) as caught:
+            await cb(callback_context=None, llm_request=req)
+        self.assertTrue(caught.exception.retryable, "forked stage with own turns must remain retryable")
+        self.assertEqual(self.rc.node_context["researcher"]["continuations"], 1)
+
+    async def test_standalone_fork_from_oversized_first_turn_also_fails_fast(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        fork_cb = gl._make_fork_before_model_callback("researcher", "planner")
+        ceil_cb = gl._make_node_context_ceiling_before_model_callback("researcher", model="m", has_schema=False)
+        events = [_ev("planner", "model", [types.Part.from_text(text="p" * 260_000)])]
+        cb_ctx = SimpleNamespace(session=SimpleNamespace(events=events))
+        req = LlmRequest(contents=[types.Content(role="user", parts=[types.Part.from_text(text="go")])])
+        await fork_cb(callback_context=cb_ctx, llm_request=req)
+        with mock.patch("core.config.resolve_context_limit", return_value=100_000), \
+             mock.patch("core.config.resolve_input_token_cap", return_value=None), \
+             contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(gl.NodeContextExhausted) as caught:
+            await ceil_cb(callback_context=cb_ctx, llm_request=req)
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(self.rc.node_context["researcher"]["continuations"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
