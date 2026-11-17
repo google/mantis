@@ -500,7 +500,7 @@ def normalize_model_id(model_id: str) -> str:
     cleaned = model_id.strip()
     if cleaned.startswith("gemini-"):
         # If explicit Google AI Studio API key exists, route to gemini/ for LiteLLM
-        if os.environ.get("GEMINI_API_KEY"):
+        if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
             return f"gemini/{cleaned}"
         # If running in GCP / Vertex environment without explicit Google AI Studio API key, route to vertex_ai/
         if (
@@ -4331,7 +4331,26 @@ def get_llm_kwargs(
                 pass
 
         if not project and not resolved_api_base:
-            raise ValueError("ERROR: You must set VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT env variables.")
+            extra_hint = ""
+            if os.environ.get("ANTHROPIC_API_KEY"):
+                extra_hint = (
+                    " Detected ANTHROPIC_API_KEY; pass '--model anthropic/<model-id>' "
+                    "(or run 'scripts/configure.py --model anthropic/<model-id>')."
+                )
+            elif os.environ.get("OPENAI_API_KEY"):
+                extra_hint = (
+                    " Detected OPENAI_API_KEY; pass '--model openai/<model-id>' "
+                    "(or run 'scripts/configure.py --model openai/<model-id>')."
+                )
+            elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+                extra_hint = (
+                    " Detected GEMINI_API_KEY; pass '--model gemini/gemini-3.8-flash' "
+                    "(or run 'scripts/configure.py --auto')."
+                )
+            raise ValueError(
+                "ERROR: You must set VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT env variables."
+                + extra_hint
+            )
 
         if project:
             llm_kwargs["vertex_project"] = project

@@ -43,11 +43,13 @@ secure software in the new AI era of software development.
 - **Python**: **3.12 – 3.14** with `venv` (on Debian/Ubuntu:
   `sudo apt install python3-venv`).
 - **LLM credentials** (pick one):
-  - **Vertex AI**: `gcloud auth application-default login`
+  - **Vertex AI**: `gcloud auth application-default login` (with an active GCP
+    project or `export GOOGLE_CLOUD_PROJECT=<project-id>`)
   - **Gemini API**: `export GEMINI_API_KEY=...`
-  - **Others**: set the provider environment variable per
-    [LiteLLM Providers](https://docs.litellm.ai/docs/providers) (or pass
-    `--api-base` for custom/local endpoints)
+  - **Anthropic / OpenAI / custom OpenAI-compatible endpoints**: export the
+    provider API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc. per
+    [LiteLLM Providers](https://docs.litellm.ai/docs/providers)) **and** select
+    a matching `--model` in Step 2 below
 
 ### 1. Install
 
@@ -63,12 +65,17 @@ no container/VM tooling is available, Mantis falls back cleanly to
 ### 2. Configure & verify
 
 ```bash
-# Auto-detect credentials, model defaults, and sandbox capabilities
+# Auto-detect sandbox capabilities and Vertex AI / GEMINI_API_KEY defaults
 # (or pass --interactive for a guided wizard). Writes gitignored workflow.local.json.
 .venv/bin/python3 scripts/configure.py --auto
 
-# Optional: switch model or force static-only (zero VM/container requirements)
-.venv/bin/python3 scripts/configure.py --sandbox static-only --model gemini-3.8-flash
+# Non-Vertex providers: set --model explicitly (required for Anthropic, OpenAI, and --api-base)
+# Gemini API:    .venv/bin/python3 scripts/configure.py --model gemini-3.8-flash
+# Anthropic:     .venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-4-5
+# OpenAI/custom: .venv/bin/python3 scripts/configure.py --model openai/gpt-4o --api-base https://api.openai.com/v1
+
+# Optional: force static-only mode (zero VM/container requirements)
+.venv/bin/python3 scripts/configure.py --sandbox static-only
 
 # Fast preflight check (~1s) + live LLM reachability probe
 .venv/bin/python3 scripts/configure.py --test --probe

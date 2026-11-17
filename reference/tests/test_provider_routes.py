@@ -65,6 +65,8 @@ class DefaultModelTest(unittest.TestCase):
     def test_bare_gemini_routes_by_credentials(self):
         with _clean_env(GEMINI_API_KEY="k"):
             self.assertEqual(normalize_model_id("gemini-3.8-flash"), "gemini/gemini-3.8-flash")
+        with _clean_env(GOOGLE_API_KEY="k"):
+            self.assertEqual(normalize_model_id("gemini-3.8-flash"), "gemini/gemini-3.8-flash")
         with _clean_env(GOOGLE_CLOUD_PROJECT="p"):
             self.assertEqual(normalize_model_id("gemini-3.8-flash"), "vertex_ai/gemini-3.8-flash")
 
@@ -114,6 +116,197 @@ class SafetySettingsPerRouteTest(unittest.TestCase):
             with _clean_env(GOOGLE_CLOUD_PROJECT="p"):
                 get_llm_kwargs(model_id="vertex_ai/gemini-3.8-flash")
             self.assertIsNotNone(litellm.vertex_ai_safety_settings)
+
+
+class NonVertexOnboardingConfigureTest(unittest.TestCase):
+    """r3-docs-2: configure.py --auto auto-selects gemini/<id> when only
+    GEMINI_API_KEY is set, and prints actionable --model guidance (without
+    falsely claiming settings were saved) for Anthropic, OpenAI, and --api-base."""
+
+    def _copy_base_workflow(self, tmp_dir: str) -> Path:
+        import shutil
+
+        src = Path(_REF_ROOT) / "workflow.json"
+        dst = Path(tmp_dir) / "workflow.json"
+        shutil.copy2(src, dst)
+        return dst
+
+    @staticmethod
+    def _offline_caps(**overrides):
+        base = {
+            "kvm": False,
+            "docker": False,
+            "podman": False,
+            "container_tool": None,
+            "runsc": False,
+            "gcloud": False,
+            "gcp_auth": False,
+            "gcp_account": None,
+            "gcp_project": None,
+            "vertex_project": None,
+            "gemini_api_key": False,
+            "anthropic_api_key": False,
+            "openai_api_key": False,
+            "llm_api_base": None,
+            "microsandbox_image": None,
+            "recommended_sandbox": "static-only",
+            "available_sandboxes": ["static-only"],
+        }
+        base.update(overrides)
+        return base
+
+    def test_auto_switches_to_gemini_api_route_when_only_gemini_api_key_is_set(self):
+        import contextlib
+        import io
+        import json
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            wf_path = self._copy_base_workflow(td)
+            local_path = wf_path.with_name("workflow.local.json")
+            buf = io.StringIO()
+            with (
+                _clean_env(GEMINI_API_KEY="ai-studio-key"),
+                mock.patch.object(
+                    cfg_mod,
+                    "detect_capabilities",
+                    return_value=self._offline_caps(gemini_api_key=True),
+                ),
+                mock.patch("sys.argv", ["configure.py", "--workflow", str(wf_path), "--auto"]),
+                contextlib.redirect_stdout(buf),
+            ):
+                rc = cfg_mod.main()
+                ok, msgs = cfg_mod.run_preflight_checks(
+                    cfg_mod.load_workflow_dict(str(wf_path)).get("config", {}),
+                    nodes=cfg_mod.load_workflow_dict(str(wf_path)).get("nodes"),
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(local_path.exists(), "workflow.local.json should persist auto-resolved gemini/ model")
+            persisted = json.loads(local_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["config"]["default_model"], "gemini/gemini-3.8-flash")
+            self.assertTrue(ok, msgs)
+            out = buf.getvalue()
+            self.assertIn("Auto-configured model: 'gemini/gemini-3.8-flash'", out)
+            self.assertIn("Auto-configured Mantis settings saved to", out)
+
+    def test_auto_with_anthropic_or_openai_key_prints_model_hint_and_does_not_claim_save(self):
+        import contextlib
+        import io
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        for env_kw, cap_kw, expected_flag in (
+            (
+                {"ANTHROPIC_API_KEY": "sk-ant-test"},
+                {"anthropic_api_key": True},
+                "--model anthropic/",
+            ),
+            (
+                {"OPENAI_API_KEY": "sk-openai-test"},
+                {"openai_api_key": True},
+                "--model openai/",
+            ),
+        ):
+            with self.subTest(provider=expected_flag), tempfile.TemporaryDirectory() as td:
+                wf_path = self._copy_base_workflow(td)
+                local_path = wf_path.with_name("workflow.local.json")
+                buf = io.StringIO()
+                with (
+                    _clean_env(**env_kw),
+                    mock.patch.object(
+                        cfg_mod,
+                        "detect_capabilities",
+                        return_value=self._offline_caps(**cap_kw),
+                    ),
+                    mock.patch("sys.argv", ["configure.py", "--workflow", str(wf_path), "--auto"]),
+                    contextlib.redirect_stdout(buf),
+                ):
+                    rc = cfg_mod.main()
+
+                self.assertEqual(rc, 0)
+                self.assertFalse(local_path.exists())
+                out = buf.getvalue()
+                self.assertNotIn("Auto-configured Mantis settings saved to", out)
+                self.assertIn("did not write", out)
+                self.assertIn(expected_flag, out)
+
+                # Runtime get_llm_kwargs also names --model when invoked directly via run.sh/main.py
+                with _clean_env(**env_kw), mock.patch("google.auth.default", side_effect=RuntimeError("no adc")):
+                    with self.assertRaises(ValueError) as ctx_err:
+                        get_llm_kwargs(model_id="vertex_ai/gemini-3.8-flash")
+                self.assertIn(expected_flag, str(ctx_err.exception))
+
+    def test_api_base_without_model_names_model_flag_and_auto_with_model_persists(self):
+        import contextlib
+        import io
+        import json
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            wf_path = self._copy_base_workflow(td)
+            local_path = wf_path.with_name("workflow.local.json")
+            buf = io.StringIO()
+            with (
+                _clean_env(),
+                mock.patch("google.auth.default", side_effect=RuntimeError("no adc")),
+                mock.patch.object(
+                    cfg_mod,
+                    "detect_capabilities",
+                    return_value=self._offline_caps(llm_api_base="http://localhost:8000/v1"),
+                ),
+                mock.patch(
+                    "sys.argv",
+                    [
+                        "configure.py",
+                        "--workflow",
+                        str(wf_path),
+                        "--api-base",
+                        "http://localhost:8000/v1",
+                        "--test",
+                    ],
+                ),
+                contextlib.redirect_stdout(buf),
+            ):
+                rc_bad = cfg_mod.main()
+            self.assertEqual(rc_bad, 1)
+            self.assertIn("--model openai/<model-id> --api-base http://localhost:8000/v1", buf.getvalue())
+
+            # Passing --auto together with --model persists the explicit non-Vertex model cleanly.
+            buf_ok = io.StringIO()
+            with (
+                _clean_env(ANTHROPIC_API_KEY="sk-ant-ok"),
+                mock.patch.object(
+                    cfg_mod,
+                    "detect_capabilities",
+                    return_value=self._offline_caps(anthropic_api_key=True),
+                ),
+                mock.patch(
+                    "sys.argv",
+                    [
+                        "configure.py",
+                        "--workflow",
+                        str(wf_path),
+                        "--auto",
+                        "--model",
+                        "anthropic/claude-sonnet-4-5",
+                    ],
+                ),
+                contextlib.redirect_stdout(buf_ok),
+            ):
+                rc_ok = cfg_mod.main()
+                wf_loaded = cfg_mod.load_workflow_dict(str(wf_path))
+                ok, msgs = cfg_mod.run_preflight_checks(
+                    wf_loaded.get("config", {}),
+                    nodes=wf_loaded.get("nodes"),
+                )
+            self.assertEqual(rc_ok, 0)
+            self.assertTrue(ok, msgs)
+            persisted = json.loads(local_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["config"]["default_model"], "anthropic/claude-sonnet-4-5")
+            self.assertIn("Auto-configured Mantis settings saved to", buf_ok.getvalue())
 
 
 if __name__ == "__main__":
