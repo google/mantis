@@ -73,8 +73,8 @@ MUTANTS = {
     ],
     "revert_sentinel_host_read": [
         ("tools/sandbox_tools.py",
-         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass",
-         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                pass\n        if not sentinel_content and Path(sentinel_path).exists():\n            sentinel_content = Path(sentinel_path).read_text(errors=\"replace\")"),
+         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except FileNotFoundError:\n                pass\n            except Exception as exc:\n                sentinel_read_error = SecretScrubber.scrub(str(exc))",
+         "        if _has_dynamic_sandbox(ctx):\n            try:\n                content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))\n                sentinel_content = content_bytes.decode(\"utf-8\", errors=\"replace\")\n            except FileNotFoundError:\n                pass\n            except Exception as exc:\n                sentinel_read_error = SecretScrubber.scrub(str(exc))\n        if not sentinel_content and Path(sentinel_path).exists():\n            sentinel_content = Path(sentinel_path).read_text(errors=\"replace\")"),
     ],
     "revert_staging_vcs_and_hardlink": [
         ("core/environments/staging.py",

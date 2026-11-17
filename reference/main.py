@@ -5121,6 +5121,8 @@ async def pipeline(
                 # object shared by every campaign; the evidence ledger is per
                 # campaign, like sandbox_executed.
                 finding_evidence={},
+                patch_applied=None,
+                bare_sandbox_crash_seen=False,
                 node_context={},
                 read_file_counts={},
                 explicit_cache_handles={},

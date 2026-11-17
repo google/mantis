@@ -1804,7 +1804,11 @@ async def write_file(filepath: str, content: str) -> str:
         return f"SUCCESS: Recorded artifact '{clean_fp}' ({len(content)} characters)."
 
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "write_file"):
-        from tools.sandbox_tools import can_write_sandbox_target, invalidate_patch_reattack_state
+        from tools.sandbox_tools import (
+            can_write_sandbox_target,
+            invalidate_patch_reattack_state,
+            mark_patch_applied,
+        )
 
         allowed_stage, stage_err = can_write_sandbox_target(ctx, str(filepath))
         if not allowed_stage:
@@ -1813,6 +1817,7 @@ async def write_file(filepath: str, content: str) -> str:
             if hasattr(ctx.sandbox, "write_file_and_rebuild") and getattr(ctx.sandbox, "rebuild_cmd", None):
                 rb_rc, rb_out = await ctx.sandbox.write_file_and_rebuild(Path(filepath), content)
                 invalidate_patch_reattack_state(ctx)
+                mark_patch_applied(ctx, rb_rc == 0)
                 if rb_rc != 0:
                     return (
                         f"Error: Wrote {len(content)} characters to {filepath}, "
@@ -1828,6 +1833,7 @@ async def write_file(filepath: str, content: str) -> str:
             invalidate_patch_reattack_state(ctx)
             if hasattr(ctx.sandbox, "run_rebuild") and getattr(ctx.sandbox, "rebuild_cmd", None):
                 rb_rc, rb_out = await ctx.sandbox.run_rebuild()
+                mark_patch_applied(ctx, rb_rc == 0)
                 if rb_rc != 0:
                     return (
                         f"Error: Wrote {len(content)} characters to {filepath}, "
@@ -1838,6 +1844,7 @@ async def write_file(filepath: str, content: str) -> str:
                         f"SUCCESS: Wrote {len(content)} characters to {filepath}\n"
                         f"[REBUILD OK]\n{rb_out.strip()[:1000]}"
                     )
+            mark_patch_applied(ctx, True)
             return f"SUCCESS: Wrote {len(content)} characters to {filepath}"
         except Exception as e:
             return f"Error writing file in sandbox: {e}"

@@ -94,11 +94,29 @@ _CLI_MISSING_SCRIPT_RE = re.compile(
     r"(?:^|\n)(?:go:\s*)?(?:stat|open|lstat)\s+[^\n:]+:\s*no such file or directory)",
     re.I,
 )
-_PY_IMPORT_SYNTAX_EXC_RE = re.compile(
-    r"(?:^|\n)\s*(?:ModuleNotFoundError|ImportError|SyntaxError)\s*(?::|$)"
+_PY_IMPORT_INDENT_EXC_RE = re.compile(
+    r"(?:^|\n)\s*(?:ModuleNotFoundError|ImportError|IndentationError|TabError)\s*(?::|$)"
+)
+_SYNTAX_EXC_RE = re.compile(
+    r"(?:^|\n)\s*SyntaxError\s*(?::|$)"
+)
+_TARGET_UNREACHABLE_RE = re.compile(
+    r"(?:connectionrefusederror|econnrefused|connection\s+refused|"
+    r"failed\s+to\s+establish\s+a\s+new\s+connection|"
+    r"curl:\s*\((?:7|28)\)\b|"
+    r"dial\s+tcp\b[^\n]*\b(?:i/o\s+timeout|connection\s+refused))",
+    re.I,
 )
 _PY_TRACEBACK_FILE_RE = re.compile(r'^\s*File\s+"([^"]+)",\s+line\s+\d+', re.M)
 _SHELL_SEP_RE = re.compile(r"(?:&&|\|\||[;|])")
+
+
+def _is_dynamic_eval_syntax_error(text: str) -> bool:
+    """True only when a Python SyntaxError came from dynamic string parsing
+    (e.g. ``ast.literal_eval`` / ``compile(..., '<string>', ...)``) rather than
+    a broken source file on disk."""
+    frames = [m.group(1) for m in _PY_TRACEBACK_FILE_RE.finditer(text or "")]
+    return bool(frames) and frames[-1] in ("<unknown>", "<string>")
 
 
 def _strip_unscoped_remote_telemetry(output: str) -> str:
@@ -485,9 +503,20 @@ def _record_finding_evidence(
         entry = entries.setdefault(key, {"reproduced": False, "reattacked": False,
                                          "reattack_present": False, "sink_symbol": "", "reason": ""})
         if getattr(ctx, "active_node", "") == "patcher":
-            if evidence_present or ran is not False:
+            if evidence_present:
                 entry["reattacked"] = True
-                entry["reattack_present"] = bool(evidence_present)
+                entry["reattack_present"] = True
+                entry["last_reattack_inconclusive"] = False
+            elif getattr(ctx, "patch_applied", None) is False:
+                entry["last_reattack_inconclusive"] = True
+                reason = (
+                    f"{reason} (inconclusive: no patch applied in patcher stage before re-attack)"
+                    if reason
+                    else "EVIDENCE_ABSENT: no patch applied in patcher stage before re-attack"
+                )
+            elif ran is not False:
+                entry["reattacked"] = True
+                entry["reattack_present"] = False
                 entry["last_reattack_inconclusive"] = False
             else:
                 # Never overwrite a prior reattack_present=True bypass on a
@@ -543,6 +572,13 @@ def invalidate_patch_reattack_state(ctx: Any) -> None:
             entry["last_reattack_inconclusive"] = False
 
 
+def mark_patch_applied(ctx: Any, applied: bool = True) -> None:
+    """Records whether a target patch/edit in the patcher stage applied cleanly."""
+    if ctx is None or getattr(ctx, "active_node", "") != "patcher":
+        return
+    ctx.patch_applied = bool(applied)
+
+
 #: Deterministic infrastructure, toolchain, or missing-scaffold substrings that
 #: unconditionally mean the PoC never got as far as attacking the target.
 POC_SETUP_FAILURE_MARKERS = (
@@ -572,16 +608,20 @@ def poc_ran(
     workdir: str = "",
 ) -> bool:
     """Whether a PoC run got as far as attacking: not a missing interpreter
-    (126/127), not a timeout or sandbox transport error, and not a launcher or
-    PoC-harness startup failure. Absent evidence means a fix only when True."""
+    (126/127), not a timeout (including guest ``timeout(1)`` exit 124) or
+    sandbox transport error, not a connection-refused / broken-target error,
+    and not a launcher or PoC-harness startup failure. Absent evidence means a
+    fix only when True."""
     try:
         code = int(exit_code)
     except (TypeError, ValueError):
         code = 1
-    if code in (126, 127) or code < 0 or timed_out:
+    if code in (124, 126, 127) or code < 0 or timed_out:
         return False
     text = _strip_unscoped_remote_telemetry(str(output or ""))
     if any(m in text for m in POC_SETUP_FAILURE_MARKERS):
+        return False
+    if _TARGET_UNREACHABLE_RE.search(text):
         return False
     if (
         _SHELL_LAUNCHER_FAIL_RE.search(text)
@@ -589,12 +629,16 @@ def poc_ran(
         or _CLI_MISSING_SCRIPT_RE.search(text)
     ):
         return False
+    if _PY_IMPORT_INDENT_EXC_RE.search(text):
+        return False
     has_target_frame = _has_target_traceback_frame(
         text, command=command, jail_dir=jail_dir, workdir=workdir
     )
     if "no such file or directory" in text.lower() and not has_target_frame:
         return False
-    if _PY_IMPORT_SYNTAX_EXC_RE.search(text) and not has_target_frame:
+    if _SYNTAX_EXC_RE.search(text) and not (
+        has_target_frame and _is_dynamic_eval_syntax_error(text)
+    ):
         return False
     return True
 
@@ -618,7 +662,29 @@ def _guest_file_reader(sandbox: Any):
     return sandbox.read_file
 
 
-async def _run_sandbox_internal(command: str) -> Tuple[str, bool]:
+def _note_bare_sandbox_evidence(ctx: Any, output: str, exit_code: int) -> None:
+    """Records bare ``run_sandbox`` crash output without polluting reproducer completion stamps.
+
+    Inside ``reproducer``, bare ``run_sandbox`` is used for compilation and setup
+    while ``run_sandbox_with_evidence`` evaluates per-finding reached-sink proof;
+    a bare crash in ``reproducer`` is recorded on ``ctx.bare_sandbox_crash_seen``
+    instead of setting ``ctx.sandbox_executed``.
+    """
+    if ctx is None:
+        return
+    active = str(getattr(ctx, "active_node", "") or "").strip()
+    if active == "reproducer" or active.startswith("reproducer_"):
+        try:
+            ev_present, _ = check_reached_sink_evidence(output=output, exit_code=exit_code)
+            if ev_present:
+                ctx.bare_sandbox_crash_seen = True
+        except Exception:
+            pass
+        return
+    _note_dynamic_evidence(ctx, output, exit_code)
+
+
+async def _run_sandbox_internal(command: str, *, note_evidence: bool = True) -> Tuple[str, bool]:
     """Internal runner returning ``(formatted_transcript, timed_out)``."""
     ctx = current_run_context.get()
     if ctx is None or ctx.sandbox is None:
@@ -683,8 +749,8 @@ async def _run_sandbox_internal(command: str) -> Tuple[str, bool]:
                         f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
                     ), False
-            elif not _is_non_repro_node(ctx):
-                _note_dynamic_evidence(ctx, raw_output, res.exit_code)
+            elif note_evidence and not _is_non_repro_node(ctx):
+                _note_bare_sandbox_evidence(ctx, raw_output, res.exit_code)
 
             if not raw_output:
                 return f"exit={res.exit_code}", bool(res.timed_out)
@@ -710,14 +776,14 @@ async def _run_sandbox_internal(command: str) -> Tuple[str, bool]:
                         f"SANDBOX-UNAVAILABLE: ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
                     ), False
-            elif res.startswith("exit=") and not _is_non_repro_node(ctx):
+            elif note_evidence and res.startswith("exit=") and not _is_non_repro_node(ctx):
                 head, _, body = res.partition("\n")
                 try:
                     parsed_exit = int(head.split("=", 1)[1].strip())
                 except (ValueError, IndexError):
                     parsed_exit = None
                 if parsed_exit is not None:
-                    _note_dynamic_evidence(ctx, body, parsed_exit)
+                    _note_bare_sandbox_evidence(ctx, body, parsed_exit)
             return SecretScrubber.scrub(res), False
         return SecretScrubber.scrub(str(res)), False
     except Exception as e:
@@ -784,7 +850,7 @@ async def run_sandbox_with_evidence(
             }
         )
 
-    raw_res, timed_out = await _run_sandbox_internal(command)
+    raw_res, timed_out = await _run_sandbox_internal(command, note_evidence=False)
     exit_code = 127
     output = raw_res
 
@@ -797,6 +863,7 @@ async def run_sandbox_with_evidence(
             exit_code = 127
 
     sentinel_content = ""
+    sentinel_read_error: Optional[str] = None
     if sentinel_path:
         ctx = current_run_context.get()
         # SECURITY (INV-1/INV-4): the sentinel is read ONLY from inside a dynamic
@@ -807,17 +874,26 @@ async def run_sandbox_with_evidence(
             try:
                 content_bytes = await _guest_file_reader(ctx.sandbox)(Path(sentinel_path))
                 sentinel_content = content_bytes.decode("utf-8", errors="replace")
-            except Exception:
+            except FileNotFoundError:
                 pass
+            except Exception as exc:
+                sentinel_read_error = SecretScrubber.scrub(str(exc))
 
-    evidence_present, reason = check_reached_sink_evidence(
-        output=output,
-        exit_code=exit_code,
-        sink_symbol=sink_symbol,
-        sentinel_content=sentinel_content,
-        expected_nonce=nonce,
-        timed_out=timed_out,
-    )
+    if sentinel_read_error is not None:
+        evidence_present = False
+        reason = (
+            f"EVIDENCE_ABSENT: failed to read sidecar sentinel '{sentinel_path}' "
+            f"from guest sandbox ({sentinel_read_error})"
+        )
+    else:
+        evidence_present, reason = check_reached_sink_evidence(
+            output=output,
+            exit_code=exit_code,
+            sink_symbol=sink_symbol,
+            sentinel_content=sentinel_content,
+            expected_nonce=nonce,
+            timed_out=timed_out,
+        )
 
     # This wrapper sees a channel the inner run_sandbox cannot: the sidecar sentinel
     # file, read from inside the sandbox above. A PoC whose sentinel reached the file
@@ -834,19 +910,41 @@ async def run_sandbox_with_evidence(
             sink_symbol=sink_symbol,
             sentinel_content=sentinel_content,
         )
+    ctx_now = current_run_context.get()
+    if evidence_present:
+        ran_flag = True
+    elif sentinel_read_error is not None:
+        ran_flag = False
+    else:
+        ran_flag = poc_ran(output, exit_code, timed_out=timed_out, command=command)
+        if (
+            ran_flag
+            and getattr(ctx_now, "active_node", "") == "patcher"
+            and _has_dynamic_sandbox(ctx_now)
+            and hasattr(ctx_now.sandbox, "check_liveness")
+        ):
+            try:
+                alive, live_err = await ctx_now.sandbox.check_liveness()
+            except Exception as exc:
+                alive, live_err = False, str(exc)
+            if not alive:
+                ran_flag = False
+                reason = (
+                    f"EVIDENCE_ABSENT: target failed post-attack liveness check "
+                    f"({SecretScrubber.scrub(live_err or 'target not healthy')})"
+                )
+
     # Which finding this verdict was about -- present or absent, both are
     # recorded: an absent re-attack is what verifies a patch. Whether the
     # PoC ran at all travels with it: absent evidence from a PoC that never
     # attacked is not a fix.
     _record_finding_evidence(
-        current_run_context.get(),
+        ctx_now,
         finding_id,
         evidence_present,
         reason,
         sink_symbol=sink_symbol,
-        ran=True
-        if evidence_present
-        else poc_ran(output, exit_code, timed_out=timed_out, command=command),
+        ran=ran_flag,
     )
     scaffold: List[str] = []
     if evidence_present and finding_id is not None:
@@ -916,8 +1014,8 @@ async def apply_patch(diff_content: str) -> str:
             return "ERROR: Patch application failed: dynamic sandbox is disabled in static-only mode."
         res = await ctx.sandbox.apply_patch(diff_content)
         out_str = str(res)
-        if out_str.startswith("exit=0"):
-            invalidate_patch_reattack_state(ctx)
+        invalidate_patch_reattack_state(ctx)
+        mark_patch_applied(ctx, out_str.startswith("exit=0"))
         return SecretScrubber.scrub(out_str)
     except Exception as e:
         return f"ERROR: Patch application failed: {SecretScrubber.scrub(str(e))}"

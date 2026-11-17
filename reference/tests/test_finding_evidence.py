@@ -246,6 +246,42 @@ class CompletionStampTest(_Base):
         }
         self.assertEqual(stamp_finding_ids(ctx, "patch_verified"), [ids[0]])
 
+    async def test_lone_finding_negative_evidence_beats_unattributed_campaign_bit(self):
+        """p2-sandbox-gates-1: when a lone open finding has explicit reproduced=False
+        in finding_evidence, apply_completion_stamp must NOT promote it via sandbox_executed."""
+        ids = self._seed(1)
+        ctx = self._ctx()
+        ctx.sandbox_executed = True
+        ctx.finding_evidence = {str(ids[0]): {"reproduced": False, "reason": "EVIDENCE_ABSENT"}}
+        self.assertEqual(stamp_finding_ids(ctx, "dynamic_confirmed"), [])
+        self.assertEqual(apply_completion_stamp(ctx, "dynamic_confirmed", "reproducer"), [])
+        self.assertEqual(self._statuses()[ids[0]], "static_confirmed")
+
+        # Integer-keyed dict entry also blocks lone-finding fallback.
+        ctx.finding_evidence = {ids[0]: {"reproduced": False}}
+        self.assertEqual(apply_completion_stamp(ctx, "dynamic_confirmed", "reproducer"), [])
+        self.assertEqual(self._statuses()[ids[0]], "static_confirmed")
+
+    async def test_patch_verified_stamp_rejects_inconclusive_or_non_ran_reattack(self):
+        ids = self._seed(2)
+        ctx = self._ctx()
+        ctx.sandbox_executed = True
+        ctx.finding_evidence = {
+            str(ids[0]): {
+                "reproduced": True,
+                "reattacked": True,
+                "reattack_present": False,
+                "ran": False,
+            },
+            str(ids[1]): {
+                "reproduced": True,
+                "reattacked": True,
+                "reattack_present": False,
+                "last_reattack_inconclusive": True,
+            },
+        }
+        self.assertEqual(stamp_finding_ids(ctx, "patch_verified"), [])
+
     async def test_stamping_is_best_effort(self):
         ctx = self._ctx()
         ctx.sandbox_executed = True
