@@ -877,6 +877,253 @@ class SandboxGateInvariantsTest(IsolatedAsyncioTestCase):
             self.assertFalse(failed_ok)
             self.assertEqual(ctrl_ok.audit_code_reads, 1)
 
+    async def test_reproducer_bare_crash_and_wrong_sink_crash_never_promote_lone_finding(self):
+        """p2-sandbox-gates-1: neither a bare run_sandbox crash in reproducer nor an
+        unrelated-sink crash inside run_sandbox_with_evidence may set sandbox_executed
+        or stamp a lone open finding dynamic_confirmed."""
+        from core.database import read_findings, write_findings
+        from core.graph_loader import apply_completion_stamp
+
+        with tempfile.TemporaryDirectory() as td:
+            db_p = str(Path(td) / "repro_gate.db")
+            init_db(db_p)
+            write_findings(
+                db_p,
+                td,
+                [
+                    {
+                        "title": "SQLi in parse_query",
+                        "severity": "HIGH",
+                        "status": "static_confirmed",
+                        "description": "unparameterized SQL",
+                        "line_numbers": [10],
+                        "filepath": "app.py",
+                        "cwe": "CWE-89",
+                    }
+                ],
+                run_id="r-gate",
+            )
+            fid = read_findings(db_p, run_id="r-gate")[0]["id"]
+
+            asan_wrong_sink = (
+                "==77==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000010\n"
+                "    #0 0x401234 in unrelated_helper /workspace/helper.c:12\n"
+            )
+
+            async def exec_wrong_sink_crash(cmd, timeout, env_vars, files):
+                return ExecutionResult(
+                    stdout=asan_wrong_sink,
+                    stderr="",
+                    exit_code=1,
+                    timed_out=False,
+                )
+
+            sb = _StubDynamicEnv(exec_wrong_sink_crash)
+            ctx = RunContext(
+                jail_dir=td,
+                db_path=db_p,
+                target_file=td,
+                run_id="r-gate",
+                active_node="reproducer",
+                sandbox=sb,
+            )
+            tok = current_run_context.set(ctx)
+            try:
+                # 1. Bare run_sandbox inside reproducer sees crash -> sets bare_sandbox_crash_seen, NOT sandbox_executed.
+                await run_sandbox("./compile_or_probe")
+                self.assertTrue(ctx.bare_sandbox_crash_seen)
+                self.assertFalse(ctx.sandbox_executed)
+                self.assertEqual(apply_completion_stamp(ctx, "dynamic_confirmed", "reproducer"), [])
+
+                # 2. run_sandbox_with_evidence with sink_symbol='parse_query' rejects unrelated_helper crash;
+                # inner _run_sandbox_internal must NOT write unscoped sandbox_executed.
+                ev_res = await run_sandbox_with_evidence(
+                    "./poc",
+                    sink_symbol="parse_query",
+                    finding_id=fid,
+                )
+                self.assertFalse(ev_res["evidence_present"])
+                self.assertFalse(ctx.sandbox_executed)
+                self.assertFalse(ctx.finding_evidence[str(fid)]["reproduced"])
+                self.assertEqual(apply_completion_stamp(ctx, "dynamic_confirmed", "reproducer"), [])
+
+                # 3. Even if an earlier unattributed command had set sandbox_executed=True,
+                # the lone finding's explicit reproduced=False record still blocks stamping.
+                ctx.sandbox_executed = True
+                self.assertEqual(apply_completion_stamp(ctx, "dynamic_confirmed", "reproducer"), [])
+                self.assertEqual(read_findings(db_p, run_id="r-gate")[0]["status"], "static_confirmed")
+            finally:
+                current_run_context.reset(tok)
+
+    async def test_reattack_rejects_broken_target_exit124_conn_refused_sentinel_read_error_exec_transport_and_unpatched_stage(self):
+        """sandbox-remote-1: VERIFIED_SECURE requires an applied patch, healthy remote
+        exec transport, readable sidecar sentinel, live target, and non-broken target syntax."""
+        from core.graph_loader import _stamp_active_node
+        import tools.research_tools as rt
+
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            local_src = td_p / "src"
+            remote_wd = td_p / "remote"
+            local_src.mkdir()
+            remote_wd.mkdir()
+            (local_src / "app.py").write_text("def handle(x):\n    return eval(x)\n", encoding="utf-8")
+            (remote_wd / "app.py").write_text("def handle(x):\n    return eval(x)\n", encoding="utf-8")
+
+            # A. poc_ran rejects exit 124, connection refused, and SyntaxError/ImportError in patched target files.
+            self.assertFalse(poc_ran("timed out waiting for server\n", 124))
+            self.assertFalse(poc_ran("ConnectionRefusedError: [Errno 111] Connection refused\n", 1))
+            self.assertFalse(poc_ran("curl: (7) Failed to connect to 127.0.0.1 port 8080: Connection refused\n", 7))
+            self.assertFalse(
+                poc_ran(
+                    'Traceback (most recent call last):\n'
+                    '  File "workspace/repro_1.py", line 1, in <module>\n'
+                    '    import app\n'
+                    '  File "/workspace/app.py", line 2\n'
+                    '    def broken(:\n'
+                    'SyntaxError: invalid syntax\n',
+                    1,
+                    command="python3 workspace/repro_1.py",
+                    jail_dir=str(local_src),
+                    workdir="/workspace",
+                )
+            )
+            self.assertFalse(
+                poc_ran(
+                    'Traceback (most recent call last):\n'
+                    '  File "workspace/repro_1.py", line 1, in <module>\n'
+                    '  File "/workspace/app.py", line 1, in <module>\n'
+                    "ImportError: cannot import name 'sanitize' from 'missing'\n",
+                    1,
+                    command="python3 workspace/repro_1.py",
+                    jail_dir=str(local_src),
+                    workdir="/workspace",
+                )
+            )
+
+            # B. Remote exec transport failure (both classifier and shell-ack handshake) emits SANDBOX-ERROR
+            # and never certifies VERIFIED_SECURE.
+            self.assertTrue(
+                RemoteTargetEnvironment._is_remote_transport_failure(
+                    "exec",
+                    1,
+                    'Error from server (NotFound): pods "target-0" not found',
+                )
+            )
+            wrapper_flag = td_p / "drop_transport"
+            wrapper_script = td_p / "exec_wrapper.sh"
+            wrapper_script.write_text(
+                f"#!/bin/sh\n"
+                f"if [ -f '{wrapper_flag}' ]; then\n"
+                f"  echo 'custom transport link down' >&2\n"
+                f"  exit 1\n"
+                f"fi\n"
+                f"exec /bin/sh -c \"$1\"\n",
+                encoding="utf-8",
+            )
+            wrapper_script.chmod(0o755)
+
+            healthy_marker = remote_wd / ".service_alive"
+            healthy_marker.write_text("ok\n", encoding="utf-8")
+
+            rem_env = RemoteTargetEnvironment(
+                str(local_src),
+                transport="exec",
+                workdir=str(remote_wd),
+                exec_argv=[str(wrapper_script)],
+                healthcheck_cmd=f"test -f {healthy_marker}",
+                timeout_seconds=5,
+            )
+            await rem_env.initialize()
+
+            db_p = str(td_p / "patch_gates.db")
+            fid = _insert_confirmed_finding(db_p, "r1", "Remote Exec & Patch Gates")
+            ctx = RunContext(
+                jail_dir=str(local_src),
+                db_path=db_p,
+                run_id="r1",
+                target_file="app.py",
+                active_node="reproducer",
+                sandbox=rem_env,
+                sandbox_executed=True,
+            )
+            ctx.finding_evidence[str(fid)] = {
+                "reproduced": True,
+                "reattacked": False,
+                "reattack_present": False,
+                "sink_symbol": "",
+                "reason": "",
+            }
+            tok = current_run_context.set(ctx)
+            try:
+                # Enter patcher stage via _stamp_active_node("patcher") -> patch_applied starts False.
+                _stamp_active_node("patcher")
+                self.assertIs(ctx.patch_applied, False)
+
+                # 1. Re-attack BEFORE applying any patch must NOT count toward VERIFIED_SECURE.
+                await run_sandbox_with_evidence("echo 'ok'", finding_id=fid)
+                self.assertFalse(ctx.finding_evidence[str(fid)]["reattacked"])
+                self.assertTrue(ctx.finding_evidence[str(fid)]["last_reattack_inconclusive"])
+                out_unpatched = record_patch(
+                    finding_id=fid,
+                    patch_diff="--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n def handle(x):\n-    return eval(x)\n+    return int(x)\n",
+                    reattack_status="failed_to_bypass",
+                )
+                self.assertIn("VERIFICATION_INCOMPLETE", out_unpatched)
+
+                # 2. Apply a real patch -> patch_applied becomes True.
+                wr_res = await rt.write_file("app.py", "def handle(x):\n    return int(x)\n")
+                self.assertIn("SUCCESS", wr_res)
+                self.assertIs(ctx.patch_applied, True)
+
+                # 3. Break the exec transport wrapper -> emits SANDBOX-ERROR, stays VERIFICATION_INCOMPLETE.
+                wrapper_flag.write_text("down\n", encoding="utf-8")
+                tr_res = await run_sandbox_with_evidence("echo 'attack'", finding_id=fid)
+                self.assertIn("SANDBOX-ERROR", tr_res["output"])
+                self.assertFalse(ctx.finding_evidence[str(fid)]["reattacked"])
+                wrapper_flag.unlink()
+
+                # 4. Sentinel read failure (non-FileNotFoundError) -> inconclusive, NEVER VERIFIED_SECURE.
+                with mock.patch.object(
+                    rem_env, "read_guest_file", side_effect=RuntimeError("remote read transport dropped")
+                ):
+                    sr_res = await run_sandbox_with_evidence("echo 'attack'", finding_id=fid)
+                self.assertFalse(sr_res["evidence_present"])
+                self.assertIn("failed to read sidecar sentinel", sr_res["evidence_reason"])
+                self.assertFalse(ctx.finding_evidence[str(fid)]["reattacked"])
+                self.assertTrue(ctx.finding_evidence[str(fid)]["last_reattack_inconclusive"])
+
+                # 5. Target service dies (healthcheck_cmd fails) -> post-attack liveness fails, NEVER VERIFIED_SECURE.
+                healthy_marker.unlink()
+                dead_res = await run_sandbox_with_evidence("echo 'attack'", finding_id=fid)
+                self.assertIn("liveness check", dead_res["evidence_reason"])
+                self.assertFalse(ctx.finding_evidence[str(fid)]["reattacked"])
+                self.assertIn(
+                    "VERIFICATION_INCOMPLETE",
+                    record_patch(
+                        finding_id=fid,
+                        patch_diff="--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n def handle(x):\n-    return eval(x)\n+    return int(x)\n",
+                        reattack_status="failed_to_bypass",
+                    ),
+                )
+
+                # 6. Restore target liveness -> clean live re-attack after applied patch certifies VERIFIED_SECURE!
+                healthy_marker.write_text("ok\n", encoding="utf-8")
+                ok_res = await run_sandbox_with_evidence("echo 'attack blocked'", finding_id=fid)
+                self.assertFalse(ok_res["evidence_present"])
+                self.assertTrue(ctx.finding_evidence[str(fid)]["reattacked"])
+                self.assertFalse(ctx.finding_evidence[str(fid)]["last_reattack_inconclusive"])
+                verified_out = record_patch(
+                    finding_id=fid,
+                    patch_diff="--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n def handle(x):\n-    return eval(x)\n+    return int(x)\n",
+                    reattack_status="failed_to_bypass",
+                )
+                self.assertIn("VERIFIED_SECURE", verified_out)
+            finally:
+                current_run_context.reset(tok)
+                wrapper_flag.unlink(missing_ok=True)
+                await rem_env.close()
+
 
 if __name__ == "__main__":
     unittest.main()

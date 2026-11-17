@@ -471,6 +471,54 @@ def _distinct_configured_models(config: dict, nodes: Optional[List[dict]] = None
     return ordered
 
 
+def _non_vertex_model_hint(
+    config: Optional[dict] = None,
+    caps: Optional[dict] = None,
+) -> str:
+    """Returns an actionable CLI hint when non-Vertex credentials or --api-base
+    are present while the model is still pinned to a vertex_ai/* default."""
+    cfg_api_base = (config.get("api_base") if isinstance(config, dict) else None) or (
+        caps.get("llm_api_base") if isinstance(caps, dict) else None
+    ) or os.environ.get("LLM_API_BASE") or os.environ.get("OPENAI_API_BASE")
+    if cfg_api_base:
+        return (
+            f"Detected custom API base ('{cfg_api_base}') with a Vertex AI model; "
+            f"select a matching provider/model explicitly, e.g.: "
+            f".venv/bin/python3 scripts/configure.py --model openai/<model-id> --api-base {cfg_api_base}"
+        )
+    has_anthropic = (
+        bool(caps.get("anthropic_api_key"))
+        if isinstance(caps, dict) and "anthropic_api_key" in caps
+        else bool(os.environ.get("ANTHROPIC_API_KEY"))
+    )
+    if has_anthropic:
+        return (
+            "Detected ANTHROPIC_API_KEY; select an Anthropic model explicitly, e.g.: "
+            ".venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-4-5"
+        )
+    has_openai = (
+        bool(caps.get("openai_api_key"))
+        if isinstance(caps, dict) and "openai_api_key" in caps
+        else bool(os.environ.get("OPENAI_API_KEY"))
+    )
+    if has_openai:
+        return (
+            "Detected OPENAI_API_KEY; select an OpenAI model explicitly, e.g.: "
+            ".venv/bin/python3 scripts/configure.py --model openai/gpt-4o"
+        )
+    has_gemini = (
+        bool(caps.get("gemini_api_key"))
+        if isinstance(caps, dict) and "gemini_api_key" in caps
+        else bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+    )
+    if has_gemini:
+        return (
+            "Detected GEMINI_API_KEY; run '.venv/bin/python3 scripts/configure.py --auto' "
+            "or '.venv/bin/python3 scripts/configure.py --model gemini/gemini-3.8-flash'."
+        )
+    return ""
+
+
 def is_default_or_unconfigured(config: dict, nodes: Optional[List[dict]] = None) -> Tuple[bool, List[str]]:
     """Evaluates if workflow config contains default placeholders or unconfigured settings."""
     issues = []
@@ -533,9 +581,13 @@ def is_default_or_unconfigured(config: dict, nodes: Optional[List[dict]] = None)
                 if caps_cache is None:
                     caps_cache = detect_capabilities()
                 if not caps_cache.get("gcp_project") and not caps_cache.get("vertex_project"):
-                    issues.append(
+                    hint = _non_vertex_model_hint(config, caps_cache)
+                    msg = (
                         f"Vertex AI Model '{resolved_m}' requires VERTEXAI_PROJECT / GOOGLE_CLOUD_PROJECT or active gcloud project."
                     )
+                    if hint:
+                        msg = f"{msg} {hint}"
+                    issues.append(msg)
 
     return bool(issues), issues
 
@@ -751,7 +803,9 @@ def _check_single_llm_preflight(
     elif resolved_model.startswith("vertex_ai/"):
         proj = kwargs.get("vertex_project")
         if not proj or is_placeholder(proj):
-            return False, "Vertex AI requires a valid GCP Project ID."
+            hint = _non_vertex_model_hint(config)
+            base_err = "Vertex AI requires a valid GCP Project ID."
+            return False, f"{base_err} {hint}" if hint else base_err
         static_msg = f"Vertex AI LLM configured (Model: {resolved_model}, Project: {proj})."
 
     elif resolved_model.startswith("anthropic/"):
@@ -765,7 +819,7 @@ def _check_single_llm_preflight(
         endpoint_info = f" @ {api_base}" if api_base else ""
         static_msg = f"OpenAI-compatible LLM configured (Model: {resolved_model}{endpoint_info})."
 
-    elif resolved_model.startswith("gemini-"):
+    elif resolved_model.startswith(("gemini/", "gemini-")):
         if not os.environ.get("GEMINI_API_KEY") and not os.environ.get("GOOGLE_API_KEY"):
             # Check if vertex credentials are available
             if not os.environ.get("GOOGLE_CLOUD_PROJECT") and not os.environ.get("VERTEXAI_PROJECT") and not kwargs.get("vertex_project"):
@@ -1269,16 +1323,41 @@ async def ensure_configured_async(
         model = cfg.get("default_model", DEFAULT_MODEL)
         if is_placeholder(model):
             updates["default_model"] = DEFAULT_MODEL
-        elif str(model).startswith("vertex_ai/"):
-            if not os.environ.get("VERTEXAI_PROJECT") and not os.environ.get("GOOGLE_CLOUD_PROJECT"):
-                resolved_proj = (
-                    caps.get("gcp_project")
-                    or caps.get("vertex_project")
-                    or sb_opts.get("project")
-                )
-                if resolved_proj and not is_placeholder(resolved_proj):
-                    os.environ.setdefault("VERTEXAI_PROJECT", resolved_proj)
-                    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", resolved_proj)
+            model = DEFAULT_MODEL
+        if str(model).startswith("vertex_ai/"):
+            has_env_proj = bool(
+                (os.environ.get("VERTEXAI_PROJECT") and not is_placeholder(os.environ.get("VERTEXAI_PROJECT")))
+                or (os.environ.get("GOOGLE_CLOUD_PROJECT") and not is_placeholder(os.environ.get("GOOGLE_CLOUD_PROJECT")))
+            )
+            resolved_proj = (
+                caps.get("gcp_project")
+                or caps.get("vertex_project")
+                or sb_opts.get("project")
+                or cfg.get("project")
+            )
+            has_resolved_proj = bool(resolved_proj and not is_placeholder(resolved_proj))
+            if not has_env_proj and has_resolved_proj:
+                os.environ.setdefault("VERTEXAI_PROJECT", str(resolved_proj))
+                os.environ.setdefault("GOOGLE_CLOUD_PROJECT", str(resolved_proj))
+            elif not has_env_proj and not has_resolved_proj:
+                if (
+                    str(model).startswith("vertex_ai/gemini-")
+                    and caps.get("gemini_api_key")
+                    and "default_model" not in overrides
+                    and not cfg.get("api_base")
+                    and not caps.get("llm_api_base")
+                ):
+                    gemini_model = f"gemini/{str(model).split('/', 1)[1]}"
+                    updates["default_model"] = gemini_model
+                    cfg = {**cfg, "default_model": gemini_model}
+                    print(
+                        f"🔑 Auto-configured model: '{gemini_model}' "
+                        "(detected GEMINI_API_KEY with no Vertex AI project)."
+                    )
+                else:
+                    hint = _non_vertex_model_hint(cfg, caps)
+                    if hint:
+                        print(f"💡 {hint}")
 
         # One-shot CLI overrides are already live for THIS run (applied above
         # with save=False, and re-applied by main.py via
@@ -1545,7 +1624,11 @@ def print_status(
         print("\n⚠️ Configuration Issues Found:")
         for iss in issues:
             print(f"  - {iss}")
-        print("\nRun './scripts/configure.py --auto' or '--interactive' to fix.")
+        hint = _non_vertex_model_hint(cfg, caps)
+        if hint and str(cfg.get("default_model", DEFAULT_MODEL)).startswith("vertex_ai/"):
+            print(f"\n💡 {hint}")
+        else:
+            print("\nRun './scripts/configure.py --auto' or '--interactive' to fix.")
     print("============================================================\n")
 
 
@@ -1696,6 +1779,8 @@ def main() -> int:
 
     # 3. Auto-Configure Mode
     if args.auto:
+        dest = target_wf if save_tracked else get_local_workflow_path(target_wf)
+        before_bytes = Path(dest).read_bytes() if os.path.exists(dest) else None
         cfg = ensure_configured(
             target_wf,
             auto=True,
@@ -1703,11 +1788,22 @@ def main() -> int:
             save=save,
             save_tracked=save_tracked,
             probe_llm=args.probe_llm,
+            persist_overrides=bool(updates),
         )
         if not args.json:
-            action = "Simulated auto-configuration for" if args.dry_run else "Auto-configured Mantis settings saved to"
-            dest = target_wf if save_tracked else get_local_workflow_path(target_wf)
-            print(f"✅ {action} {dest}")
+            if args.dry_run:
+                print(f"✅ Simulated auto-configuration for {dest}")
+            else:
+                after_bytes = Path(dest).read_bytes() if os.path.exists(dest) else None
+                if after_bytes is not None and after_bytes != before_bytes:
+                    print(f"✅ Auto-configured Mantis settings saved to {dest}")
+                elif after_bytes is not None:
+                    print(f"ℹ️ Mantis configuration unchanged ({dest})")
+                else:
+                    print(
+                        f"⚠️ Auto-configuration did not write {dest} "
+                        "(explicit model or project configuration is still required; see status below)"
+                    )
         print_status(target_wf, as_json=args.json, config_override=cfg if args.dry_run else None, probe_llm=args.probe_llm)
         return 0
 

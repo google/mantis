@@ -138,6 +138,14 @@ class RunContext:
     # scans (never injected into judge stage openers; forked judges see
     # upstream stem turns under `INHERITED_STEM_NEUTRALITY_RULE`).
     repo_docs_inventory: Optional[str] = None
+    # Per-campaign patcher & reproducer dynamic-gate tracking:
+    # `patch_applied` is None outside stage-managed patcher runs (INV-6), set
+    # False on `patcher` stage entry, and set True only when a target patch/edit
+    # applies cleanly without rollback. `bare_sandbox_crash_seen` records crash
+    # output from unattributed `run_sandbox` calls inside `reproducer` without
+    # polluting `sandbox_executed` / `dynamic_confirmed` completion stamps.
+    patch_applied: Optional[bool] = None
+    bare_sandbox_crash_seen: bool = False
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

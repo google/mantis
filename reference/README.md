@@ -15,12 +15,18 @@ comes with automated configuration and launcher tools (`mantis-configure` and
 cd reference && ./install.sh
 
 # 0. Authenticate an LLM provider (pick one):
-gcloud auth application-default login        # Vertex AI ADC
-# or: export GEMINI_API_KEY=...              # Gemini API
-# or: see https://docs.litellm.ai/docs/providers for other providers / --api-base
+gcloud auth application-default login        # Vertex AI ADC (+ active gcloud project or GOOGLE_CLOUD_PROJECT)
+# or: export GEMINI_API_KEY=...              # Gemini API (auto-selected by configure.py --auto)
+# or: export ANTHROPIC_API_KEY=...           # Anthropic (requires --model anthropic/<id> below)
+# or: export OPENAI_API_KEY=...              # OpenAI / custom endpoint (requires --model openai/<id> below)
 
 # 1. Fast Configuration & Capability Auto-Detection (or --interactive wizard)
 .venv/bin/python3 scripts/configure.py --auto
+
+# Non-Vertex providers other than GEMINI_API_KEY require an explicit --model:
+# .venv/bin/python3 scripts/configure.py --model gemini-3.8-flash
+# .venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-4-5
+# .venv/bin/python3 scripts/configure.py --model openai/gpt-4o --api-base https://api.openai.com/v1
 
 # 2. Fast Preflight Validation (~1s) & Live Reachability Probe
 .venv/bin/python3 scripts/configure.py --test --probe
