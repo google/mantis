@@ -15,6 +15,7 @@
 import asyncio
 import contextvars
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -718,22 +719,36 @@ def llm_streaming_enabled() -> bool:
 
 
 # How long one request may wait before it is abandoned and retried, when
-# the operator sets no timeout (LLM_TIMEOUT / MANTIS_TIMEOUT /
-# LLM_REQUEST_TIMEOUT). Streamed (the default), the timeout runs between
-# chunks, and the providers keep a stream fed while the model thinks in
-# silence (measured: turns of 650 and 905 seconds with no visible chunk
-# completed under per-chunk timeouts of 10 to 60 seconds; a 641k-token
-# prompt's first chunk arrived in 78 seconds), so a server that is
-# working never meets the bound, however long the turn, and one value
-# serves every effort: a dead connection is noticed in minutes.
-# Unstreamed, the whole response -- thinking included -- must arrive
-# inside it, and at the highest effort a single turn has been measured
-# past five minutes; a timed-out turn is retried as the same long
-# request, so the value scales with effort. Models that do not think get
-# no timeout here and keep LiteLLM's.
-REQUEST_TIMEOUT_STREAMED = 300.0
-REQUEST_TIMEOUT_BY_EFFORT = {"max": 1800.0, "high": 900.0, "medium": 300.0}
-REQUEST_TIMEOUT_THINKING_MODEL = 300.0
+# the operator sets no timeout (--timeout / LLM_TIMEOUT / MANTIS_TIMEOUT /
+# LLM_REQUEST_TIMEOUT / workflow.local.json).
+#
+# Streamed (the default): the harness enforces the timeout itself via
+# `asyncio.timeout` across opening the stream + waiting for the first chunk,
+# and then between consecutive chunks (pinned LiteLLM 1.103.10 drops `timeout`
+# on the Vertex/Gemini streaming path and otherwise leaves dead sockets on its
+# 6000s default client timeout). Because the timer resets on every chunk, a
+# long-thinking model that streams thought summaries stays alive for as long
+# as the turn runs. The defaults are still intentionally generous (10 min
+# default/medium, 15 min high, 30 min xhigh/max) so models that think silently
+# before emitting chunks, pause between thought bursts, handle huge cold
+# prefills, or wait in Vertex flex queues are never cut off early -- while a
+# genuinely dead connection is still caught and retried well inside the 3600s
+# retry patience window.
+#
+# Unstreamed: the whole response -- thinking included -- must arrive inside
+# the timeout, using the same effort-scaled bounds. Non-thinking / low-effort
+# models leave `timeout` unset in `get_llm_kwargs` (keeping LiteLLM's default
+# when unstreamed), while streamed turns still enforce
+# `REQUEST_TIMEOUT_STREAMED` as the harness-level per-chunk fallback.
+REQUEST_TIMEOUT_STREAMED = 600.0
+REQUEST_TIMEOUT_BY_EFFORT = {
+    "max": 1800.0,
+    "xhigh": 1800.0,
+    "high": 900.0,
+    "medium": 600.0,
+}
+REQUEST_TIMEOUT_THINKING_MODEL = 600.0
+_STREAM_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 def default_request_timeout(model: str, effort: Optional[str]) -> Optional[float]:
@@ -743,11 +758,64 @@ def default_request_timeout(model: str, effort: Optional[str]) -> Optional[float
     thinking = level in REQUEST_TIMEOUT_BY_EFFORT or "glm" in name or "claude" in name
     if not thinking:
         return None
-    if llm_streaming_enabled():
-        return REQUEST_TIMEOUT_STREAMED
     if level in REQUEST_TIMEOUT_BY_EFFORT:
         return REQUEST_TIMEOUT_BY_EFFORT[level]
+    if llm_streaming_enabled():
+        return REQUEST_TIMEOUT_STREAMED
     return REQUEST_TIMEOUT_THINKING_MODEL
+
+
+def _resolve_stream_chunk_timeout(kwargs: Mapping[str, Any]) -> float:
+    """Returns the effective per-chunk timeout (seconds) for a streamed turn.
+
+    Honors any positive explicit `timeout` in `kwargs` (including httpx.Timeout
+    objects via `.read`), and falls back to `REQUEST_TIMEOUT_STREAMED` when no
+    timeout was configured (for example on low-effort non-thinking nodes) so no
+    streamed call can hang on LiteLLM's 6000s default client timeout.
+    """
+    raw = kwargs.get("timeout")
+    if raw is not None and not isinstance(raw, bool):
+        if isinstance(raw, (int, float, str)):
+            candidate = raw
+        else:
+            candidate = getattr(raw, "read", None)
+            if candidate is None:
+                candidate = getattr(raw, "connect", None)
+        try:
+            val = float(candidate)
+            if math.isfinite(val) and val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    return float(REQUEST_TIMEOUT_STREAMED)
+
+
+async def _close_stream_quietly(*objs: Any) -> None:
+    """Best-effort async teardown of stream iterators / response wrappers.
+
+    Closes each distinct object once (preferring `aclose`, falling back to
+    `close`), bounded by `_STREAM_CLOSE_TIMEOUT_SECONDS` and swallowing errors
+    so releasing a dead socket never masks the timeout or stalls retries.
+    """
+    seen: set[int] = set()
+    for obj in objs:
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        try:
+            aclose = getattr(obj, "aclose", None)
+            if callable(aclose):
+                res = aclose()
+                if inspect.isawaitable(res):
+                    await asyncio.wait_for(res, timeout=_STREAM_CLOSE_TIMEOUT_SECONDS)
+                continue
+            close = getattr(obj, "close", None)
+            if callable(close):
+                res = close()
+                if inspect.isawaitable(res):
+                    await asyncio.wait_for(res, timeout=_STREAM_CLOSE_TIMEOUT_SECONDS)
+        except Exception:
+            pass
 
 
 def resolve_output_ceiling(model: str) -> Optional[int]:
@@ -2138,7 +2206,8 @@ class _ContinuationSplicer:
         self.usage_total: Optional[dict] = None
         self.segments = 1
 
-    async def deliver(self, first_chunk: Any, stream_iter: Any):
+    async def deliver(self, first_chunk: Any, stream_iter: Any, stream_response: Any = None):
+        chunk_timeout = _resolve_stream_chunk_timeout(self.kwargs)
         while True:
             # --- one segment. Chunks that end a turn -- a finish reason, usage
             # -- are held until the segment is over, because only then is it
@@ -2169,11 +2238,19 @@ class _ContinuationSplicer:
                             held = []
                         yield chunk
                         self.chunks_yielded += 1
+                timeout_cm = asyncio.timeout(chunk_timeout)
                 try:
-                    chunk = await stream_iter.__anext__()
+                    async with timeout_cm:
+                        chunk = await stream_iter.__anext__()
                 except StopAsyncIteration:
                     break
                 except Exception as e:
+                    await _close_stream_quietly(stream_iter, stream_response)
+                    if isinstance(e, TimeoutError) and timeout_cm.expired():
+                        e = TimeoutError(
+                            f"Stream from '{self.model}' timed out after {chunk_timeout:g}s "
+                            "waiting for the next chunk"
+                        )
                     raise MantisStreamInterruptedError(
                         f"Stream from '{self.model}' failed after {self.chunks_yielded} chunk(s) were already delivered "
                         f"({type(e).__name__}: {e}). A transparent retry would re-sample the model and splice "
@@ -2212,7 +2289,7 @@ class _ContinuationSplicer:
                     flush=True,
                 )
                 try:
-                    first_chunk, stream_iter = await self.client._open_stream_with_retry(
+                    first_chunk, stream_iter, stream_response = await self.client._open_stream_with_retry(
                         self.model, self.messages, self.tools, with_continuation_token(self.kwargs, pending_token),
                     )
                 except Exception as e:
@@ -2904,11 +2981,13 @@ class ResilientLiteLLMClient(LiteLLMClient):
         the finish and usage of the segments in between withheld, the usage of
         the whole turn summed on the final usage chunk.
         """
-        first_chunk, stream_iter = await self._open_stream_with_retry(model, messages, tools, kwargs)
+        first_chunk, stream_iter, stream_response = await self._open_stream_with_retry(
+            model, messages, tools, kwargs
+        )
         if first_chunk is None:
             return
         splicer = _ContinuationSplicer(self, model, messages, tools, kwargs)
-        async for chunk in splicer.deliver(first_chunk, stream_iter):
+        async for chunk in splicer.deliver(first_chunk, stream_iter, stream_response=stream_response):
             yield chunk
 
     async def _open_stream_with_retry(
@@ -2917,35 +2996,54 @@ class ResilientLiteLLMClient(LiteLLMClient):
         messages: Any,
         tools: Any,
         kwargs: dict,
-    ) -> "tuple[Any, Any]":
+    ) -> "tuple[Any, Any, Any]":
         """Opens a stream and reads its first chunk, retrying everything up to that
-        point. Returns (first_chunk, iterator); (None, None) for an empty stream."""
+        point. Returns (first_chunk, iterator, response); (None, None, None) for an
+        empty stream."""
         import litellm
 
         max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
         if _is_discard_loopback_api_base(kwargs.get("api_base")):
             max_patience = 0.0
+        chunk_timeout = _resolve_stream_chunk_timeout(kwargs)
 
         start_time = time.time()
         attempt = 0
         auth_refreshed = False
         while True:
+            response = None
+            stream_iter = None
             try:
-                response = await litellm.acompletion(
-                    model=model,
-                    messages=messages,
-                    tools=tools,
-                    stream=True,
-                    **kwargs,
-                )
-                stream_iter = response.__aiter__()
+                empty_stream = False
+                timeout_cm = asyncio.timeout(chunk_timeout)
                 try:
-                    first_chunk = await stream_iter.__anext__()
-                except StopAsyncIteration:
+                    async with timeout_cm:
+                        response = await litellm.acompletion(
+                            model=model,
+                            messages=messages,
+                            tools=tools,
+                            stream=True,
+                            **kwargs,
+                        )
+                        stream_iter = response.__aiter__()
+                        try:
+                            first_chunk = await stream_iter.__anext__()
+                        except StopAsyncIteration:
+                            empty_stream = True
+                except TimeoutError as exc:
+                    if timeout_cm.expired():
+                        raise TimeoutError(
+                            f"Stream from '{model}' timed out after {chunk_timeout:g}s "
+                            "waiting for the first chunk"
+                        ) from exc
+                    raise
+                if empty_stream:
                     # An empty stream is a successfully completed (if silent) response.
-                    return None, None
-                return first_chunk, stream_iter
+                    await _close_stream_quietly(stream_iter, response)
+                    return None, None, None
+                return first_chunk, stream_iter, response
             except Exception as e:
+                await _close_stream_quietly(stream_iter, response)
                 if is_auth_error(e):
                     if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
                         auth_refreshed = True
