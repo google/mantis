@@ -324,6 +324,8 @@ def _rehydrate_session_metrics(
     prior_reads = 0
     prior_tokens = 0
     prior_llm_calls = 0
+    seen_nodes_order: list[str] = []
+    seen_nodes_set: set[str] = set()
     for ev in active_events:
         if getattr(ev, "partial", False):
             continue
@@ -341,6 +343,9 @@ def _rehydrate_session_metrics(
             if npath
             else str(getattr(ev, "author", "") or "")
         ).split(":", 1)[0].strip()
+        if clean_node and not getattr(ev, "error_code", None) and clean_node not in seen_nodes_set:
+            seen_nodes_set.add(clean_node)
+            seen_nodes_order.append(clean_node)
         for part in getattr(getattr(ev, "content", None), "parts", None) or []:
             fc = getattr(part, "function_call", None)
             if fc is None:
@@ -356,6 +361,66 @@ def _rehydrate_session_metrics(
                 and _is_in_scope_code_read(run_ctx, call_name, call_args)
             ):
                 prior_reads += 1
+
+    # On shared-prefix (`prefix_group`) workflows, `researcher` relies on files
+    # already read into the inherited stem by upstream stages (e.g. `planner`,
+    # `architect`, `threat_modeler`) and does not re-read them. An unbroken run
+    # credits those inherited in-scope reads on `researcher` Turn 1 inside
+    # `graph_loader.fork_before_model`; when a campaign pauses after `researcher`
+    # starts (e.g. during `critic`) and resumes, reconstruct that same credit so
+    # `[COVERAGE GUARD]` does not falsely withhold coverage.
+    raw_state = getattr(existing_session, "state", None)
+    if hasattr(raw_state, "to_dict"):
+        try:
+            state_dict = raw_state.to_dict()
+        except Exception:
+            state_dict = {}
+    elif isinstance(raw_state, dict):
+        state_dict = raw_state
+    else:
+        state_dict = {}
+
+    if state_dict and seen_nodes_order:
+        from core.graph_loader import (
+            PREFIX_U_STATE_KEY_PREFIX,
+            _count_inherited_in_scope_code_reads,
+            forked_prefix_contents,
+        )
+
+        def _has_prefix_opener(node_name: str) -> bool:
+            val = state_dict.get(f"{PREFIX_U_STATE_KEY_PREFIX}{node_name}")
+            return isinstance(val, str) and bool(val)
+
+        resumed_prefix_researchers = [
+            n
+            for n in seen_nodes_order
+            if (n == "researcher" or n.startswith("researcher_")) and _has_prefix_opener(n)
+        ]
+        if resumed_prefix_researchers:
+            last_researcher_idx = max(
+                seen_nodes_order.index(rn) for rn in resumed_prefix_researchers
+            )
+            stem_ancestors = [
+                n
+                for n in seen_nodes_order[:last_researcher_idx]
+                if n not in AUDIT_NODES
+                and not (n == "researcher" or n.startswith("researcher_"))
+                and _has_prefix_opener(n)
+            ]
+            if stem_ancestors:
+                stem_contents = forked_prefix_contents(
+                    active_events,
+                    stem_ancestors,
+                    state=state_dict,
+                    preserve_signatures=False,
+                )
+                prior_reads += _count_inherited_in_scope_code_reads(run_ctx, stem_contents)
+            if run_ctx is not None and isinstance(getattr(run_ctx, "node_context", None), dict):
+                for rn in resumed_prefix_researchers:
+                    slot = run_ctx.node_context.setdefault(
+                        rn, {"tokens": 0, "limit": 0, "continuations": 0, "handoff": ""}
+                    )
+                    slot["credited_inherited_reads"] = True
 
     if budget_controller is not None and prior_reads > 0:
         budget_controller.audit_code_reads += prior_reads
