@@ -1950,6 +1950,12 @@ NODE_CONTEXT_RESERVE_RATIO = 0.08
 # generous one lets it reach the refusal.
 NODE_CONTEXT_CHARS_PER_TOKEN = 3
 
+# Fraction of a stage's context ceiling (which is itself NODE_CONTEXT_CEILING_RATIO
+# of the model window) that an inherited shared-prefix stem may occupy before its
+# oldest tool results are cleared deterministically so forked stages retain room
+# for their own stage prompt and working turns (p2-context-fork-interplay-1).
+STEM_CONTEXT_CEILING_SHARE = 0.50
+
 # How many times a stage may continue in a fresh context before it is ended.
 # A continuation is ADK's own node retry, admitted for NodeContextExhausted
 # alone (core.config's retry predicate) and counted here rather than by
@@ -2036,20 +2042,12 @@ def _continuation_block(handoff: str, number: int) -> str:
     )
 
 
-def _request_chars(llm_request: Any, keep_tool_results: Optional[int] = None) -> int:
-    """Characters in a request: instruction, every content part, tool schemas.
-    Counts the request as built -- what the model would be sent -- so it is
-    the same number whatever the session looks like.
-
-    With `keep_tool_results`, the request is counted as the provider reads it
-    under context editing: every tool result but the newest that many as the
-    provider's placeholder (core.config.anthropic_context_editing)."""
+def _contents_chars(contents: Sequence[Any], keep_tool_results: Optional[int] = None) -> int:
+    """Characters across a list of `Content` messages (same accounting as `_request_chars`)."""
     total = 0
-    config = getattr(llm_request, "config", None)
-    total += len(str(getattr(config, "system_instruction", "") or ""))
     responses: list[int] = []
-    for content in getattr(llm_request, "contents", None) or []:
-        for part in getattr(content, "parts", None) or []:
+    for content in contents or ():
+        for part in getattr(content, "parts", None) or ():
             text = getattr(part, "text", None)
             if text:
                 total += len(text)
@@ -2064,6 +2062,39 @@ def _request_chars(llm_request: Any, keep_tool_results: Optional[int] = None) ->
     else:
         kept = responses[-keep_tool_results:] if keep_tool_results else []
         total += sum(kept) + 32 * (len(responses) - len(kept))
+    return total
+
+
+def _resolve_effective_context_limit(model: Any = None) -> Optional[int]:
+    """Resolves the tighter of the model's context window and any operator input cap."""
+    try:
+        from core.config import resolve_context_limit, resolve_input_token_cap
+
+        limits = [
+            lim
+            for lim in (
+                resolve_context_limit(model) if model else None,
+                resolve_input_token_cap(),
+            )
+            if lim
+        ]
+        return min(limits) if limits else None
+    except Exception:
+        return None
+
+
+def _request_chars(llm_request: Any, keep_tool_results: Optional[int] = None) -> int:
+    """Characters in a request: instruction, every content part, tool schemas.
+    Counts the request as built -- what the model would be sent -- so it is
+    the same number whatever the session looks like.
+
+    With `keep_tool_results`, the request is counted as the provider reads it
+    under context editing: every tool result but the newest that many as the
+    provider's placeholder (core.config.anthropic_context_editing)."""
+    total = 0
+    config = getattr(llm_request, "config", None)
+    total += len(str(getattr(config, "system_instruction", "") or ""))
+    total += _contents_chars(getattr(llm_request, "contents", None) or (), keep_tool_results)
     tools = getattr(llm_request, "tools_dict", None) or {}
     total += 2000 * len(tools)
     return total
@@ -2238,11 +2269,11 @@ CLEARED_TOOL_RESULT_TEXT = "[cleared by context editing]"
 NODE_CONTEXT_CLEARED_KEY = "cleared_tool_results"
 
 
-def _function_response_parts(llm_request: Any) -> list:
-    """`[(content, part_index, chars)]` for every tool result in the request,
-    in order: the list client-side context editing clears from the front."""
+def _function_response_parts_from_contents(contents: Sequence[Any]) -> list:
+    """`[(content, part_index, chars)]` for every tool result in `contents`,
+    in order: the list client-side context editing and stem bounding clear from the front."""
     out: list = []
-    for content in getattr(llm_request, "contents", None) or []:
+    for content in contents or ():
         parts = getattr(content, "parts", None) or []
         for i, part in enumerate(parts):
             response = getattr(part, "function_response", None)
@@ -2254,6 +2285,12 @@ def _function_response_parts(llm_request: Any) -> list:
             else:
                 out.append((content, i, len(json.dumps(payload, default=str))))
     return out
+
+
+def _function_response_parts(llm_request: Any) -> list:
+    """`[(content, part_index, chars)]` for every tool result in the request,
+    in order: the list client-side context editing clears from the front."""
+    return _function_response_parts_from_contents(getattr(llm_request, "contents", None) or ())
 
 
 def _clear_function_response(content: Any, index: int) -> None:
@@ -2552,6 +2589,7 @@ def _make_fork_before_model_callback(node_id: str, parent_id: str):
             ):
                 inherited = inherited[:-1]
         llm_request.contents = inherited + own
+        setattr(llm_request, "_mantis_inherited_len", len(inherited))
         if hasattr(llm_request, "append_instructions"):
             sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
             if FORK_NOTICE_MARKER not in sys_inst:
@@ -2586,20 +2624,19 @@ def _count_protected_inherited_tool_responses(llm_request: Any, node_id: str) ->
     return count if found_marker else 0
 
 
-def _strip_claude_thoughts_up_to_last_cleared(
-    llm_request: Any, last_cleared_content: Any
-) -> None:
+def _strip_claude_thoughts_from_contents(
+    contents: Sequence[Any], last_cleared_content: Any
+) -> list:
     """Strips prefix-bound `thought` blocks and `thought_signature` metadata
     from `role='model'` turns at or before `last_cleared_content` when
-    client-side context editing mutates historical tool results on a Claude
-    route (e.g. Bedrock Converse or OpenRouter), keeping `function_call`
-    pairings and recent kept turns intact."""
-    contents = list(getattr(llm_request, "contents", None) or [])
-    last_idx = next((i for i, c in enumerate(contents) if c is last_cleared_content), -1)
+    historical tool results are cleared on a Claude route, keeping
+    `function_call` pairings and recent kept turns intact."""
+    content_list = list(contents or ())
+    last_idx = next((i for i, c in enumerate(content_list) if c is last_cleared_content), -1)
     if last_idx < 0:
-        return
+        return content_list
     updated_contents = []
-    for idx, content in enumerate(contents):
+    for idx, content in enumerate(content_list):
         if idx <= last_idx and getattr(content, "role", None) == "model":
             kept_parts = []
             for part in getattr(content, "parts", None) or []:
@@ -2613,7 +2650,108 @@ def _strip_claude_thoughts_up_to_last_cleared(
                 updated_contents.append(content)
         else:
             updated_contents.append(content)
-    llm_request.contents = updated_contents
+    return updated_contents
+
+
+def _strip_claude_thoughts_up_to_last_cleared(
+    llm_request: Any, last_cleared_content: Any
+) -> None:
+    """Strips prefix-bound `thought` blocks and `thought_signature` metadata
+    from `role='model'` turns at or before `last_cleared_content` when
+    client-side context editing mutates historical tool results on a Claude
+    route (e.g. Bedrock Converse or OpenRouter), keeping `function_call`
+    pairings and recent kept turns intact."""
+    llm_request.contents = _strip_claude_thoughts_from_contents(
+        getattr(llm_request, "contents", None) or (), last_cleared_content
+    )
+
+
+def _bound_inherited_stem(
+    inherited: list[Any],
+    *,
+    limit_tokens: Optional[int],
+    model: Any = None,
+    keep_tool_results: Optional[int] = None,
+) -> tuple[list[Any], int]:
+    """Deterministically bounds an inherited shared-prefix stem to
+    `STEM_CONTEXT_CEILING_SHARE` of the stage's context ceiling by clearing the
+    oldest inherited tool results first.
+
+    Because the calculation depends only on `(inherited, limit_tokens, model,
+    keep_tool_results)`, all sibling stages sharing the same `(prefix_group,
+    ancestors, model)` produce the exact byte-identical bounded stem, keeping
+    both implicit and explicit stem prompt caches intact.
+    """
+    if not inherited or not limit_tokens:
+        return inherited, 0
+    ceiling_tokens = int(limit_tokens * NODE_CONTEXT_CEILING_RATIO)
+    budget_chars = int(ceiling_tokens * STEM_CONTEXT_CEILING_SHARE) * NODE_CONTEXT_CHARS_PER_TOKEN
+    if budget_chars <= 0:
+        return inherited, 0
+    if _contents_chars(inherited, keep_tool_results=keep_tool_results) <= budget_chars:
+        return inherited, 0
+
+    responses = _function_response_parts_from_contents(inherited)
+    if not responses:
+        return inherited, 0
+
+    placeholder_chars = len(json.dumps({"result": CLEARED_TOOL_RESULT_TEXT}))
+    total_chars = _contents_chars(inherited, keep_tool_results=None)
+    freed = 0
+    cleared = 0
+    while cleared < len(responses):
+        if keep_tool_results is not None:
+            if _contents_chars(inherited, keep_tool_results=keep_tool_results) <= budget_chars:
+                break
+        elif total_chars - freed <= budget_chars:
+            break
+        content, idx, chars = responses[cleared]
+        _clear_function_response(content, idx)
+        freed += max(0, chars - placeholder_chars)
+        cleared += 1
+
+    if cleared > 0 and is_claude_model(model):
+        inherited = _strip_claude_thoughts_from_contents(
+            inherited, responses[cleared - 1][0]
+        )
+    return inherited, cleared
+
+
+def _is_unrecoverable_forked_first_turn(llm_request: Any, node_id: str) -> bool:
+    """True when `llm_request` carries an inherited fork stem and `node_id` has
+    taken zero model or tool turns of its own in this attempt.
+
+    When Turn 1 of a forked stage already reaches the context ceiling, a
+    continuation retry replays the exact same inherited stem and cannot shrink
+    the request, while ending with canned ceiling text would falsely record an
+    unexecuted stage as clean and coverage-credited.
+    """
+    contents = list(getattr(llm_request, "contents", None) or ())
+
+    def _has_own_progress(own_slice: Sequence[Any]) -> bool:
+        return any(
+            getattr(c, "role", "") == "model"
+            or any(
+                getattr(p, "function_response", None) is not None
+                for p in (getattr(c, "parts", None) or ())
+            )
+            for c in own_slice
+        )
+
+    inherited_len = getattr(llm_request, "_mantis_inherited_len", None)
+    if isinstance(inherited_len, int) and inherited_len > 0:
+        return not _has_own_progress(contents[inherited_len:])
+
+    marker = f"{ACTIVE_STAGE_HEADER_PREFIX}{node_id}]"
+    for idx, content in enumerate(contents):
+        if getattr(content, "role", "") == "user" and any(
+            marker in (getattr(p, "text", None) or "")
+            for p in (getattr(content, "parts", None) or ())
+        ):
+            if idx > 0:
+                return not _has_own_progress(contents[idx + 1 :])
+            break
+    return False
 
 
 def _make_client_context_editing_before_model_callback(
@@ -2803,6 +2941,19 @@ def _make_node_context_ceiling_before_model_callback(
         ceiling = int(limit * NODE_CONTEXT_CEILING_RATIO)
         if estimated < ceiling:
             return None
+        if _is_unrecoverable_forked_first_turn(llm_request, node_id):
+            print(
+                f"\n[CONTEXT CEILING] {node_id}: inherited fork stem already uses ~{estimated:,} "
+                f"tokens against a {limit:,}-token window (ceiling {ceiling:,}) on turn 1; "
+                "continuations cannot shrink the inherited stem; failing stage.",
+                file=sys.stderr,
+            )
+            _observe("ceiling_failures")
+            raise NodeContextExhausted(
+                f"{node_id}: inherited fork stem (~{estimated:,} tokens) exceeds context ceiling "
+                f"({ceiling:,} / {limit:,}) on turn 1; continuation cannot recover.",
+                retryable=False,
+            )
         may_continue = slot is not None and continuations < _cap()
         if may_continue:
             handoff, used = await _write_handoff(node_id, _llm(), llm_request, limit_tokens=limit)
@@ -3530,6 +3681,8 @@ def _make_prefix_group_before_model_callback(
     preserve_signatures: bool = True,
     prefix_group: str = "",
     enable_explicit_stem_cache: bool = False,
+    model: Any = None,
+    keep_tool_results: Optional[int] = None,
 ):
     """Builds the shared-prefix request envelope (`[S_base, T_shared, *inherited, u_stage, *own_turns]`).
 
@@ -3572,6 +3725,16 @@ def _make_prefix_group_before_model_callback(
                 )
             except Exception:
                 inherited = []
+
+        stem_limit = _resolve_effective_context_limit(model) if inherited else None
+        stem_cleared = 0
+        if inherited and stem_limit:
+            inherited, stem_cleared = _bound_inherited_stem(
+                inherited,
+                limit_tokens=stem_limit,
+                model=model,
+                keep_tool_results=keep_tool_results,
+            )
 
         own = list(getattr(llm_request, "contents", None) or [])
         has_opener = bool(
@@ -3714,6 +3877,20 @@ def _make_prefix_group_before_model_callback(
             )
         else:
             llm_request.contents = list(inherited) + [u_stage_content] + own_tail
+
+        setattr(
+            llm_request,
+            "_mantis_inherited_len",
+            (len(llm_request.contents) - len(own_tail)) if inherited else 0,
+        )
+        if stem_cleared > 0 and is_first_turn_of_attempt and stem_limit:
+            print(
+                f"\n[STEM BOUND] {node_id}: cleared {stem_cleared} oldest inherited tool "
+                f"result(s) to bound the shared stem within "
+                f"{int(STEM_CONTEXT_CEILING_SHARE * 100)}% of the "
+                f"{int(stem_limit * NODE_CONTEXT_CEILING_RATIO):,}-token ceiling.",
+                file=sys.stderr,
+            )
 
         if getattr(llm_request, "config", None) is not None:
             llm_request.config.system_instruction = base_instruction
@@ -5322,6 +5499,8 @@ def load_workflow_from_json(
                         preserve_signatures=same_prefix_and_model,
                         prefix_group=prefix_group or "",
                         enable_explicit_stem_cache=(node_id not in pg_parent_ids),
+                        model=node_model_id,
+                        keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
                     ),
                     _make_client_context_editing_before_model_callback(
                         node_id,
