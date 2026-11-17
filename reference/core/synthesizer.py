@@ -747,7 +747,7 @@ class ResearchGraphSynthesizer:
                 "id": "dedupe",
                 "type": "agent",
                 "skill": "mantis-dedupe",
-                "tools": ["get_findings", "report_findings", "dedupe_findings"],
+                "tools": ["get_findings", "dedupe_findings"],
             },
             {
                 "id": "reviewer",

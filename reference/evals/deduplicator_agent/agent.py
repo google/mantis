@@ -33,7 +33,7 @@ def build_deduplicator_agent():
     )
 
     skill_path = Path(__file__).resolve().parent.parent.parent / 'mantis-dedupe'
-    tools_list = [TOOLS[t] for t in ['read_file', 'write_file', 'get_findings', 'report_findings', 'dedupe_findings'] if t in TOOLS]
+    tools_list = [TOOLS[t] for t in ['read_file', 'write_file', 'get_findings', 'dedupe_findings'] if t in TOOLS]
 
     if skill_path.is_dir() and (skill_path / 'SKILL.md').exists():
         skill_obj = load_skill_from_dir(str(skill_path))
@@ -41,13 +41,13 @@ def build_deduplicator_agent():
         instruction = (
             "You are the 'deduplicator' stage in the Mantis vulnerability review pipeline.\n"
             f"Execute your assigned skill '{skill_obj.frontmatter.name}' using your available tools.\n"
-            "Retrieve findings using get_findings, analyze duplicates, and merge or update findings using dedupe_findings and report_findings."
+            "Retrieve findings using get_findings, analyze duplicates, and merge duplicate findings using dedupe_findings."
         )
     else:
         agent_tools = tools_list
         instruction = (
             "You are the 'deduplicator' stage in the Mantis vulnerability review pipeline.\n"
-            "Retrieve findings using get_findings, analyze duplicates, and merge or update findings using dedupe_findings and report_findings."
+            "Retrieve findings using get_findings, analyze duplicates, and merge duplicate findings using dedupe_findings."
         )
 
     return Agent(
