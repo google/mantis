@@ -313,6 +313,26 @@ def find_cached_microsandbox_image(preferred: str = "") -> Optional[str]:
         return None
 
 
+def _detect_adc_project() -> Optional[str]:
+    """Safely extracts a non-placeholder GCP project from Application Default
+    Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, user ADC, or GCE metadata
+    server via `google.auth.default()`). Never raises."""
+    try:
+        import google.auth
+
+        creds, proj = google.auth.default()
+        candidate = (
+            proj
+            or getattr(creds, "project_id", None)
+            or getattr(creds, "quota_project_id", None)
+        )
+        if candidate and not is_placeholder(str(candidate)):
+            return str(candidate).strip()
+    except Exception:
+        pass
+    return None
+
+
 def detect_capabilities() -> dict:
     """Inspects the local host environment to detect available sandboxes, tools, and credentials."""
     caps: dict[str, Any] = {
@@ -325,6 +345,7 @@ def detect_capabilities() -> dict:
         "gcp_auth": False,
         "gcp_account": None,
         "gcp_project": None,
+        "gcp_project_probe_failed": False,
         "vertex_project": os.environ.get("VERTEXAI_PROJECT")
         or os.environ.get("GOOGLE_CLOUD_PROJECT"),
         "gemini_api_key": bool(
@@ -401,8 +422,16 @@ def detect_capabilities() -> dict:
                 val = p_proj.stdout.strip()
                 if val and "unset" not in val and not is_placeholder(val):
                     caps["gcp_project"] = val
+        except subprocess.TimeoutExpired:
+            caps["gcp_project_probe_failed"] = True
         except Exception:
             pass
+
+    if not caps["gcp_project"] and not caps["vertex_project"]:
+        adc_proj = _detect_adc_project()
+        if adc_proj:
+            caps["vertex_project"] = adc_proj
+            caps["gcp_project_probe_failed"] = False
 
     if caps["gcloud"] and caps["gcp_auth"] and (caps["gcp_project"] or caps["vertex_project"]):
         caps["available_sandboxes"].append("gce")
@@ -819,10 +848,23 @@ def _check_single_llm_preflight(
         endpoint_info = f" @ {api_base}" if api_base else ""
         static_msg = f"OpenAI-compatible LLM configured (Model: {resolved_model}{endpoint_info})."
 
-    elif resolved_model.startswith(("gemini/", "gemini-")):
+    elif resolved_model.startswith("gemini/"):
         if not os.environ.get("GEMINI_API_KEY") and not os.environ.get("GOOGLE_API_KEY"):
-            # Check if vertex credentials are available
-            if not os.environ.get("GOOGLE_CLOUD_PROJECT") and not os.environ.get("VERTEXAI_PROJECT") and not kwargs.get("vertex_project"):
+            return (
+                False,
+                "Gemini API model ('gemini/...') requires GEMINI_API_KEY or GOOGLE_API_KEY "
+                "(use 'vertex_ai/...' to authenticate with a GCP Project ID).",
+            )
+        static_msg = f"Gemini LLM configured (Model: {resolved_model})."
+
+    elif resolved_model.startswith("gemini-"):
+        if not os.environ.get("GEMINI_API_KEY") and not os.environ.get("GOOGLE_API_KEY"):
+            proj_candidates = (
+                os.environ.get("GOOGLE_CLOUD_PROJECT"),
+                os.environ.get("VERTEXAI_PROJECT"),
+                kwargs.get("vertex_project"),
+            )
+            if not any(p and not is_placeholder(str(p)) for p in proj_candidates):
                 return False, "Gemini model requires GEMINI_API_KEY or GCP Project ID for Vertex AI."
         static_msg = f"Gemini LLM configured (Model: {resolved_model})."
 
@@ -1147,6 +1189,39 @@ def _sandbox_choice_is_explicit(workflow_path: str) -> bool:
     return False
 
 
+def _model_choice_is_explicit(workflow_path: str) -> bool:
+    """True when the local overlay (`workflow.local.json`) explicitly sets a
+    non-placeholder `default_model`.
+
+    The tracked `workflow.json` ships with `vertex_ai/gemini-3.8-flash` as a
+    default, not a per-machine choice; only the local overlay pins the model
+    so auto-configuration will not overwrite an explicit operator choice
+    (`r4-vertex-to-gemini-autoselect`).
+    """
+    base_dir = os.path.dirname(os.path.abspath(workflow_path))
+    base_name = os.path.basename(workflow_path)
+    stem = base_name[:-5] if base_name.endswith(".json") else base_name
+    for cand in (
+        os.path.join(base_dir, f"{stem}.local.json"),
+        os.path.join(base_dir, f".{stem}.local.json"),
+    ):
+        if not os.path.exists(cand):
+            continue
+        try:
+            with open(cand, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            # Unreadable overlay: treat as explicit so we never overwrite it.
+            return True
+        if isinstance(data, dict):
+            raw = (data.get("config", {}) or {}).get("default_model")
+            if raw is None:
+                raw = data.get("default_model")
+            if raw and not is_placeholder(str(raw)):
+                return True
+    return False
+
+
 def _print_static_floor_hint(caps: dict) -> None:
     """One-line, every-launch hint that dynamic reproduction is disabled."""
     if "microsandbox" in caps.get("available_sandboxes", []):
@@ -1340,10 +1415,14 @@ async def ensure_configured_async(
                 os.environ.setdefault("VERTEXAI_PROJECT", str(resolved_proj))
                 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", str(resolved_proj))
             elif not has_env_proj and not has_resolved_proj:
+                explicit_local_model = _model_choice_is_explicit(target_wf)
+                probe_timed_out = bool(caps.get("gcp_project_probe_failed"))
                 if (
                     str(model).startswith("vertex_ai/gemini-")
                     and caps.get("gemini_api_key")
                     and "default_model" not in overrides
+                    and not explicit_local_model
+                    and not probe_timed_out
                     and not cfg.get("api_base")
                     and not caps.get("llm_api_base")
                 ):
@@ -1355,6 +1434,17 @@ async def ensure_configured_async(
                         "(detected GEMINI_API_KEY with no Vertex AI project)."
                     )
                 else:
+                    if str(model).startswith("vertex_ai/gemini-") and caps.get("gemini_api_key"):
+                        if explicit_local_model:
+                            print(
+                                f"ℹ️ Keeping explicit local overlay model '{model}' "
+                                "(not switching to Gemini API automatically)."
+                            )
+                        elif probe_timed_out:
+                            print(
+                                f"ℹ️ Keeping '{model}' because the gcloud project probe timed out "
+                                "(not switching to Gemini API automatically)."
+                            )
                     hint = _non_vertex_model_hint(cfg, caps)
                     if hint:
                         print(f"💡 {hint}")
@@ -1369,14 +1459,20 @@ async def ensure_configured_async(
             # Safety net: never allow a downgraded sandbox type to be persisted to disk
             if all_updates.get("sandbox", {}).get("type") == "static-only" and sb_type not in ("", "static-only"):
                 del all_updates["sandbox"]
-            # Never write workflow.local.json when --no-auto-configure (auto=False) or
-            # when an explicit per-invocation CLI --sandbox override is active without --save-config.
+            # Never persist a one-shot CLI --sandbox override (or sandbox options
+            # derived from it) when persist_overrides is False, while still
+            # allowing unrelated auto-resolutions (e.g. default_model) to persist
+            # (`r4-autoselect-not-saved`).
+            if not persist_overrides and "sandbox" in overrides and "sandbox" in all_updates:
+                del all_updates["sandbox"]
+            # Never write workflow.local.json when --no-auto-configure (auto=False)
+            # unless save_tracked / persist_overrides explicitly requested persistence.
             effective_save = bool(
                 save
                 and (
                     save_tracked
                     or persist_overrides
-                    or (auto and "sandbox" not in overrides)
+                    or auto
                 )
             )
             if all_updates:
@@ -1396,7 +1492,9 @@ async def ensure_configured_async(
                         target_wf, {**all_updates, **overrides}, save=False, save_tracked=save_tracked
                     )
                 ret_cfg = dict(wf_data.get("config", {}))
-                if downgraded_sandbox is not None and "sandbox" not in overrides:
+                if "sandbox" in overrides and not persist_overrides and isinstance(cfg.get("sandbox"), dict):
+                    ret_cfg["sandbox"] = dict(cfg["sandbox"])
+                elif downgraded_sandbox is not None and "sandbox" not in overrides:
                     ret_cfg["sandbox"] = dict(downgraded_sandbox)
                 return ret_cfg
 
