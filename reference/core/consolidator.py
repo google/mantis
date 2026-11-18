@@ -380,13 +380,11 @@ async def _run_structured_one_shot(
     budget_controller: Any = None,
 ) -> Any:
     """Executes a single structured ADK `set_model_response` LLM call against `schema_cls`."""
-    from core.config import ResilientLiteLlm, get_llm_kwargs, structured_llm_request
+    from core.config import ResilientLiteLlm, get_run_llm_kwargs, structured_llm_request
 
     cfg = config or {}
-    _, llm_kw = get_llm_kwargs(
+    _, llm_kw = get_run_llm_kwargs(
         cfg.get("default_model"),
-        api_base=cfg.get("api_base"),
-        reasoning_effort=cfg.get("reasoning_effort"),
         config=cfg,
     )
     llm = ResilientLiteLlm(**llm_kw)

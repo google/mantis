@@ -574,6 +574,81 @@ def is_rate_limit_error(e: Exception) -> bool:
     return False
 
 
+def _is_timeout_error(e: Exception) -> bool:
+    """True when `e` represents a transient request/read/gateway timeout raised
+    by any layer (asyncio, built-in TimeoutError, LiteLLM, httpx, OpenAI/Anthropic
+    SDK, HTTP 408/504, gRPC DEADLINE_EXCEEDED, or chained `__cause__`/`__context__`).
+
+    Never matches auth errors, rate-limit (429) errors, config/validation errors,
+    or deterministic non-retryable 4xx client errors.
+    """
+    if is_auth_error(e) or is_rate_limit_error(e):
+        return False
+    if isinstance(
+        e,
+        (
+            MantisAuthError,
+            ConfigValidationError,
+            PermissionError,
+            FileNotFoundError,
+            ValueError,
+            TypeError,
+        ),
+    ):
+        return False
+    if _is_deterministic_non_retryable_exc(e):
+        return False
+    status_top = _http_status_of(e)
+    if status_top is not None and status_top not in (408, 504):
+        return False
+    seen: set[int] = set()
+    curr: Optional[BaseException] = e
+    while curr is not None and id(curr) not in seen:
+        seen.add(id(curr))
+        if isinstance(curr, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        cls_name = type(curr).__name__.lower()
+        if "timeout" in cls_name and "auth" not in cls_name:
+            return True
+        try:
+            import litellm
+            lt_to = tuple(
+                c
+                for c in (
+                    getattr(litellm, "Timeout", None),
+                    getattr(getattr(litellm, "exceptions", None), "Timeout", None),
+                )
+                if isinstance(c, type)
+            )
+            if lt_to and isinstance(curr, lt_to):
+                return True
+        except Exception:
+            pass
+        if isinstance(curr, Exception):
+            st = _http_status_of(curr)
+            if st in (408, 504):
+                return True
+        msg = str(curr).lower()
+        if any(
+            k in msg
+            for k in (
+                "timed out",
+                "timeout",
+                "sockettimeout",
+                "gateway timeout",
+                "deadline exceeded",
+                "deadline_exceeded",
+            )
+        ):
+            if not (
+                isinstance(curr, Exception)
+                and (is_rate_limit_error(curr) or is_auth_error(curr))
+            ):
+                return True
+        curr = getattr(curr, "__cause__", None) or getattr(curr, "__context__", None)
+    return False
+
+
 def is_retryable_llm_error(e: Exception) -> bool:
     """Detects whether an exception represents a retryable transient error (429, 408, 5xx, timeout, or network reset)."""
     if is_auth_error(e) or isinstance(e, (MantisAuthError, ConfigValidationError, PermissionError, FileNotFoundError)):
@@ -581,6 +656,8 @@ def is_retryable_llm_error(e: Exception) -> bool:
     if _is_deterministic_non_retryable_exc(e):
         return False
     if is_rate_limit_error(e):
+        return True
+    if _is_timeout_error(e):
         return True
     # An empty STOP turn is retried like a 429: same backoff, same patience.
     # Its cost is metered where it is raised (see MantisEmptyResponseError).
@@ -2300,6 +2377,7 @@ class _ContinuationSplicer:
         self.kwargs = kwargs
         self.chunks_yielded = 0
         self.usage_total: Optional[dict] = None
+        self._last_usage_template: Any = None
         self.segments = 1
 
     async def deliver(self, first_chunk: Any, stream_iter: Any, stream_response: Any = None):
@@ -2317,6 +2395,7 @@ class _ContinuationSplicer:
                 # different chunks, in any order, so none of them is judged alone.
                 pending_token: Optional[str] = None
                 held: list = []
+                segment_has_usage = False
                 chunk = first_chunk
                 first_chunk = None
                 while True:
@@ -2327,6 +2406,8 @@ class _ContinuationSplicer:
                         usage = getattr(chunk, "usage", None)
                         if usage is not None:
                             self.usage_total = _add_usage(self.usage_total, usage)
+                            self._last_usage_template = usage
+                            segment_has_usage = True
                         if usage is not None or _chunk_has_finish(chunk):
                             held.append(chunk)
                         else:
@@ -2340,13 +2421,13 @@ class _ContinuationSplicer:
                             yield chunk
                             self.chunks_yielded += 1
                     has_terminal = bool(not pending_token and _has_terminal_finish(held))
-                    has_usage = bool(
-                        self.usage_total is not None
-                        or any(getattr(h, "usage", None) is not None for h in held)
-                    )
+                    # Only shrink the EOF wait once *this* segment has delivered its
+                    # own usage chunk -- never from an earlier continuation segment's
+                    # `self.usage_total`, or the final segment's trailing usage chunk
+                    # could be dropped by an early `eof_timeout_cap` break.
                     wait_timeout = (
                         min(chunk_timeout, eof_timeout_cap)
-                        if (has_terminal and has_usage)
+                        if (has_terminal and segment_has_usage)
                         else chunk_timeout
                     )
                     timeout_cm = asyncio.timeout(wait_timeout)
@@ -2430,7 +2511,29 @@ class _ContinuationSplicer:
                         break  # an empty continuation: the turn ends here
                     continue
                 # This segment ends the turn: its held chunks go on as they came,
-                # the usage carrying the whole turn's sum.
+                # the usage carrying the whole turn's sum. If a multi-segment turn
+                # ended (or hit a post-finish EOF stall) without a usage chunk on
+                # the final segment, attach the accumulated `usage_total` onto the
+                # last held chunk so earlier segments' token counts are not lost.
+                if (
+                    self.segments > 1
+                    and self.usage_total is not None
+                    and not segment_has_usage
+                    and held
+                    and not any(getattr(h, "usage", None) is not None for h in held)
+                ):
+                    try:
+                        import copy as _copy
+                        import types as _types
+                        synth_usage = (
+                            _copy.deepcopy(self._last_usage_template)
+                            if self._last_usage_template is not None
+                            else _types.SimpleNamespace()
+                        )
+                        _apply_usage(synth_usage, self.usage_total)
+                        held[-1].usage = synth_usage
+                    except Exception:
+                        pass
                 for h in held:
                     if getattr(h, "usage", None) is not None and self.segments > 1:
                         _apply_usage(h.usage, self.usage_total)
@@ -3184,6 +3287,16 @@ class ResilientLiteLLMClient(LiteLLMClient):
                 remaining_patience=rem_patience,
                 remaining_wall_seconds=_remaining_wall_clock_budget_seconds(),
             )
+            attempt_kwargs = dict(kwargs)
+            if timeout_retries > 0 and not explicit_op_timeout:
+                try:
+                    cur_to = float(attempt_kwargs.get("timeout") or 0.0)
+                except (TypeError, ValueError):
+                    cur_to = 0.0
+                if attempt_timeout > cur_to:
+                    attempt_kwargs["timeout"] = attempt_timeout
+                    if "stream_timeout" in attempt_kwargs:
+                        attempt_kwargs["stream_timeout"] = attempt_timeout
             attempt_t0 = time.monotonic()
             try:
                 empty_stream = False
@@ -3195,7 +3308,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
                             messages=messages,
                             tools=tools,
                             stream=True,
-                            **kwargs,
+                            **attempt_kwargs,
                         )
                         stream_iter = response.__aiter__()
                         try:
@@ -3231,7 +3344,11 @@ class ResilientLiteLLMClient(LiteLLMClient):
                         original_exception=e,
                     ) from None
                 elapsed = time.time() - start_time
-                if is_first_chunk_timeout:
+                # Count ANY pre-first-chunk timeout (our asyncio.timeout OR an
+                # upstream client/LiteLLM/httpx/504 cutoff such as LiteLLM's
+                # internal 600s Vertex/Gemini streaming timeout) toward
+                # `max_timeout_retries` so repeated cutoffs stop cleanly.
+                if is_first_chunk_timeout or _is_timeout_error(e):
                     if timeout_retries >= max_timeout_retries or elapsed >= max_patience:
                         raise
                     timeout_retries += 1
@@ -4835,7 +4952,7 @@ def get_run_llm_kwargs(
         or cfg.get("_local_reasoning_effort")
         or None
     )
-    return get_llm_kwargs(
+    resolved, llm_kwargs = get_llm_kwargs(
         model_id=model_id,
         default_model=str(cfg.get("default_model") or DEFAULT_MODEL),
         api_base=eff_api_base,
@@ -4848,4 +4965,12 @@ def get_run_llm_kwargs(
         config=cfg,
         explicit_reasoning_effort=bool(reasoning_effort or cfg.get("_cli_reasoning_effort")),
     )
+    if (
+        timeout is not None
+        or cfg.get("_cli_timeout") is not None
+        or cfg.get("_explicit_timeout")
+        or (cfg.get("timeout") is not None and "_explicit_timeout" not in cfg)
+    ):
+        llm_kwargs["explicit_timeout"] = True
+    return resolved, llm_kwargs
 

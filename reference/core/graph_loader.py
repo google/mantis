@@ -5673,7 +5673,11 @@ def load_workflow_from_json(
                         has_schema=bool(node_cfg.output_schema),
                         keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
                         llm_factory=(
-                            (lambda kw=dict(llm_kwargs): _HandoffLiteLlm(**kw, preserve_system_prefix=True))
+                            (
+                                lambda kw=dict(llm_kwargs), et=node_explicit_timeout: _HandoffLiteLlm(
+                                    **kw, preserve_system_prefix=True, explicit_timeout=et
+                                )
+                            )
                             if llm_kwargs
                             else None
                         ),
@@ -5697,7 +5701,13 @@ def load_workflow_from_json(
                         # The handoff is written by the stage's own model, built
                         # from the same kwargs; None under the hermetic path.
                         llm_factory=(
-                            (lambda kw=dict(llm_kwargs): _HandoffLiteLlm(**kw)) if llm_kwargs else None
+                            (
+                                lambda kw=dict(llm_kwargs), et=node_explicit_timeout: _HandoffLiteLlm(
+                                    **kw, explicit_timeout=et
+                                )
+                            )
+                            if llm_kwargs
+                            else None
                         ),
                         max_continuations=spec.config.max_node_continuations,
                     ),
@@ -5864,6 +5874,14 @@ def load_workflow_from_json(
         cfg["_cli_api_base"] = api_base_override
     if timeout_override is not None:
         cfg["_cli_timeout"] = timeout_override
+    cfg["_explicit_timeout"] = bool(
+        timeout_override is not None
+        or overlay_meta.get("local_timeout_set")
+        or (
+            spec.config.timeout is not None
+            and not overlay_meta.get("base_timeout_was_shipped_180")
+        )
+    )
     if reasoning_effort_override:
         cfg["_cli_reasoning_effort"] = reasoning_effort_override
     if overlay_meta.get("local_reasoning_effort"):

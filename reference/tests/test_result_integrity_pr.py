@@ -308,13 +308,15 @@ class FindingIdentityAndConsolidationIntegrityTest(unittest.IsolatedAsyncioTestC
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        # Scenario 1 (with real CWE set, hitting BOTH Step 1 signature AND Step 2
+        # filepath+cwe+bare-symbol matching): UserView.get vs OrderView.get in views.py
         cur.execute(
-            """INSERT INTO findings (run_id, filepath, title, description, severity, status,
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
                                      signature, prose_signature, lineage_id, target_symbol,
                                      symbol_source, qualified_symbol, line_numbers)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                "r1", "views.py", "Missing auth in UserView.get", "desc", "HIGH", "confirmed",
+                "r1", "views.py", "Missing auth in UserView.get", "desc", "HIGH", "confirmed", "CWE-862",
                 "bare_get_sig", "prose_user_get", "lin-user-get", "get",
                 "", "UserView.get", "[12]",
             ),
@@ -334,27 +336,47 @@ class FindingIdentityAndConsolidationIntegrityTest(unittest.IsolatedAsyncioTestC
         )
         self.assertNotEqual(
             lin_order, "lin-user-get",
-            "OrderView.get MUST NOT collide onto UserView.get via dead `if prose_sig:` guard!",
+            "OrderView.get MUST NOT collide onto UserView.get via Step 1 or Step 2 when CWE matches!",
         )
 
+        # Positive control: re-reporting the SAME method (UserView.get) with CWE-862 still links.
+        lin_same = resolve_ancestor_lineage(
+            cur,
+            "views.py",
+            signature="sig_user_get_v2",
+            cwe="CWE-862",
+            symbol="get",
+            db_path=db,
+            bare_signature="different_bare_sig",
+            prose_signature="different_prose",
+            symbol_source="catalog",
+            qualified_symbol="UserView.get",
+        )
+        self.assertEqual(
+            lin_same, "lin-user-get",
+            "Same qualified_symbol UserView.get with CWE-862 must still resolve to its lineage!",
+        )
+
+        # Scenario 2 (with real CWE set): legacy pre-migration row (empty qualified_symbol)
+        # adopted by UserView.get must NOT let OrderView.get steal lin-legacy via Step 1 or Step 2.
         cur.execute(
-            """INSERT INTO findings (run_id, filepath, title, description, severity, status,
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
                                      signature, prose_signature, lineage_id, target_symbol,
                                      symbol_source, qualified_symbol, line_numbers)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                "r0", "legacy.py", "Missing auth in get", "desc", "HIGH", "confirmed",
+                "r0", "legacy.py", "Missing auth in get", "desc", "HIGH", "confirmed", "CWE-862",
                 "legacy_bare_sig", "legacy_prose", "lin-legacy", "get",
                 "", "", "[10]",
             ),
         )
         cur.execute(
-            """INSERT INTO findings (run_id, filepath, title, description, severity, status,
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
                                      signature, prose_signature, lineage_id, target_symbol,
                                      symbol_source, qualified_symbol, line_numbers)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                "r1", "legacy.py", "Missing auth in UserView.get", "desc", "HIGH", "confirmed",
+                "r1", "legacy.py", "Missing auth in UserView.get", "desc", "HIGH", "confirmed", "CWE-862",
                 "sig_uv_get", "legacy_prose", "lin-legacy", "get",
                 "catalog", "UserView.get", "[10]",
             ),
@@ -374,7 +396,49 @@ class FindingIdentityAndConsolidationIntegrityTest(unittest.IsolatedAsyncioTestC
         )
         self.assertNotEqual(
             lin_ov, "lin-legacy",
-            "OrderView.get MUST NOT join a legacy lineage already claimed by UserView.get!",
+            "OrderView.get MUST NOT join a legacy lineage (with CWE-862) already claimed by UserView.get!",
+        )
+
+        # Scenario 3: pure Step 2 match (empty cwe='' legacy row adopted by UserView.get)
+        # with completely distinct signature so Step 1 yields 0 rows.
+        cur.execute(
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
+                                     signature, prose_signature, lineage_id, target_symbol,
+                                     symbol_source, qualified_symbol, line_numbers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "r0", "step2.py", "Old finding in get", "desc", "HIGH", "confirmed", "",
+                "sig_old_0", "prose_old_0", "lin-step2", "get",
+                "", "", "[15]",
+            ),
+        )
+        cur.execute(
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
+                                     signature, prose_signature, lineage_id, target_symbol,
+                                     symbol_source, qualified_symbol, line_numbers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "r1", "step2.py", "UserView.get", "desc", "HIGH", "confirmed", "CWE-862",
+                "sig_old_1", "prose_old_1", "lin-step2", "get",
+                "", "UserView.get", "[15]",
+            ),
+        )
+        conn.commit()
+        lin_step2_ov = resolve_ancestor_lineage(
+            cur,
+            "step2.py",
+            signature="completely_unrelated_sig",
+            cwe="CWE-862",
+            symbol="get",
+            db_path=db,
+            bare_signature="",
+            prose_signature="",
+            symbol_source="catalog",
+            qualified_symbol="OrderView.get",
+        )
+        self.assertNotEqual(
+            lin_step2_ov, "lin-step2",
+            "Step 2 MUST NOT match bare symbol `get` when qualified_symbol conflicts!",
         )
         conn.close()
 

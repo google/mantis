@@ -1134,6 +1134,10 @@ def resolve_ancestor_lineage(
                 cand_sym, cand_src, cand_qual, cand[1], cand_pass, cand_lines
             ):
                 continue
+            if incoming_qualified and cand_qual and cand_qual != incoming_qualified:
+                continue
+            if _lineage_has_conflicting_qualified_symbol(str(cand[0])):
+                continue
             if cand_sym and cand_sym == norm_sym:
                 return str(cand[0])
 
@@ -1152,6 +1156,8 @@ def resolve_ancestor_lineage(
                 candidate_rows = cursor.fetchall()
                 for cand in candidate_rows:
                     if not _same_target(cand[3]):
+                        continue
+                    if _lineage_has_conflicting_qualified_symbol(str(cand[2])):
                         continue
                     cand_lines_raw = cand[1]
                     try:
