@@ -90,7 +90,7 @@
       "fork_from": "explorer",
       "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
-      "tools": ["read_file", "get_findings", "get_threat_model", "get_summary", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check", "list_prior_findings"],
+      "tools": ["read_file", "list_files", "get_findings", "get_threat_model", "get_summary", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check", "list_prior_findings"],
       "output_schema": "ReviewVerdict",
       "output_key": "verdict"
     },

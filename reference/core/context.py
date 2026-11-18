@@ -148,9 +148,8 @@ class RunContext:
     bare_sandbox_crash_seen: bool = False
     # In `--scan-mode changed`, IDs of open confirmed prior findings touching
     # this campaign's scope (for `list_prior_findings`, `findings_gate`, and
-    # one-shot completion nudge) plus any target-relative paths deleted on disk.
+    # one-shot completion nudge).
     campaign_prior_ids: tuple[int, ...] = ()
-    campaign_deleted_files: tuple[str, ...] = ()
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

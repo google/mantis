@@ -582,11 +582,14 @@ class BriefTest(_Base):
         tools = {n["id"]: n.get("tools", []) for n in wf["nodes"] if n.get("type") == "agent"}
         self.assertIn("record_regression_check", tools["reviewer"])
         self.assertIn("record_regression_check", tools["reproducer"])
+        self.assertIn("list_files", tools["reviewer"])
         self.assertIn("list_prior_findings", tools["researcher"])
         self.assertIn("list_prior_findings", tools["reviewer"])
         self.assertIn("list_prior_findings", tools["reproducer"])
         self.assertIn("get_prior_poc", tools["reproducer"])
         self.assertNotIn("get_prior_poc", tools["researcher"], "the researcher writes new PoCs; the reproducer re-runs old ones")
+        from evals.stage_agents import STAGE_CONFIGS
+        self.assertIn("list_files", STAGE_CONFIGS["reviewer"]["tools"])
 
 
 class ChangedModeSettlementFixesTest(_Base):
@@ -986,6 +989,391 @@ class ChangedModeSettlementFixesTest(_Base):
         entry_line = next(t for is_untrusted, t in lines if is_untrusted and f"- #{own_id} " in t)
         self.assertIn("...", entry_line)
         self.assertTrue(entry_line.endswith("..."), entry_line)
+
+    async def test_subfolder_changed_scan_does_not_flag_rest_of_repo_or_existing_files_deleted(self):
+        """Scanning a subfolder (`sub/`) after a full-repo scan must resolve each
+        finding against its producing run's `target_root`, skip findings outside
+        `sub/` (`other/y.py`), not flag existing `sub/x.py` as deleted, and still
+        flag truly deleted `sub/gone.py` relative to `sub/`."""
+        import main
+        from core.cost import record_coverage_files, record_spend, scope_identities
+        from core.database import (
+            prior_findings_on_deleted_files,
+            prior_findings_touching,
+            record_run,
+            unsettled_prior_findings_summary,
+        )
+
+        sub_dir = os.path.join(self.target, "sub")
+        other_dir = os.path.join(self.target, "other")
+        os.makedirs(sub_dir, exist_ok=True)
+        os.makedirs(other_dir, exist_ok=True)
+        f_other = os.path.join(other_dir, "y.py")
+        f_sub_x = os.path.join(sub_dir, "x.py")
+        f_sub_gone = os.path.join(sub_dir, "gone.py")
+        Path(f_other).write_text("y = 1\n")
+        Path(f_sub_x).write_text("x = 1\n")
+        Path(f_sub_gone).write_text("g = 1\n")
+
+        full_run = "aaaa0001-2222-3333-4444-555555555555"
+        record_run(
+            self.db,
+            full_run,
+            "vertex_ai/gemini-3.8-flash",
+            metadata={"target_root": os.path.realpath(self.target), "target": os.path.realpath(self.target)},
+        )
+        record_spend(self.db, full_run, self.target, "whole", tokens=100, metadata={"failed": False})
+        record_coverage_files(self.db, full_run, self.target, scope_identities([f_other, f_sub_x, f_sub_gone]))
+        write_findings(
+            self.db,
+            self.target,
+            [
+                _finding("other/y.py", "bug in other", status="static_confirmed", line=1),
+                _finding("sub/x.py", "bug in sub x", status="dynamic_confirmed", line=1),
+                _finding("sub/gone.py", "bug in sub gone", status="static_confirmed", line=1),
+            ],
+            run_id=full_run,
+        )
+        by_title = {f["title"]: f for f in read_findings(self.db, run_id=full_run)}
+        x_id = int(by_title["bug in sub x"]["id"])
+        gone_id = int(by_title["bug in sub gone"]["id"])
+
+        # 1. Nothing deleted yet: scanning `sub/` must report ZERO deleted files and nothing_changed!
+        missing_0, del_0 = prior_findings_on_deleted_files(
+            self.db, NEW, sub_dir, scope_path=sub_dir, include_untriaged=False
+        )
+        self.assertEqual((missing_0, del_0), ([], []))
+
+        scope_clean: dict = {}
+        targets_0, _, mode_0 = main.resolve_scan_targets(
+            Path(sub_dir),
+            {"scan_mode": "changed", "surveyor": {"min_source_files": 1000}},
+            [f_sub_x, f_sub_gone],
+            db_path=self.db,
+            scope_out=scope_clean,
+        )
+        self.assertEqual((targets_0, mode_0), ([], "changed"))
+        self.assertTrue(scope_clean["nothing_changed"])
+
+        # 2. Delete `sub/gone.py`: ONLY `gone.py` is flagged relative to `sub/`; `other/y.py` and `sub/x.py` stay clean!
+        os.unlink(f_sub_gone)
+        missing_1, del_1 = prior_findings_on_deleted_files(
+            self.db, NEW, sub_dir, scope_path=sub_dir, include_untriaged=False
+        )
+        self.assertEqual(missing_1, ["gone.py"])
+        self.assertEqual([int(r["id"]) for r in del_1], [gone_id])
+
+        # Edit `sub/x.py` too, and verify prior_findings_touching, _regression_brief, and summary
+        # resolve across the repo->subfolder anchor mismatch cleanly.
+        Path(f_sub_x).write_text("x = 2  # fixed\n")
+        touching = prior_findings_touching(
+            self.db, NEW, ["x.py", "gone.py"], scope_path=sub_dir, include_untriaged=False
+        )
+        self.assertEqual(sorted(int(r["id"]) for r in touching), sorted([x_id, gone_id]))
+
+        priors, brief = main._regression_brief(
+            self.db, NEW, [f_sub_x, f_sub_gone], sub_dir, sub_dir, include_untriaged=False
+        )
+        self.assertEqual(sorted(int(r["id"]) for r in priors), sorted([x_id, gone_id]))
+        self.assertIn(f"#{gone_id} [static_confirmed] [FILE DELETED ON DISK]", brief)
+        self.assertNotIn(f"#{x_id} [dynamic_confirmed] [FILE DELETED ON DISK]", brief)
+
+        summary = unsettled_prior_findings_summary(self.db, NEW, [x_id, gone_id], target_root=sub_dir)
+        by_id_sum = {g["id"]: g for g in summary["groups"]}
+        self.assertFalse(by_id_sum[x_id]["deleted_on_disk"])
+        self.assertTrue(by_id_sum[gone_id]["deleted_on_disk"])
+
+        # 3. Reverse direction: Run recorded on `sub/` (`filepath="x.py"`), next run scans full repo!
+        sub_run = "bbbb0002-2222-3333-4444-555555555555"
+        f_sub_keep = os.path.join(sub_dir, "keep.py")
+        Path(f_sub_keep).write_text("k = 1\n")
+        f_sub_rm = os.path.join(sub_dir, "rm_me.py")
+        Path(f_sub_rm).write_text("r = 1\n")
+        record_run(
+            self.db,
+            sub_run,
+            "vertex_ai/gemini-3.8-flash",
+            metadata={"target_root": os.path.realpath(sub_dir), "target": os.path.realpath(sub_dir)},
+        )
+        write_findings(
+            self.db,
+            sub_dir,
+            [
+                _finding("keep.py", "sub-rooted keep", status="static_confirmed", line=1),
+                _finding("rm_me.py", "sub-rooted rm", status="static_confirmed", line=1),
+            ],
+            run_id=sub_run,
+        )
+        os.unlink(f_sub_rm)
+        missing_full, del_full = prior_findings_on_deleted_files(
+            self.db, NEW, self.target, scope_path=self.target, include_untriaged=False
+        )
+        self.assertEqual(missing_full, ["sub/gone.py", "sub/rm_me.py"])
+        self.assertNotIn("keep.py", missing_full)
+        self.assertNotIn("sub/keep.py", missing_full)
+        touching_full = prior_findings_touching(
+            self.db, NEW, ["sub/keep.py"], scope_path=self.target, include_untriaged=False
+        )
+        self.assertEqual([r["title"] for r in touching_full], ["sub-rooted keep"])
+
+    async def test_dotfiles_preserve_leading_dot_in_changed_and_deleted_checks(self):
+        """Dotfiles like `.github/workflows/ci.yml` must never lose their leading dot
+        via `.lstrip('./')`, neither during deleted-file scans nor brief tagging."""
+        import main
+        from core.database import (
+            _normalize_target_relpath,
+            prior_findings_on_deleted_files,
+            prior_findings_touching,
+            unsettled_prior_findings_summary,
+        )
+
+        wf_dir = os.path.join(self.target, ".github", "workflows")
+        os.makedirs(wf_dir, exist_ok=True)
+        wf_file = os.path.join(wf_dir, "ci.yml")
+        Path(wf_file).write_text("name: CI\non: push\n")
+
+        real_root = os.path.realpath(self.target)
+        self.assertEqual(
+            _normalize_target_relpath(".github/workflows/ci.yml", real_root),
+            ".github/workflows/ci.yml",
+        )
+        self.assertEqual(
+            _normalize_target_relpath("./.github/workflows/ci.yml", real_root),
+            ".github/workflows/ci.yml",
+        )
+        self.assertEqual(_normalize_target_relpath("../escape.yml", real_root), "")
+
+        write_findings(
+            self.db,
+            self.target,
+            [_finding(".github/workflows/ci.yml", "Workflow injection", status="static_confirmed", line=2)],
+            run_id=OLD,
+        )
+        dot_id = int(read_findings(self.db, run_id=OLD)[0]["id"])
+
+        # Existing dotfile must NOT be flagged deleted!
+        missing_0, del_0 = prior_findings_on_deleted_files(
+            self.db, NEW, self.target, scope_path=self.target, include_untriaged=False
+        )
+        self.assertEqual((missing_0, del_0), ([], []))
+
+        priors_0, brief_0 = main._regression_brief(
+            self.db, NEW, [wf_file], self.target, self.target, include_untriaged=False
+        )
+        self.assertEqual([int(p["id"]) for p in priors_0], [dot_id])
+        self.assertIn(f"#{dot_id} [static_confirmed] .github/workflows/ci.yml", brief_0)
+        self.assertNotIn(f"#{dot_id} [static_confirmed] [FILE DELETED ON DISK]", brief_0)
+
+        sum_0 = unsettled_prior_findings_summary(self.db, NEW, [dot_id], target_root=self.target)
+        self.assertFalse(sum_0["groups"][0]["deleted_on_disk"])
+
+        # Once deleted, dotfile IS flagged with its leading dot intact!
+        os.unlink(wf_file)
+        missing_1, del_1 = prior_findings_on_deleted_files(
+            self.db, NEW, self.target, scope_path=self.target, include_untriaged=False
+        )
+        self.assertEqual(missing_1, [".github/workflows/ci.yml"])
+        self.assertEqual([int(r["id"]) for r in del_1], [dot_id])
+        self.assertEqual(
+            [int(r["id"]) for r in prior_findings_touching(self.db, NEW, [".github/workflows/ci.yml"], scope_path=self.target)],
+            [dot_id],
+        )
+        _, brief_1 = main._regression_brief(
+            self.db, NEW, [wf_file], self.target, self.target, include_untriaged=False
+        )
+        self.assertIn(f"#{dot_id} [static_confirmed] [FILE DELETED ON DISK] .github/workflows/ci.yml", brief_1)
+        sum_1 = unsettled_prior_findings_summary(self.db, NEW, [dot_id], target_root=self.target)
+        self.assertTrue(sum_1["groups"][0]["deleted_on_disk"])
+
+    async def test_deleted_file_is_excluded_from_changed_files_and_silent_poc_stays_inconclusive(self):
+        """Deleting a vulnerable file must NOT add it to `scope_out['changed_files']`,
+        and a prior PoC returning silent/404 against a deleted file must record
+        `inconclusive` (not `fixed`) so the agent checks for rename/move first."""
+        import main
+        from core.cost import record_coverage_files, record_spend, scope_identities
+
+        all_files = [
+            os.path.join(self.target, "a.py"),
+            os.path.join(self.target, "b.py"),
+            os.path.join(self.target, "pkg", "c.py"),
+        ]
+        record_spend(self.db, OLD, self.target, "whole", tokens=100, metadata={"failed": False})
+        record_coverage_files(self.db, OLD, self.target, scope_identities(all_files))
+        write_findings(
+            self.db,
+            self.target,
+            [_finding("b.py", "RCE in b", status="dynamic_confirmed", code_paths=["b.py:10", "a.py:2"])],
+            run_id=OLD,
+        )
+        b_id = int(read_findings(self.db, run_id=OLD)[0]["id"])
+        record_artifact(self.db, OLD, "workspace_file", f"workspace/repro_{b_id}.py", "# poc\n")
+
+        # Edit a.py AND delete b.py
+        Path(self.target, "a.py").write_text("x = 2\n")
+        os.unlink(os.path.join(self.target, "b.py"))
+
+        scope: dict = {}
+        main.resolve_scan_targets(
+            Path(self.target),
+            {"scan_mode": "changed", "surveyor": {"min_source_files": 1000}},
+            [os.path.join(self.target, "a.py"), os.path.join(self.target, "pkg", "c.py")],
+            db_path=self.db,
+            scope_out=scope,
+        )
+        self.assertTrue(any(p.endswith("/b.py") for p in scope["deleted_files"]))
+        self.assertFalse(
+            any(p.endswith("/b.py") for p in scope["changed_files"]),
+            "deleted files must NEVER enter changed_files",
+        )
+        self.assertTrue(any(p.endswith("/a.py") for p in scope["changed_files"]))
+
+        # Even though helper `a.py` IS in changed_paths, `b.py` itself is deleted on disk,
+        # so a silent PoC (e.g. HTTP 404 after rename) MUST stay inconclusive!
+        sb_404 = HarnessRerunTest._SB({b_id: "absent"})
+        ctx = self.ctx("harness", sandbox=sb_404)
+        prior = prior_findings_touching(self.db, NEW, ["a.py", "b.py"], scope_path=self.target)
+        note = await main._rerun_prior_pocs(ctx, self.db, NEW, prior, changed_paths={"a.py"})
+        self.assertIn(f"#{b_id}: inconclusive", note)
+        self.assertIn("deleted on disk", note)
+        settled = main._settle_regression_checks(self.db, NEW, prior, target_root=self.target)
+        self.assertEqual(settled["fixed"], [])
+        self.assertIn(b_id, settled["unverified"])
+        self.assertEqual(read_findings(self.db, run_id=OLD)[0]["status"], "dynamic_confirmed")
+
+        # Conversely, if the PoC STILL reaches the sink (moved endpoint still mounted),
+        # it MUST still record still_present!
+        new_run2 = "33333333-2222-3333-4444-555555555555"
+        sb_hit = HarnessRerunTest._SB({b_id: "present"})
+        ctx2 = self.ctx("harness", sandbox=sb_hit)
+        ctx2.run_id = new_run2
+        note2 = await main._rerun_prior_pocs(ctx2, self.db, new_run2, prior, changed_paths={"a.py"})
+        self.assertIn(f"#{b_id}: still_present", note2)
+
+    async def test_moved_file_archives_dead_path_row_and_stops_repeat_changed_triggers(self):
+        """When a deleted file's finding is settled `still_present` pointing to a
+        confirmed active finding at a different existing path (rename/move), the
+        stale dead-path row is archived so future `--scan-mode changed` runs stop
+        re-triggering forever while keeping the vulnerability open at the new path."""
+        import main
+        from core.cost import record_coverage_files, record_spend, scope_identities
+
+        export_old = os.path.join(self.target, "export.py")
+        export_new = os.path.join(self.target, "export_v2.py")
+        Path(export_old).write_text("def export(): pass\n")
+        base_files = [
+            os.path.join(self.target, "a.py"),
+            os.path.join(self.target, "b.py"),
+            os.path.join(self.target, "pkg", "c.py"),
+            export_old,
+        ]
+        record_spend(self.db, OLD, self.target, "whole", tokens=100, metadata={"failed": False})
+        record_coverage_files(self.db, OLD, self.target, scope_identities(base_files))
+        write_findings(
+            self.db,
+            self.target,
+            [_finding("export.py", "IDOR in export", status="dynamic_confirmed", line=1)],
+            run_id=OLD,
+        )
+        old_id = int(read_findings(self.db, run_id=OLD)[0]["id"])
+
+        # Move export.py -> export_v2.py
+        os.rename(export_old, export_new)
+        prior = prior_findings_touching(self.db, NEW, ["export.py", "export_v2.py"], scope_path=self.target)
+        self.assertEqual([int(p["id"]) for p in prior], [old_id])
+
+        # Fail-closed 1: `still_present` with NO new_finding_id keeps old row OPEN!
+        r_noid = "44444444-2222-3333-4444-555555555555"
+        record_regression_check(self.db, r_noid, old_id, "still_present", reason="moved somewhere", evidence="static")
+        main._settle_regression_checks(self.db, r_noid, prior, target_root=self.target)
+        self.assertEqual(read_findings(self.db, run_id=OLD)[0]["status"], "dynamic_confirmed")
+
+        # Fail-closed 2: `new_finding_id` is only untriaged `reported` -> MUST NOT archive old row!
+        r_untr = "55555555-2222-3333-4444-555555555555"
+        write_findings(
+            self.db,
+            self.target,
+            [_finding("export_v2.py", "IDOR in export_v2", status="reported", line=1)],
+            run_id=r_untr,
+        )
+        untr_id = int(read_findings(self.db, run_id=r_untr)[0]["id"])
+        record_regression_check(
+            self.db, r_untr, old_id, "still_present", reason="moved to export_v2.py",
+            evidence="lineage", new_finding_id=untr_id,
+        )
+        main._settle_regression_checks(self.db, r_untr, prior, target_root=self.target)
+        self.assertEqual(read_findings(self.db, run_id=OLD)[0]["status"], "dynamic_confirmed")
+
+        # Confirmed relocation: new finding at `export_v2.py` is `static_confirmed`!
+        write_findings(
+            self.db,
+            self.target,
+            [_finding("export_v2.py", "IDOR in export_v2", status="static_confirmed", line=1)],
+            run_id=NEW,
+        )
+        new_id = int(read_findings(self.db, run_id=NEW)[0]["id"])
+        record_regression_check(
+            self.db, NEW, old_id, "still_present", reason="relocated to export_v2.py",
+            evidence="lineage", new_finding_id=new_id,
+        )
+        settled = main._settle_regression_checks(self.db, NEW, prior, target_root=self.target)
+        self.assertEqual(settled, {"still_present": [old_id], "fixed": [], "unverified": []})
+
+        old_row = read_findings(self.db, run_id=OLD)[0]
+        new_row = read_findings(self.db, run_id=NEW)[0]
+        self.assertEqual(old_row["status"], "archived")
+        self.assertIn(f"relocated to #{new_id} at export_v2.py", old_row["triage_reasoning"])
+        self.assertEqual(new_row["status"], "static_confirmed")
+
+        # Report lines show the relocation clearly.
+        fmt = "\n".join(t for _, t in main._format_regression_settlement_lines(self.db, NEW, prior, settled))
+        self.assertIn(f"dead path archived; relocated -> #{new_id}", fmt)
+
+        # Cover export_v2.py in the ledger as Run NEW finished; Run 3 MUST report nothing_changed!
+        record_spend(self.db, NEW, self.target, "changed", tokens=50, metadata={"failed": False})
+        record_coverage_files(self.db, NEW, self.target, scope_identities([export_new]))
+        after_files = [
+            os.path.join(self.target, "a.py"),
+            os.path.join(self.target, "b.py"),
+            os.path.join(self.target, "pkg", "c.py"),
+            export_new,
+        ]
+        scope_next: dict = {}
+        targets_next, _, _ = main.resolve_scan_targets(
+            Path(self.target),
+            {"scan_mode": "changed", "surveyor": {"min_source_files": 1000}},
+            after_files,
+            db_path=self.db,
+            scope_out=scope_next,
+        )
+        self.assertEqual(targets_next, [])
+        self.assertTrue(scope_next["nothing_changed"])
+
+    async def test_prior_findings_touching_partitioned_and_no_dead_campaign_deleted_files(self):
+        import dataclasses
+        from core.database import prior_findings_touching_partitioned
+
+        self.assertNotIn(
+            "campaign_deleted_files",
+            {f.name for f in dataclasses.fields(RunContext)},
+            "unused campaign_deleted_files field should be removed",
+        )
+        # Untriaged row on a.py sharing a lineage with a confirmed row on untouched b.py
+        # must NOT leak b.py into confirmed results for ["a.py"].
+        write_findings(
+            self.db,
+            self.target,
+            [
+                {**_finding("a.py", "Confirmed bug", status="static_confirmed", line=10), "lineage_id": "lin-a"},
+                {**_finding("a.py", "Untriaged draft", status="reported", line=20), "lineage_id": "lin-shared"},
+                {**_finding("b.py", "Untouched confirmed", status="static_confirmed", line=30), "lineage_id": "lin-shared"},
+            ],
+            run_id=OLD,
+        )
+        confirmed, skipped = prior_findings_touching_partitioned(
+            self.db, NEW, ["a.py"], scope_path=self.target, target_root=self.target
+        )
+        self.assertEqual([r["title"] for r in confirmed], ["Confirmed bug"])
+        self.assertEqual(skipped, 1)
 
 
 if __name__ == "__main__":

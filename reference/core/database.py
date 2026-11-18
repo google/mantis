@@ -2442,37 +2442,165 @@ def read_regression_checks(db_path: str, run_id: Optional[str] = None,
         return []
 
 
-def prior_findings_touching(
+def _strip_leading_dotslash(raw_path: str) -> str:
+    """Normalizes slashes and strips leading `./` segments without eating the
+    leading dot of dotfiles like `.github/workflows/ci.yml` or `.env`."""
+    s = str(raw_path or "").strip().replace("\\", "/")
+    if s.startswith("file://"):
+        s = s[7:]
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def _clean_rel_key(raw_path: str) -> str:
+    """Normalizes a relative path key for comparison, stripping leading `./`
+    and `/` safely while preserving dotfiles such as `.github/workflows/ci.yml`."""
+    s = _strip_leading_dotslash(raw_path)
+    while s.startswith("/") or s.startswith("./"):
+        if s.startswith("/"):
+            s = s[1:]
+        elif s.startswith("./"):
+            s = s[2:]
+    if not s or s == ".":
+        return ""
+    norm = posixpath.normpath(s)
+    return "" if norm in ("", ".", "/") else norm
+
+
+def _strip_line_suffix(raw: str) -> str:
+    """Strips `:line` / `:line:col` suffixes from a `code_paths` entry."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if len(s) >= 2 and s[1] == ":" and s[0].isalpha():
+        return s[:2] + s[2:].split(":", 1)[0]
+    return s.split(":", 1)[0]
+
+
+def _normalize_target_relpath(raw_path: str, real_root: str) -> str:
+    """Normalizes a finding's `filepath` to a clean, traversal-free relative
+    path under `real_root`, preserving dotfiles (e.g. `.github/workflows/ci.yml`),
+    or returns `""` when empty or outside `real_root`."""
+    raw = _strip_leading_dotslash(raw_path)
+    if not raw or raw in (".", "/"):
+        return ""
+    real_base = os.path.realpath(str(real_root))
+    base_prefix = real_base.rstrip(os.sep) + os.sep
+    if os.path.isabs(raw):
+        norm_abs = os.path.realpath(raw)
+        if norm_abs == real_base or not norm_abs.startswith(base_prefix):
+            return ""
+        rel = os.path.relpath(norm_abs, real_base).replace("\\", "/")
+    else:
+        rel = raw
+        if rel.startswith("/") or ".." in rel.split("/"):
+            return ""
+        rel = posixpath.normpath(rel)
+    if not rel or rel in (".", "/") or rel.startswith("/") or ".." in rel.split("/"):
+        return ""
+    norm_joined = os.path.normpath(os.path.join(real_base, rel))
+    if norm_joined == real_base or not norm_joined.startswith(base_prefix):
+        return ""
+    return rel
+
+
+def _finding_run_root(
+    finding_run_id: Any,
+    roots_map: Optional[Dict[str, str]],
+    fallback_root: str = "",
+) -> str:
+    """Returns the real directory anchor relative to which `finding_run_id`'s
+    finding filepaths were canonicalized, falling back to `fallback_root` when
+    the run recorded no `target_root` (INV-6 legacy rows)."""
+    rid = str(finding_run_id or "").strip()
+    recorded = str((roots_map or {}).get(rid, "") or "").strip()
+    if recorded:
+        real_rec = os.path.realpath(recorded)
+        if os.path.isfile(real_rec):
+            real_rec = os.path.dirname(real_rec)
+        return real_rec.rstrip(os.sep) or real_rec
+    if fallback_root:
+        real_fb = os.path.realpath(str(fallback_root))
+        if os.path.isfile(real_fb):
+            real_fb = os.path.dirname(real_fb)
+        return real_fb.rstrip(os.sep) or real_fb
+    return ""
+
+
+def resolve_finding_abs_path(
+    raw_path: str,
+    finding_run_id: Any,
+    fallback_root: str = "",
+    roots_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """Resolves a finding's stored `raw_path` to its real absolute path on disk
+    against its producing run's recorded `target_root` (or `fallback_root` for
+    legacy runs with no recorded root). Preserves dotfiles and rejects path
+    traversal. Returns `""` if unresolved or unsafe."""
+    base_root = _finding_run_root(finding_run_id, roots_map, fallback_root)
+    if not base_root:
+        return ""
+    rel_in_base = _normalize_target_relpath(raw_path, base_root)
+    if not rel_in_base:
+        return ""
+    return os.path.normpath(os.path.join(base_root, rel_in_base))
+
+
+def resolve_finding_path_for_root(
+    raw_path: str,
+    finding_run_id: Any,
+    current_root: str,
+    roots_map: Optional[Dict[str, str]] = None,
+) -> "tuple[str, str]":
+    """Resolves a finding's stored `raw_path` (anchored to its own producing
+    run's `target_root`) relative to `current_root`.
+
+    Returns `(abs_path, rel_under_current)` when the finding lies strictly
+    under `current_root`, or `("", "")` when outside `current_root` (e.g. a
+    full-repo finding in `other/y.py` during a subfolder scan of `sub/`).
+    """
+    if not current_root:
+        return "", ""
+    real_current = os.path.realpath(str(current_root))
+    if os.path.isfile(real_current):
+        real_current = os.path.dirname(real_current)
+    cur_prefix = real_current.rstrip(os.sep) + os.sep
+    abs_path = resolve_finding_abs_path(raw_path, finding_run_id, real_current, roots_map)
+    if not abs_path:
+        return "", ""
+    if abs_path == real_current or not abs_path.startswith(cur_prefix):
+        return "", ""
+    rel_under_current = os.path.relpath(abs_path, real_current).replace(os.sep, "/")
+    return abs_path, rel_under_current
+
+
+def _select_prior_findings(
+    rows: List[Dict[str, Any]],
     db_path: str,
     current_run_id: str,
-    rel_paths: Sequence[str],
-    scope_path: Optional[str] = None,
+    wanted: set,
     *,
-    include_untriaged: bool = True,
+    eff_root: str,
+    match_root: str,
+    roots_map: Dict[str, str],
+    allowed_statuses: set,
 ) -> List[Dict[str, Any]]:
-    """Open findings from runs other than `current_run_id` that sit in one of
-    `rel_paths` (target-relative, as findings store them), cite one in their
-    `code_paths`, or share a non-empty `lineage_id` with a finding that does.
-    What a change-scoped run must say something about. Oldest first, one entry
-    per finding. Never raises.
-
-    When `include_untriaged` is False, excludes untriaged `'reported'` rows
-    (`OPEN_CONFIRMED_STATUSES` only) so suppressed/unreviewed findings from
-    earlier runs do not bloat regression briefs or unverified counts.
-    """
-    wanted = {str(p).replace("\\", "/").lstrip("./") for p in rel_paths if str(p).strip()}
-    if not wanted:
-        return []
-    try:
-        rows = read_findings(db_path, scope_path=scope_path)
-    except Exception:
-        return []
-    allowed_statuses = set(OPEN_FINDING_STATUSES if include_untriaged else OPEN_CONFIRMED_STATUSES)
-    roots_map = run_target_roots(db_path)
-    eff_root = active_target_root(scope_path or "")
     candidates: List[Dict[str, Any]] = []
     direct_ids: set = set()
     touched_lineages: set = set()
+
+    def _norm_for_match(raw_entry: str, finding_run_id: Any) -> str:
+        path_only = _strip_line_suffix(raw_entry)
+        if not path_only:
+            return ""
+        if match_root:
+            _, rel = resolve_finding_path_for_root(
+                path_only, finding_run_id, match_root, roots_map
+            )
+            return rel
+        return _clean_rel_key(path_only)
+
     for f in rows:
         if str(f.get("run_id") or "") == str(current_run_id):
             continue
@@ -2483,7 +2611,8 @@ def prior_findings_touching(
         if str(f.get("status") or "").lower() not in allowed_statuses:
             continue
         candidates.append(f)
-        fp = str(f.get("filepath") or "").replace("\\", "/").lstrip("./")
+        f_rid = f.get("run_id")
+        fp = _norm_for_match(str(f.get("filepath") or ""), f_rid)
         cited: set = set()
         raw = f.get("code_paths")
         try:
@@ -2492,12 +2621,16 @@ def prior_findings_touching(
             paths = []
         for entry in paths if isinstance(paths, list) else []:
             if isinstance(entry, str):
-                cited.add(entry.split(":")[0].replace("\\", "/").lstrip("./"))
+                c_rel = _norm_for_match(entry, f_rid)
+                if c_rel:
+                    cited.add(c_rel)
             elif isinstance(entry, dict):
                 for key in ("file", "filepath", "path"):
                     if entry.get(key):
-                        cited.add(str(entry[key]).split(":")[0].replace("\\", "/").lstrip("./"))
-        if fp in wanted or cited & wanted:
+                        c_rel = _norm_for_match(str(entry[key]), f_rid)
+                        if c_rel:
+                            cited.add(c_rel)
+        if (fp and fp in wanted) or (cited & wanted):
             direct_ids.add(f.get("id"))
             lin = str(f.get("lineage_id") or "").strip()
             if lin:
@@ -2510,25 +2643,116 @@ def prior_findings_touching(
     return out
 
 
-def _normalize_target_relpath(raw_path: str, real_root: str) -> str:
-    """Normalizes a finding's `filepath` to a clean, traversal-free relative
-    path under `real_root`, or returns `""` when empty or outside `real_root`."""
-    raw = str(raw_path or "").strip().replace("\\", "/")
-    if not raw or raw in (".", "/"):
-        return ""
-    if os.path.isabs(raw):
-        norm_abs = os.path.normpath(raw)
-        if norm_abs == real_root or not norm_abs.startswith(real_root + os.sep):
-            return ""
-        rel = os.path.relpath(norm_abs, real_root).replace("\\", "/")
+def _resolve_prior_query_roots(
+    scope_path: Optional[str],
+    target_root: Optional[str],
+) -> "tuple[str, str]":
+    """Returns `(eff_root, match_root)` for `prior_findings_touching*`."""
+    match_root = ""
+    if target_root:
+        rt = os.path.realpath(str(target_root))
+        match_root = (os.path.dirname(rt) if os.path.isfile(rt) else rt).rstrip(os.sep) or rt
+    elif scope_path and os.path.isabs(str(scope_path)) and os.path.exists(str(scope_path)):
+        sp = os.path.realpath(str(scope_path))
+        match_root = (os.path.dirname(sp) if os.path.isfile(sp) else sp).rstrip(os.sep) or sp
     else:
-        rel = raw.lstrip("./")
-    if not rel or rel.startswith("/") or ".." in rel.split("/"):
-        return ""
-    norm_joined = os.path.normpath(os.path.join(real_root, rel))
-    if norm_joined == real_root or not norm_joined.startswith(real_root + os.sep):
-        return ""
-    return rel
+        eff_auto = active_target_root(scope_path or "")
+        match_root = eff_auto
+    eff_root = match_root or active_target_root(scope_path or "")
+    return eff_root, match_root
+
+
+def prior_findings_touching(
+    db_path: str,
+    current_run_id: str,
+    rel_paths: Sequence[str],
+    scope_path: Optional[str] = None,
+    *,
+    include_untriaged: bool = True,
+    target_root: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Open findings from runs other than `current_run_id` that sit in one of
+    `rel_paths` (relative to `target_root` / `scope_path`), cite one in their
+    `code_paths`, or share a non-empty `lineage_id` with a finding that does.
+    What a change-scoped run must say something about. Oldest first, one entry
+    per finding. Never raises.
+
+    When `include_untriaged` is False, excludes untriaged `'reported'` rows
+    (`OPEN_CONFIRMED_STATUSES` only) so suppressed/unreviewed findings from
+    earlier runs do not bloat regression briefs or unverified counts.
+    """
+    wanted = {_clean_rel_key(str(p)) for p in rel_paths if _clean_rel_key(str(p))}
+    if not wanted:
+        return []
+    try:
+        use_sql_scope = scope_path if (scope_path and not os.path.isabs(str(scope_path))) else None
+        rows = read_findings(db_path, scope_path=use_sql_scope)
+    except Exception:
+        return []
+    allowed_statuses = set(OPEN_FINDING_STATUSES if include_untriaged else OPEN_CONFIRMED_STATUSES)
+    roots_map = run_target_roots(db_path)
+    eff_root, match_root = _resolve_prior_query_roots(scope_path, target_root)
+    return _select_prior_findings(
+        rows,
+        db_path,
+        current_run_id,
+        wanted,
+        eff_root=eff_root,
+        match_root=match_root,
+        roots_map=roots_map,
+        allowed_statuses=allowed_statuses,
+    )
+
+
+def prior_findings_touching_partitioned(
+    db_path: str,
+    current_run_id: str,
+    rel_paths: Sequence[str],
+    scope_path: Optional[str] = None,
+    *,
+    target_root: Optional[str] = None,
+) -> "tuple[List[Dict[str, Any]], int]":
+    """Reads findings once and returns `(open_confirmed_rows, skipped_untriaged_count)`.
+
+    Avoids building `_regression_brief` twice (or running duplicate SQLite /
+    PoC artifact lookups) just to report how many untriaged `'reported'` rows
+    were skipped in `--scan-mode changed`. Never raises.
+    """
+    wanted = {_clean_rel_key(str(p)) for p in rel_paths if _clean_rel_key(str(p))}
+    if not wanted:
+        return [], 0
+    try:
+        use_sql_scope = scope_path if (scope_path and not os.path.isabs(str(scope_path))) else None
+        rows = read_findings(db_path, scope_path=use_sql_scope)
+    except Exception:
+        return [], 0
+    roots_map = run_target_roots(db_path)
+    eff_root, match_root = _resolve_prior_query_roots(scope_path, target_root)
+    confirmed_statuses = set(OPEN_CONFIRMED_STATUSES)
+    confirmed = _select_prior_findings(
+        rows,
+        db_path,
+        current_run_id,
+        wanted,
+        eff_root=eff_root,
+        match_root=match_root,
+        roots_map=roots_map,
+        allowed_statuses=confirmed_statuses,
+    )
+    all_open = _select_prior_findings(
+        rows,
+        db_path,
+        current_run_id,
+        wanted,
+        eff_root=eff_root,
+        match_root=match_root,
+        roots_map=roots_map,
+        allowed_statuses=set(OPEN_FINDING_STATUSES),
+    )
+    skipped_untriaged = sum(
+        1 for f in all_open if str(f.get("status") or "").lower() not in confirmed_statuses
+    )
+    return confirmed, skipped_untriaged
 
 
 def prior_findings_on_deleted_files(
@@ -2540,7 +2764,15 @@ def prior_findings_on_deleted_files(
     include_untriaged: bool = False,
 ) -> "tuple[List[str], List[Dict[str, Any]]]":
     """Returns `(missing_rel_paths, open_findings)` for earlier runs' open
-    findings whose `filepath` no longer exists on disk under `target_root`.
+    findings whose `filepath` falls inside `target_root` and no longer exists
+    on disk.
+
+    Each finding's stored path is resolved against its producing run's recorded
+    `target_root` (not blindly joined to the current scan folder). Findings
+    whose resolved path lies outside `target_root` (e.g. sibling folders during
+    a subfolder `--scan-mode changed` run) are skipped rather than misreported
+    as deleted. Returned `missing_rel_paths` are normalized relative to
+    `target_root`, preserving dotfiles such as `.github/workflows/ci.yml`.
 
     Used by `--scan-mode changed` so deleting a vulnerable file (without
     modifying any other file) is never silently skipped as 'nothing to scan',
@@ -2554,12 +2786,16 @@ def prior_findings_on_deleted_files(
     if not os.path.isdir(real_root):
         return [], []
     try:
-        rows = read_findings(db_path, scope_path=scope_path)
+        rows = read_findings(db_path)
     except Exception:
         return [], []
     allowed_statuses = set(OPEN_FINDING_STATUSES if include_untriaged else OPEN_CONFIRMED_STATUSES)
     roots_map = run_target_roots(db_path)
-    eff_root = active_target_root(scope_path or real_root)
+    eff_root = (
+        os.path.realpath(str(scope_path)).rstrip(os.sep)
+        if (scope_path and os.path.isabs(str(scope_path)) and os.path.isdir(str(scope_path)))
+        else active_target_root(scope_path or real_root)
+    )
     missing_rels: set[str] = set()
     deleted_findings: List[Dict[str, Any]] = []
     for f in rows:
@@ -2571,11 +2807,12 @@ def prior_findings_on_deleted_files(
             continue
         if str(f.get("status") or "").lower() not in allowed_statuses:
             continue
-        rel = _normalize_target_relpath(str(f.get("filepath") or ""), real_root)
-        if not rel:
+        abs_path, rel = resolve_finding_path_for_root(
+            str(f.get("filepath") or ""), f.get("run_id"), real_root, roots_map
+        )
+        if not abs_path or not rel:
             continue
-        candidate = os.path.join(real_root, rel)
-        if not os.path.lexists(candidate) and not os.path.exists(candidate):
+        if not os.path.lexists(abs_path) and not os.path.exists(abs_path):
             missing_rels.add(rel)
             deleted_findings.append(f)
     return sorted(missing_rels), deleted_findings
@@ -2667,6 +2904,7 @@ def unsettled_prior_findings_summary(
                 grouped.append([r])
 
         real_root = os.path.realpath(target_root) if target_root and os.path.isdir(target_root) else ""
+        roots_map = run_target_roots(db_path) if real_root else {}
 
         def _rep_rank(row: dict[str, Any]) -> tuple:
             has_poc = bool(row.get("_has_poc"))
@@ -2724,10 +2962,14 @@ def unsettled_prior_findings_summary(
 
             deleted_on_disk = False
             if real_root:
-                rel = _normalize_target_relpath(str(rep.get("filepath") or ""), real_root)
-                if rel:
-                    cand = os.path.join(real_root, rel)
-                    deleted_on_disk = not os.path.lexists(cand) and not os.path.exists(cand)
+                abs_path = resolve_finding_abs_path(
+                    str(rep.get("filepath") or ""),
+                    rep.get("run_id"),
+                    real_root,
+                    roots_map,
+                )
+                if abs_path:
+                    deleted_on_disk = not os.path.lexists(abs_path) and not os.path.exists(abs_path)
 
             entry = {
                 "representative": rep,
@@ -2776,6 +3018,67 @@ def mitigate_finding(db_path: str, finding_id: int, reason: str, by_run_id: str 
             existing = str(row[2] or "")
             conn.execute("UPDATE findings SET triage_reasoning = ? WHERE id = ?",
                          ((existing + "\n" if existing else "") + note, fid))
+        return True
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
+def archive_relocated_finding(
+    db_path: str,
+    finding_id: int,
+    reason: str,
+    *,
+    new_finding_id: Optional[int] = None,
+    new_filepath: str = "",
+    by_run_id: str = "",
+) -> bool:
+    """Shelves an open finding whose file no longer exists on disk as `archived`
+    when a later run confirmed the vulnerability relocated to a different
+    existing file.
+
+    Keeps the active defect tracked once at the new location (`new_finding_id`)
+    and stops the old dead-path row from re-triggering `--scan-mode changed` on
+    every subsequent run. Because `archived` is reopenable and NOT `mitigated`,
+    the historical row is preserved without pretending the defect was fixed.
+    Returns whether the status changed to `'archived'`. Never raises (INV-6).
+    """
+    try:
+        fid = int(finding_id)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with _db(db_path) as conn:
+            row = conn.execute(
+                "SELECT run_id, status, triage_reasoning FROM findings WHERE id = ?",
+                (fid,),
+            ).fetchone()
+            if row is None:
+                return False
+            prior_status = str(row[1] or "").lower()
+            if prior_status not in OPEN_FINDING_STATUSES:
+                return False
+        update_finding_status_by_id(db_path, fid, str(row[0] or ""), ARCHIVED_STATUS)
+        with _db(db_path) as conn:
+            now = str(
+                conn.execute("SELECT status FROM findings WHERE id = ?", (fid,)).fetchone()[0]
+                or ""
+            ).lower()
+            if now != ARCHIVED_STATUS or prior_status == ARCHIVED_STATUS:
+                return False
+            dest = ""
+            if new_finding_id is not None:
+                dest = f": relocated to #{int(new_finding_id)}" + (
+                    f" at {new_filepath}" if new_filepath else ""
+                )
+            note = (
+                f"[archived by run {str(by_run_id)[:8] or 'later'}{dest}] "
+                f"{str(reason or '').strip()}"
+            )[:2000]
+            existing = str(row[2] or "")
+            conn.execute(
+                "UPDATE findings SET triage_reasoning = ? WHERE id = ?",
+                ((existing + "\n" if existing else "") + note, fid),
+            )
         return True
     except (sqlite3.Error, OSError, TypeError, ValueError):
         return False

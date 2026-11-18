@@ -77,7 +77,7 @@ STAGE_CONFIGS = {
     'reviewer': {
         'skill': 'mantis-review',
         'tools': [
-            'read_file', 'get_findings', 'get_threat_model', 'get_summary', 'find_symbol',
+            'read_file', 'list_files', 'get_findings', 'get_threat_model', 'get_summary', 'find_symbol',
             'find_callers', 'find_callees', 'get_function_boundary', 'record_regression_check', 'list_prior_findings',
         ],
         'instruction': get_stage_prompt('reviewer', 'mantis-review'),

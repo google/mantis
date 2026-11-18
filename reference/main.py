@@ -706,7 +706,9 @@ def _is_in_scope_code_read(
     raw_fp = str(call_args.get("filepath") or "").strip()
     if not raw_fp:
         return False
-    clean_fp = raw_fp.replace("\\", "/").lstrip("./")
+    clean_fp = raw_fp.replace("\\", "/")
+    while clean_fp.startswith("./") or clean_fp.startswith("/"):
+        clean_fp = clean_fp[2:] if clean_fp.startswith("./") else clean_fp[1:]
     if (
         clean_fp in ("workspace", "findings", "mantis-summary.md", "learnings.jsonl")
         or clean_fp.startswith("workspace/")
@@ -2596,11 +2598,13 @@ def resolve_scan_targets(
             scope_out["focus_files"] = focus_all
             scope_out["focus_groups"] = groups
             scope_out["deleted_files"] = list(deleted_abs)
-            # The subset whose content actually changed (or was deleted on disk),
-            # apart from the never-covered: only a finding in one of these can
-            # be called fixed by its PoC's silence (see _rerun_prior_pocs).
+            # The subset whose content actually changed on disk (existing files
+            # only, NEVER deleted_abs or never-covered files): only a finding in
+            # an edited existing file can be called fixed by its PoC's silence
+            # in `_rerun_prior_pocs`. A deleted file's silent PoC (e.g. HTTP 404)
+            # must stay inconclusive so the agent checks for renames/moves first.
             edited_set = set(edited.get("files") or [])
-            scope_out["changed_files"] = [f for f in focus if f in edited_set] + list(deleted_abs)
+            scope_out["changed_files"] = [f for f in focus if f in edited_set]
             scope_out["nothing_changed"] = False
         return [g["dir"] for g in groups], None, SCAN_MODE_CHANGED
 
@@ -2803,10 +2807,28 @@ def _campaign_finding_counts(
     return counts
 
 
-def _finding_files(finding: dict) -> set:
-    """The target-relative files a finding sits in or cites."""
+def _finding_files(
+    finding: dict,
+    *,
+    current_root: str = "",
+    roots_map: Optional[dict] = None,
+) -> set:
+    """The target-relative files a finding sits in or cites (dotfile-safe)."""
+    from core.database import _clean_rel_key, _strip_line_suffix, resolve_finding_path_for_root
+
+    def _norm(raw_entry: str) -> str:
+        path_only = _strip_line_suffix(raw_entry)
+        if not path_only:
+            return ""
+        if current_root:
+            _, rel = resolve_finding_path_for_root(
+                path_only, finding.get("run_id"), current_root, roots_map
+            )
+            return rel
+        return _clean_rel_key(path_only)
+
     files = set()
-    fp = str(finding.get("filepath") or "").replace("\\", "/").lstrip("./")
+    fp = _norm(str(finding.get("filepath") or ""))
     if fp:
         files.add(fp)
     raw = finding.get("code_paths")
@@ -2816,12 +2838,16 @@ def _finding_files(finding: dict) -> set:
         paths = []
     for entry in paths if isinstance(paths, list) else []:
         if isinstance(entry, str):
-            files.add(entry.split(":")[0].replace("\\", "/").lstrip("./"))
+            norm = _norm(entry)
+            if norm:
+                files.add(norm)
         elif isinstance(entry, dict):
             for key in ("file", "filepath", "path"):
                 v = entry.get(key)
                 if isinstance(v, str) and v:
-                    files.add(v.split(":")[0].replace("\\", "/").lstrip("./"))
+                    norm = _norm(v)
+                    if norm:
+                        files.add(norm)
     return {f for f in files if f}
 
 
@@ -2856,7 +2882,13 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
     must not do. None (unknown) disables nothing: with no changed set every
     silent PoC is inconclusive.
     """
-    from core.database import read_artifact, record_regression_check
+    from core.database import (
+        _clean_rel_key,
+        read_artifact,
+        record_regression_check,
+        resolve_finding_abs_path,
+        run_target_roots,
+    )
     from core.poc_scaffold import restore_poc_companions
     from tools.sandbox_tools import (
         MANTIS_SENTINEL_TOKEN,
@@ -2868,7 +2900,10 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
     sandbox = getattr(ctx, "sandbox", None)
     if sandbox is None or type(sandbox).__name__ in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
         return ""
-    changed = {str(p).replace("\\", "/").lstrip("./") for p in (changed_paths or set())}
+    changed = {_clean_rel_key(str(p)) for p in (changed_paths or set()) if _clean_rel_key(str(p))}
+    current_root = str(getattr(ctx, "path_root", "") or getattr(ctx, "jail_dir", "") or "")
+    real_root = os.path.realpath(current_root) if current_root and os.path.isdir(current_root) else ""
+    roots_map = run_target_roots(db_path) if real_root else {}
     results: list[str] = []
     for p in prior:
         pid = int(p["id"])
@@ -2923,9 +2958,21 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
             # yes -- that is the exploit failing, which is what a fix looks
             # like from the PoC's side. (tools.sandbox_tools.poc_ran.)
             ran = poc_ran(output, exit_code, timed_out=bool(getattr(res, "timed_out", False)))
-            touched = bool(_finding_files(p) & changed)
+            touched = bool(_finding_files(p, current_root=real_root, roots_map=roots_map) & changed)
+            file_deleted = False
+            if real_root:
+                abs_fp = resolve_finding_abs_path(
+                    str(p.get("filepath") or ""), p.get("run_id"), real_root, roots_map
+                )
+                if abs_fp and not os.path.lexists(abs_fp) and not os.path.exists(abs_fp):
+                    file_deleted = True
             if present:
                 outcome, why = "still_present", f"prior PoC re-run reached the sink: {reason}"
+            elif file_deleted:
+                outcome, why = "inconclusive", (
+                    f"prior PoC re-run did not reach the sink (exit {exit_code}), but "
+                    f"{p.get('filepath')} is deleted on disk; rename/move must be checked before marking fixed"
+                )
             elif ran and touched:
                 outcome, why = "fixed", f"prior PoC re-run no longer reaches the sink (exit {exit_code}): {reason}"
             elif ran:
@@ -2972,7 +3019,12 @@ def _regression_brief(
     re-run. Missing files on disk are tagged `[FILE DELETED ON DISK]` so the
     agent verifies true deletion vs rename/move before marking `fixed`.
     """
-    from core.database import prior_findings_touching, read_artifact
+    from core.database import (
+        prior_findings_touching,
+        read_artifact,
+        resolve_finding_abs_path,
+        run_target_roots,
+    )
     from core.llm_gateway import wrap_untrusted_content
 
     real_root = os.path.realpath(str(root))
@@ -2984,13 +3036,19 @@ def _regression_brief(
             continue
     try:
         prior = prior_findings_touching(
-            db_path, run_id, rels, scope_path=scope_path, include_untriaged=include_untriaged
+            db_path,
+            run_id,
+            rels,
+            scope_path=scope_path,
+            include_untriaged=include_untriaged,
+            target_root=real_root,
         )
     except Exception as exc:
         print(f"[REGRESSION BRIEF WARNING] {exc}", file=sys.stderr)
         return [], ""
     if not prior:
         return [], ""
+    roots_map = run_target_roots(db_path)
     for f in prior:
         has_poc = False
         try:
@@ -3029,12 +3087,12 @@ def _regression_brief(
         f = max(grp, key=_rep_rank)
         others = [int(g["id"]) for g in grp if int(g["id"]) != int(f["id"])]
         also = (", also " + ", ".join(f"#{oid}" for oid in others[:6]) + (f" (+{len(others) - 6})" if len(others) > 6 else "")) if others else ""
-        fp = str(f.get("filepath") or "").replace("\\", "/").lstrip("./")
         deleted_tag = ""
-        if fp and not os.path.isabs(fp) and ".." not in fp.split("/"):
-            cand = os.path.join(real_root, fp)
-            if not os.path.lexists(cand) and not os.path.exists(cand):
-                deleted_tag = " [FILE DELETED ON DISK]"
+        abs_fp = resolve_finding_abs_path(
+            str(f.get("filepath") or ""), f.get("run_id"), real_root, roots_map
+        )
+        if abs_fp and not os.path.lexists(abs_fp) and not os.path.exists(abs_fp):
+            deleted_tag = " [FILE DELETED ON DISK]"
         lines.append(
             f"#{f['id']} [{f.get('status')}]{deleted_tag} {f.get('filepath')}:{f.get('line_numbers') or '?'} "
             f"{str(f.get('title') or '')[:120]} "
@@ -3077,7 +3135,13 @@ def _regression_brief(
     return prior, text
 
 
-def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> dict:
+def _settle_regression_checks(
+    db_path: str,
+    run_id: str,
+    prior: list[dict],
+    *,
+    target_root: str = "",
+) -> dict:
     """After a change-scoped campaign: one decision per prior finding (grouped
     by non-empty `lineage_id` when multiple earlier runs reported the same
     defect), from the checks the stages recorded and from lineage, and the
@@ -3089,10 +3153,26 @@ def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> d
     disagreement; then a fixed check (dynamic before static), propagated across
     all open sibling rows of that lineage; then nothing, which is unverified.
     A fixed finding is closed as mitigated -- the operator chose this -- with
-    the evidence kind on the record. Returns the summary `{"still_present":
-    [...], "fixed": [...], "unverified": [...]}` of ids.
+    the evidence kind on the record.
+
+    When a `still_present` finding sits on a dead path (deleted on disk) AND
+    this run has a live confirmed finding (`CONFIRMED_LIVE_STATUSES`) at a
+    different existing filepath linked via `new_finding_id` or `lineage_id`,
+    the stale dead-path row is archived (`status='archived'`) with a note
+    pointing to the replacement finding so it does not re-trigger deleted-file
+    scans forever while keeping the active vulnerability open at its new path.
+    Returns the summary `{"still_present": [...], "fixed": [...], "unverified": [...]}` of ids.
     """
-    from core.database import mitigate_finding, read_findings, read_regression_checks
+    from core.database import (
+        CONFIRMED_LIVE_STATUSES,
+        _finding_run_root,
+        archive_relocated_finding,
+        mitigate_finding,
+        read_findings,
+        read_regression_checks,
+        resolve_finding_abs_path,
+        run_target_roots,
+    )
     from core.database import record_regression_check as _record
 
     summary = {"still_present": [], "fixed": [], "unverified": []}
@@ -3103,9 +3183,71 @@ def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> d
     except Exception:
         current = []
     by_lineage: dict = {}
+    current_by_id: dict[int, dict] = {}
     for f in current:
+        if f.get("id") is not None:
+            current_by_id[int(f["id"])] = f
         if f.get("lineage_id"):
             by_lineage.setdefault(str(f["lineage_id"]), []).append(f)
+
+    roots_map = run_target_roots(db_path)
+    fallback_root = (
+        os.path.realpath(str(target_root))
+        if target_root and os.path.isdir(str(target_root))
+        else ""
+    )
+    confirmed_live = set(CONFIRMED_LIVE_STATUSES)
+
+    def _find_relocation_target(
+        old_row: dict, old_abs: str, own_present_checks: list[dict],
+        all_present_checks: list[dict], rereported_rows: list[dict],
+    ) -> Optional[tuple[dict, str]]:
+        candidates: list[tuple[dict, str]] = []
+        seen_ids: set[int] = set()
+
+        def _add_candidate(row: Optional[dict], why_text: str) -> None:
+            if not row or row.get("id") is None:
+                return
+            cid = int(row["id"])
+            if cid in seen_ids:
+                return
+            seen_ids.add(cid)
+            st = str(row.get("status") or "").lower()
+            if st in confirmed_live:
+                candidates.append((row, why_text))
+            elif st == "duplicate_merged":
+                # Follow deduplicator merge within this run via shared lineage_id.
+                c_lin = str(row.get("lineage_id") or "").strip()
+                if c_lin:
+                    for sib in by_lineage.get(c_lin, ()):
+                        sid = sib.get("id")
+                        if sid is not None and int(sid) not in seen_ids:
+                            seen_ids.add(int(sid))
+                            if str(sib.get("status") or "").lower() in confirmed_live:
+                                candidates.append((sib, why_text))
+
+        for chk in (*own_present_checks, *all_present_checks):
+            nfid = chk.get("new_finding_id")
+            if nfid is not None:
+                try:
+                    _add_candidate(current_by_id.get(int(nfid)), str(chk.get("reason") or ""))
+                except (TypeError, ValueError):
+                    pass
+        for rr in rereported_rows:
+            _add_candidate(rr, "re-reported under same lineage at new path")
+
+        for cand, why_text in candidates:
+            cand_abs = resolve_finding_abs_path(
+                str(cand.get("filepath") or ""),
+                cand.get("run_id"),
+                fallback_root or _finding_run_root(old_row.get("run_id"), roots_map, fallback_root),
+                roots_map,
+            )
+            if not cand_abs or cand_abs == old_abs:
+                continue
+            if os.path.lexists(cand_abs) or os.path.exists(cand_abs):
+                return cand, why_text
+        return None
 
     groups: list[tuple[str, list[dict]]] = []
     grouped_by_lin: dict[str, list[dict]] = {}
@@ -3151,6 +3293,29 @@ def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> d
                             evidence=src["evidence"], node="harness",
                             new_finding_id=src.get("new_finding_id"),
                         )
+                # If the prior finding's own file no longer exists on disk AND this run
+                # confirmed the relocated vulnerability at a different existing file,
+                # archive the dead-path row so future changed scans do not re-trigger on it.
+                p_base = _finding_run_root(p.get("run_id"), roots_map, fallback_root)
+                if p_base and os.path.isdir(p_base):
+                    old_abs = resolve_finding_abs_path(
+                        str(p.get("filepath") or ""),
+                        p.get("run_id"),
+                        fallback_root,
+                        roots_map,
+                    )
+                    if old_abs and not os.path.lexists(old_abs) and not os.path.exists(old_abs):
+                        reloc = _find_relocation_target(p, old_abs, own_present, present, rereported)
+                        if reloc is not None:
+                            new_row, reloc_why = reloc
+                            archive_relocated_finding(
+                                db_path,
+                                pid,
+                                reloc_why or "file moved; defect remains open at new path",
+                                new_finding_id=int(new_row["id"]),
+                                new_filepath=str(new_row.get("filepath") or ""),
+                                by_run_id=run_id,
+                            )
         elif fixed:
             c = fixed[0]
             src_pid = int(c["prior_finding_id"])
@@ -3196,9 +3361,19 @@ def _format_regression_settlement_lines(
     """Builds `(is_untrusted, line)` pairs for the end-of-run `changed` mode
     regression summary, showing per-finding CWE, filepath, title, evidence,
     and reason instead of only raw numeric IDs."""
-    from core.database import read_regression_checks
+    from core.database import ARCHIVED_STATUS, read_findings, read_regression_checks
 
     by_id = {int(p["id"]): p for p in (prior or ()) if p.get("id") is not None}
+    current_status_by_id: dict[int, str] = {}
+    still_ids = {int(i) for i in (settled.get("still_present") or ())}
+    if still_ids and db_path and os.path.exists(db_path):
+        try:
+            for r in read_findings(db_path):
+                rid = r.get("id")
+                if rid is not None and int(rid) in still_ids:
+                    current_status_by_id[int(rid)] = str(r.get("status") or "").lower()
+        except Exception:
+            pass
     checks_by_id: dict[int, list[dict[str, Any]]] = {}
     try:
         for chk in read_regression_checks(db_path, run_id=run_id):
@@ -3250,7 +3425,15 @@ def _format_regression_settlement_lines(
                 detail = f" — [{ev}] {rsn}" if rsn else f" — [{ev}]"
             else:
                 detail = ""
-            lines.append((True, f"     - #{pid} [{cwe}] {fp}: {title}{detail}"))
+            reloc_note = ""
+            if key == "still_present" and current_status_by_id.get(int(pid)) == ARCHIVED_STATUS:
+                nfid = match.get("new_finding_id") if match else None
+                reloc_note = (
+                    f" (dead path archived; relocated -> #{nfid})"
+                    if nfid is not None
+                    else " (dead path archived)"
+                )
+            lines.append((True, f"     - #{pid} [{cwe}] {fp}: {title}{detail}{reloc_note}"))
         if len(ids) > max_per_section:
             lines.append(
                 (
@@ -4369,24 +4552,27 @@ async def pipeline(
     settle_priors = changed_files_override is None
     prior_in_scope: list[dict] = []
     if focus_files and settle_priors:
-        prior_in_scope, _brief = _regression_brief(
-            db_path, run_id, focus_files, str(resolved_path_root or target_path), str(target_path),
-            include_untriaged=False,
+        from core.database import prior_findings_touching_partitioned
+
+        _focus_rels: list[str] = []
+        for _f in focus_files:
+            try:
+                _focus_rels.append(os.path.relpath(os.path.realpath(str(_f)), _rel_root).replace(os.sep, "/"))
+            except ValueError:
+                continue
+        prior_in_scope, skipped_untriaged = prior_findings_touching_partitioned(
+            db_path,
+            run_id,
+            _focus_rels,
+            scope_path=str(target_path),
+            target_root=_rel_root,
         )
-        try:
-            all_prior_with_untriaged, _ = _regression_brief(
-                db_path, run_id, focus_files, str(resolved_path_root or target_path), str(target_path),
-                include_untriaged=True,
+        if skipped_untriaged > 0:
+            print(
+                f"[CHANGED] Ignored {skipped_untriaged} untriaged 'reported' row(s) from earlier runs "
+                f"(not confirmed active alerts); checking {len(prior_in_scope)} open confirmed finding(s).",
+                file=sys.stderr,
             )
-            skipped_untriaged = max(0, len(all_prior_with_untriaged) - len(prior_in_scope))
-            if skipped_untriaged > 0:
-                print(
-                    f"[CHANGED] Ignored {skipped_untriaged} untriaged 'reported' row(s) from earlier runs "
-                    f"(not confirmed active alerts); checking {len(prior_in_scope)} open confirmed finding(s).",
-                    file=sys.stderr,
-                )
-        except Exception:
-            pass
         if prior_in_scope:
             print(f"{len(prior_in_scope)} earlier confirmed finding(s) sit in the changed/deleted files; this run will say "
                   "whether each is still present or fixed.", file=sys.stderr)
@@ -5323,15 +5509,6 @@ async def pipeline(
                 campaign_prior_ids=tuple(
                     int(p["id"]) for p in (campaign_priors or ()) if p.get("id") is not None
                 ),
-                campaign_deleted_files=tuple(
-                    sorted(
-                        {
-                            os.path.relpath(os.path.realpath(str(df)), _rel_root).replace(os.sep, "/")
-                            for df in (group.get("focus") or ())
-                            if df and not os.path.exists(str(df))
-                        }
-                    )
-                ),
             )
             if resume_run_id:
                 _rehydrate_campaign_resume_state(
@@ -5941,7 +6118,9 @@ async def pipeline(
     # silence alone.
     if prior_in_scope:
         try:
-            settled = _settle_regression_checks(db_path, run_id, prior_in_scope)
+            settled = _settle_regression_checks(
+                db_path, run_id, prior_in_scope, target_root=str(resolved_path_root or target_path)
+            )
             for is_untrusted, line in _format_regression_settlement_lines(
                 db_path, run_id, prior_in_scope, settled
             ):
