@@ -316,6 +316,61 @@ class RemoteTargetEnvironmentTest(unittest.IsolatedAsyncioTestCase):
             current_run_context.reset(tok)
             await env.close()
 
+    async def test_failed_cd_does_not_execute_command_and_trailing_comment_works(self):
+        """[r4-remote-ack-cd]: Wrapping remote_shell_cmd in a POSIX brace group
+        prevents a failed `cd` from falling through to the user command in `$HOME`,
+        and places `}` on its own line so trailing `# comments` never break syntax."""
+        import shutil
+
+        # 1. Missing workdir: cd fails -> user command MUST NOT execute!
+        canary = self.local_dir / "escaped_canary.txt"
+        missing_wd = self.remote_dir / "nonexistent_workdir"
+        env_bad = RemoteTargetEnvironment(
+            target_path=str(self.local_dir),
+            transport="exec",
+            exec_argv=["/bin/sh", "-c"],
+            workdir=str(missing_wd),
+        )
+        # Skip initialize() mkdir so workdir genuinely does not exist when execute() runs.
+        env_bad._started = True
+        res = await env_bad.execute(f"printf 'ESCAPED' > {canary}")
+        self.assertFalse(
+            canary.exists(),
+            f"command executed despite failed cd into nonexistent workdir! stdout={res.stdout!r} stderr={res.stderr!r}",
+        )
+        self.assertNotEqual(res.exit_code, 0)
+        self.assertIn("SANDBOX-ERROR", f"{res.stdout}{res.stderr}")
+
+        # Even if initialize() ran and then the directory was removed mid-campaign:
+        vanished_wd = self.remote_dir / "vanished_dir"
+        vanished_wd.mkdir()
+        env_van = RemoteTargetEnvironment(
+            target_path=str(self.local_dir),
+            transport="exec",
+            exec_argv=["/bin/sh", "-c"],
+            workdir=str(vanished_wd),
+        )
+        await env_van.initialize()
+        shutil.rmtree(vanished_wd)
+        res2 = await env_van.execute(f"printf 'ESCAPED2' > {canary}")
+        self.assertFalse(canary.exists())
+        self.assertNotEqual(res2.exit_code, 0)
+
+        # 2. Valid workdir: trailing `# comment`, multi-line script, and empty command all work!
+        env_ok = self._make_exec_env()
+        await env_ok.initialize()
+        res_comment = await env_ok.execute("printf 'COMMENT_OK' # trailing comment must not eat brace")
+        self.assertEqual(res_comment.exit_code, 0, res_comment.stderr)
+        self.assertIn("COMMENT_OK", res_comment.stdout)
+
+        res_multi = await env_ok.execute("x=1\ny=2\nprintf '%s-%s' \"$x\" \"$y\" # end")
+        self.assertEqual(res_multi.exit_code, 0, res_multi.stderr)
+        self.assertIn("1-2", res_multi.stdout)
+
+        res_empty = await env_ok.execute("   ")
+        self.assertEqual(res_empty.exit_code, 0, res_empty.stderr)
+        await env_ok.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2968,6 +2968,32 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(eval_set.eval_set_id, "mantis_synthetic_webapp_deduplication_bench")
         self.assertGreaterEqual(len(eval_set.eval_cases), 4)
 
+        # Verify every golden tool call in deduplication.test.json uses a tool actually
+        # declared on the deduplicator node in workflow.json (`r4-dedupe-eval-golden`).
+        import inspect
+        from tools.research_tools import dedupe_findings as _dedupe_fn
+
+        with open(os.path.join(os.path.dirname(__file__), "workflow.json"), "r", encoding="utf-8") as wf_fh:
+            wf_raw = json.load(wf_fh)
+        dedupe_node = next(n for n in wf_raw["nodes"] if n["id"] == "deduplicator")
+        allowed_dedupe_tools = set(dedupe_node["tools"])
+        dedupe_params = set(inspect.signature(_dedupe_fn).parameters.keys())
+        saw_dedupe_call = False
+        for case in raw_data["eval_cases"]:
+            for turn in case.get("conversation", []):
+                for use in turn.get("intermediate_data", {}).get("tool_uses", []):
+                    t_name = use["name"]
+                    self.assertIn(
+                        t_name,
+                        allowed_dedupe_tools,
+                        f"eval case {case['eval_id']} expects tool {t_name!r} not in deduplicator tools {sorted(allowed_dedupe_tools)}",
+                    )
+                    if t_name == "dedupe_findings":
+                        saw_dedupe_call = True
+                        unknown_args = set((use.get("args") or {}).keys()) - dedupe_params
+                        self.assertEqual(unknown_args, set(), f"unknown dedupe_findings args: {unknown_args}")
+        self.assertTrue(saw_dedupe_call, "deduplication.test.json must include dedupe_findings golden calls")
+
         with open(synthetic_path, "r", encoding="utf-8") as f:
             raw_syn = json.load(f)
         self.assertIn("findings", raw_syn)
