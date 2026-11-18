@@ -1124,6 +1124,359 @@ class SandboxGateInvariantsTest(IsolatedAsyncioTestCase):
                 wrapper_flag.unlink(missing_ok=True)
                 await rem_env.close()
 
+    async def test_patch_applied_latches_across_failed_second_patch_and_rollback(self):
+        """[r4-patch-applied-reset]: A failed first patch keeps patch_applied=False,
+        but once a patch applies cleanly inside a patcher visit, a later failed
+        apply_patch or rolled-back write_file must NOT clear patch_applied."""
+        from core.graph_loader import _stamp_active_node
+        import tools.research_tools as rt
+
+        class _MultiPatchSandbox(BaseEnvironment):
+            def __init__(self, root: Path):
+                self.target_path = str(root)
+                self._root = root
+                self.patch_outcomes: list[str] = []
+                self.rebuild_cmd = "make"
+                self.rebuild_rc = 0
+
+            @property
+            def working_dir(self) -> Path:
+                return self._root
+
+            async def preflight(self):
+                return True
+
+            async def initialize(self):
+                pass
+
+            async def execute(self, command: str, timeout: int = 30) -> ExecutionResult:
+                return ExecutionResult(stdout="blocked cleanly\n", stderr="", exit_code=0)
+
+            async def read_file(self, rel_path: Path) -> bytes:
+                raise FileNotFoundError(str(rel_path))
+
+            async def write_file(self, rel_path: Path, content: str) -> None:
+                pass
+
+            async def list_files(self, rel_dir: str = "") -> list[str]:
+                return ["app.py"]
+
+            async def apply_patch(self, diff_content: str) -> str:
+                return self.patch_outcomes.pop(0)
+
+            async def write_file_and_rebuild(self, rel_path: Path, content: str):
+                return self.rebuild_rc, "rebuild output"
+
+            async def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="mantis_patch_latch_") as td:
+            root = Path(td)
+            (root / "app.py").write_text("def handle(x): return eval(x)\n", encoding="utf-8")
+            db_p = str(root / "latch.db")
+            fid = _insert_confirmed_finding(db_p, "r-latch", "Multi-finding patch latch")
+            sb = _MultiPatchSandbox(root)
+            ctx = RunContext(
+                jail_dir=str(root),
+                db_path=db_p,
+                run_id="r-latch",
+                target_file="app.py",
+                active_node="reproducer",
+                sandbox=sb,
+                sandbox_executed=True,
+            )
+            ctx.finding_evidence[str(fid)] = {
+                "reproduced": True,
+                "reattacked": False,
+                "reattack_present": False,
+                "sink_symbol": "",
+                "reason": "",
+            }
+            tok = current_run_context.set(ctx)
+            try:
+                _stamp_active_node("patcher")
+                self.assertIs(ctx.patch_applied, False)
+
+                # 1. First apply_patch fails -> stays False (no patch applied yet!).
+                sb.patch_outcomes.append("exit=1\npatch failed: hunk #1 rejected")
+                await apply_patch("bad diff")
+                self.assertIs(ctx.patch_applied, False)
+
+                # First write_file_and_rebuild fails and rolls back -> STILL False!
+                sb.rebuild_rc = 2
+                rb_fail = await rt.write_file("app.py", "broken(")
+                self.assertIn("rolled back", rb_fail)
+                self.assertIs(ctx.patch_applied, False)
+
+                # 2. First patch applies cleanly -> latches True!
+                sb.patch_outcomes.append("exit=0\npatch applied cleanly")
+                await apply_patch("good diff 1")
+                self.assertIs(ctx.patch_applied, True)
+
+                res1 = await run_sandbox_with_evidence("python3 poc1.py", finding_id=fid)
+                self.assertFalse(res1["inconclusive"], res1)
+                self.assertTrue(ctx.finding_evidence[str(fid)]["reattacked"])
+
+                # 3. Second apply_patch fails -> invalidates prior re-attack,
+                #    but MUST keep patch_applied latched True!
+                sb.patch_outcomes.append("exit=1\npatch failed: context mismatch")
+                await apply_patch("bad diff 2")
+                self.assertIs(ctx.patch_applied, True, "failed second patch wiped patch_applied!")
+                self.assertFalse(ctx.finding_evidence[str(fid)]["reattacked"])
+
+                # 4. Subsequent rolled-back write_file_and_rebuild ALSO keeps patch_applied True!
+                sb.rebuild_rc = 2
+                await rt.write_file("app.py", "still broken(")
+                self.assertIs(ctx.patch_applied, True, "rolled-back write_file wiped patch_applied!")
+
+                # 5. Re-attack succeeds and Finding 1 verifies as VERIFIED_SECURE!
+                res2 = await run_sandbox_with_evidence("python3 poc1.py", finding_id=fid)
+                self.assertFalse(res2["evidence_present"])
+                self.assertTrue(res2["ran"])
+                self.assertFalse(res2["inconclusive"])
+                self.assertTrue(ctx.finding_evidence[str(fid)]["reattacked"])
+                out = record_patch(
+                    finding_id=fid,
+                    patch_diff="--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-eval(x)\n+int(x)\n",
+                    reattack_status="failed_to_bypass",
+                )
+                self.assertIn("VERIFIED_SECURE", out)
+            finally:
+                current_run_context.reset(tok)
+
+    async def test_inconclusive_reason_and_flags_surfaced_to_caller(self):
+        """[r4-inconclusive-reason-hidden]: run_sandbox_with_evidence must return the
+        explicit inconclusive cause and `ran`/`inconclusive` booleans to the model."""
+        from core.graph_loader import _stamp_active_node
+
+        class _ScriptedSandbox(BaseEnvironment):
+            def __init__(self, root: Path):
+                self.target_path = str(root)
+                self._root = root
+                self.next_result = ExecutionResult(stdout="ok\n", stderr="", exit_code=0)
+
+            @property
+            def working_dir(self) -> Path:
+                return self._root
+
+            async def preflight(self):
+                return True
+
+            async def initialize(self):
+                pass
+
+            async def execute(self, command: str, timeout: int = 30) -> ExecutionResult:
+                return self.next_result
+
+            async def read_file(self, rel_path: Path) -> bytes:
+                raise FileNotFoundError(str(rel_path))
+
+            async def write_file(self, rel_path: Path, content: str) -> None:
+                pass
+
+            async def apply_patch(self, diff_content: str) -> str:
+                return "exit=0"
+
+            async def list_files(self, rel_dir: str = "") -> list[str]:
+                return ["app.py"]
+
+            async def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="mantis_inconc_reason_") as td:
+            root = Path(td)
+            sb = _ScriptedSandbox(root)
+            db_p = str(root / "inc.db")
+            fid = _insert_confirmed_finding(db_p, "r-inc", "Inconclusive cause surface")
+            ctx = RunContext(
+                jail_dir=str(root),
+                db_path=db_p,
+                run_id="r-inc",
+                target_file="app.py",
+                active_node="reproducer",
+                sandbox=sb,
+            )
+            tok = current_run_context.set(ctx)
+            try:
+                _stamp_active_node("patcher")
+                # 1. No patch applied before re-attack -> explicit reason returned to model!
+                r_nopatch = await run_sandbox_with_evidence("echo clean", finding_id=fid)
+                self.assertFalse(r_nopatch["evidence_present"])
+                self.assertTrue(r_nopatch["inconclusive"])
+                self.assertIn("EVIDENCE_ABSENT:", r_nopatch["evidence_reason"])
+                self.assertIn("no patch applied in patcher stage", r_nopatch["evidence_reason"])
+                self.assertIn("apply_patch", r_nopatch["evidence_reason"])
+
+                # Apply a patch so subsequent checks isolate timeout / setup failure / clean run.
+                ctx.patch_applied = True
+
+                # 2. Timed-out re-attack -> explicit timeout cause + ran=False + inconclusive=True.
+                sb.next_result = ExecutionResult(stdout="", stderr="", exit_code=124, timed_out=True)
+                r_to = await run_sandbox_with_evidence("python3 slow_poc.py", finding_id=fid)
+                self.assertFalse(r_to["evidence_present"])
+                self.assertFalse(r_to["ran"])
+                self.assertTrue(r_to["inconclusive"])
+                self.assertIn("timed out", r_to["evidence_reason"])
+
+                # 3. Missing module / import error -> explicit cause + ran=False + inconclusive=True.
+                sb.next_result = ExecutionResult(
+                    stdout="",
+                    stderr="ModuleNotFoundError: No module named 'missing_dep'\n",
+                    exit_code=1,
+                )
+                r_imp = await run_sandbox_with_evidence("python3 poc.py", finding_id=fid)
+                self.assertFalse(r_imp["evidence_present"])
+                self.assertFalse(r_imp["ran"])
+                self.assertTrue(r_imp["inconclusive"])
+                self.assertTrue(r_imp["evidence_reason"].startswith("EVIDENCE_ABSENT:"))
+                self.assertIn("import", r_imp["evidence_reason"].lower())
+
+                # 4. Clean run after patch -> ran=True, inconclusive=False.
+                sb.next_result = ExecutionResult(stdout="safe rejection\n", stderr="", exit_code=0)
+                r_ok = await run_sandbox_with_evidence("python3 poc.py", finding_id=fid)
+                self.assertFalse(r_ok["evidence_present"])
+                self.assertTrue(r_ok["ran"])
+                self.assertFalse(r_ok["inconclusive"])
+            finally:
+                current_run_context.reset(tok)
+
+    async def test_channel_b_crash_proof_survives_sentinel_read_error(self):
+        """[r4-sentinel-error-overrides-crash]: Positive Channel-B sanitizer crash proof
+        naming the sink must survive a sidecar sentinel read error in BOTH reproducer
+        and patcher (fail-closed: a real crash bypass beats a sentinel read error)."""
+        asan_trace = (
+            "==4242==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000018\n"
+            "READ of size 8 at 0x602000000018 thread T0\n"
+            "    #0 0x4012ab in parse_header src/parser.c:88\n"
+            "    #1 0x401500 in main src/main.c:12\n"
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow src/parser.c:88 in parse_header\n"
+        )
+
+        class _BrokenSentinelSandbox(BaseEnvironment):
+            def __init__(self, root: Path, output_text: str, exit_code: int):
+                self.target_path = str(root)
+                self._root = root
+                self.output_text = output_text
+                self.exit_code = exit_code
+
+            @property
+            def working_dir(self) -> Path:
+                return self._root
+
+            async def preflight(self):
+                return True
+
+            async def initialize(self):
+                pass
+
+            async def execute(self, command: str, timeout: int = 30) -> ExecutionResult:
+                return ExecutionResult(stdout="", stderr=self.output_text, exit_code=self.exit_code)
+
+            async def read_file(self, rel_path: Path) -> bytes:
+                raise RuntimeError("remote sidecar transport dropped")
+
+            async def write_file(self, rel_path: Path, content: str) -> None:
+                pass
+
+            async def apply_patch(self, diff_content: str) -> str:
+                return "exit=0"
+
+            async def list_files(self, rel_dir: str = "") -> list[str]:
+                return ["src/parser.c"]
+
+            async def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="mantis_sentinel_crash_") as td:
+            root = Path(td)
+            db_p = str(root / "crash.db")
+            fid = _insert_confirmed_finding(db_p, "r-crash", "ASan crash survives read error", filepath="src/parser.c")
+
+            # 1. Reproducer: ASan trace + sentinel read error -> positive evidence preserved!
+            sb_crash = _BrokenSentinelSandbox(root, asan_trace, exit_code=1)
+            ctx_repro = RunContext(
+                jail_dir=str(root),
+                db_path=db_p,
+                run_id="r-crash",
+                target_file="src/parser.c",
+                active_node="reproducer",
+                sandbox=sb_crash,
+            )
+            tok = current_run_context.set(ctx_repro)
+            try:
+                res = await run_sandbox_with_evidence(
+                    "./target poc.bin",
+                    sentinel_path=f"sentinel_{fid}",
+                    sink_symbol="parse_header",
+                    finding_id=fid,
+                )
+                self.assertTrue(res["evidence_present"], res)
+                self.assertTrue(res["ran"], res)
+                self.assertFalse(res["inconclusive"], res)
+                self.assertIn("could not be read", res["evidence_reason"])
+                self.assertTrue(ctx_repro.sandbox_executed)
+                self.assertTrue(ctx_repro.finding_evidence[str(fid)]["reproduced"])
+            finally:
+                current_run_context.reset(tok)
+
+            # 2. Patcher: ASan trace + sentinel read error -> fail-closed bypass preserved!
+            ctx_patch = RunContext(
+                jail_dir=str(root),
+                db_path=db_p,
+                run_id="r-crash",
+                target_file="src/parser.c",
+                active_node="patcher",
+                sandbox=sb_crash,
+                sandbox_executed=True,
+                patch_applied=True,
+            )
+            ctx_patch.finding_evidence[str(fid)] = {
+                "reproduced": True,
+                "reattacked": False,
+                "reattack_present": False,
+                "sink_symbol": "parse_header",
+                "reason": "",
+            }
+            tok2 = current_run_context.set(ctx_patch)
+            try:
+                res_p = await run_sandbox_with_evidence(
+                    "./target poc.bin",
+                    sentinel_path=f"sentinel_{fid}",
+                    sink_symbol="parse_header",
+                    finding_id=fid,
+                )
+                self.assertTrue(res_p["evidence_present"], res_p)
+                self.assertTrue(ctx_patch.finding_evidence[str(fid)]["reattack_present"])
+                self.assertFalse(ctx_patch.finding_evidence[str(fid)]["last_reattack_inconclusive"])
+            finally:
+                current_run_context.reset(tok2)
+
+            # 3. Benign output + sentinel read error -> stays inconclusive (no crash proof)!
+            sb_benign = _BrokenSentinelSandbox(root, "exited normally\n", exit_code=0)
+            ctx_benign = RunContext(
+                jail_dir=str(root),
+                db_path=db_p,
+                run_id="r-crash",
+                target_file="src/parser.c",
+                active_node="patcher",
+                sandbox=sb_benign,
+                patch_applied=True,
+            )
+            tok3 = current_run_context.set(ctx_benign)
+            try:
+                res_b = await run_sandbox_with_evidence(
+                    "./target poc.bin",
+                    sentinel_path=f"sentinel_{fid}",
+                    sink_symbol="parse_header",
+                    finding_id=fid,
+                )
+                self.assertFalse(res_b["evidence_present"])
+                self.assertFalse(res_b["ran"])
+                self.assertTrue(res_b["inconclusive"])
+                self.assertIn("failed to read sidecar sentinel", res_b["evidence_reason"])
+            finally:
+                current_run_context.reset(tok3)
+
 
 if __name__ == "__main__":
     unittest.main()
