@@ -278,7 +278,12 @@ class RemoteTargetEnvironment(BaseEnvironment):
             argv.extend(["-w", self._workdir_posix, self.container, "sh", "-c", remote_shell_cmd])
             return argv
 
-        cd_wrapped = f"cd {shlex.quote(self._workdir_posix)} && {remote_shell_cmd}"
+        # Wrap in a POSIX brace group with `}` on its own line so:
+        # 1. A failed `cd` aborts BEFORE multi-line commands (including `execute()`'s
+        #    `printf ack >&2\n<user_cmd>`) execute in the login directory (`r4-remote-ack-cd`).
+        # 2. A trailing `# comment` in `remote_shell_cmd` cannot swallow the closing `}`.
+        body = remote_shell_cmd if remote_shell_cmd.strip() else ":"
+        cd_wrapped = f"cd {shlex.quote(self._workdir_posix)} && {{\n{body}\n}}"
         if self.transport == "ssh":
             argv = [
                 self.ssh_bin,

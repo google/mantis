@@ -37,11 +37,14 @@ if str(_REF_ROOT) not in sys.path:
 from core.budget import BudgetConfig, BudgetController, BudgetExceededError
 from core.context import RunContext, current_run_context
 from core.cost import (
+    changed_files,
     covered_below_depth,
     has_active_file_sweep,
     load_run_plan,
+    record_coverage_files,
     record_run_plan,
     record_spend,
+    scope_identities,
     uncovered_files,
 )
 from core.database import init_db, read_risk_scores, record_calibration, record_run
@@ -724,6 +727,277 @@ class RepoDocsBatchAndLiveSmokeFixesTest(unittest.TestCase):
         self.assertEqual(len(rows2), 1)
         self.assertAlmostEqual(rows2[0]["score"], 9.5)
         self.assertEqual(rows2[0]["reasoning"], "Critical auth bypass")
+
+    def test_shallow_scan_does_not_hide_file_edit_from_deeper_runs(self):
+        """[r4-depth-change-detection]: A --depth 5 triage after an edit must not hide
+        the edited file from a subsequent --depth 30 scan."""
+        repo = self.root / "depth_change_repo"
+        repo.mkdir()
+        a = repo / "a.py"
+        b = repo / "b.py"
+        a.write_text("def a(): return 1\n", encoding="utf-8")
+        b.write_text("def b(): return 1\n", encoding="utf-8")
+        files = [str(a), str(b)]
+        model = "vertex_ai/gemini-3.8-flash"
+
+        # Run 1 at depth 30 covers the repo with v1 hashes.
+        record_run(self.db, "run_d30", model=model)
+        record_spend(
+            self.db, "run_d30", str(repo), mantis_main.SCAN_MODE_WHOLE,
+            tokens=5000, metadata={"failed": False, "depth": 30},
+        )
+        record_coverage_files(self.db, "run_d30", str(repo), scope_identities(files))
+        self.assertEqual(uncovered_files(self.db, files, model=model, min_depth=30), [])
+
+        # Edit a.py -> v2 (different size so mtime/size cache never collides).
+        a.write_text("def a():\n    return 2 + 2  # edited\n", encoding="utf-8")
+
+        # Run 2 at depth 5 records the new v2 hash.
+        record_run(self.db, "run_d5", model=model)
+        record_spend(
+            self.db, "run_d5", str(repo), mantis_main.SCAN_MODE_WHOLE,
+            tokens=1000, metadata={"failed": False, "depth": 5},
+        )
+        record_coverage_files(self.db, "run_d5", str(repo), scope_identities(files))
+
+        # At min_depth=5 (or None), a.py is covered as v2.
+        self.assertEqual(uncovered_files(self.db, files, model=model, min_depth=5), [])
+        self.assertEqual(uncovered_files(self.db, files, model=model, min_depth=None), [])
+        self.assertEqual(changed_files(self.db, files, model=model), {"files": []})
+
+        # At min_depth=30, the depth-5 row must NOT hide the edit to a.py!
+        self.assertEqual(uncovered_files(self.db, files, model=model, min_depth=30), [str(a)])
+        self.assertEqual(
+            changed_files(self.db, files, model=model, min_depth=30),
+            {"files": [str(a)]},
+        )
+
+    def test_mixed_depth_resume_under_one_run_id_and_legacy_null_depth_rows(self):
+        """[r4-depth-change-detection]: Filtering by (run_id, campaign_target) separates
+        mixed-depth campaigns resumed under ONE run_id, while preserving legacy depth-less
+        (INV-6) and imported coverage rows."""
+        repo = self.root / "mixed_resume_repo"
+        dir_a = repo / "dirA"
+        dir_b = repo / "dirB"
+        dir_c = repo / "dirC"
+        for d in (dir_a, dir_b, dir_c):
+            d.mkdir(parents=True)
+        fa = dir_a / "a.py"
+        fb = dir_b / "b.py"
+        fc = dir_c / "c.py"
+        fa.write_text("x = 1\n", encoding="utf-8")
+        fb.write_text("y = 1\n", encoding="utf-8")
+        fc.write_text("z = 1\n", encoding="utf-8")
+        model = "vertex_ai/gemini-3.8-flash"
+
+        # Baseline depth-30 run covers dirA and dirB; legacy depth-less import covers dirC.
+        record_run(self.db, "run_base", model=model)
+        record_spend(self.db, "run_base", str(dir_a), "cross-functional", tokens=4000, metadata={"depth": 30})
+        record_coverage_files(self.db, "run_base", str(dir_a), scope_identities([str(fa)]))
+        record_spend(self.db, "run_base", str(dir_b), "cross-functional", tokens=4000, metadata={"depth": 30})
+        record_coverage_files(self.db, "run_base", str(dir_b), scope_identities([str(fb)]))
+
+        # Imported legacy row: campaign_spend has per-file target with NO depth,
+        # while coverage_files records campaign_target=str(repo) (knowledge.py shape).
+        record_run(self.db, "run_imported", model=model)
+        record_spend(self.db, "run_imported", str(fc), "whole", tokens=0, metadata={"imported": True})
+        record_coverage_files(self.db, "run_imported", str(repo), scope_identities([str(fc)]))
+
+        # Edit a.py and b.py.
+        fa.write_text("x = 2  # modified\n", encoding="utf-8")
+        fb.write_text("y = 2  # modified\n", encoding="utf-8")
+
+        # ONE resumed run_id ("run_mixed") scans dirA at depth=30, then resumes dirB at depth=5!
+        record_run(self.db, "run_mixed", model=model)
+        record_spend(self.db, "run_mixed", str(dir_a), "cross-functional", tokens=4000, metadata={"depth": 30})
+        record_coverage_files(self.db, "run_mixed", str(dir_a), scope_identities([str(fa)]))
+        record_spend(self.db, "run_mixed", str(dir_b), "cross-functional", tokens=1000, metadata={"depth": 5})
+        record_coverage_files(self.db, "run_mixed", str(dir_b), scope_identities([str(fb)]))
+
+        # Under min_depth=30:
+        # - dirA/a.py was re-scanned at depth 30 -> covered.
+        # - dirB/b.py was only re-scanned at depth 5 (under the SAME run_id!) -> still uncovered!
+        # - dirC/c.py has legacy NULL depth (INV-6) -> still covered even at min_depth=100!
+        self.assertEqual(
+            uncovered_files(self.db, [str(fa), str(fb), str(fc)], model=model, min_depth=30),
+            [str(fb)],
+        )
+        # If legacy c.py is later edited, min_depth=100 still sees the change against the imported row.
+        fc.write_text("z = 999  # edited legacy\n", encoding="utf-8")
+        self.assertEqual(
+            uncovered_files(self.db, [str(fc)], model=model, min_depth=100),
+            [str(fc)],
+        )
+
+    def test_has_active_file_sweep_scopes_to_newest_coverage_earning_run(self):
+        """[r4-sticky-file-sweep]: One historical per-file campaign must not permanently lock
+        future default runs into file-by-file sweeps once a newer batch/whole run supersedes it."""
+        repo = self.root / "large_sticky_repo"
+        repo.mkdir()
+        files = []
+        for i in range(1050):
+            p = repo / f"mod_{i:04d}.py"
+            p.write_text(f"def f_{i}(): return {i}\n", encoding="utf-8")
+            files.append(str(p))
+        other_repo = self.root / "other_sticky_repo"
+        other_repo.mkdir()
+        other_files = []
+        for i in range(3):
+            p = other_repo / f"o_{i}.py"
+            p.write_text(f"def o_{i}(): return {i}\n", encoding="utf-8")
+            other_files.append(str(p))
+        model = "vertex_ai/gemini-3.8-flash"
+
+        # 1. Start with a paused file-by-file (or --scan-mode uncovered) sweep -> active.
+        record_run(self.db, "r1_sweep", model=model)
+        record_spend(
+            self.db, "r1_sweep", files[0], mantis_main.SCAN_MODE_FILE_BY_FILE,
+            tokens=2000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 2. A FAILED cross-functional run does not supersede the sweep.
+        record_run(self.db, "r2_failed", model=model)
+        record_spend(
+            self.db, "r2_failed", files[1], mantis_main.SCAN_MODE_CROSS_FUNCTIONAL,
+            tokens=2000, metadata={"failed": True, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 3. A completed cross-functional batch run supersedes the old file sweep.
+        record_run(self.db, "r3_batch", model=model)
+        record_spend(
+            self.db, "r3_batch", files[2], mantis_main.SCAN_MODE_CROSS_FUNCTIONAL,
+            tokens=10_000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertFalse(has_active_file_sweep(self.db, files, model=model))
+
+        # 4. A newer file-by-file run on an UNRELATED repo must not flip this repo back.
+        record_run(self.db, "r4_other", model=model)
+        record_spend(
+            self.db, "r4_other", other_files[0], mantis_main.SCAN_MODE_FILE_BY_FILE,
+            tokens=2000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertFalse(has_active_file_sweep(self.db, files, model=model))
+
+        # End-to-end: plain `auto` on the >1000-file repo stays in depth batches!
+        scope: dict = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            _t, _a, mode = mantis_main.resolve_scan_targets(
+                repo,
+                {"depth": 30, "default_model": model},
+                files,
+                precomputed_astm={"slices": []},
+                db_path=self.db,
+                scope_out=scope,
+            )
+        self.assertEqual(mode, mantis_main.SCAN_MODE_CROSS_FUNCTIONAL)
+
+        # 5. Starting a new file-by-file run on THIS repo activates sweep continuation again.
+        record_run(self.db, "r5_new_sweep", model=model)
+        record_spend(
+            self.db, "r5_new_sweep", files[3], mantis_main.SCAN_MODE_FILE_BY_FILE,
+            tokens=2000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+    def test_has_active_file_sweep_ignores_changed_and_narrow_subdir_runs(self):
+        """A small `--scan-mode changed` run or narrow subdirectory scan (e.g. `lib/`)
+        must neither terminate an active repo-wide file-by-file sweep nor lock the
+        entire repository into per-file sweeps."""
+        repo = self.root / "scoped_sweep_repo"
+        src_dir = repo / "src"
+        lib_dir = repo / "lib"
+        src_dir.mkdir(parents=True)
+        lib_dir.mkdir(parents=True)
+        src_file = src_dir / "main.py"
+        lib_file = lib_dir / "util.py"
+        src_file.write_text("x = 1\n", encoding="utf-8")
+        lib_file.write_text("y = 1\n", encoding="utf-8")
+        files = [str(src_file), str(lib_file)]
+        model = "vertex_ai/gemini-3.8-flash"
+
+        # 1. Start a repo-wide file-by-file sweep -> active.
+        record_run(
+            self.db, "r_full_sweep", model=model,
+            metadata={"target": str(repo), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_full_sweep", str(src_file), mantis_main.SCAN_MODE_FILE_BY_FILE,
+            tokens=2000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 2. A newer `--scan-mode changed` run on lib/ (or even repo root) must NOT end it.
+        record_run(
+            self.db, "r_chg_lib", model=model,
+            metadata={"target": str(repo), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_chg_lib", str(lib_dir), mantis_main.SCAN_MODE_CHANGED,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+        record_spend(
+            self.db, "r_chg_lib", str(repo), mantis_main.SCAN_MODE_CHANGED,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 3. A newer narrow `whole` scan strictly on lib/ (or lib/util.py) must NOT end it.
+        record_run(
+            self.db, "r_whole_lib", model=model,
+            metadata={"target": str(lib_dir), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_whole_lib", str(lib_dir), mantis_main.SCAN_MODE_WHOLE,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # Even a legacy `whole` row lacking `runs.metadata_json.target` (only `target_root`) on lib/ must NOT end it.
+        record_run(
+            self.db, "r_whole_lib_legacy", model=model,
+            metadata={"target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_whole_lib_legacy", str(lib_dir), mantis_main.SCAN_MODE_WHOLE,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 4. A newer narrow `cross-functional` run targeting ONLY lib/ must NOT end it.
+        record_run(
+            self.db, "r_cf_lib", model=model,
+            metadata={"target": str(lib_dir), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_cf_lib", str(lib_file), mantis_main.SCAN_MODE_CROSS_FUNCTIONAL,
+            tokens=3000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 5. A FULL-REPO `whole` run on `repo` DOES end the sweep!
+        record_run(
+            self.db, "r_whole_repo", model=model,
+            metadata={"target": str(repo), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_whole_repo", str(repo), mantis_main.SCAN_MODE_WHOLE,
+            tokens=8000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertFalse(has_active_file_sweep(self.db, files, model=model))
+
+        # 6. A narrow `file-by-file` run targeting ONLY lib/ must NOT activate a repo-wide sweep!
+        record_run(
+            self.db, "r_sweep_lib_only", model=model,
+            metadata={"target": str(lib_dir), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_sweep_lib_only", str(lib_file), mantis_main.SCAN_MODE_FILE_BY_FILE,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertFalse(has_active_file_sweep(self.db, files, model=model))
 
 
 if __name__ == "__main__":

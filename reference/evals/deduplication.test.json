@@ -33,33 +33,17 @@
                 }
               },
               {
-                "name": "report_findings",
+                "name": "dedupe_findings",
                 "args": {
-                  "report": {
-                    "findings": [
-                      {
-                        "id": 101,
-                        "title": "Unbounded memory consumption via unconstrained deserialization in session state hydration",
-                        "severity": "HIGH",
-                        "status": "reported",
-                        "filepath": "services/cart/session.py",
-                        "lines": [
-                          42,
-                          43
-                        ]
-                      },
-                      {
-                        "id": 102,
-                        "title": "Denial of service through malformed shopping bag payload header",
-                        "severity": "HIGH",
-                        "status": "duplicate_merged",
-                        "filepath": "controllers/cart_controller.py",
-                        "lines": [
-                          18
-                        ]
-                      }
-                    ]
-                  }
+                  "primary_id": 101,
+                  "duplicate_ids": [
+                    102
+                  ],
+                  "primary_title": "Unbounded memory consumption via unconstrained deserialization in session state hydration",
+                  "duplicate_titles": [
+                    "Denial of service through malformed shopping bag payload header"
+                  ],
+                  "reason": "Finding 102 in controllers/cart_controller.py:18 is a duplicate manifestation of the same unconstrained deserialization flaw in services/cart/session.py:42."
                 }
               }
             ],
@@ -105,32 +89,17 @@
                 }
               },
               {
-                "name": "report_findings",
+                "name": "dedupe_findings",
                 "args": {
-                  "report": {
-                    "findings": [
-                      {
-                        "id": 201,
-                        "title": "Missing tenant boundary enforcement in API request routing",
-                        "severity": "CRITICAL",
-                        "status": "reported",
-                        "filepath": "api/gateway.py",
-                        "lines": [
-                          115
-                        ]
-                      },
-                      {
-                        "id": 202,
-                        "title": "Insecure Direct Object Reference (IDOR) via unauthenticated tenant header override",
-                        "severity": "CRITICAL",
-                        "status": "duplicate_merged",
-                        "filepath": "middleware/context.py",
-                        "lines": [
-                          34
-                        ]
-                      }
-                    ]
-                  }
+                  "primary_id": 201,
+                  "duplicate_ids": [
+                    202
+                  ],
+                  "primary_title": "Missing tenant boundary enforcement in API request routing",
+                  "duplicate_titles": [
+                    "Insecure Direct Object Reference (IDOR) via unauthenticated tenant header override"
+                  ],
+                  "reason": "Finding 202 in middleware/context.py:34 traces to the identical underlying context propagation flaw as Finding 201 in api/gateway.py:115."
                 }
               }
             ],

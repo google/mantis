@@ -314,12 +314,25 @@ def record_coverage_files(db_path: str, run_id: str, campaign_target: str,
                 pass
 
 
-def _covered_identities(db_path: str, model: str = "", run_id: str = "") -> dict:
+def _covered_identities(
+    db_path: str,
+    model: str = "",
+    run_id: str = "",
+    min_depth: Optional[int] = None,
+) -> dict:
     """Every path with recorded content, mapped to the most recent identity
     `((content_hash, size | None, mtime_ns | None),)` it was covered as -- by
     this model and by unknown models when `model` is given (the rule
     _completed_coverage follows), by one run when `run_id` is given. `{}`
     when the ledger records no content.
+
+    When `min_depth` is given, only `coverage_files` rows belonging to a
+    qualifying `(run_id, campaign_target)` row in `campaign_spend` (non-failed,
+    non-unexamined, and recorded depth `>= min_depth` or `None` for legacy/
+    imported INV-6 rows) are included. This prevents a shallow triage (e.g.
+    `--depth 5`) or a mixed-depth `--resume --depth M` campaign under the same
+    `run_id` from recording a fresh file hash that hides an edit from deeper
+    runs (`r4-depth-change-detection`).
 
     Only the latest recorded row per path counts: if a file was scanned at H1,
     fixed and scanned at H2, and later reverted back to H1, comparing against
@@ -332,7 +345,7 @@ def _covered_identities(db_path: str, model: str = "", run_id: str = "") -> dict
     try:
         if not has_coverage_files_table(conn):
             return {}
-        rows = _content_rows(conn, model, run_id)
+        rows = _content_rows(conn, model, run_id, min_depth=min_depth)
     finally:
         conn.close()
     out: dict = {}
@@ -342,26 +355,154 @@ def _covered_identities(db_path: str, model: str = "", run_id: str = "") -> dict
     return out
 
 
-def _content_rows(conn: sqlite3.Connection, model: str = "", run_id: str = "") -> list:
+def _depth_spend_filter(
+    conn: sqlite3.Connection,
+    model: str,
+    min_depth: int,
+    run_id: str = "",
+) -> Optional[tuple[set, set, set, set]]:
+    """Returns `(seen_pairs, qualifying_pairs, seen_runs, qualifying_runs)` from
+    `campaign_spend` for depth-filtering `coverage_files` rows, or `None` when
+    the `campaign_spend` table does not exist.
+
+    Keyed by `(run_id, normalized_target)` so mixed-depth `--resume --depth M`
+    runs under a single `run_id` exclude shallow targets without disqualifying
+    deeper targets from the same run. Rows with no recorded depth (`None`) count
+    as qualifying at every `min_depth` (INV-6).
+    """
+    try:
+        if run_id:
+            spend_rows = conn.execute(
+                "SELECT run_id, target, metadata_json FROM campaign_spend "
+                "WHERE run_id = ? AND target IS NOT NULL",
+                (str(run_id),),
+            ).fetchall()
+        else:
+            has_runs = model and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+            ).fetchone()
+            if has_runs:
+                spend_rows = conn.execute(
+                    "SELECT s.run_id, s.target, s.metadata_json FROM campaign_spend s "
+                    "LEFT JOIN runs r ON r.run_id = s.run_id "
+                    "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                    (str(model),),
+                ).fetchall()
+            else:
+                spend_rows = conn.execute(
+                    "SELECT run_id, target, metadata_json FROM campaign_spend "
+                    "WHERE target IS NOT NULL"
+                ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
+    depth_floor = int(min_depth)
+    seen_pairs: set[tuple[str, str]] = set()
+    qualifying_pairs: set[tuple[str, str]] = set()
+    seen_runs: set[str] = set()
+    qualifying_runs: set[str] = set()
+    for r_id, target, metadata_json in spend_rows:
+        rid = str(r_id or "")
+        t = str(target or "").rstrip("/")
+        if not (rid and t):
+            continue
+        seen_pairs.add((rid, t))
+        seen_runs.add(rid)
+        if _row_failed(metadata_json) or _row_unexamined(metadata_json):
+            continue
+        row_depth = _row_depth(metadata_json)
+        if row_depth is None or row_depth >= depth_floor:
+            qualifying_pairs.add((rid, t))
+            qualifying_runs.add(rid)
+    return seen_pairs, qualifying_pairs, seen_runs, qualifying_runs
+
+
+def _row_passes_depth_filter(
+    run_id: str,
+    campaign_target: str,
+    path: str,
+    seen_pairs: set,
+    qualifying_pairs: set,
+    seen_runs: set,
+    qualifying_runs: set,
+) -> bool:
+    """Checks whether a single `coverage_files` row qualifies under `min_depth`."""
+    rid = str(run_id or "")
+    ct = str(campaign_target or "").rstrip("/")
+    p_norm = str(path or "").rstrip("/")
+    if rid and ct and (rid, ct) in seen_pairs:
+        return (rid, ct) in qualifying_pairs
+    if rid and p_norm and (rid, p_norm) in seen_pairs:
+        return (rid, p_norm) in qualifying_pairs
+    if rid and p_norm:
+        probe = p_norm
+        while probe:
+            if (rid, probe) in seen_pairs:
+                return (rid, probe) in qualifying_pairs
+            parent = probe.rsplit("/", 1)[0] if "/" in probe else ""
+            if parent == probe:
+                break
+            probe = parent
+    if rid and rid in seen_runs:
+        return rid in qualifying_runs
+    # No campaign_spend row for this run_id (legacy / bare synthetic row): preserve (INV-6).
+    return True
+
+
+def _content_rows(
+    conn: sqlite3.Connection,
+    model: str = "",
+    run_id: str = "",
+    min_depth: Optional[int] = None,
+) -> list:
     """`(path, content_hash, size, mtime_ns, run_id)` rows of coverage_files,
-    oldest first (`ORDER BY id ASC`), under the same model rule as
-    _completed_coverage."""
+    oldest first (`ORDER BY id ASC`), under the same model (and optional
+    `min_depth`) rule as _completed_coverage."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(coverage_files)").fetchall()}
+    has_ct = "campaign_target" in cols
+    ct_col = "campaign_target" if has_ct else "''"
+    ct_col_c = "c.campaign_target" if has_ct else "''"
     if run_id:
-        return conn.execute(
-            "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files "
+        raw_rows = conn.execute(
+            f"SELECT path, content_hash, size, mtime_ns, run_id, {ct_col} FROM coverage_files "
             "WHERE run_id = ? ORDER BY id ASC",
-            (str(run_id),)).fetchall()
-    has_runs = model and conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
-    if has_runs:
-        return conn.execute(
-            "SELECT c.path, c.content_hash, c.size, c.mtime_ns, c.run_id FROM coverage_files c "
-            "LEFT JOIN runs r ON r.run_id = c.run_id "
-            "WHERE r.model = ? OR r.model IS NULL OR r.model = '' ORDER BY c.id ASC",
-            (str(model),)).fetchall()
-    return conn.execute(
-        "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files ORDER BY id ASC"
-    ).fetchall()
+            (str(run_id),),
+        ).fetchall()
+    else:
+        has_runs = model and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+        ).fetchone()
+        if has_runs:
+            raw_rows = conn.execute(
+                f"SELECT c.path, c.content_hash, c.size, c.mtime_ns, c.run_id, {ct_col_c} FROM coverage_files c "
+                "LEFT JOIN runs r ON r.run_id = c.run_id "
+                "WHERE r.model = ? OR r.model IS NULL OR r.model = '' ORDER BY c.id ASC",
+                (str(model),),
+            ).fetchall()
+        else:
+            raw_rows = conn.execute(
+                f"SELECT path, content_hash, size, mtime_ns, run_id, {ct_col} FROM coverage_files ORDER BY id ASC"
+            ).fetchall()
+    if min_depth is None:
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in raw_rows]
+    depth_filter = _depth_spend_filter(conn, model, int(min_depth), run_id=run_id)
+    if depth_filter is None:
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in raw_rows]
+    seen_pairs, qualifying_pairs, seen_runs, qualifying_runs = depth_filter
+    return [
+        (r[0], r[1], r[2], r[3], r[4])
+        for r in raw_rows
+        if _row_passes_depth_filter(
+            r[4],
+            r[5],
+            r[0],
+            seen_pairs,
+            qualifying_pairs,
+            seen_runs,
+            qualifying_runs,
+        )
+    ]
 
 
 def _coverage_runs(
@@ -396,7 +537,9 @@ def _coverage_runs(
             raise
         recorded: set = set()
         if has_coverage_files_table(conn):
-            recorded = {str(r[4]) for r in _content_rows(conn, model) if r[4]}
+            recorded = {
+                str(r[4]) for r in _content_rows(conn, model, min_depth=min_depth) if r[4]
+            }
     finally:
         conn.close()
     targets: dict = {}
@@ -451,15 +594,22 @@ def content_recorded_for(db_path: str, files, model: str = "") -> int:
     return sum(1 for f in files if str(f) in covered)
 
 
-def changed_files(db_path: str, files, model: str = "", run_id: str = "") -> Optional[dict]:
+def changed_files(
+    db_path: str,
+    files,
+    model: str = "",
+    run_id: str = "",
+    min_depth: Optional[int] = None,
+) -> Optional[dict]:
     """`{"files": [...]}`: the subset of `files` whose content the ledger
-    recorded (for this model, or for one run) and that differs now. None
-    when the ledger cannot be read. Files with no recorded content are not
-    changed -- they are covered or uncovered, which uncovered_files says."""
+    recorded (for this model, or for one run, optionally filtered by
+    `min_depth`) and that differs now. None when the ledger cannot be read.
+    Files with no recorded content are not changed -- they are covered or
+    uncovered, which uncovered_files says."""
     if not db_path:
         return None
     try:
-        covered = _covered_identities(db_path, model, run_id=run_id)
+        covered = _covered_identities(db_path, model, run_id=run_id, min_depth=min_depth)
         if not covered:
             return {"files": []}
         return {"files": [str(f) for f in files if content_changed(str(f), covered.get(str(f), ()))]}
@@ -651,39 +801,126 @@ def covered_below_depth(
         return None
 
 
-def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
-    """True when at least one file in `files` is covered by a completed
-    `file-by-file` (or legacy `file-sweep`) campaign row for `model`.
+def _common_path_prefix(files) -> str:
+    """Longest `/` directory prefix shared by all paths in `files` (pure string
+    ops so mixed/relative inputs never raise `ValueError`)."""
+    parts_list = [str(f).rstrip("/").split("/") for f in files if str(f).rstrip("/")]
+    if not parts_list:
+        return ""
+    common = parts_list[0]
+    for parts in parts_list[1:]:
+        limit = min(len(common), len(parts))
+        i = 0
+        while i < limit and common[i] == parts[i]:
+            i += 1
+        common = common[:i]
+        if not common:
+            return ""
+    joined = "/".join(common)
+    if not joined and any(str(f).startswith("/") for f in files):
+        return "/"
+    return joined
 
-    Used by `resolve_scan_targets` so partial coverage from depth-planned
-    `cross-functional` batches never flips a subsequent default `auto` run
-    into an unfiltered per-file sweep over the rest of a large repository,
-    while genuine in-progress per-file sweeps still continue cleanly.
+
+def _scope_covers_root(scope_path: str, common_root: str) -> bool:
+    """True when `scope_path` equals `common_root` or is an ancestor of it."""
+    raw = str(scope_path or "").strip()
+    if not raw or not common_root:
+        return False
+    if raw == "/":
+        return common_root.startswith("/")
+    s = raw.rstrip("/")
+    if not s:
+        return False
+    return common_root == s or common_root.startswith(s + "/")
+
+
+def _run_target_from_metadata(metadata_json: Any) -> str:
+    """Extracts the exact run-level `target` (never the broader `target_root`
+    repo anchor) from `runs.metadata_json`, or `''` when absent."""
+    if not metadata_json:
+        return ""
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    val = meta.get("target") or ""
+    return str(val).strip() if isinstance(val, str) else ""
+
+
+def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
+    """True when the newest full-target coverage-earning run covering `files`
+    (for `model`) was a `file-by-file` (or legacy `file-sweep`) sweep.
+
+    Scoping to the newest full-target coverage-earning row (`ORDER BY id DESC`):
+    - One historical `--scan-mode uncovered` / `file-by-file` campaign cannot
+      permanently lock subsequent default `auto` runs into per-file sweeps once
+      a newer full-repo `cross-functional` / `slices` / `whole` run supersedes
+      it (`r4-sticky-file-sweep`).
+    - Targeted delta runs (`scan_mode == 'changed'`) and narrow subdirectory /
+      single-file runs (e.g., `./run.sh repo/lib` when `files` spans `repo/`)
+      are ignored so they neither prematurely terminate an active repo-wide
+      sweep nor flip the entire repo into a per-file sweep.
     Never raises.
     """
     if not db_path or not files or not os.path.exists(db_path):
         return False
     try:
+        file_list = [str(f) for f in files if str(f).rstrip("/")]
+        if not file_list:
+            return False
+        common_root = _common_path_prefix(file_list)
+        file_ancestors: set[str] = set()
+        for f in file_list:
+            probe = f.rstrip("/")
+            while probe:
+                if probe in file_ancestors:
+                    break
+                file_ancestors.add(probe)
+                parent = probe.rsplit("/", 1)[0] if "/" in probe else ""
+                if parent == probe:
+                    break
+                probe = parent
+        if not file_ancestors:
+            return False
         conn = _connect(db_path)
         try:
             try:
-                has_runs = model and conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
-                ).fetchone()
-                if has_runs:
+                has_runs_table = bool(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+                    ).fetchone()
+                )
+                has_runs_meta = False
+                if has_runs_table:
+                    run_cols = {
+                        r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()
+                    }
+                    has_runs_meta = "metadata_json" in run_cols
+                r_meta_col = "r.metadata_json" if has_runs_meta else "NULL"
+                if has_runs_table and model:
                     rows = conn.execute(
-                        "SELECT s.target, s.metadata_json FROM campaign_spend s "
+                        f"SELECT s.target, s.scan_mode, s.metadata_json, {r_meta_col} "
+                        "FROM campaign_spend s "
                         "LEFT JOIN runs r ON r.run_id = s.run_id "
                         "WHERE s.target IS NOT NULL "
-                        "AND s.scan_mode IN ('file-by-file', 'file-sweep') "
-                        "AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                        "AND (r.model = ? OR r.model IS NULL OR r.model = '') "
+                        "ORDER BY s.id DESC",
                         (str(model),),
+                    ).fetchall()
+                elif has_runs_table:
+                    rows = conn.execute(
+                        f"SELECT s.target, s.scan_mode, s.metadata_json, {r_meta_col} "
+                        "FROM campaign_spend s "
+                        "LEFT JOIN runs r ON r.run_id = s.run_id "
+                        "WHERE s.target IS NOT NULL ORDER BY s.id DESC"
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT target, metadata_json FROM campaign_spend "
-                        "WHERE target IS NOT NULL "
-                        "AND scan_mode IN ('file-by-file', 'file-sweep')"
+                        "SELECT target, scan_mode, metadata_json, NULL FROM campaign_spend "
+                        "WHERE target IS NOT NULL ORDER BY id DESC"
                     ).fetchall()
             except sqlite3.OperationalError as exc:
                 if "no such table" in str(exc).lower():
@@ -691,16 +928,32 @@ def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
                 raise
         finally:
             conn.close()
-        sweep_targets: dict = {}
-        for target, metadata_json in rows:
+        for target, scan_mode, metadata_json, run_metadata_json in rows:
             t = str(target or "").rstrip("/")
-            if t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
-                sweep_targets.setdefault(t, set()).add(True)
-        if not sweep_targets:
-            return False
-        for f in files:
-            if _covering_fingerprints(str(f), sweep_targets):
+            if not t or t not in file_ancestors:
+                continue
+            if _row_failed(metadata_json) or _row_unexamined(metadata_json):
+                continue
+            sm = str(scan_mode or "").strip().lower()
+            # A targeted delta check (`--scan-mode changed`) never ends a repo-wide sweep.
+            if sm == "changed":
+                continue
+            run_target = _run_target_from_metadata(run_metadata_json)
+            if sm in ("file-by-file", "file-sweep"):
+                # A narrow subdirectory file-by-file run must not lock a larger repo into sweeps.
+                if run_target and common_root and not _scope_covers_root(run_target, common_root):
+                    continue
                 return True
+            if sm == "whole":
+                effective_scope = run_target or t
+                if common_root and not _scope_covers_root(effective_scope, common_root):
+                    continue
+                return False
+            # Full-repo batch mode (`cross-functional`, `slices`, etc.): if run metadata
+            # narrows it to a subdirectory, ignore; otherwise it supersedes the sweep.
+            if run_target and common_root and not _scope_covers_root(run_target, common_root):
+                continue
+            return False
         return False
     except Exception:
         return False
@@ -813,7 +1066,11 @@ def uncovered_files(
         targets = _completed_coverage(db_path, model, min_depth=min_depth)
         if targets is None:
             return all_files  # Ledger never written: genuine first run.
-        covered_as = _covered_identities(db_path, model) if rescan_changed_files else {}
+        covered_as = (
+            _covered_identities(db_path, model, min_depth=min_depth)
+            if rescan_changed_files
+            else {}
+        )
         target_runs, recording_runs = (
             _coverage_runs(db_path, model, min_depth=min_depth) if covered_as else ({}, set())
         )
@@ -909,6 +1166,153 @@ def _row_pass_index(metadata_json: Any) -> int:
         return 1
 
 
+def _parse_meta_dict(metadata_json: Any) -> dict[str, Any]:
+    if not metadata_json:
+        return {}
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _norm_target_key(target: str) -> str:
+    raw = str(target or "").strip()
+    if not raw:
+        return ""
+    try:
+        return os.path.realpath(raw).rstrip("/")
+    except OSError:
+        return raw.rstrip("/")
+
+
+def _attach_fallback_meta(entry: dict[str, Any], metadata_json: Any) -> None:
+    meta = _parse_meta_dict(metadata_json)
+    if meta.get("reviewer_fallback"):
+        entry["reviewer_fallback"] = True
+    if meta.get("review_incomplete"):
+        entry["review_incomplete"] = True
+    if meta.get("terminal_reviewer_fallback"):
+        entry["terminal_reviewer_fallback"] = True
+    if meta.get("fallback_attempts") is not None:
+        try:
+            entry["fallback_attempts"] = int(meta["fallback_attempts"])
+        except (TypeError, ValueError):
+            pass
+
+
+def fallback_attempt_count(
+    db_path: str,
+    run_id: str,
+    target: str,
+    pass_index: Optional[int] = None,
+) -> int:
+    """Number of prior `campaign_spend` rows for `(run_id, target[, pass_index])`
+    that ended because of a synthesized reviewer fallback (`reviewer_fallback=True`).
+    Never raises (INV-6)."""
+    if not db_path or not run_id or not target:
+        return 0
+    try:
+        if not _db_exists(db_path):
+            return 0
+        want_key = _norm_target_key(target)
+        want_raw = str(target).strip().rstrip("/")
+        want_pass = max(1, int(pass_index)) if pass_index is not None else None
+        conn = _connect(db_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
+                    (str(run_id),),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return 0
+                raise
+        finally:
+            conn.close()
+        count = 0
+        for row_target, metadata_json in rows:
+            t_raw = str(row_target or "").strip().rstrip("/")
+            if not t_raw:
+                continue
+            if t_raw != want_raw and _norm_target_key(t_raw) != want_key:
+                continue
+            if want_pass is not None and _row_pass_index(metadata_json) != want_pass:
+                continue
+            meta = _parse_meta_dict(metadata_json)
+            if meta.get("reviewer_fallback"):
+                count += 1
+        return count
+    except Exception:
+        return 0
+
+
+def run_reviewer_fallback_summary(db_path: str, run_id: str) -> dict[str, Any]:
+    """Summarizes reviewer-fallback outcomes for `run_id` across restarts.
+
+    Latest row per `(normalized_target, pass_index)` wins, matching `run_ledger`:
+    a campaign that failed with a reviewer fallback on Attempt 1 and later
+    completed cleanly on Attempt 2 is NOT included in `active_targets`,
+    `terminal_campaigns`, or `failed_fallback_campaigns`. Never raises (INV-6).
+    """
+    empty: dict[str, Any] = {
+        "active_targets": [],
+        "terminal_campaigns": 0,
+        "failed_fallback_campaigns": 0,
+        "total_fallback_rows": 0,
+    }
+    if not db_path or not run_id:
+        return empty
+    try:
+        if not _db_exists(db_path):
+            return empty
+        conn = _connect(db_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
+                    (str(run_id),),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return empty
+                raise
+        finally:
+            conn.close()
+        latest: dict[tuple[str, int], tuple[str, dict[str, Any]]] = {}
+        total_fb_rows = 0
+        for row_target, metadata_json in rows:
+            raw_t = str(row_target or "").strip().rstrip("/")
+            if not raw_t:
+                continue
+            meta = _parse_meta_dict(metadata_json)
+            if meta.get("reviewer_fallback"):
+                total_fb_rows += 1
+            key = (_norm_target_key(raw_t), _row_pass_index(metadata_json))
+            latest[key] = (raw_t, meta)
+        active_targets: list[tuple[str, int]] = []
+        terminal_n = 0
+        failed_fb_n = 0
+        for (_norm_t, p_idx), (raw_t, meta) in latest.items():
+            if meta.get("reviewer_fallback") or meta.get("review_incomplete") or meta.get("terminal_reviewer_fallback"):
+                active_targets.append((raw_t, p_idx))
+                if meta.get("terminal_reviewer_fallback") or meta.get("review_incomplete"):
+                    terminal_n += 1
+                elif meta.get("failed"):
+                    failed_fb_n += 1
+        return {
+            "active_targets": active_targets,
+            "terminal_campaigns": terminal_n,
+            "failed_fallback_campaigns": failed_fb_n,
+            "total_fallback_rows": total_fb_rows,
+        }
+    except Exception:
+        return empty
+
+
 def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
     """What one run's campaigns did, as
     `{target: {"failed": bool, "harness_fingerprint": str | None}}`, the
@@ -950,6 +1354,7 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
                 }
                 if _row_unexamined(metadata_json):
                     entry["unexamined"] = True
+                _attach_fallback_meta(entry, metadata_json)
                 out[t] = entry
         return out
     except Exception:
@@ -991,6 +1396,7 @@ def run_pass_ledger(db_path: str, run_id: str) -> Optional[dict[tuple[str, int],
                 }
                 if _row_unexamined(metadata_json):
                     entry["unexamined"] = True
+                _attach_fallback_meta(entry, metadata_json)
                 out[(t, p_idx)] = entry
         return out
     except Exception:

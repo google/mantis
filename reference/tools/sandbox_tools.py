@@ -509,11 +509,14 @@ def _record_finding_evidence(
                 entry["last_reattack_inconclusive"] = False
             elif getattr(ctx, "patch_applied", None) is False:
                 entry["last_reattack_inconclusive"] = True
-                reason = (
-                    f"{reason} (inconclusive: no patch applied in patcher stage before re-attack)"
-                    if reason
-                    else "EVIDENCE_ABSENT: no patch applied in patcher stage before re-attack"
-                )
+                if "no patch applied in patcher stage" not in str(reason or ""):
+                    reason = (
+                        f"{reason} (inconclusive: no patch applied in patcher stage before re-attack; "
+                        "apply edits via apply_patch or write_file, not run_sandbox)"
+                        if reason
+                        else "EVIDENCE_ABSENT: no patch applied in patcher stage before re-attack "
+                        "(apply edits via apply_patch or write_file, not run_sandbox)"
+                    )
             elif ran is not False:
                 entry["reattacked"] = True
                 entry["reattack_present"] = False
@@ -573,10 +576,21 @@ def invalidate_patch_reattack_state(ctx: Any) -> None:
 
 
 def mark_patch_applied(ctx: Any, applied: bool = True) -> None:
-    """Records whether a target patch/edit in the patcher stage applied cleanly."""
+    """Records whether a target patch/edit in the patcher stage applied cleanly.
+
+    Latches True once any patch has applied cleanly during a patcher visit so a
+    later failed `apply_patch` or rolled-back `write_file` does not clear
+    `patch_applied` while an earlier patch is still live in the sandbox
+    (`r4-patch-applied-reset`). Still keeps `patch_applied` False when the first
+    attempt fails (and prior re-attacks are still invalidated via
+    `invalidate_patch_reattack_state`).
+    """
     if ctx is None or getattr(ctx, "active_node", "") != "patcher":
         return
-    ctx.patch_applied = bool(applied)
+    if applied:
+        ctx.patch_applied = True
+    elif not getattr(ctx, "patch_applied", False):
+        ctx.patch_applied = False
 
 
 #: Deterministic infrastructure, toolchain, or missing-scaffold substrings that
@@ -598,6 +612,53 @@ POC_SETUP_FAILURE_MARKERS = (
 )
 
 
+def _inconclusive_poc_reason(
+    output: str,
+    exit_code: int,
+    timed_out: bool = False,
+    *,
+    command: str = "",
+    jail_dir: str = "",
+    workdir: str = "",
+) -> Optional[str]:
+    """Returns a concise human/model-readable cause when `poc_ran()` is False,
+    or `None` when the PoC got as far as attacking (`r4-inconclusive-reason-hidden`)."""
+    try:
+        code = int(exit_code)
+    except (TypeError, ValueError):
+        code = 1
+    if timed_out or code == 124:
+        return "command timed out before completing"
+    if code in (126, 127):
+        return f"command/interpreter not found or not executable (exit={code})"
+    if code < 0:
+        return f"process terminated by signal (exit={code})"
+    text = _strip_unscoped_remote_telemetry(str(output or ""))
+    for marker in POC_SETUP_FAILURE_MARKERS:
+        if marker in text:
+            return f"sandbox/setup error ({marker})"
+    if _TARGET_UNREACHABLE_RE.search(text):
+        return "target unreachable or connection refused"
+    if (
+        _SHELL_LAUNCHER_FAIL_RE.search(text)
+        or _ENV_LAUNCHER_FAIL_RE.search(text)
+        or _CLI_MISSING_SCRIPT_RE.search(text)
+    ):
+        return "shell/launcher failed to start the PoC script"
+    if _PY_IMPORT_INDENT_EXC_RE.search(text):
+        return "Python import or indentation error prevented PoC startup"
+    has_target_frame = _has_target_traceback_frame(
+        text, command=command, jail_dir=jail_dir, workdir=workdir
+    )
+    if "no such file or directory" in text.lower() and not has_target_frame:
+        return "missing file or directory during PoC startup"
+    if _SYNTAX_EXC_RE.search(text) and not (
+        has_target_frame and _is_dynamic_eval_syntax_error(text)
+    ):
+        return "syntax error prevented PoC startup"
+    return None
+
+
 def poc_ran(
     output: str,
     exit_code: int,
@@ -612,35 +673,17 @@ def poc_ran(
     sandbox transport error, not a connection-refused / broken-target error,
     and not a launcher or PoC-harness startup failure. Absent evidence means a
     fix only when True."""
-    try:
-        code = int(exit_code)
-    except (TypeError, ValueError):
-        code = 1
-    if code in (124, 126, 127) or code < 0 or timed_out:
-        return False
-    text = _strip_unscoped_remote_telemetry(str(output or ""))
-    if any(m in text for m in POC_SETUP_FAILURE_MARKERS):
-        return False
-    if _TARGET_UNREACHABLE_RE.search(text):
-        return False
-    if (
-        _SHELL_LAUNCHER_FAIL_RE.search(text)
-        or _ENV_LAUNCHER_FAIL_RE.search(text)
-        or _CLI_MISSING_SCRIPT_RE.search(text)
-    ):
-        return False
-    if _PY_IMPORT_INDENT_EXC_RE.search(text):
-        return False
-    has_target_frame = _has_target_traceback_frame(
-        text, command=command, jail_dir=jail_dir, workdir=workdir
+    return (
+        _inconclusive_poc_reason(
+            output,
+            exit_code,
+            timed_out=timed_out,
+            command=command,
+            jail_dir=jail_dir,
+            workdir=workdir,
+        )
+        is None
     )
-    if "no such file or directory" in text.lower() and not has_target_frame:
-        return False
-    if _SYNTAX_EXC_RE.search(text) and not (
-        has_target_frame and _is_dynamic_eval_syntax_error(text)
-    ):
-        return False
-    return True
 
 
 def _has_dynamic_sandbox(ctx: Any) -> bool:
@@ -879,21 +922,29 @@ async def run_sandbox_with_evidence(
             except Exception as exc:
                 sentinel_read_error = SecretScrubber.scrub(str(exc))
 
+    # Evaluate Channel-A (stdout/stderr token) and Channel-B (sanitizer/crash proof)
+    # even when the sidecar sentinel file could not be read (`r4-sentinel-error-overrides-crash`):
+    # positive crash/stdout proof must survive a sentinel read glitch in BOTH `reproducer`
+    # (never hide valid ASan proof) and `patcher` (fail-closed: bypass beats read error).
+    evidence_present, reason = check_reached_sink_evidence(
+        output=output,
+        exit_code=exit_code,
+        sink_symbol=sink_symbol,
+        sentinel_content=sentinel_content,
+        expected_nonce=nonce,
+        timed_out=timed_out,
+    )
     if sentinel_read_error is not None:
-        evidence_present = False
-        reason = (
-            f"EVIDENCE_ABSENT: failed to read sidecar sentinel '{sentinel_path}' "
-            f"from guest sandbox ({sentinel_read_error})"
-        )
-    else:
-        evidence_present, reason = check_reached_sink_evidence(
-            output=output,
-            exit_code=exit_code,
-            sink_symbol=sink_symbol,
-            sentinel_content=sentinel_content,
-            expected_nonce=nonce,
-            timed_out=timed_out,
-        )
+        if evidence_present:
+            reason = (
+                f"{reason} (note: sidecar sentinel '{sentinel_path}' could not be read: "
+                f"{sentinel_read_error})"
+            )
+        else:
+            reason = (
+                f"EVIDENCE_ABSENT: failed to read sidecar sentinel '{sentinel_path}' "
+                f"from guest sandbox ({sentinel_read_error}) (inconclusive)"
+            )
 
     # This wrapper sees a channel the inner run_sandbox cannot: the sidecar sentinel
     # file, read from inside the sandbox above. A PoC whose sentinel reached the file
@@ -911,15 +962,27 @@ async def run_sandbox_with_evidence(
             sentinel_content=sentinel_content,
         )
     ctx_now = current_run_context.get()
+    inconclusive_flag = False
     if evidence_present:
         ran_flag = True
     elif sentinel_read_error is not None:
         ran_flag = False
+        inconclusive_flag = True
     else:
-        ran_flag = poc_ran(output, exit_code, timed_out=timed_out, command=command)
-        if (
-            ran_flag
-            and getattr(ctx_now, "active_node", "") == "patcher"
+        not_ran_cause = _inconclusive_poc_reason(
+            output, exit_code, timed_out=timed_out, command=command
+        )
+        ran_flag = not_ran_cause is None
+        if not ran_flag:
+            inconclusive_flag = True
+            if "inconclusive:" not in reason:
+                reason = (
+                    f"{reason} (inconclusive: PoC did not run against target — {not_ran_cause})"
+                    if reason
+                    else f"EVIDENCE_ABSENT: inconclusive — PoC did not run against target ({not_ran_cause})"
+                )
+        elif (
+            getattr(ctx_now, "active_node", "") == "patcher"
             and _has_dynamic_sandbox(ctx_now)
             and hasattr(ctx_now.sandbox, "check_liveness")
         ):
@@ -929,9 +992,30 @@ async def run_sandbox_with_evidence(
                 alive, live_err = False, str(exc)
             if not alive:
                 ran_flag = False
+                inconclusive_flag = True
                 reason = (
                     f"EVIDENCE_ABSENT: target failed post-attack liveness check "
-                    f"({SecretScrubber.scrub(live_err or 'target not healthy')})"
+                    f"({SecretScrubber.scrub(live_err or 'target not healthy')}) (inconclusive)"
+                )
+        elif reason.startswith(EVIDENCE_TRUNCATED_PREFIX + ":"):
+            inconclusive_flag = True
+
+        # Surface missing-patcher-edit cause to the caller/model directly
+        # (`r4-inconclusive-reason-hidden`), instead of rewriting only a local
+        # variable inside `_record_finding_evidence`.
+        if (
+            not evidence_present
+            and getattr(ctx_now, "active_node", "") == "patcher"
+            and getattr(ctx_now, "patch_applied", None) is False
+        ):
+            inconclusive_flag = True
+            if "no patch applied in patcher stage" not in reason:
+                reason = (
+                    f"{reason} (inconclusive: no patch applied in patcher stage before re-attack; "
+                    "apply edits via apply_patch or write_file, not run_sandbox)"
+                    if reason
+                    else "EVIDENCE_ABSENT: no patch applied in patcher stage before re-attack "
+                    "(apply edits via apply_patch or write_file, not run_sandbox)"
                 )
 
     # Which finding this verdict was about -- present or absent, both are
@@ -956,6 +1040,8 @@ async def run_sandbox_with_evidence(
         "output": output,
         "evidence_present": evidence_present,
         "evidence_reason": reason,
+        "ran": ran_flag,
+        "inconclusive": inconclusive_flag,
         "finding_id": finding_id,
         "scaffold_files_kept": scaffold,
     }

@@ -308,6 +308,309 @@ class NonVertexOnboardingConfigureTest(unittest.TestCase):
             self.assertEqual(persisted["config"]["default_model"], "anthropic/claude-sonnet-4-5")
             self.assertIn("Auto-configured Mantis settings saved to", buf_ok.getvalue())
 
+    def test_adc_project_prevents_switching_vertex_to_gemini_api(self):
+        """[r4-vertex-to-gemini-autoselect]: detect_capabilities reads project from an
+        existing local ADC file via load_credentials_from_file() (NEVER google.auth.default())
+        so a working Vertex service-account install with GEMINI_API_KEY in env is not
+        silently rewritten to gemini/*."""
+        import contextlib
+        import io
+        import json
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            wf_path = self._copy_base_workflow(td)
+            local_path = wf_path.with_name("workflow.local.json")
+            sa_path = Path(td) / "sa.json"
+            sa_path.write_text(
+                json.dumps({"type": "service_account", "project_id": "adc-vertex-proj"}),
+                encoding="utf-8",
+            )
+            with (
+                _clean_env(
+                    GEMINI_API_KEY="ai-studio-key",
+                    GOOGLE_APPLICATION_CREDENTIALS=str(sa_path),
+                ),
+                mock.patch.object(cfg_mod, "check_microsandbox_virtualization", return_value=(False, "")),
+                mock.patch("shutil.which", return_value=None),
+                mock.patch(
+                    "google.auth.load_credentials_from_file",
+                    return_value=(object(), "adc-vertex-proj"),
+                ) as load_mock,
+                mock.patch(
+                    "google.auth.default",
+                    side_effect=AssertionError("detect_capabilities must not call google.auth.default()"),
+                ),
+            ):
+                caps = cfg_mod.detect_capabilities()
+                self.assertEqual(caps.get("vertex_project"), "adc-vertex-proj")
+                load_mock.assert_called_once_with(str(sa_path))
+                buf = io.StringIO()
+                with (
+                    mock.patch.object(
+                        cfg_mod,
+                        "run_preflight_checks_async",
+                        new=mock.AsyncMock(return_value=(True, [])),
+                    ),
+                    contextlib.redirect_stdout(buf),
+                ):
+                    # 1. Plain ensure_configured keeps Vertex without rewriting workflow.local.json.
+                    cfg_plain = cfg_mod.ensure_configured(
+                        workflow_path=str(wf_path),
+                        auto=True,
+                        save=True,
+                        persist_overrides=False,
+                    )
+                    self.assertEqual(cfg_plain.get("default_model"), "vertex_ai/gemini-3.8-flash")
+                    self.assertFalse(local_path.exists(), "must not rewrite workflow.local.json to gemini/*")
+
+                    # 2. With a CLI override (forcing past the early preflight shortcut into
+                    # auto-resolution), ADC project still preserves vertex_ai/* and exports
+                    # VERTEXAI_PROJECT instead of falling back to gemini/*.
+                    cfg = cfg_mod.ensure_configured(
+                        workflow_path=str(wf_path),
+                        auto=True,
+                        overrides={"sandbox": {"type": "static-only", "options": {}}},
+                        save=True,
+                        persist_overrides=False,
+                    )
+                self.assertEqual(cfg.get("default_model"), "vertex_ai/gemini-3.8-flash")
+                self.assertEqual(os.environ.get("VERTEXAI_PROJECT"), "adc-vertex-proj")
+                self.assertFalse(local_path.exists(), "must not rewrite workflow.local.json to gemini/*")
+
+    def test_detect_adc_project_never_probes_metadata_ignores_quota_project_and_skips_on_timeout(self):
+        """PR #36 review hardening:
+        - Missing ADC file returns immediately without calling google.auth.default/load_credentials_from_file.
+        - authorized_user ADC with quota_project_id returns None (never leaks billing project as GCE/Vertex project).
+        - external_account JSON is skipped without network/pluggable execution.
+        - gcloud TimeoutExpired skips _detect_adc_project and preserves gcp_project_probe_failed=True."""
+        import json
+        import subprocess
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            # 1. No ADC file anywhere -> zero google.auth calls (no 12s metadata probe, no gcloud).
+            missing_cfg = Path(td) / "empty_gcloud"
+            missing_cfg.mkdir()
+            with (
+                _clean_env(GEMINI_API_KEY="k", CLOUDSDK_CONFIG=str(missing_cfg), HOME=td),
+                mock.patch("google.auth.default", side_effect=AssertionError("must not call default()")),
+                mock.patch(
+                    "google.auth.load_credentials_from_file",
+                    side_effect=AssertionError("must not call load_credentials_from_file() when file missing"),
+                ),
+            ):
+                self.assertIsNone(cfg_mod._detect_adc_project())
+
+            # 2. Real authorized_user ADC file with quota_project_id -> returns None (no billing leak, no gcloud).
+            user_adc = missing_cfg / "application_default_credentials.json"
+            user_adc.write_text(
+                json.dumps(
+                    {
+                        "type": "authorized_user",
+                        "client_id": "test-client-id.apps.googleusercontent.com",
+                        "client_secret": "test-secret",
+                        "refresh_token": "1//test-refresh-token",
+                        "quota_project_id": "billing-only-project",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                _clean_env(CLOUDSDK_CONFIG=str(missing_cfg), HOME=td),
+                mock.patch("google.auth.default", side_effect=AssertionError("must not call default()")),
+            ):
+                self.assertIsNone(cfg_mod._detect_adc_project())
+
+            # 3. external_account JSON -> skipped without invoking load_credentials_from_file / network.
+            ext_adc = Path(td) / "ext.json"
+            ext_adc.write_text(
+                json.dumps({"type": "external_account", "audience": "//iam.googleapis.com/projects/123"}),
+                encoding="utf-8",
+            )
+            with (
+                _clean_env(GOOGLE_APPLICATION_CREDENTIALS=str(ext_adc)),
+                mock.patch(
+                    "google.auth.load_credentials_from_file",
+                    side_effect=AssertionError("must skip external_account without network/exec"),
+                ),
+            ):
+                self.assertIsNone(cfg_mod._detect_adc_project())
+
+            # 4. gcloud probe TimeoutExpired -> skips _detect_adc_project() and keeps gcp_project_probe_failed=True.
+            def _fake_run(argv, **kwargs):
+                if "auth" in argv:
+                    return subprocess.CompletedProcess(argv, 0, stdout="dev@example.com\n", stderr="")
+                raise subprocess.TimeoutExpired(argv, timeout=3)
+
+            with (
+                _clean_env(GEMINI_API_KEY="k"),
+                mock.patch.object(cfg_mod, "check_microsandbox_virtualization", return_value=(False, "")),
+                mock.patch("shutil.which", side_effect=lambda name: "/usr/bin/gcloud" if name == "gcloud" else None),
+                mock.patch("subprocess.run", side_effect=_fake_run),
+                mock.patch.object(
+                    cfg_mod,
+                    "_detect_adc_project",
+                    side_effect=AssertionError("must skip _detect_adc_project when gcloud timed out"),
+                ),
+            ):
+                caps = cfg_mod.detect_capabilities()
+            self.assertTrue(caps.get("gcp_project_probe_failed"))
+            self.assertIsNone(caps.get("vertex_project"))
+
+    def test_overlay_explicit_helpers_handle_non_dict_config_without_raising(self):
+        """Non-dict `config` in workflow.local.json must not raise AttributeError in
+        _model_choice_is_explicit / _sandbox_choice_is_explicit."""
+        import json
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        for bad_cfg in ("not-a-dict", [1, 2, 3], 42, True):
+            with self.subTest(bad_cfg=bad_cfg), tempfile.TemporaryDirectory() as td:
+                wf_path = self._copy_base_workflow(td)
+                local_path = wf_path.with_name("workflow.local.json")
+                local_path.write_text(json.dumps({"config": bad_cfg}), encoding="utf-8")
+                self.assertFalse(cfg_mod._model_choice_is_explicit(str(wf_path)))
+                self.assertFalse(cfg_mod._sandbox_choice_is_explicit(str(wf_path)))
+
+    def test_explicit_local_overlay_and_gcloud_timeout_preserve_vertex_model(self):
+        """[r4-vertex-to-gemini-autoselect]: Never overwrite an explicit vertex_ai/* model
+        pinned in workflow.local.json, and never switch when gcloud project probe timed out."""
+        import contextlib
+        import io
+        import json
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        # Case 1: workflow.local.json explicitly pins vertex_ai/gemini-3.8-flash.
+        with tempfile.TemporaryDirectory() as td:
+            wf_path = self._copy_base_workflow(td)
+            local_path = wf_path.with_name("workflow.local.json")
+            local_payload = {"config": {"default_model": "vertex_ai/gemini-3.8-flash"}}
+            local_path.write_text(json.dumps(local_payload), encoding="utf-8")
+            buf = io.StringIO()
+            with (
+                _clean_env(GEMINI_API_KEY="ai-studio-key"),
+                mock.patch.object(
+                    cfg_mod,
+                    "detect_capabilities",
+                    return_value=self._offline_caps(gemini_api_key=True),
+                ),
+                contextlib.redirect_stdout(buf),
+            ):
+                cfg = cfg_mod.ensure_configured(
+                    workflow_path=str(wf_path),
+                    auto=True,
+                    save=True,
+                    persist_overrides=False,
+                )
+            self.assertEqual(cfg.get("default_model"), "vertex_ai/gemini-3.8-flash")
+            self.assertEqual(json.loads(local_path.read_text(encoding="utf-8")), local_payload)
+            self.assertIn("Keeping explicit local overlay model", buf.getvalue())
+
+        # Case 2: gcloud probe timed out (`gcp_project_probe_failed=True`).
+        with tempfile.TemporaryDirectory() as td:
+            wf_path = self._copy_base_workflow(td)
+            local_path = wf_path.with_name("workflow.local.json")
+            buf = io.StringIO()
+            with (
+                _clean_env(GEMINI_API_KEY="ai-studio-key"),
+                mock.patch.object(
+                    cfg_mod,
+                    "detect_capabilities",
+                    return_value=self._offline_caps(
+                        gemini_api_key=True,
+                        gcp_project_probe_failed=True,
+                    ),
+                ),
+                contextlib.redirect_stdout(buf),
+            ):
+                cfg = cfg_mod.ensure_configured(
+                    workflow_path=str(wf_path),
+                    auto=True,
+                    save=True,
+                    persist_overrides=False,
+                )
+            self.assertEqual(cfg.get("default_model"), "vertex_ai/gemini-3.8-flash")
+            self.assertFalse(local_path.exists())
+            self.assertIn("probe timed out", buf.getvalue())
+
+    def test_gemini_prefix_preflight_requires_api_key_not_gcp_project(self):
+        """[r4-gemini-preflight-key]: `gemini/*` routes strictly to AI Studio and must fail
+        preflight when only a GCP project is set (no GEMINI_API_KEY/GOOGLE_API_KEY)."""
+        from scripts import configure as cfg_mod
+
+        with _clean_env(GOOGLE_CLOUD_PROJECT="my-gcp-project"):
+            ok_prefixed, msg_prefixed = cfg_mod._check_single_llm_preflight(
+                "gemini/gemini-3.8-flash", {}, probe=False
+            )
+            self.assertFalse(ok_prefixed, msg_prefixed)
+            self.assertIn("GEMINI_API_KEY", msg_prefixed)
+
+            # Bare `gemini-*` routes to Vertex AI when a real GCP project is set.
+            ok_bare, msg_bare = cfg_mod._check_single_llm_preflight(
+                "gemini-3.8-flash", {}, probe=False
+            )
+            self.assertTrue(ok_bare, msg_bare)
+
+        with _clean_env(GOOGLE_CLOUD_PROJECT="YOUR_PROJECT_ID"):
+            ok_placeholder, _ = cfg_mod._check_single_llm_preflight(
+                "gemini-3.8-flash", {}, probe=False
+            )
+            self.assertFalse(ok_placeholder)
+
+        with _clean_env(GEMINI_API_KEY="ai-studio-key"):
+            ok_key, msg_key = cfg_mod._check_single_llm_preflight(
+                "gemini/gemini-3.8-flash", {}, probe=False
+            )
+            self.assertTrue(ok_key, msg_key)
+
+    def test_autoselected_model_persists_when_one_shot_sandbox_override_passed(self):
+        """[r4-autoselect-not-saved]: Passing a one-shot CLI `--sandbox` override must still
+        persist auto-selected `default_model` while keeping `--sandbox` itself non-sticky."""
+        import contextlib
+        import io
+        import json
+        import tempfile
+        from scripts import configure as cfg_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            wf_path = self._copy_base_workflow(td)
+            local_path = wf_path.with_name("workflow.local.json")
+            buf = io.StringIO()
+            with (
+                _clean_env(GEMINI_API_KEY="ai-studio-key"),
+                mock.patch.object(
+                    cfg_mod,
+                    "detect_capabilities",
+                    return_value=self._offline_caps(
+                        gemini_api_key=True,
+                        available_sandboxes=["static-only", "gvisor"],
+                    ),
+                ),
+                mock.patch.object(
+                    cfg_mod,
+                    "run_preflight_checks_async",
+                    new=mock.AsyncMock(return_value=(True, [])),
+                ),
+                contextlib.redirect_stdout(buf),
+            ):
+                cfg = cfg_mod.ensure_configured(
+                    workflow_path=str(wf_path),
+                    auto=True,
+                    overrides={"sandbox": {"type": "gvisor", "options": {}}},
+                    save=True,
+                    persist_overrides=False,
+                )
+            self.assertEqual(cfg.get("default_model"), "gemini/gemini-3.8-flash")
+            self.assertEqual(cfg.get("sandbox", {}).get("type"), "gvisor")
+            self.assertTrue(local_path.exists(), "auto-selected model must persist despite one-shot --sandbox")
+            persisted = json.loads(local_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["config"].get("default_model"), "gemini/gemini-3.8-flash")
+            self.assertNotIn("sandbox", persisted["config"], "one-shot --sandbox must stay non-sticky")
+
 
 if __name__ == "__main__":
     unittest.main()

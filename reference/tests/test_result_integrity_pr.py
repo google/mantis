@@ -613,6 +613,577 @@ class StageAndVerdictIntegrityTest(unittest.IsolatedAsyncioTestCase):
         finally:
             current_run_context.reset(tok)
 
+    async def test_streamed_max_tokens_retries_and_keeps_tools_open(self):
+        """Regression test for r4-max-tokens-reask:
+        1. Streamed `partial=True` chunks followed by `partial=False` `MAX_TOKENS`
+           (both bare string AND Python 3.12 `FinishReason` enum!) MUST fire the
+           one-shot retry instead of being skipped by `not streamed_content`.
+        2. Mid-JSON truncation (`{` + `"route"`) uses concise JSON prompt;
+           narration/thinking truncation keeps tool calling open.
+        3. Real ADK `Runner` (`StreamingMode.SSE`) drops ephemeral `partial=True`
+           chunks and persists only the clean retried verdict.
+        4. `FinishReason.SAFETY` enum MUST NOT trigger retry and still synthesizes
+           fail-closed `Fallback:` JSON (`route == "false_positive"`).
+        """
+        from google.adk.agents.run_config import RunConfig, StreamingMode
+
+        # Case A: Streamed mid-JSON truncation with real FinishReason.MAX_TOKENS enum
+        seen_a: list[LlmRequest] = []
+        streams_a: list[bool] = []
+
+        async def _fake_stream_json(_self, req, stream=False):
+            seen_a.append(req)
+            streams_a.append(bool(stream))
+            if len(seen_a) == 1:
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text='{"route": "confirmed", "reason": "verbose...')],
+                    ),
+                    partial=True,
+                )
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text='{"route": "confirmed", "reason": "verbose...')],
+                    ),
+                    partial=False,
+                    finish_reason=types.FinishReason.MAX_TOKENS,
+                    error_code=types.FinishReason.MAX_TOKENS,
+                )
+            else:
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text='{"route": "confirmed", "reason": "Brief valid SQLi."}')],
+                    ),
+                    partial=False,
+                    finish_reason=types.FinishReason.STOP,
+                )
+
+        llm_a = cfg_mod.ResilientLiteLlm(model="openai/gpt-test")
+        llm_a._output_schema_override = cfg_mod.ExtendedReviewVerdict
+        req_a = LlmRequest(
+            model="openai/gpt-test",
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text="Review findings")])],
+        )
+        with mock.patch.object(LiteLlm, "generate_content_async", _fake_stream_json):
+            out_a = [r async for r in llm_a.generate_content_async(req_a, stream=True)]
+
+        self.assertEqual(len(seen_a), 2, "Streamed MAX_TOKENS must retry once!")
+        self.assertEqual(streams_a, [True, False])
+        reask_a = seen_a[1].contents[-1].parts[0].text
+        self.assertIn("output token limit", reask_a)
+        self.assertIn("Emit a concise ExtendedReviewVerdict JSON", reask_a)
+        finals_a = [r for r in out_a if not getattr(r, "partial", False)]
+        self.assertEqual(len(finals_a), 1)
+        parsed_a = json.loads(finals_a[0].content.parts[0].text)
+        self.assertEqual(parsed_a["route"], "confirmed")
+
+        # Case B: Streamed narration truncation (no JSON started) keeps tool calls open
+        seen_b: list[LlmRequest] = []
+
+        async def _fake_stream_narration(_self, req, stream=False):
+            seen_b.append(req)
+            if len(seen_b) == 1:
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text="Let me trace every middleware file in detail...")],
+                    ),
+                    partial=True,
+                )
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text="Let me trace every middleware file in detail...")],
+                    ),
+                    partial=False,
+                    finish_reason=types.FinishReason.MAX_TOKENS,
+                    error_code=None,
+                )
+            else:
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[
+                            types.Part(
+                                function_call=types.FunctionCall(
+                                    name="read_file", args={"filepath": "auth.py"}
+                                )
+                            )
+                        ],
+                    ),
+                    partial=False,
+                    finish_reason=types.FinishReason.STOP,
+                )
+
+        llm_b = cfg_mod.ResilientLiteLlm(model="openai/gpt-test")
+        llm_b._output_schema_override = cfg_mod.ExtendedReviewVerdict
+        with mock.patch.object(LiteLlm, "generate_content_async", _fake_stream_narration):
+            out_b = [r async for r in llm_b.generate_content_async(req_a, stream=True)]
+
+        self.assertEqual(len(seen_b), 2)
+        reask_b = seen_b[1].contents[-1].parts[0].text
+        self.assertIn("function-calling interface", reask_b)
+        finals_b = [r for r in out_b if not getattr(r, "partial", False)]
+        self.assertEqual(len(finals_b), 1)
+        self.assertEqual(finals_b[0].content.parts[0].function_call.name, "read_file")
+
+        # Case C: Real ADK Runner with StreamingMode.SSE drops partial truncation and saves clean retry
+        seen_c: list[int] = []
+
+        async def _fake_runner_stream(_self, req, stream=False):
+            seen_c.append(1)
+            if len(seen_c) == 1:
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text='{"route": "conf')],
+                    ),
+                    partial=True,
+                )
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text='{"route": "conf')],
+                    ),
+                    partial=False,
+                    finish_reason=types.FinishReason.MAX_TOKENS,
+                    error_code=types.FinishReason.MAX_TOKENS,
+                )
+            else:
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text='{"route": "confirmed", "reason": "Clean retry."}')],
+                    ),
+                    partial=False,
+                    finish_reason=types.FinishReason.STOP,
+                )
+
+        llm_c = cfg_mod.ResilientLiteLlm(
+            model="openai/gpt-test",
+            output_schema_override=cfg_mod.ExtendedReviewVerdict,
+        )
+        rev_ag = LlmAgent(name="reviewer", model=llm_c, instruction="Review.")
+        app_c = App(name="mantis_stream_test", root_agent=rev_ag)
+        sess_svc = InMemorySessionService()
+        await sess_svc.create_session(app_name="mantis_stream_test", user_id="u", session_id="s1")
+        runner = Runner(app=app_c, session_service=sess_svc)
+        with mock.patch.object(LiteLlm, "generate_content_async", _fake_runner_stream):
+            async for _ev in runner.run_async(
+                user_id="u",
+                session_id="s1",
+                new_message=types.Content(role="user", parts=[types.Part.from_text(text="Go")]),
+                run_config=RunConfig(streaming_mode=StreamingMode.SSE),
+            ):
+                pass
+        saved_sess = await sess_svc.get_session(app_name="mantis_stream_test", user_id="u", session_id="s1")
+        model_events = [e for e in saved_sess.events if getattr(e, "author", "") == "reviewer" and not getattr(e, "partial", False)]
+        self.assertEqual(len(model_events), 1)
+        self.assertEqual(json.loads(model_events[0].content.parts[0].text)["route"], "confirmed")
+
+        # Case D: FinishReason.SAFETY enum MUST NOT trigger retry
+        seen_d: list[int] = []
+
+        async def _fake_safety(_self, req, stream=False):
+            seen_d.append(1)
+            yield LlmResponse(
+                content=types.Content(role="model", parts=[types.Part.from_text(text="Blocked")]),
+                partial=False,
+                finish_reason=types.FinishReason.SAFETY,
+                error_code=types.FinishReason.SAFETY,
+            )
+
+        llm_d = cfg_mod.ResilientLiteLlm(model="openai/gpt-test")
+        llm_d._output_schema_override = cfg_mod.ExtendedReviewVerdict
+        with mock.patch.object(LiteLlm, "generate_content_async", _fake_safety), contextlib.redirect_stderr(io.StringIO()):
+            out_d = [r async for r in llm_d.generate_content_async(req_a, stream=False)]
+        self.assertEqual(len(seen_d), 1, "SAFETY enum must NOT trigger schema retry")
+        parsed_d = json.loads(out_d[0].content.parts[0].text)
+        self.assertEqual(parsed_d["route"], "false_positive")
+        self.assertTrue(parsed_d["reason"].startswith("Fallback:"))
+
+    def test_reviewer_fallback_persistence_and_attempt_isolation(self):
+        """Regression test for r4-reviewer-fallback-not-persisted:
+        - `_sanitize_structured_response` persists a durable `reviewer_fallback`
+          artifact keyed by `(resource, pass_index, attempt)`.
+        - `_rehydrate_campaign_resume_state` restores it into a fresh `RunContext`.
+        - `_rehydrate_session_metrics` also recovers it from ADK session events
+          even without the SQLite artifact, without double-counting when both exist.
+        - Attempt 1's artifact does NOT bleed into Attempt 2 after Attempt 1 fails.
+        - Parallel campaigns do NOT cross-contaminate each other's fallback counts.
+        """
+        from types import SimpleNamespace
+        from core.cost import fallback_attempt_count, record_spend
+
+        tmp = tempfile.mkdtemp(prefix="mantis_fb_persist_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        db = os.path.join(tmp, "fb.db")
+        init_db(db)
+        target_a = os.path.join(tmp, "a.py")
+        target_b = os.path.join(tmp, "b.py")
+        Path(target_a).write_text("x = 1\n", encoding="utf-8")
+        Path(target_b).write_text("y = 2\n", encoding="utf-8")
+
+        rc_a = RunContext(
+            jail_dir=tmp,
+            db_path=db,
+            target_file=target_a,
+            run_id="run_fb_iso",
+            pass_index=1,
+            fallback_attempt=1,
+        )
+        tok = current_run_context.set(rc_a)
+        try:
+            resp = LlmResponse(
+                content=types.Content(role="model", parts=[types.Part.from_text(text="Blocked")]),
+                finish_reason=types.FinishReason.SAFETY,
+                error_code=types.FinishReason.SAFETY,
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                cfg_mod.ResilientLiteLlm._sanitize_structured_response(resp, cfg_mod.ExtendedReviewVerdict)
+        finally:
+            current_run_context.reset(tok)
+        self.assertEqual(rc_a.reviewer_verdict_fallbacks, 1)
+
+        # Fresh RunContext simulating process restart for campaign A, attempt 1
+        fresh_a = RunContext(
+            jail_dir=tmp,
+            db_path=db,
+            target_file=target_a,
+            run_id="run_fb_iso",
+            pass_index=1,
+            fallback_attempt=1,
+        )
+        mantis_main._rehydrate_campaign_resume_state(fresh_a, db, "run_fb_iso", target_a, pass_idx=1)
+        self.assertEqual(fresh_a.reviewer_verdict_fallbacks, 1)
+
+        # Parallel sibling campaign B has zero fallbacks (no cross-contamination)
+        fresh_b = RunContext(
+            jail_dir=tmp,
+            db_path=db,
+            target_file=target_b,
+            run_id="run_fb_iso",
+            pass_index=1,
+            fallback_attempt=1,
+        )
+        mantis_main._rehydrate_campaign_resume_state(fresh_b, db, "run_fb_iso", target_b, pass_idx=1)
+        self.assertEqual(fresh_b.reviewer_verdict_fallbacks, 0)
+
+        # Session event rehydration catches Fallback: reviewer event independently
+        # and does NOT double-count when artifact already restored count=1.
+        fake_events = [
+            SimpleNamespace(
+                author="reviewer_classifier",
+                partial=False,
+                node_info=None,
+                usage_metadata=None,
+                error_code=None,
+                actions=SimpleNamespace(end_of_agent=False),
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text='{"route": "false_positive", "reason": "Fallback: ignored"}')],
+                ),
+            ),
+            SimpleNamespace(
+                author="reviewer",
+                partial=False,
+                node_info=None,
+                usage_metadata=None,
+                error_code=None,
+                actions=SimpleNamespace(end_of_agent=False),
+                content=types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text='{"route": "false_positive", "reason": "Fallback: SAFETY"}')],
+                ),
+            ),
+        ]
+        fake_sess = SimpleNamespace(events=fake_events, state={})
+        fake_runner = SimpleNamespace(agent=SimpleNamespace(name="mantis_vulnerability_pipeline"))
+        mantis_main._rehydrate_session_metrics(fake_sess, fake_runner, run_ctx=fresh_a)
+        self.assertEqual(fresh_a.reviewer_verdict_fallbacks, 1, "Must not double-count artifact + session event")
+
+        session_only_ctx = RunContext(jail_dir=tmp, db_path="", target_file=target_a, run_id="run_fb_iso")
+        mantis_main._rehydrate_session_metrics(fake_sess, fake_runner, run_ctx=session_only_ctx)
+        self.assertEqual(session_only_ctx.reviewer_verdict_fallbacks, 1)
+
+        # After Attempt 1 records failure in campaign_spend, Attempt 2 starts clean (0 fallbacks)
+        record_spend(
+            db, "run_fb_iso", target_a, "whole", tokens=100,
+            metadata={"failed": True, "reviewer_fallback": True, "fallback_attempts": 1},
+        )
+        self.assertEqual(fallback_attempt_count(db, "run_fb_iso", target_a), 1)
+        attempt2_ctx = RunContext(
+            jail_dir=tmp,
+            db_path=db,
+            target_file=target_a,
+            run_id="run_fb_iso",
+            pass_index=1,
+            fallback_attempt=2,
+        )
+        mantis_main._rehydrate_campaign_resume_state(attempt2_ctx, db, "run_fb_iso", target_a, pass_idx=1)
+        self.assertEqual(attempt2_ctx.reviewer_verdict_fallbacks, 0)
+
+    def test_pipeline_pause_resume_reviewer_fallback_cap_and_sarif_properties(self):
+        """End-to-end test in `main.pipeline` covering:
+        1. Mid-campaign pause after reviewer fallback -> `--resume` rehydrates
+           durable fallback signal, fails Attempt 1 (exit 1, zero coverage),
+           labels summary `(unreviewed: reviewer fallback)`, and stamps accurate
+           SARIF `runs[0].properties`.
+        2. Recurring fallback on Attempt 2 (`--resume`) hits the retry cap (`2`),
+           settles into terminal `review_incomplete` (`failed=False`,
+           `unexamined=True`, `terminal_reviewer_fallback=True`), withholds
+           coverage, keeps findings as `reported`, does NOT finalize run, and
+           exits `1`.
+        3. Subsequent `--resume` (Attempt 3) does NOT restart an infinite loop
+           (0 `execute_sub_task` calls) and still exits `1`.
+        4. Explicit `--resume --retry-unexamined` retries, succeeds when reviewer
+           confirms the finding, clears `terminal_campaigns`, exports the finding
+           to SARIF `results`, and exits `0`.
+        """
+        from core.budget import BudgetExceededError
+        from core.cost import run_ledger, run_reviewer_fallback_summary
+        from core.database import update_status
+
+        tmp = tempfile.mkdtemp(prefix="mantis_fb_e2e_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = os.path.realpath(os.path.join(tmp, "repo"))
+        os.makedirs(repo)
+        target_file = os.path.join(repo, "app.py")
+        Path(target_file).write_text("def vuln(x):\n    return eval(x)\n", encoding="utf-8")
+        db = os.path.join(tmp, "mantis.db")
+        sarif_path = os.path.join(tmp, "out.sarif")
+        wf_data = json.loads((_REF_ROOT / "workflow.json").read_text(encoding="utf-8"))
+        wf_data.setdefault("config", {})["sarif_output"] = sarif_path
+        wf_path = os.path.join(tmp, "wf.json")
+        Path(wf_path).write_text(json.dumps(wf_data), encoding="utf-8")
+        env = {
+            "GOOGLE_CLOUD_PROJECT": "ci-offline-project",
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+            "LITELLM_MODE": "PRODUCTION",
+            "OPENAI_API_KEY": "test-key",
+            "MANTIS_MAX_REVIEWER_FALLBACK_ATTEMPTS": "2",
+        }
+        captured_run_id: list[str] = []
+
+        def _trigger_reviewer_fallback():
+            resp = LlmResponse(
+                content=types.Content(role="model", parts=[types.Part.from_text(text="Safety refusal")]),
+                finish_reason=types.FinishReason.SAFETY,
+                error_code=types.FinishReason.SAFETY,
+            )
+            cfg_mod.ResilientLiteLlm._sanitize_structured_response(resp, cfg_mod.ExtendedReviewVerdict)
+
+        # Slice 1a: writes candidate finding, reviewer emits fallback (persisted!), then budget pauses.
+        async def _slice_pause(_runner, _ss, filepath, rid, **kw):
+            captured_run_id.append(rid)
+            write_findings(
+                db,
+                filepath,
+                [
+                    {
+                        "title": "Code Injection via eval",
+                        "filepath": "app.py",
+                        "line_numbers": [2],
+                        "cwe": "CWE-95",
+                        "severity": "High",
+                        "description": "eval executes user input",
+                        "status": "reported",
+                    }
+                ],
+                run_id=rid,
+            )
+            kw["budget_controller"].audit_code_reads += 1
+            _trigger_reviewer_fallback()
+            raise BudgetExceededError("max_tokens", 1000, 1000, rid)
+
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(mantis_main, "execute_sub_task", side_effect=_slice_pause), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            rc_pause = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=target_file,
+                    workflow_path=wf_path,
+                    load_local=False,
+                    db_override=db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    scan_mode_override="whole",
+                    assume_yes=True,
+                )
+            )
+        self.assertEqual(rc_pause, 2, "Paused run must exit 2")
+        run_id = captured_run_id[0]
+
+        # Slice 1b (`--resume`): finishes cleanly WITHOUT emitting another fallback.
+        # Durable artifact MUST restore reviewer_verdict_fallbacks=1 so Attempt 1 fails (exit 1)!
+        async def _slice_finish_clean(_runner, _ss, filepath, rid, **kw):
+            kw["budget_controller"].audit_code_reads += 1
+            return False
+
+        out1, err1 = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(mantis_main, "execute_sub_task", side_effect=_slice_finish_clean), \
+             contextlib.redirect_stdout(out1), \
+             contextlib.redirect_stderr(err1):
+            rc1 = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=target_file,
+                    workflow_path=wf_path,
+                    load_local=False,
+                    db_override=db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    resume_run_id=run_id,
+                    assume_yes=True,
+                )
+            )
+        self.assertEqual(rc1, 1, f"Resumed post-fallback campaign MUST exit 1!\nstdout:\n{out1.getvalue()}\nstderr:\n{err1.getvalue()}")
+        self.assertIn("(unreviewed: reviewer fallback)", out1.getvalue())
+        self.assertNotIn("(suppressed at review)", out1.getvalue())
+        self.assertIn("attempt 1/2", err1.getvalue())
+        ledger1 = run_ledger(db, run_id)
+        row1 = next(iter(ledger1.values()))
+        self.assertTrue(row1.get("failed"))
+        self.assertTrue(row1.get("reviewer_fallback"))
+        self.assertEqual(row1.get("fallback_attempts"), 1)
+        sarif1 = json.loads(Path(sarif_path).read_text(encoding="utf-8"))
+        self.assertEqual(sarif1["runs"][0]["results"], [])
+        props1 = sarif1["runs"][0]["properties"]
+        self.assertEqual(props1["untriaged_omitted"], 1)
+        self.assertEqual(props1["reviewer_fallback_count"], 1)
+        self.assertEqual(props1["unreviewed_reviewer_fallback_findings"], 1)
+        self.assertEqual(props1["review_incomplete_campaigns"], 0)
+
+        # Verify zero coverage_files recorded on failure
+        conn = sqlite3.connect(db)
+        cov_tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        cov_count1 = conn.execute("SELECT COUNT(*) FROM coverage_files").fetchone()[0] if "coverage_files" in cov_tables else 0
+        conn.close()
+        self.assertEqual(cov_count1, 0)
+
+        # Slice 2 (`--resume` Attempt 2): reviewer falls back AGAIN -> hits cap (2/2)!
+        async def _slice_fallback_again(_runner, _ss, filepath, rid, **kw):
+            kw["budget_controller"].audit_code_reads += 1
+            _trigger_reviewer_fallback()
+            return False
+
+        out2, err2 = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(mantis_main, "execute_sub_task", side_effect=_slice_fallback_again), \
+             contextlib.redirect_stdout(out2), \
+             contextlib.redirect_stderr(err2):
+            rc2 = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=target_file,
+                    workflow_path=wf_path,
+                    load_local=False,
+                    db_override=db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    resume_run_id=run_id,
+                    assume_yes=True,
+                )
+            )
+        self.assertEqual(rc2, 1, f"Terminal review-incomplete run must exit 1!\n{out2.getvalue()}\n{err2.getvalue()}")
+        self.assertIn("retry cap reached", err2.getvalue())
+        self.assertIn("(unreviewed: reviewer fallback)", out2.getvalue())
+        ledger2 = run_ledger(db, run_id)
+        row2 = next(iter(ledger2.values()))
+        self.assertFalse(row2.get("failed"), "Terminal fallback settles as failed=False to stop infinite retry")
+        self.assertTrue(row2.get("unexamined"), "Terminal fallback withholds coverage credit")
+        self.assertTrue(row2.get("terminal_reviewer_fallback"))
+        self.assertTrue(row2.get("review_incomplete"))
+        self.assertEqual(row2.get("fallback_attempts"), 2)
+        sarif2 = json.loads(Path(sarif_path).read_text(encoding="utf-8"))
+        self.assertEqual(sarif2["runs"][0]["properties"]["review_incomplete_campaigns"], 1)
+        self.assertEqual(sarif2["runs"][0]["properties"]["reviewer_fallback_count"], 2)
+        # Finding stays "reported" (preserving DB/MCP/SARIF status vocabulary)
+        f_rows = read_findings(db, run_id=run_id)
+        self.assertEqual(len(f_rows), 1)
+        self.assertEqual(f_rows[0]["status"], "reported")
+        # Still zero coverage credit recorded and run is NOT finalized
+        conn = sqlite3.connect(db)
+        cov_count2 = conn.execute("SELECT COUNT(*) FROM coverage_files").fetchone()[0] if "coverage_files" in cov_tables else 0
+        run_meta_row = conn.execute("SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        conn.close()
+        self.assertEqual(cov_count2, 0)
+        if run_meta_row is not None and run_meta_row[0]:
+            self.assertFalse(bool(json.loads(run_meta_row[0]).get("finalized")), "Incomplete review run must not be marked finalized")
+
+        # Slice 3 (`--resume` Attempt 3): MUST NOT restart campaign; exits 1 with notice
+        calls_3: list[str] = []
+
+        async def _should_not_run(_runner, _ss, filepath, rid, **kw):
+            calls_3.append(filepath)
+            return False
+
+        out3, err3 = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(mantis_main, "execute_sub_task", side_effect=_should_not_run), \
+             contextlib.redirect_stdout(out3), \
+             contextlib.redirect_stderr(err3):
+            rc3 = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=target_file,
+                    workflow_path=wf_path,
+                    load_local=False,
+                    db_override=db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    resume_run_id=run_id,
+                    assume_yes=True,
+                )
+            )
+        self.assertEqual(calls_3, [], "Retry-capped campaign must NOT loop infinitely on --resume!")
+        self.assertEqual(rc3, 1)
+        self.assertIn("incomplete review", out3.getvalue())
+
+        # Slice 4 (`--resume --retry-unexamined`): operator-forced retry succeeds!
+        async def _slice_recover(_runner, _ss, filepath, rid, **kw):
+            kw["budget_controller"].audit_code_reads += 1
+            update_status(db, filepath, rid, "confirmed", campaign=filepath)
+            return False
+
+        out4, err4 = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(mantis_main, "execute_sub_task", side_effect=_slice_recover), \
+             contextlib.redirect_stdout(out4), \
+             contextlib.redirect_stderr(err4):
+            rc4 = asyncio.run(
+                mantis_main.pipeline(
+                    scan_target=target_file,
+                    workflow_path=wf_path,
+                    load_local=False,
+                    db_override=db,
+                    model_override="openai/nonexistent",
+                    api_base_override="http://127.0.0.1:9",
+                    sandbox_override="static-only",
+                    auto_configure=False,
+                    resume_run_id=run_id,
+                    retry_unexamined=True,
+                    assume_yes=True,
+                )
+            )
+        self.assertEqual(rc4, 0, f"Recovered run must exit 0!\n{out4.getvalue()}\n{err4.getvalue()}")
+        summary4 = run_reviewer_fallback_summary(db, run_id)
+        self.assertEqual(summary4["terminal_campaigns"], 0)
+        self.assertEqual(summary4["active_targets"], [])
+        sarif4 = json.loads(Path(sarif_path).read_text(encoding="utf-8"))
+        self.assertEqual(len(sarif4["runs"][0]["results"]), 1)
+        self.assertEqual(sarif4["runs"][0]["properties"]["review_incomplete_campaigns"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
