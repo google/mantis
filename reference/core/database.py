@@ -1031,12 +1031,31 @@ def resolve_ancestor_lineage(
                 return True
         return False
 
+    def _lineage_has_conflicting_qualified_symbol(lineage_id: str) -> bool:
+        """True when `lineage_id` already carries a row with a different
+        non-empty `qualified_symbol` (e.g. `UserView.get` vs `OrderView.get`).
+        Prevents legacy pre-migration rows (empty `qualified_symbol`) from
+        bridging two distinct methods onto the same lineage."""
+        if not incoming_qualified or not lineage_id:
+            return False
+        try:
+            chk = cursor.execute(
+                "SELECT 1 FROM findings WHERE lineage_id = ? "
+                "AND qualified_symbol IS NOT NULL AND qualified_symbol != '' "
+                "AND LOWER(qualified_symbol) != ? LIMIT 1",
+                (lineage_id, incoming_qualified),
+            ).fetchone()
+            return chk is not None
+        except sqlite3.OperationalError:
+            return False
+
     # 1. Exact Stable Content Signature Match (< 1ms, 0 tokens)
     if signature or prose_sig or bare_sig:
         try:
             cursor.execute("""
                 SELECT lineage_id, run_id, signature, target_symbol, symbol_source,
-                       qualified_symbol, COALESCE(pass_index, 1), line_numbers
+                       qualified_symbol, COALESCE(pass_index, 1), line_numbers,
+                       COALESCE(prose_signature, '')
                 FROM findings
                 WHERE (
                     signature = ?
@@ -1068,15 +1087,20 @@ def resolve_ancestor_lineage(
             row_qual = str(row[5] or "").strip().lower()
             row_pass = int(row[6] or 1)
             row_lines = str(row[7] or "[]")
+            row_prose_sig = str(row[8] or "").strip() if len(row) > 8 else ""
             if _different_catalog_functions(
                 row_sym, row_src, row_qual, row[1], row_pass, row_lines
             ):
+                continue
+            if incoming_qualified and row_qual and row_qual != incoming_qualified:
+                continue
+            if _lineage_has_conflicting_qualified_symbol(str(row[0])):
                 continue
             if signature and row_sig == signature:
                 return str(row[0])
             if bare_sig and row_sig == bare_sig and not row_qual:
                 return str(row[0])
-            if prose_sig:
+            if prose_sig and (row_prose_sig == prose_sig or row_sig == prose_sig):
                 return str(row[0])
 
     # 2. File + Normalized CWE + Grounded Target Symbol Match

@@ -121,25 +121,19 @@ def _tier1_exact_groups(
 ) -> List[Tuple[int, List[int], str]]:
     """Deterministic zero-LLM consolidation of exact/near-exact cross-pass or
     cross-slice duplicates (matching signature, lineage_id, or same file + line
-    proximity/symbol + CWE/high lexical overlap)."""
-    parent: Dict[int, int] = {int(f["id"]): int(f["id"]) for f in findings}
+    proximity/symbol + CWE/high lexical overlap).
 
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
+    Uses complete-linkage (non-transitive clique) clustering rather than
+    Union-Find so line-proximity edges never chain transitively across more
+    than the 8-line window (e.g. lines 10 -> 16 -> 22 stay separated unless
+    every pair inside the merged cluster satisfies the pairwise match rules).
+    """
     sigs_by_id: Dict[int, str] = {}
     lins_by_id: Dict[int, str] = {}
     syms_by_id: Dict[int, Set[str]] = {}
     lines_by_id: Dict[int, Set[int]] = {}
     toks_by_id: Dict[int, Set[str]] = {}
+    compat: Dict[int, Set[int]] = {}
 
     for f in findings:
         fid = int(f["id"])
@@ -151,6 +145,7 @@ def _tier1_exact_groups(
         syms_by_id[fid] = syms
         lines_by_id[fid] = _lines_set(f)
         toks_by_id[fid] = _tokens(f"{f.get('title', '')} {f.get('description', '')}")
+        compat[fid] = set()
 
     n = len(findings)
     for i in range(n):
@@ -164,8 +159,6 @@ def _tier1_exact_groups(
         for j in range(i + 1, n):
             fj = findings[j]
             idj = int(fj["id"])
-            if find(idi) == find(idj):
-                continue
             lj = lines_by_id[idj]
             both_have_lines = bool(li and lj)
             if not both_have_lines:
@@ -189,40 +182,63 @@ def _tier1_exact_groups(
             if q_sym_i and q_sym_j and q_sym_i != q_sym_j:
                 continue
 
+            matched = False
             if (sigi and sigi == sigs_by_id[idj]) or (lini and lini == lins_by_id[idj]):
-                union(idi, idj)
-                continue
+                matched = True
+            else:
+                fpj = str(fj.get("filepath") or "").strip()
+                if fpi and fpi == fpj:
+                    cwej = _norm_cwe(fj)
+                    if not (cwei and cwej and cwei != cwej):
+                        sim = _jaccard(toks_by_id[idi], toks_by_id[idj])
+                        same_symbol = bool(syms_i and (syms_i & syms_j)) or bool(q_sym_i and q_sym_i == q_sym_j)
+                        exact_line_overlap = bool(li & lj)
+                        if same_symbol and (sim >= 0.70 or (bool(cwei and cwei == cwej) and sim >= 0.50)):
+                            matched = True
+                        elif exact_line_overlap and not syms_i and not syms_j and sim >= 0.70:
+                            matched = True
+            if matched:
+                compat[idi].add(idj)
+                compat[idj].add(idi)
 
-            fpj = str(fj.get("filepath") or "").strip()
-            if not fpi or fpi != fpj:
-                continue
-            cwej = _norm_cwe(fj)
-            if cwei and cwej and cwei != cwej:
-                continue
-            sim = _jaccard(toks_by_id[idi], toks_by_id[idj])
-            same_symbol = bool(syms_i and (syms_i & syms_j)) or bool(q_sym_i and q_sym_i == q_sym_j)
-            exact_line_overlap = bool(li & lj)
-            if same_symbol and (sim >= 0.70 or (bool(cwei and cwei == cwej) and sim >= 0.50)):
-                union(idi, idj)
-            elif exact_line_overlap and not syms_i and not syms_j and sim >= 0.70:
-                union(idi, idj)
+    def _priority_key(r: Dict[str, Any]) -> Tuple[int, float, int]:
+        return (
+            -finding_assurance_rank(r.get("status")),
+            -float(r.get("mantis_risk_score") or 0.0),
+            int(r["id"]),
+        )
 
-    buckets: Dict[int, List[Dict[str, Any]]] = {}
-    for f in findings:
-        buckets.setdefault(find(int(f["id"])), []).append(f)
+    def _min_line_dist(a: Set[int], b: Set[int]) -> int:
+        if not a or not b:
+            return 10**9
+        return min(abs(x - y) for x in a for y in b)
+
+    # Assign findings in priority order into complete-linkage cliques so every
+    # pair inside a merged cluster satisfies pairwise compatibility directly.
+    ordered_all = sorted(findings, key=_priority_key)
+    clusters: List[List[Dict[str, Any]]] = []
+    for f in ordered_all:
+        fid = int(f["id"])
+        best_idx = -1
+        best_score: Optional[Tuple[int, int, int]] = None
+        for c_idx, members in enumerate(clusters):
+            if all(fid in compat[int(m["id"])] for m in members):
+                anchor_id = int(members[0]["id"])
+                dist = _min_line_dist(lines_by_id[fid], lines_by_id[anchor_id])
+                cand_score = (dist, -len(members), anchor_id)
+                if best_score is None or cand_score < best_score:
+                    best_score = cand_score
+                    best_idx = c_idx
+        if best_idx >= 0:
+            clusters[best_idx].append(f)
+        else:
+            clusters.append([f])
 
     groups: List[Tuple[int, List[int], str]] = []
-    for members in buckets.values():
+    for members in clusters:
         if len(members) < 2:
             continue
-        ordered = sorted(
-            members,
-            key=lambda r: (
-                -finding_assurance_rank(r.get("status")),
-                -float(r.get("mantis_risk_score") or 0.0),
-                int(r["id"]),
-            ),
-        )
+        ordered = sorted(members, key=_priority_key)
         prim = int(ordered[0]["id"])
         dups = [int(m["id"]) for m in ordered[1:]]
         groups.append((prim, dups, "Deterministic signature/location root-cause match across passes/slices"))

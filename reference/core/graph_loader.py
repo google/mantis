@@ -2791,12 +2791,81 @@ def _is_unrecoverable_forked_first_turn(llm_request: Any, node_id: str) -> bool:
     return False
 
 
+def _inherited_stem_tokens(llm_request: Any, node_id: str) -> int:
+    """Estimated tokens belonging to the immutable inherited stem prefix
+    (system instruction + tools + inherited `contents[:split_idx]`, including
+    the fork opener). Returns 0 when `llm_request` carries no inherited stem."""
+    contents = list(getattr(llm_request, "contents", None) or ())
+    if not contents:
+        return 0
+    split_idx = 0
+    inherited_len = getattr(llm_request, "_mantis_inherited_len", None)
+    if isinstance(inherited_len, int) and inherited_len > 0:
+        split_idx = min(inherited_len, len(contents))
+    else:
+        marker = f"{ACTIVE_STAGE_HEADER_PREFIX}{node_id}]"
+        for idx, content in enumerate(contents):
+            if getattr(content, "role", "") == "user" and any(
+                marker in (getattr(p, "text", None) or "")
+                for p in (getattr(content, "parts", None) or ())
+            ):
+                if idx > 0:
+                    split_idx = idx + 1
+                break
+    if split_idx <= 0:
+        return 0
+    stem_chars = _contents_chars(contents[:split_idx])
+    sys_and_tools_chars = max(0, _request_chars(llm_request) - _contents_chars(contents))
+    return (sys_and_tools_chars + stem_chars) // NODE_CONTEXT_CHARS_PER_TOKEN
+
+
+def _effective_context_editing_trigger(
+    base_trigger: int,
+    *,
+    clear_at_least: int,
+    stem_tokens: int,
+    context_limit: Optional[int],
+    explicit_trigger: bool = False,
+) -> int:
+    """Computes the effective client-side context-editing trigger for a stage.
+
+    On a forked shared-prefix stage whose inherited stem is already near or
+    above the shipped 180k default trigger (e.g. a 317k stem on a 1M Gemini
+    window), leaving `trigger = 180k` fires clearing on EVERY turn and blinds
+    the model to all but its newest 5 tool results. When no explicit operator
+    override is active (`MANTIS_CONTEXT_EDITING_TRIGGER_TOKENS` or
+    `workflow.local.json`), lifts the trigger relative to the inherited stem:
+
+        min(ceiling - margin, max(base_trigger, stem_tokens + own_margin))
+
+    where `margin = 0.05 * limit` (keeping the trigger safely below the
+    `0.80 * limit` node context ceiling) and
+    `own_margin = max(clear_at_least, int(min(base_trigger, clear_at_least * 1.5)))`.
+    """
+    if base_trigger <= 0 or explicit_trigger or stem_tokens <= 0:
+        return int(base_trigger)
+    env_override = str(os.environ.get("MANTIS_CONTEXT_EDITING_TRIGGER_TOKENS", "") or "").strip()
+    if env_override:
+        return int(base_trigger)
+    own_margin = max(int(clear_at_least or 0), int(min(base_trigger, int((clear_at_least or 0) * 1.5))))
+    if own_margin <= 0:
+        own_margin = max(1, int(base_trigger * 0.5))
+    lifted = max(int(base_trigger), int(stem_tokens) + own_margin)
+    if context_limit and context_limit > 0:
+        ceiling = int(context_limit * NODE_CONTEXT_CEILING_RATIO)
+        margin = max(1, int(context_limit * 0.05))
+        ceiling_cap = max(int(base_trigger), ceiling - margin)
+        return min(ceiling_cap, lifted)
+    return lifted
+
+
 def _make_client_context_editing_before_model_callback(
     node_id: str,
     model: Any = None,
     config: Any = None,
     *,
     preserve_system_prefix: bool = False,
+    explicit_trigger: bool = False,
 ):
     """Clears a stage's older tool results before dispatch, for models that
     do not run server-side `clear_tool_uses_20250919` (Gemini, OpenAI, and
@@ -2860,11 +2929,25 @@ def _make_client_context_editing_before_model_callback(
             _clear_function_response(content, index)
         effective_cleared = cleared
         estimated = _request_chars(llm_request) // NODE_CONTEXT_CHARS_PER_TOKEN
-        trigger = int(editing.get("trigger_tokens") or 0)
+        base_trigger = int(editing.get("trigger_tokens") or 0)
+        clear_at_least_tokens = int(editing.get("clear_at_least_tokens") or 0)
+        trigger = base_trigger
+        if base_trigger and preserve_system_prefix:
+            stem_tokens = _inherited_stem_tokens(llm_request, node_id)
+            if stem_tokens > 0:
+                from core.config import _effective_context_window
+
+                trigger = _effective_context_editing_trigger(
+                    base_trigger,
+                    clear_at_least=clear_at_least_tokens,
+                    stem_tokens=stem_tokens,
+                    context_limit=_effective_context_window(model),
+                    explicit_trigger=explicit_trigger,
+                )
         if trigger and estimated >= trigger and cleared < clearable:
             # At least clear-at-least worth, and enough to get back under
             # the trigger, so one edit (one cache miss) buys a long stretch.
-            target = int(editing.get("clear_at_least_tokens") or 0) * NODE_CONTEXT_CHARS_PER_TOKEN
+            target = clear_at_least_tokens * NODE_CONTEXT_CHARS_PER_TOKEN
             total_chars = estimated * NODE_CONTEXT_CHARS_PER_TOKEN
             freed = 0
             new_cleared = cleared
@@ -2880,9 +2963,10 @@ def _make_client_context_editing_before_model_callback(
             slot[NODE_CONTEXT_CLEARED_KEY] = new_cleared
             _observe("context_edits_applied")
             _observe("context_edit_cleared_tokens", freed // NODE_CONTEXT_CHARS_PER_TOKEN)
+            lifted_note = f" (lifted from {base_trigger:,} for inherited stem)" if trigger != base_trigger else ""
             print(
                 f"\n[CONTEXT EDITING] {node_id}: ~{estimated:,} tokens of working context at the "
-                f"{trigger:,}-token trigger; cleared {new_cleared - cleared} older tool result(s) "
+                f"{trigger:,}-token trigger{lifted_note}; cleared {new_cleared - cleared} older tool result(s) "
                 f"(~{freed // NODE_CONTEXT_CHARS_PER_TOKEN:,} tokens), {new_cleared} of "
                 f"{len(responses)} now cleared, newest {effective_keep} kept.",
                 file=sys.stderr,
@@ -4623,6 +4707,11 @@ def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> t
         ),
         "local_timeout_set": False,
         "local_reasoning_effort": None,
+        "base_trigger_was_shipped_default": (
+            os.path.basename(abs_json) == "workflow.json"
+            and base_cfg.get("context_editing_trigger_tokens") == 180000
+        ),
+        "local_context_editing_trigger_set": False,
     }
     ignore_local = str(os.environ.get("MANTIS_IGNORE_LOCAL_CONFIG", "") or "").strip().lower() in (
         "1",
@@ -4653,6 +4742,8 @@ def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> t
                 local_cfg = local_data.get("config") if isinstance(local_data.get("config"), dict) else {}
                 if "timeout" in local_cfg or "timeout" in local_data:
                     overlay_meta["local_timeout_set"] = True
+                if "context_editing_trigger_tokens" in local_cfg or "context_editing_trigger_tokens" in local_data:
+                    overlay_meta["local_context_editing_trigger_set"] = True
                 if local_cfg.get("reasoning_effort") or local_data.get("reasoning_effort"):
                     overlay_meta["local_reasoning_effort"] = (
                         local_cfg.get("reasoning_effort") or local_data.get("reasoning_effort")
@@ -4669,6 +4760,7 @@ def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> t
                     "api_base",
                     "timeout",
                     "reasoning_effort",
+                    "context_editing_trigger_tokens",
                     "db_path",
                     "seed_prompt",
                 ):
@@ -4899,6 +4991,18 @@ def load_workflow_from_json(
         and timeout_override is None
     ):
         spec.config.timeout = None
+    elif (
+        overlay_meta.get("local_timeout_set")
+        and timeout_override is None
+        and spec.config.timeout == 180
+    ):
+        print(
+            "[CONFIG WARNING] Local overlay (workflow.local.json) carries legacy `timeout: 180`. "
+            "Streamed turns now enforce this as a 180s per-chunk timeout instead of effort-scaled "
+            "defaults (600s–1800s). Remove `timeout` from workflow.local.json (or raise it) if "
+            "long thinking turns stall.",
+            file=sys.stderr,
+        )
 
     # Apply global runtime overrides if provided
     if model_override:
@@ -5253,6 +5357,17 @@ def load_workflow_from_json(
                 instruction = f"{instruction.rstrip()}\n\n{guard_text}"
 
             model_extra_kwargs: dict[str, Any] = {}
+            node_explicit_timeout = bool(
+                timeout_override is not None
+                or overlay_meta.get("local_timeout_set")
+                or node_cfg.timeout is not None
+                or (
+                    spec.config.timeout is not None
+                    and not overlay_meta.get("base_timeout_was_shipped_180")
+                )
+            )
+            if node_explicit_timeout:
+                model_extra_kwargs["explicit_timeout"] = True
             if is_prefix_group:
                 model_extra_kwargs["preserve_system_prefix"] = True
                 if schema_cls is not None:
@@ -5514,6 +5629,13 @@ def load_workflow_from_json(
                 node_id
             )
 
+            trigger_is_explicit = bool(
+                overlay_meta.get("local_context_editing_trigger_set")
+                or (
+                    spec.config.context_editing_trigger_tokens is not None
+                    and not overlay_meta.get("base_trigger_was_shipped_default")
+                )
+            )
             if is_prefix_group:
                 pg_members_here = prefix_group_nodes.get(prefix_group or "", [])
                 pg_parent_ids = {m.fork_from for m in pg_members_here if m.fork_from}
@@ -5543,6 +5665,7 @@ def load_workflow_from_json(
                         model=node_model_id,
                         config=spec.config.model_dump(),
                         preserve_system_prefix=True,
+                        explicit_trigger=trigger_is_explicit,
                     ),
                     _make_node_context_ceiling_before_model_callback(
                         node_id,
