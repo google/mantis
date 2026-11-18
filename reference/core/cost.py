@@ -801,23 +801,80 @@ def covered_below_depth(
         return None
 
 
-def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
-    """True when the newest coverage-earning campaign covering any file in
-    `files` (for `model`) was a `file-by-file` (or legacy `file-sweep`) run.
+def _common_path_prefix(files) -> str:
+    """Longest `/` directory prefix shared by all paths in `files` (pure string
+    ops so mixed/relative inputs never raise `ValueError`)."""
+    parts_list = [str(f).rstrip("/").split("/") for f in files if str(f).rstrip("/")]
+    if not parts_list:
+        return ""
+    common = parts_list[0]
+    for parts in parts_list[1:]:
+        limit = min(len(common), len(parts))
+        i = 0
+        while i < limit and common[i] == parts[i]:
+            i += 1
+        common = common[:i]
+        if not common:
+            return ""
+    joined = "/".join(common)
+    if not joined and any(str(f).startswith("/") for f in files):
+        return "/"
+    return joined
 
-    Scoping to the newest coverage-earning row (`ORDER BY id DESC`) ensures
-    that a single historical `--scan-mode uncovered` / `file-by-file` campaign
-    cannot permanently lock subsequent default `auto` runs into per-file sweeps
-    after a newer `cross-functional`, `whole`, or `changed` run supersedes it
-    (`r4-sticky-file-sweep`), while genuine in-progress per-file sweeps still
-    continue cleanly. Never raises.
+
+def _scope_covers_root(scope_path: str, common_root: str) -> bool:
+    """True when `scope_path` equals `common_root` or is an ancestor of it."""
+    raw = str(scope_path or "").strip()
+    if not raw or not common_root:
+        return False
+    if raw == "/":
+        return common_root.startswith("/")
+    s = raw.rstrip("/")
+    if not s:
+        return False
+    return common_root == s or common_root.startswith(s + "/")
+
+
+def _run_target_from_metadata(metadata_json: Any) -> str:
+    """Extracts the exact run-level `target` (never the broader `target_root`
+    repo anchor) from `runs.metadata_json`, or `''` when absent."""
+    if not metadata_json:
+        return ""
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    val = meta.get("target") or ""
+    return str(val).strip() if isinstance(val, str) else ""
+
+
+def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
+    """True when the newest full-target coverage-earning run covering `files`
+    (for `model`) was a `file-by-file` (or legacy `file-sweep`) sweep.
+
+    Scoping to the newest full-target coverage-earning row (`ORDER BY id DESC`):
+    - One historical `--scan-mode uncovered` / `file-by-file` campaign cannot
+      permanently lock subsequent default `auto` runs into per-file sweeps once
+      a newer full-repo `cross-functional` / `slices` / `whole` run supersedes
+      it (`r4-sticky-file-sweep`).
+    - Targeted delta runs (`scan_mode == 'changed'`) and narrow subdirectory /
+      single-file runs (e.g., `./run.sh repo/lib` when `files` spans `repo/`)
+      are ignored so they neither prematurely terminate an active repo-wide
+      sweep nor flip the entire repo into a per-file sweep.
+    Never raises.
     """
     if not db_path or not files or not os.path.exists(db_path):
         return False
     try:
+        file_list = [str(f) for f in files if str(f).rstrip("/")]
+        if not file_list:
+            return False
+        common_root = _common_path_prefix(file_list)
         file_ancestors: set[str] = set()
-        for f in files:
-            probe = str(f).rstrip("/")
+        for f in file_list:
+            probe = f.rstrip("/")
             while probe:
                 if probe in file_ancestors:
                     break
@@ -831,21 +888,38 @@ def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
         conn = _connect(db_path)
         try:
             try:
-                has_runs = model and conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
-                ).fetchone()
-                if has_runs:
+                has_runs_table = bool(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+                    ).fetchone()
+                )
+                has_runs_meta = False
+                if has_runs_table:
+                    run_cols = {
+                        r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()
+                    }
+                    has_runs_meta = "metadata_json" in run_cols
+                r_meta_col = "r.metadata_json" if has_runs_meta else "NULL"
+                if has_runs_table and model:
                     rows = conn.execute(
-                        "SELECT s.target, s.scan_mode, s.metadata_json FROM campaign_spend s "
+                        f"SELECT s.target, s.scan_mode, s.metadata_json, {r_meta_col} "
+                        "FROM campaign_spend s "
                         "LEFT JOIN runs r ON r.run_id = s.run_id "
                         "WHERE s.target IS NOT NULL "
                         "AND (r.model = ? OR r.model IS NULL OR r.model = '') "
                         "ORDER BY s.id DESC",
                         (str(model),),
                     ).fetchall()
+                elif has_runs_table:
+                    rows = conn.execute(
+                        f"SELECT s.target, s.scan_mode, s.metadata_json, {r_meta_col} "
+                        "FROM campaign_spend s "
+                        "LEFT JOIN runs r ON r.run_id = s.run_id "
+                        "WHERE s.target IS NOT NULL ORDER BY s.id DESC"
+                    ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT target, scan_mode, metadata_json FROM campaign_spend "
+                        "SELECT target, scan_mode, metadata_json, NULL FROM campaign_spend "
                         "WHERE target IS NOT NULL ORDER BY id DESC"
                     ).fetchall()
             except sqlite3.OperationalError as exc:
@@ -854,13 +928,32 @@ def has_active_file_sweep(db_path: str, files, model: str = "") -> bool:
                 raise
         finally:
             conn.close()
-        for target, scan_mode, metadata_json in rows:
+        for target, scan_mode, metadata_json, run_metadata_json in rows:
             t = str(target or "").rstrip("/")
             if not t or t not in file_ancestors:
                 continue
             if _row_failed(metadata_json) or _row_unexamined(metadata_json):
                 continue
-            return str(scan_mode or "").strip().lower() in ("file-by-file", "file-sweep")
+            sm = str(scan_mode or "").strip().lower()
+            # A targeted delta check (`--scan-mode changed`) never ends a repo-wide sweep.
+            if sm == "changed":
+                continue
+            run_target = _run_target_from_metadata(run_metadata_json)
+            if sm in ("file-by-file", "file-sweep"):
+                # A narrow subdirectory file-by-file run must not lock a larger repo into sweeps.
+                if run_target and common_root and not _scope_covers_root(run_target, common_root):
+                    continue
+                return True
+            if sm == "whole":
+                effective_scope = run_target or t
+                if common_root and not _scope_covers_root(effective_scope, common_root):
+                    continue
+                return False
+            # Full-repo batch mode (`cross-functional`, `slices`, etc.): if run metadata
+            # narrows it to a subdirectory, ignore; otherwise it supersedes the sweep.
+            if run_target and common_root and not _scope_covers_root(run_target, common_root):
+                continue
+            return False
         return False
     except Exception:
         return False

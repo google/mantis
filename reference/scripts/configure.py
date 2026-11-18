@@ -313,19 +313,63 @@ def find_cached_microsandbox_image(preferred: str = "") -> Optional[str]:
         return None
 
 
-def _detect_adc_project() -> Optional[str]:
-    """Safely extracts a non-placeholder GCP project from Application Default
-    Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, user ADC, or GCE metadata
-    server via `google.auth.default()`). Never raises."""
+def _adc_credentials_candidates() -> List[str]:
+    """Returns candidate Application Default Credentials file paths in
+    `google.auth.default()` precedence order without invoking `gcloud` or
+    probing the GCE metadata server."""
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path:
+        return [env_path]
     try:
+        from google.auth import _cloud_sdk
+
+        well_known = _cloud_sdk.get_application_default_credentials_path()
+        if well_known:
+            return [well_known]
+    except Exception:
+        pass
+    cfg_dir = os.environ.get("CLOUDSDK_CONFIG")
+    if not cfg_dir:
+        if os.name == "nt" and os.environ.get("APPDATA"):
+            cfg_dir = os.path.join(os.environ["APPDATA"], "gcloud")
+        else:
+            cfg_dir = os.path.join(os.path.expanduser("~"), ".config", "gcloud")
+    return [os.path.join(cfg_dir, "application_default_credentials.json")]
+
+
+def _detect_adc_project() -> Optional[str]:
+    """Safely extracts a non-placeholder GCP project from an existing local ADC
+    credentials file using `google.auth.load_credentials_from_file()`.
+
+    Avoids `google.auth.default()` so startup never probes the GCE metadata
+    server (`169.254.169.254`) when no ADC file exists and never launches an
+    unbounded `gcloud config get project` subprocess. Skips `external_account`
+    files (which can trigger HTTP or pluggable-command calls) and intentionally
+    does NOT fall back to `quota_project_id` so a billing project is never
+    mistaken for (or persisted as) a Vertex/GCE sandbox project. Never raises.
+    """
+    adc_path = next(
+        (p for p in _adc_credentials_candidates() if p and os.path.isfile(p)),
+        None,
+    )
+    if not adc_path:
+        return None
+    try:
+        with open(adc_path, "r", encoding="utf-8") as fh:
+            info = json.load(fh)
+        if not isinstance(info, dict):
+            return None
+        if info.get("type") in ("external_account", "external_account_authorized_user"):
+            return None
+
+        import warnings
         import google.auth
 
-        creds, proj = google.auth.default()
-        candidate = (
-            proj
-            or getattr(creds, "project_id", None)
-            or getattr(creds, "quota_project_id", None)
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            warnings.simplefilter("ignore", UserWarning)
+            creds, proj = google.auth.load_credentials_from_file(adc_path)
+        candidate = proj or getattr(creds, "project_id", None)
         if candidate and not is_placeholder(str(candidate)):
             return str(candidate).strip()
     except Exception:
@@ -427,11 +471,14 @@ def detect_capabilities() -> dict:
         except Exception:
             pass
 
-    if not caps["gcp_project"] and not caps["vertex_project"]:
+    if (
+        not caps["gcp_project"]
+        and not caps["vertex_project"]
+        and not caps["gcp_project_probe_failed"]
+    ):
         adc_proj = _detect_adc_project()
         if adc_proj:
             caps["vertex_project"] = adc_proj
-            caps["gcp_project_probe_failed"] = False
 
     if caps["gcloud"] and caps["gcp_auth"] and (caps["gcp_project"] or caps["vertex_project"]):
         caps["available_sandboxes"].append("gce")
@@ -1182,10 +1229,10 @@ def _sandbox_choice_is_explicit(workflow_path: str) -> bool:
         except Exception:
             # Unreadable overlay: treat as explicit so we never overwrite it.
             return True
-        if isinstance(data, dict) and (
-            "sandbox" in data or "sandbox" in (data.get("config", {}) or {})
-        ):
-            return True
+        if isinstance(data, dict):
+            cfg_section = data.get("config")
+            if "sandbox" in data or (isinstance(cfg_section, dict) and "sandbox" in cfg_section):
+                return True
     return False
 
 
@@ -1214,10 +1261,11 @@ def _model_choice_is_explicit(workflow_path: str) -> bool:
             # Unreadable overlay: treat as explicit so we never overwrite it.
             return True
         if isinstance(data, dict):
-            raw = (data.get("config", {}) or {}).get("default_model")
+            cfg_section = data.get("config")
+            raw = cfg_section.get("default_model") if isinstance(cfg_section, dict) else None
             if raw is None:
                 raw = data.get("default_model")
-            if raw and not is_placeholder(str(raw)):
+            if isinstance(raw, str) and raw.strip() and not is_placeholder(raw):
                 return True
     return False
 

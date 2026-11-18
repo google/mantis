@@ -901,6 +901,104 @@ class RepoDocsBatchAndLiveSmokeFixesTest(unittest.TestCase):
         )
         self.assertTrue(has_active_file_sweep(self.db, files, model=model))
 
+    def test_has_active_file_sweep_ignores_changed_and_narrow_subdir_runs(self):
+        """A small `--scan-mode changed` run or narrow subdirectory scan (e.g. `lib/`)
+        must neither terminate an active repo-wide file-by-file sweep nor lock the
+        entire repository into per-file sweeps."""
+        repo = self.root / "scoped_sweep_repo"
+        src_dir = repo / "src"
+        lib_dir = repo / "lib"
+        src_dir.mkdir(parents=True)
+        lib_dir.mkdir(parents=True)
+        src_file = src_dir / "main.py"
+        lib_file = lib_dir / "util.py"
+        src_file.write_text("x = 1\n", encoding="utf-8")
+        lib_file.write_text("y = 1\n", encoding="utf-8")
+        files = [str(src_file), str(lib_file)]
+        model = "vertex_ai/gemini-3.8-flash"
+
+        # 1. Start a repo-wide file-by-file sweep -> active.
+        record_run(
+            self.db, "r_full_sweep", model=model,
+            metadata={"target": str(repo), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_full_sweep", str(src_file), mantis_main.SCAN_MODE_FILE_BY_FILE,
+            tokens=2000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 2. A newer `--scan-mode changed` run on lib/ (or even repo root) must NOT end it.
+        record_run(
+            self.db, "r_chg_lib", model=model,
+            metadata={"target": str(repo), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_chg_lib", str(lib_dir), mantis_main.SCAN_MODE_CHANGED,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+        record_spend(
+            self.db, "r_chg_lib", str(repo), mantis_main.SCAN_MODE_CHANGED,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 3. A newer narrow `whole` scan strictly on lib/ (or lib/util.py) must NOT end it.
+        record_run(
+            self.db, "r_whole_lib", model=model,
+            metadata={"target": str(lib_dir), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_whole_lib", str(lib_dir), mantis_main.SCAN_MODE_WHOLE,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # Even a legacy `whole` row lacking `runs.metadata_json.target` (only `target_root`) on lib/ must NOT end it.
+        record_run(
+            self.db, "r_whole_lib_legacy", model=model,
+            metadata={"target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_whole_lib_legacy", str(lib_dir), mantis_main.SCAN_MODE_WHOLE,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 4. A newer narrow `cross-functional` run targeting ONLY lib/ must NOT end it.
+        record_run(
+            self.db, "r_cf_lib", model=model,
+            metadata={"target": str(lib_dir), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_cf_lib", str(lib_file), mantis_main.SCAN_MODE_CROSS_FUNCTIONAL,
+            tokens=3000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertTrue(has_active_file_sweep(self.db, files, model=model))
+
+        # 5. A FULL-REPO `whole` run on `repo` DOES end the sweep!
+        record_run(
+            self.db, "r_whole_repo", model=model,
+            metadata={"target": str(repo), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_whole_repo", str(repo), mantis_main.SCAN_MODE_WHOLE,
+            tokens=8000, metadata={"failed": False, "depth": 30},
+        )
+        self.assertFalse(has_active_file_sweep(self.db, files, model=model))
+
+        # 6. A narrow `file-by-file` run targeting ONLY lib/ must NOT activate a repo-wide sweep!
+        record_run(
+            self.db, "r_sweep_lib_only", model=model,
+            metadata={"target": str(lib_dir), "target_root": str(repo)},
+        )
+        record_spend(
+            self.db, "r_sweep_lib_only", str(lib_file), mantis_main.SCAN_MODE_FILE_BY_FILE,
+            tokens=1500, metadata={"failed": False, "depth": 30},
+        )
+        self.assertFalse(has_active_file_sweep(self.db, files, model=model))
+
 
 if __name__ == "__main__":
     unittest.main()
