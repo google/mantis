@@ -3273,6 +3273,83 @@ FINDINGS_SNAPSHOT_MAX_LINES = 150
 FINDINGS_SNAPSHOT_HEADER = "[STATE STORE: RECORDED FINDINGS (DO NOT RE-REPORT)]"
 
 
+def _reason_code_name(val: Any) -> str:
+    """Normalizes a finish_reason / error_code enum or string to its bare token
+    name (e.g. `types.FinishReason.MAX_TOKENS` -> `'MAX_TOKENS'`). In Python
+    3.12 `str(FinishReason.MAX_TOKENS)` returns `'FinishReason.MAX_TOKENS'`, so
+    comparing `str(val) == 'MAX_TOKENS'` silently failed."""
+    if val is None:
+        return ""
+    raw = getattr(val, "value", val)
+    text = str(raw).strip()
+    if not text:
+        return ""
+    return text.rsplit(".", 1)[-1].upper()
+
+
+def _normalize_fallback_resource(resource: str) -> str:
+    raw = str(resource or "").strip()
+    if not raw:
+        return ""
+    if "#pass" in raw:
+        base, suffix = raw.rsplit("#pass", 1)
+        norm_base = os.path.realpath(base).rstrip("/") if os.path.exists(base) else base.rstrip("/")
+        return f"{norm_base}#pass{suffix}"
+    return (os.path.realpath(raw) if os.path.exists(raw) else raw).rstrip("/")
+
+
+def reviewer_fallback_artifact_path(
+    resource: str, pass_index: int = 1, attempt: int = 1
+) -> str:
+    """Stable per-(campaign, pass, attempt) artifact path used to persist
+    synthesized reviewer fallback counts across budget pauses, Ctrl-C, SIGTERM,
+    and `--resume` restarts."""
+    norm = _normalize_fallback_resource(resource) or "default"
+    digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:12]
+    p_idx = max(1, int(pass_index or 1))
+    att = max(1, int(attempt or 1))
+    return f"workspace/.structured/reviewer_fallback_{digest}_p{p_idx}_a{att}.json"
+
+
+def _persist_reviewer_fallback_artifact(
+    rc: Any, *, schema_name: str, reason: str
+) -> None:
+    """Best-effort durable write of the active campaign's reviewer fallback
+    counter into `campaign_artifacts` so a mid-campaign interruption never
+    zeroes it out across `--resume`. Never raises (INV-6)."""
+    db_path = str(getattr(rc, "db_path", "") or "")
+    run_id = str(getattr(rc, "run_id", "") or "")
+    if not db_path or not run_id or not os.path.exists(db_path):
+        return
+    try:
+        from core.database import record_artifact
+
+        res_key = str(getattr(rc, "artifact_resource", "") or getattr(rc, "target_file", "") or "")
+        pass_idx = max(1, int(getattr(rc, "pass_index", 1) or 1))
+        attempt = max(1, int(getattr(rc, "fallback_attempt", 1) or 1))
+        artifact_path = reviewer_fallback_artifact_path(res_key, pass_index=pass_idx, attempt=attempt)
+        payload = json.dumps(
+            {
+                "count": int(getattr(rc, "reviewer_verdict_fallbacks", 0) or 0),
+                "schema": str(schema_name or ""),
+                "reason": str(reason or ""),
+                "target": str(getattr(rc, "target_file", "") or ""),
+                "pass_index": pass_idx,
+                "attempt": attempt,
+            }
+        )
+        record_artifact(
+            db_path,
+            run_id,
+            "reviewer_fallback",
+            artifact_path,
+            payload,
+            metadata={"resource": res_key, "pass_index": pass_idx, "attempt": attempt},
+        )
+    except Exception:
+        pass
+
+
 class ResilientLiteLlm(LiteLlm):
     """LiteLlm wrapper with resilient full jitter retry (min 5s offset, 1h patience) on quota and rate limits."""
 
@@ -3663,7 +3740,10 @@ class ResilientLiteLlm(LiteLlm):
                 if not getattr(p, "thought", False)
             )
 
-        is_safety_block = getattr(response, "finish_reason", None) in (types.FinishReason.SAFETY, "SAFETY") or getattr(response, "error_code", None) == "SAFETY"
+        is_safety_block = (
+            _reason_code_name(getattr(response, "finish_reason", None)) == "SAFETY"
+            or _reason_code_name(getattr(response, "error_code", None)) == "SAFETY"
+        )
 
         # Check if the text (or fenced/embedded JSON inside it) validates against schema_cls.
         is_valid = False
@@ -3760,6 +3840,11 @@ class ResilientLiteLlm(LiteLlm):
                         _rc.reviewer_verdict_fallbacks = (
                             int(getattr(_rc, "reviewer_verdict_fallbacks", 0) or 0) + 1
                         )
+                        _persist_reviewer_fallback_artifact(
+                            _rc,
+                            schema_name=schema_name,
+                            reason=str(fallback_payload.get("reason") or ""),
+                        )
             except Exception:
                 pass
 
@@ -3850,6 +3935,7 @@ class ResilientLiteLlm(LiteLlm):
         while True:
             streamed_content = False  # per attempt: has this turn yielded an answer yet
             yielded_any = False       # per attempt: did upstream yield any LlmResponse at all
+            yielded_final = False     # per attempt: has a non-partial (persisted) response been yielded yet
             pending_empty = None      # a final with no answer, held until the stream shows what follows
             retry_schema_turn = False
             used_cache_entry: Optional[dict[str, Any]] = None
@@ -3919,6 +4005,8 @@ class ResilientLiteLlm(LiteLlm):
                             # Something followed it, so it was not the end of the
                             # turn: pass it on as it came.
                             yielded_any = True
+                            if not getattr(pending_empty, "partial", False):
+                                yielded_final = True
                             yield self._sanitize_structured_response(
                                 pending_empty, schema_cls, allow_set_model_response_tool=has_smr_tool
                             )
@@ -3926,38 +4014,59 @@ class ResilientLiteLlm(LiteLlm):
                         if is_empty_stop_response(response) and not streamed_content:
                             pending_empty = response
                             continue
+                        err_code_name = _reason_code_name(getattr(response, "error_code", None))
+                        finish_reason_name = _reason_code_name(getattr(response, "finish_reason", None))
+                        is_max_tokens_err = (
+                            err_code_name == "MAX_TOKENS" or finish_reason_name == "MAX_TOKENS"
+                        )
+                        is_safety_err = (
+                            err_code_name == "SAFETY" or finish_reason_name == "SAFETY"
+                        )
                         if (
                             schema_cls is not None
                             and not getattr(response, "partial", False)
                             and not schema_error_retried
-                            and not streamed_content
+                            and not yielded_final
+                            and not is_safety_err
                             and (
-                                (
-                                    getattr(response, "error_code", None)
-                                    and str(getattr(response, "error_code", "")) != "SAFETY"
-                                )
-                                or str(getattr(response, "finish_reason", "")).endswith("MALFORMED_FUNCTION_CALL")
+                                bool(err_code_name)
+                                or finish_reason_name == "MALFORMED_FUNCTION_CALL"
+                                or is_max_tokens_err
                             )
                         ):
                             meter_response_usage(response)
                             schema_error_retried = True
                             retry_schema_turn = True
                             current_stream = False
-                            if str(getattr(response, "error_code", "")) == "MAX_TOKENS":
+                            if is_max_tokens_err:
                                 schema_label = getattr(schema_cls, "__name__", "verdict")
+                                resp_parts = getattr(getattr(response, "content", None), "parts", None) or []
+                                resp_text = "".join(
+                                    getattr(p, "text", "") or ""
+                                    for p in resp_parts
+                                    if not getattr(p, "thought", False)
+                                )
+                                if "{" in resp_text and '"route"' in resp_text:
+                                    reask_text = (
+                                        f"Your previous turn hit the output token limit before completing "
+                                        f"valid {schema_label} JSON. Emit a concise {schema_label} JSON "
+                                        "object keeping each reason brief (one short sentence)."
+                                    )
+                                else:
+                                    reask_text = (
+                                        f"Your previous turn hit the output token limit before completing. "
+                                        f"If your analysis is complete, emit a concise raw {schema_label} JSON "
+                                        "object keeping each reason brief (one short sentence). Otherwise "
+                                        "continue your verification with the next focused tool call through "
+                                        "the function-calling interface."
+                                    )
                                 retry_req = active_request.model_copy()
                                 appended = list(getattr(active_request, "contents", None) or [])
                                 appended.append(
                                     genai_types.Content(
                                         role="user",
                                         parts=[
-                                            genai_types.Part.from_text(
-                                                text=(
-                                                    f"Your previous turn hit the output token limit before completing "
-                                                    f"valid {schema_label} JSON. Emit a concise {schema_label} JSON "
-                                                    "object keeping each reason brief (one short sentence)."
-                                                )
-                                            )
+                                            genai_types.Part.from_text(text=reask_text)
                                         ],
                                     )
                                 )
@@ -4040,6 +4149,8 @@ class ResilientLiteLlm(LiteLlm):
                         if response_has_meaningful_content(response):
                             streamed_content = True
                         yielded_any = True
+                        if not getattr(response, "partial", False):
+                            yielded_final = True
                         yield self._sanitize_structured_response(
                             response, schema_cls, allow_set_model_response_tool=has_smr_tool
                         )

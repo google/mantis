@@ -651,7 +651,7 @@ MUTANTS = {
     ],
     'sarif_sink_never_runs': [
         ('main.py',
-         '        count, skipped = write_sarif(\n            str(resolved_sarif),\n            active_findings,\n            scan_root=str(target_path),\n        )',
+         '        count, skipped = write_sarif(\n            str(resolved_sarif),\n            active_findings,\n            scan_root=str(target_path),\n            run_properties=sarif_run_props,\n        )',
          '        count, skipped = 0, []  # MUTATED: configured export never written'),
     ],
     # ---- Custom tool registry (H-1) ----

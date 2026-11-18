@@ -324,6 +324,7 @@ def _rehydrate_session_metrics(
     prior_reads = 0
     prior_tokens = 0
     prior_llm_calls = 0
+    prior_reviewer_fallbacks = 0
     seen_nodes_order: list[str] = []
     seen_nodes_set: set[str] = set()
     for ev in active_events:
@@ -346,6 +347,24 @@ def _rehydrate_session_metrics(
         if clean_node and not getattr(ev, "error_code", None) and clean_node not in seen_nodes_set:
             seen_nodes_set.add(clean_node)
             seen_nodes_order.append(clean_node)
+        if clean_node == "reviewer" or (clean_node.startswith("reviewer_") and "classifier" not in clean_node):
+            ev_parts = getattr(getattr(ev, "content", None), "parts", None) or []
+            ev_text = "".join(
+                getattr(p, "text", "") or ""
+                for p in ev_parts
+                if not getattr(p, "thought", False)
+            ).strip()
+            if ev_text.startswith("{"):
+                try:
+                    ev_obj = json.loads(ev_text)
+                except (TypeError, ValueError):
+                    ev_obj = None
+                if (
+                    isinstance(ev_obj, dict)
+                    and str(ev_obj.get("route") or "").strip().lower() == "false_positive"
+                    and str(ev_obj.get("reason") or "").startswith("Fallback:")
+                ):
+                    prior_reviewer_fallbacks += 1
         for part in getattr(getattr(ev, "content", None), "parts", None) or []:
             fc = getattr(part, "function_call", None)
             if fc is None:
@@ -427,6 +446,11 @@ def _rehydrate_session_metrics(
     if run_ctx is not None:
         run_ctx.pre_pause_tokens = prior_tokens
         run_ctx.pre_pause_llm_calls = prior_llm_calls
+        if prior_reviewer_fallbacks > 0:
+            run_ctx.reviewer_verdict_fallbacks = max(
+                int(getattr(run_ctx, "reviewer_verdict_fallbacks", 0) or 0),
+                prior_reviewer_fallbacks,
+            )
 
 
 def _rehydrate_campaign_resume_state(
@@ -507,8 +531,85 @@ def _rehydrate_campaign_resume_state(
                 branch_ctx.sandbox_executed = True
         if promoted:
             branch_ctx.promoted_finding_ids = promoted
+
+        # Restore durable reviewer-fallback count recorded for THIS attempt of
+        # the campaign so a pause/Ctrl-C/SIGTERM between reviewer fallback and
+        # campaign end cannot zero out the counter on `--resume`. Keyed by
+        # `(resource, pass_idx, fallback_attempt)` so Attempt 1's failed record
+        # never bleeds into a clean Attempt 2 retry.
+        try:
+            from core.config import reviewer_fallback_artifact_path
+            from core.database import read_artifact_record
+
+            cur_attempt = max(1, int(getattr(branch_ctx, "fallback_attempt", 1) or 1))
+            fb_path = reviewer_fallback_artifact_path(
+                want_res, pass_index=max(1, int(pass_idx or 1)), attempt=cur_attempt
+            )
+            fb_rec = read_artifact_record(
+                db_path,
+                filepath=fb_path,
+                artifact_type="reviewer_fallback",
+                run_id=run_id,
+                resource=None,
+            )
+            if fb_rec is not None:
+                fb_payload = json.loads(fb_rec.get("content") or "{}")
+                if isinstance(fb_payload, dict):
+                    fb_count = int(fb_payload.get("count", 0) or 0)
+                    if fb_count > 0:
+                        branch_ctx.reviewer_verdict_fallbacks = max(
+                            int(getattr(branch_ctx, "reviewer_verdict_fallbacks", 0) or 0),
+                            fb_count,
+                        )
+        except Exception:
+            pass
     except Exception:
         pass
+
+
+DEFAULT_MAX_REVIEWER_FALLBACK_ATTEMPTS = 2
+
+
+def _max_reviewer_fallback_attempts() -> int:
+    raw = str(os.environ.get("MANTIS_MAX_REVIEWER_FALLBACK_ATTEMPTS", "") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_MAX_REVIEWER_FALLBACK_ATTEMPTS
+
+
+def _evaluate_reviewer_fallback_outcome(
+    *,
+    task_failed: bool,
+    rev_fallbacks: int,
+    unreviewed_reported: int,
+    prior_fallback_attempts: int,
+    max_attempts: int,
+) -> dict[str, Any]:
+    """Determines whether a campaign with synthesized reviewer fallback verdicts
+    should fail for `--resume` retry or settle into a terminal `review_incomplete`
+    end state (preventing infinite `--resume` loops while keeping findings
+    `'reported'` and withholding coverage credit)."""
+    if task_failed or rev_fallbacks <= 0 or unreviewed_reported <= 0:
+        return {
+            "triggered": False,
+            "task_failed": bool(task_failed),
+            "terminal": False,
+            "attempt_num": 0,
+            "max_attempts": max(1, int(max_attempts)),
+        }
+    cap = max(1, int(max_attempts))
+    attempt_num = max(0, int(prior_fallback_attempts)) + 1
+    terminal = attempt_num >= cap
+    return {
+        "triggered": True,
+        "task_failed": not terminal,
+        "terminal": terminal,
+        "attempt_num": attempt_num,
+        "max_attempts": cap,
+    }
 
 
 def _build_operator_steering_blocks(focus: str, seed_report: str) -> tuple[str, str]:
@@ -4457,11 +4558,23 @@ async def pipeline(
                 if not row.get("failed") and not (retry_unexamined and row.get("unexamined"))
             }
             failed_pairs = {pair for pair, row in norm_pass_ledger.items() if row.get("failed")} - completed_pass_pairs
+            terminal_fb_pairs = {
+                pair
+                for pair, row in norm_pass_ledger.items()
+                if not row.get("failed") and (row.get("terminal_reviewer_fallback") or row.get("review_incomplete"))
+            }
             unexamined_pairs = {
                 pair
                 for pair, row in norm_pass_ledger.items()
-                if not row.get("failed") and row.get("unexamined")
+                if not row.get("failed") and row.get("unexamined") and pair not in terminal_fb_pairs
             }
+            if terminal_fb_pairs and not retry_unexamined:
+                print(
+                    f"[RESUME] {len(terminal_fb_pairs)} earlier campaign pass(es) stopped after "
+                    "hitting the reviewer-fallback retry cap (findings remain 'reported'/unreviewed). "
+                    "Pass --retry-unexamined with --resume to force another attempt.",
+                    file=sys.stderr,
+                )
             if unexamined_pairs and not retry_unexamined:
                 print(
                     f"[RESUME] {len(unexamined_pairs)} earlier campaign pass(es) exited without "
@@ -4510,6 +4623,13 @@ async def pipeline(
                 file=sys.stderr,
             )
             if not remaining_pairs:
+                if terminal_fb_pairs:
+                    print(
+                        f"Run {run_id} has {len(terminal_fb_pairs)} campaign pass(es) with incomplete "
+                        "review (reviewer-fallback retry cap reached). Inspect the unreviewed "
+                        "'reported' findings or pass --retry-unexamined with --resume to force retry."
+                    )
+                    return 1
                 print("Nothing left to scan for this run. To scan again, start a new run.")
                 return 0
             remaining_target_keys = {_key(t) for (t, _p) in remaining_pairs}
@@ -4537,11 +4657,23 @@ async def pipeline(
                 if not row.get("failed") and not (retry_unexamined and row.get("unexamined"))
             }
             failed = {_key(t) for t, row in ledger.items() if row.get("failed")} - completed
+            terminal_fb_completed = {
+                _key(t)
+                for t, row in ledger.items()
+                if not row.get("failed") and (row.get("terminal_reviewer_fallback") or row.get("review_incomplete"))
+            }
             unexamined_completed = {
                 _key(t)
                 for t, row in ledger.items()
-                if not row.get("failed") and row.get("unexamined")
+                if not row.get("failed") and row.get("unexamined") and _key(t) not in terminal_fb_completed
             }
+            if terminal_fb_completed and not retry_unexamined:
+                print(
+                    f"[RESUME] {len(terminal_fb_completed)} earlier campaign(s) stopped after "
+                    "hitting the reviewer-fallback retry cap (findings remain 'reported'/unreviewed). "
+                    "Pass --retry-unexamined with --resume to force another attempt.",
+                    file=sys.stderr,
+                )
             if unexamined_completed and not retry_unexamined:
                 print(
                     f"[RESUME] {len(unexamined_completed)} earlier campaign(s) exited without "
@@ -4612,6 +4744,13 @@ async def pipeline(
                 file=sys.stderr,
             )
             if not remaining:
+                if terminal_fb_completed:
+                    print(
+                        f"Run {run_id} has {len(terminal_fb_completed)} campaign(s) with incomplete "
+                        "review (reviewer-fallback retry cap reached). Inspect the unreviewed "
+                        "'reported' findings or pass --retry-unexamined with --resume to force retry."
+                    )
+                    return 1
                 try:
                     from core.database import mark_run_finalized
 
@@ -5024,6 +5163,7 @@ async def pipeline(
 
     failures = 0
     successes = 0
+    review_incomplete_campaigns = 0
     paused = False
     # Areas whose campaign ran to completion, for the coverage ledger. Appended to only
     # on the success path below, so the ledger records what was examined rather than
@@ -5064,7 +5204,7 @@ async def pipeline(
     shared_prefix = {"briefed": False}
 
     async def _campaign_worker(worker_runner: Optional[Runner] = None):
-        nonlocal campaign_queue, failures, successes, paused
+        nonlocal campaign_queue, failures, successes, review_incomplete_campaigns, paused
         nonlocal replan_notice_shown, pause_banner_shown
         active_runner = worker_runner or runner
         while campaign_queue and not paused:
@@ -5111,6 +5251,14 @@ async def pipeline(
             effective_directive = change_focus or _render_slice_scope_directive(
                 scan_item, group, jail_dir
             )
+            from core.cost import fallback_attempt_count
+
+            prior_fallback_attempts = fallback_attempt_count(
+                db_path,
+                run_id,
+                scan_item,
+                pass_index=pass_idx if total_passes > 1 else None,
+            )
             branch_ctx = dataclasses.replace(
                 base_ctx,
                 target_file=scan_item,
@@ -5130,6 +5278,9 @@ async def pipeline(
                 pass_index=pass_idx,
                 artifact_resource=pass_resource,
                 reported_in_pass=False,
+                verdict_fallbacks=0,
+                reviewer_verdict_fallbacks=0,
+                fallback_attempt=prior_fallback_attempts + 1,
                 pre_pause_tokens=0,
                 resumed_mid_invocation=False,
                 promoted_finding_ids=None,
@@ -5322,32 +5473,66 @@ async def pipeline(
                 )
                 rev_fallbacks = int(getattr(branch_ctx, "reviewer_verdict_fallbacks", 0) or 0)
                 unreviewed_reported = int(finding_counts.get("reported", 0) or 0)
-                if not task_failed and rev_fallbacks > 0 and unreviewed_reported > 0:
-                    task_failed = True
-                    print(
-                        f"\n[REVIEWER FALLBACK] '{scan_item}': reviewer emitted {rev_fallbacks} "
-                        f"synthesized fallback verdict(s) leaving {unreviewed_reported} candidate "
-                        "finding(s) unreviewed; marking campaign failed so findings are not silently "
-                        "dropped as a clean exit and --resume retries review.",
-                        file=sys.stderr,
-                    )
-                earned_coverage = should_credit_coverage(task_failed, code_reads)
+                fb_outcome = _evaluate_reviewer_fallback_outcome(
+                    task_failed=task_failed,
+                    rev_fallbacks=rev_fallbacks,
+                    unreviewed_reported=unreviewed_reported,
+                    prior_fallback_attempts=prior_fallback_attempts,
+                    max_attempts=_max_reviewer_fallback_attempts(),
+                )
+                review_incomplete_terminal = False
+                if fb_outcome["triggered"]:
+                    if fb_outcome["terminal"]:
+                        review_incomplete_terminal = True
+                        review_incomplete_campaigns += 1
+                        print(
+                            f"\n[REVIEWER FALLBACK] '{scan_item}': reviewer emitted {rev_fallbacks} "
+                            f"synthesized fallback verdict(s) leaving {unreviewed_reported} candidate "
+                            f"finding(s) unreviewed (attempt {fb_outcome['attempt_num']}/{fb_outcome['max_attempts']}; "
+                            "retry cap reached). Stopping automatic --resume retries; findings remain "
+                            "'reported' (unreviewed) and coverage credit is withheld. Inspect them manually "
+                            "or pass --retry-unexamined with --resume to force another attempt.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        task_failed = True
+                        print(
+                            f"\n[REVIEWER FALLBACK] '{scan_item}': reviewer emitted {rev_fallbacks} "
+                            f"synthesized fallback verdict(s) leaving {unreviewed_reported} candidate "
+                            f"finding(s) unreviewed (attempt {fb_outcome['attempt_num']}/{fb_outcome['max_attempts']}); "
+                            "marking campaign failed so findings are not silently dropped as a clean exit "
+                            "and --resume retries review.",
+                            file=sys.stderr,
+                        )
+                earned_coverage = (
+                    False
+                    if review_incomplete_terminal
+                    else should_credit_coverage(task_failed, code_reads)
+                )
                 # What this campaign actually cost. Recorded for completed campaigns
                 # only -- including failed ones, which still ran the graph and are a
                 # real observation. The budget-pause path below deliberately does NOT
                 # record: a campaign cut off partway through cost less than a campaign
                 # costs, and averaging truncated runs in would bias every future
                 # estimate downward, making the next run plan a scan it cannot finish.
+                spend_meta: dict[str, Any] = {"failed": bool(task_failed), "depth": int(resolved_depth)}
+                if fb_outcome["triggered"]:
+                    spend_meta["reviewer_fallback"] = True
+                    spend_meta["fallback_attempts"] = int(fb_outcome["attempt_num"])
+                    spend_meta["unreviewed_count"] = int(unreviewed_reported)
+                    if review_incomplete_terminal:
+                        spend_meta["review_incomplete"] = True
+                        spend_meta["terminal_reviewer_fallback"] = True
+                        spend_meta["unexamined"] = True
+                if not task_failed and not earned_coverage:
+                    spend_meta["unexamined"] = True
+                if getattr(branch_ctx, "resumed_mid_invocation", False) and pre_pause_tokens == 0:
+                    spend_meta["resumed_tail"] = True
+                if pass_idx > 1:
+                    spend_meta["pass_index"] = int(pass_idx)
                 try:
                     from core.cost import record_spend
 
-                    spend_meta: dict[str, Any] = {"failed": bool(task_failed), "depth": int(resolved_depth)}
-                    if not task_failed and not earned_coverage:
-                        spend_meta["unexamined"] = True
-                    if getattr(branch_ctx, "resumed_mid_invocation", False) and pre_pause_tokens == 0:
-                        spend_meta["resumed_tail"] = True
-                    if pass_idx > 1:
-                        spend_meta["pass_index"] = int(pass_idx)
                     record_spend(
                         db_path,
                         run_id,
@@ -5363,8 +5548,13 @@ async def pipeline(
                 except Exception as exc:
                     # Bookkeeping must never cost a scan that is finding real bugs.
                     print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
+                _spend_status = (
+                    "failed"
+                    if task_failed
+                    else ("review_incomplete" if review_incomplete_terminal else "done")
+                )
                 _note_campaign_spend(pass_resource or scan_item, campaign_files, budget_ctrl,
-                                     "failed" if task_failed else "done",
+                                     _spend_status,
                                      elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0)
 
                 # Stages that continued in a fresh context (core.graph_loader
@@ -5414,6 +5604,12 @@ async def pipeline(
                             record_coverage_files(db_path, run_id, scan_item, scope_content)
                         except Exception as exc:
                             print(f"[CONTENT LEDGER WARNING] {exc}", file=sys.stderr)
+                    elif review_incomplete_terminal:
+                        print(
+                            f"[COVERAGE GUARD] '{scan_item}': withholding examined-area credit because "
+                            "reviewer fallback left candidate findings unreviewed.",
+                            file=sys.stderr,
+                        )
                     else:
                         print(
                             f"[COVERAGE GUARD] '{scan_item}': campaign finished without "
@@ -5794,16 +5990,50 @@ async def pipeline(
         print(f"\n💾 {render_sessions_store_note(store)}")
     except Exception as exc:
         print(f"[SESSION STORE WARNING] {exc}", file=sys.stderr)
+    from core.cost import run_reviewer_fallback_summary
+    from core.database import is_untriaged
+
+    fallback_summary = run_reviewer_fallback_summary(db_path, run_id)
+    total_review_incomplete = max(
+        int(review_incomplete_campaigns),
+        int(fallback_summary.get("terminal_campaigns", 0) or 0),
+    )
+    fallback_reported_ids: set[int] = set()
+    for fb_target, fb_pass in fallback_summary.get("active_targets") or []:
+        try:
+            fb_rows = read_findings(
+                db_path,
+                run_id=run_id,
+                status="reported",
+                scope_path=fb_target or None,
+                campaign=fb_target or None,
+                pass_index=fb_pass if total_passes > 1 else None,
+            )
+            for row in fb_rows:
+                if row.get("id") is not None:
+                    fallback_reported_ids.add(int(row["id"]))
+        except Exception:
+            pass
+
     unique_active_count = _count_unique_active_findings(active_findings)
     print(f"\n📊 Summary: {unique_active_count} active / {len(findings)} total vulnerability finding(s) recorded.")
+    if fallback_reported_ids:
+        print(
+            f"   ⚠️ {len(fallback_reported_ids)} finding(s) unreviewed (reviewer fallback); "
+            "retained as 'reported' and omitted from active/SARIF alerts."
+        )
     for f in findings:
         lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""
         st = f.get("status") or ""
         st_key = str(st).strip().lower()
+        fid_val = f.get("id")
         if st_key == "duplicate_merged":
             mark = " [duplicate_merged]"
         elif st_key == "reported":
-            mark = " (suppressed at review)"
+            if fid_val is not None and int(fid_val) in fallback_reported_ids:
+                mark = " (unreviewed: reviewer fallback)"
+            else:
+                mark = " (suppressed at review)"
         elif st_key in ("false_positive", "non_viable", "sample_or_test"):
             mark = f" [{st}]"
         else:
@@ -5880,10 +6110,21 @@ async def pipeline(
             # for a specific path and silently got another one would look for the
             # export where they asked for it and conclude the run produced nothing.
             raise SarifExportError(f"Cannot write SARIF: {path_error}")
+        untriaged_count = sum(1 for f in findings if is_untriaged(f.get("status")))
+        sarif_run_props: dict[str, Any] = {
+            "run_id": run_id,
+            "scan_mode": scan_mode,
+            "partial": bool(paused),
+            "untriaged_omitted": untriaged_count,
+            "reviewer_fallback_count": int(fallback_summary.get("total_fallback_rows", 0) or 0),
+            "review_incomplete_campaigns": total_review_incomplete,
+            "unreviewed_reviewer_fallback_findings": len(fallback_reported_ids),
+        }
         count, skipped = write_sarif(
             str(resolved_sarif),
             active_findings,
             scan_root=str(target_path),
+            run_properties=sarif_run_props,
         )
         print(f"\n📤 SARIF: wrote {count} result(s) to {resolved_sarif}")
         if skipped:
@@ -5906,8 +6147,21 @@ async def pipeline(
 
     if paused:
         return 2
-    if failures > 0:
-        print(f"\n⚠️ Pipeline completed with {failures} failure(s).")
+    if failures > 0 or total_review_incomplete > 0:
+        if failures > 0 and total_review_incomplete > 0:
+            print(
+                f"\n⚠️ Pipeline completed with {failures} failure(s) and "
+                f"{total_review_incomplete} review-incomplete campaign(s) "
+                f"({len(fallback_reported_ids)} finding(s) unreviewed due to reviewer fallback)."
+            )
+        elif total_review_incomplete > 0:
+            print(
+                f"\n⚠️ Pipeline completed with {total_review_incomplete} review-incomplete "
+                f"campaign(s) ({len(fallback_reported_ids)} finding(s) unreviewed due to "
+                "reviewer fallback; automatic retries capped)."
+            )
+        else:
+            print(f"\n⚠️ Pipeline completed with {failures} failure(s).")
         return 1
     try:
         from core.database import mark_run_finalized

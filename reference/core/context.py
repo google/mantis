@@ -110,6 +110,8 @@ class RunContext:
     # Count of synthesized Fallback: verdict turns observed in this campaign.
     verdict_fallbacks: int = 0
     reviewer_verdict_fallbacks: int = 0
+    # 1-indexed reviewer-fallback retry attempt for the active campaign.
+    fallback_attempt: int = 1
     # Mid-invocation --resume accounting.
     pre_pause_tokens: int = 0
     pre_pause_llm_calls: int = 0
