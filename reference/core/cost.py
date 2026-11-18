@@ -909,6 +909,153 @@ def _row_pass_index(metadata_json: Any) -> int:
         return 1
 
 
+def _parse_meta_dict(metadata_json: Any) -> dict[str, Any]:
+    if not metadata_json:
+        return {}
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _norm_target_key(target: str) -> str:
+    raw = str(target or "").strip()
+    if not raw:
+        return ""
+    try:
+        return os.path.realpath(raw).rstrip("/")
+    except OSError:
+        return raw.rstrip("/")
+
+
+def _attach_fallback_meta(entry: dict[str, Any], metadata_json: Any) -> None:
+    meta = _parse_meta_dict(metadata_json)
+    if meta.get("reviewer_fallback"):
+        entry["reviewer_fallback"] = True
+    if meta.get("review_incomplete"):
+        entry["review_incomplete"] = True
+    if meta.get("terminal_reviewer_fallback"):
+        entry["terminal_reviewer_fallback"] = True
+    if meta.get("fallback_attempts") is not None:
+        try:
+            entry["fallback_attempts"] = int(meta["fallback_attempts"])
+        except (TypeError, ValueError):
+            pass
+
+
+def fallback_attempt_count(
+    db_path: str,
+    run_id: str,
+    target: str,
+    pass_index: Optional[int] = None,
+) -> int:
+    """Number of prior `campaign_spend` rows for `(run_id, target[, pass_index])`
+    that ended because of a synthesized reviewer fallback (`reviewer_fallback=True`).
+    Never raises (INV-6)."""
+    if not db_path or not run_id or not target:
+        return 0
+    try:
+        if not _db_exists(db_path):
+            return 0
+        want_key = _norm_target_key(target)
+        want_raw = str(target).strip().rstrip("/")
+        want_pass = max(1, int(pass_index)) if pass_index is not None else None
+        conn = _connect(db_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
+                    (str(run_id),),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return 0
+                raise
+        finally:
+            conn.close()
+        count = 0
+        for row_target, metadata_json in rows:
+            t_raw = str(row_target or "").strip().rstrip("/")
+            if not t_raw:
+                continue
+            if t_raw != want_raw and _norm_target_key(t_raw) != want_key:
+                continue
+            if want_pass is not None and _row_pass_index(metadata_json) != want_pass:
+                continue
+            meta = _parse_meta_dict(metadata_json)
+            if meta.get("reviewer_fallback"):
+                count += 1
+        return count
+    except Exception:
+        return 0
+
+
+def run_reviewer_fallback_summary(db_path: str, run_id: str) -> dict[str, Any]:
+    """Summarizes reviewer-fallback outcomes for `run_id` across restarts.
+
+    Latest row per `(normalized_target, pass_index)` wins, matching `run_ledger`:
+    a campaign that failed with a reviewer fallback on Attempt 1 and later
+    completed cleanly on Attempt 2 is NOT included in `active_targets`,
+    `terminal_campaigns`, or `failed_fallback_campaigns`. Never raises (INV-6).
+    """
+    empty: dict[str, Any] = {
+        "active_targets": [],
+        "terminal_campaigns": 0,
+        "failed_fallback_campaigns": 0,
+        "total_fallback_rows": 0,
+    }
+    if not db_path or not run_id:
+        return empty
+    try:
+        if not _db_exists(db_path):
+            return empty
+        conn = _connect(db_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
+                    (str(run_id),),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return empty
+                raise
+        finally:
+            conn.close()
+        latest: dict[tuple[str, int], tuple[str, dict[str, Any]]] = {}
+        total_fb_rows = 0
+        for row_target, metadata_json in rows:
+            raw_t = str(row_target or "").strip().rstrip("/")
+            if not raw_t:
+                continue
+            meta = _parse_meta_dict(metadata_json)
+            if meta.get("reviewer_fallback"):
+                total_fb_rows += 1
+            key = (_norm_target_key(raw_t), _row_pass_index(metadata_json))
+            latest[key] = (raw_t, meta)
+        active_targets: list[tuple[str, int]] = []
+        terminal_n = 0
+        failed_fb_n = 0
+        for (_norm_t, p_idx), (raw_t, meta) in latest.items():
+            if meta.get("reviewer_fallback") or meta.get("review_incomplete") or meta.get("terminal_reviewer_fallback"):
+                active_targets.append((raw_t, p_idx))
+                if meta.get("terminal_reviewer_fallback") or meta.get("review_incomplete"):
+                    terminal_n += 1
+                elif meta.get("failed"):
+                    failed_fb_n += 1
+        return {
+            "active_targets": active_targets,
+            "terminal_campaigns": terminal_n,
+            "failed_fallback_campaigns": failed_fb_n,
+            "total_fallback_rows": total_fb_rows,
+        }
+    except Exception:
+        return empty
+
+
 def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
     """What one run's campaigns did, as
     `{target: {"failed": bool, "harness_fingerprint": str | None}}`, the
@@ -950,6 +1097,7 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
                 }
                 if _row_unexamined(metadata_json):
                     entry["unexamined"] = True
+                _attach_fallback_meta(entry, metadata_json)
                 out[t] = entry
         return out
     except Exception:
@@ -991,6 +1139,7 @@ def run_pass_ledger(db_path: str, run_id: str) -> Optional[dict[tuple[str, int],
                 }
                 if _row_unexamined(metadata_json):
                     entry["unexamined"] = True
+                _attach_fallback_meta(entry, metadata_json)
                 out[(t, p_idx)] = entry
         return out
     except Exception:
