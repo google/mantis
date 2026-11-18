@@ -281,7 +281,6 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "the safeguard.\n"
         "- Setup failures (missing module, missing file, exit 127, sandbox unavailable) are not negatives about "
         "the bug: report them in the reason as setup failures so the finding stays retry-eligible.\n"
-        "- CHANGE-SCOPED REGRESSION CHECKS (`--scan-mode changed`): Call list_prior_findings(status_filter='unsettled') to see any prior dynamic findings whose stored PoC was not already settled by the harness; use get_prior_poc(<id>) to re-run or rebuild the PoC and call record_regression_check(<id>, 'fixed' | 'still_present' | 'inconclusive', '<reason>').\n"
         + TRUNCATION_RULE
         + "- Conclude by emitting a structured ReproVerdict covering the campaign:\n"
         '  - {"route": "success", "reason": "<which findings reached their sink through which entry point, per the tool\'s evidence_reason>"} if at least one finding has Tier-3 reached-sink evidence.\n'
