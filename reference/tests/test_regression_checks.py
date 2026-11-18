@@ -582,8 +582,356 @@ class BriefTest(_Base):
         tools = {n["id"]: n.get("tools", []) for n in wf["nodes"] if n.get("type") == "agent"}
         self.assertIn("record_regression_check", tools["reviewer"])
         self.assertIn("record_regression_check", tools["reproducer"])
+        self.assertIn("list_prior_findings", tools["researcher"])
+        self.assertIn("list_prior_findings", tools["reviewer"])
+        self.assertIn("list_prior_findings", tools["reproducer"])
         self.assertIn("get_prior_poc", tools["reproducer"])
         self.assertNotIn("get_prior_poc", tools["researcher"], "the researcher writes new PoCs; the reproducer re-runs old ones")
+
+
+class ChangedModeSettlementFixesTest(_Base):
+    """Regression tests for GitHub Issue #32 (`changed` mode closing fixes + deleted code/files)."""
+
+    async def test_include_untriaged_excludes_reported_rows_when_disabled(self):
+        write_findings(
+            self.db,
+            self.target,
+            [
+                _finding("a.py", "confirmed bug", status="static_confirmed", line=10),
+                _finding("a.py", "untriaged draft", status="reported", line=25),
+            ],
+            run_id=OLD,
+        )
+        # Default preserves backward compatibility (includes untriaged 'reported').
+        all_rows = prior_findings_touching(self.db, NEW, ["a.py"], scope_path=self.target)
+        self.assertEqual(sorted(r["title"] for r in all_rows), ["confirmed bug", "untriaged draft"])
+        # Changed mode uses include_untriaged=False so suppressed 'reported' rows don't bloat unverified.
+        confirmed_only = prior_findings_touching(
+            self.db, NEW, ["a.py"], scope_path=self.target, include_untriaged=False
+        )
+        self.assertEqual([r["title"] for r in confirmed_only], ["confirmed bug"])
+
+    async def test_deleted_file_with_open_finding_triggers_changed_scan_and_tags_brief(self):
+        import main
+        from core.cost import record_coverage_files, record_spend, scope_identities
+        from core.database import prior_findings_on_deleted_files
+
+        # Cover all 3 files initially, with an open confirmed finding on b.py and none on pkg/c.py.
+        all_files = [
+            os.path.join(self.target, "a.py"),
+            os.path.join(self.target, "b.py"),
+            os.path.join(self.target, "pkg", "c.py"),
+        ]
+        record_spend(self.db, OLD, self.target, "whole", tokens=100, metadata={"failed": False})
+        record_coverage_files(self.db, OLD, self.target, scope_identities(all_files))
+        write_findings(
+            self.db,
+            self.target,
+            [
+                _finding("b.py", "vuln in deleted file", status="static_confirmed", line=1),
+                _finding("b.py", "untriaged noise", status="reported", line=2),
+            ],
+            run_id=OLD,
+        )
+        b_id = next(f["id"] for f in read_findings(self.db, run_id=OLD) if f["title"] == "vuln in deleted file")
+
+        # 1. Deleting a clean file (pkg/c.py, zero open confirmed findings) does NOT trigger a scan.
+        os.unlink(os.path.join(self.target, "pkg", "c.py"))
+        remaining_files = [os.path.join(self.target, "a.py"), os.path.join(self.target, "b.py")]
+        scope1: dict = {}
+        targets1, _, mode1 = main.resolve_scan_targets(
+            Path(self.target),
+            {"scan_mode": "changed", "surveyor": {"min_source_files": 1000}},
+            remaining_files,
+            db_path=self.db,
+            scope_out=scope1,
+        )
+        self.assertEqual((targets1, mode1), ([], "changed"))
+        self.assertTrue(scope1["nothing_changed"])
+
+        # 2. Deleting b.py (which HAS an open confirmed finding) MUST trigger a changed campaign!
+        os.unlink(os.path.join(self.target, "b.py"))
+        remaining_files2 = [os.path.join(self.target, "a.py")]
+        missing_rels, del_rows = prior_findings_on_deleted_files(
+            self.db, NEW, self.target, scope_path=self.target, include_untriaged=False
+        )
+        self.assertEqual(missing_rels, ["b.py"])
+        self.assertEqual([r["id"] for r in del_rows], [b_id])
+
+        scope2: dict = {}
+        targets2, _, mode2 = main.resolve_scan_targets(
+            Path(self.target),
+            {"scan_mode": "changed", "surveyor": {"min_source_files": 1000}},
+            remaining_files2,
+            db_path=self.db,
+            scope_out=scope2,
+        )
+        self.assertEqual(mode2, "changed")
+        self.assertFalse(scope2["nothing_changed"])
+        self.assertEqual(len(targets2), 1)
+        self.assertEqual(len(scope2["deleted_files"]), 1)
+        self.assertTrue(scope2["deleted_files"][0].endswith("/b.py"))
+
+        # Brief tags the deleted file explicitly and includes rename-check instructions.
+        priors, brief = main._regression_brief(
+            self.db, NEW, scope2["focus_files"], self.target, self.target, include_untriaged=False
+        )
+        self.assertEqual([p["id"] for p in priors], [b_id])
+        self.assertIn("[FILE DELETED ON DISK]", brief)
+        self.assertIn("NOT renamed or moved", brief)
+
+        # 3. Once the agent settles #b_id as fixed (mitigated), the next changed run returns nothing_changed!
+        mitigate_finding(self.db, b_id, "file deleted and verified not relocated", by_run_id=NEW)
+        scope3: dict = {}
+        targets3, _, _ = main.resolve_scan_targets(
+            Path(self.target),
+            {"scan_mode": "changed", "surveyor": {"min_source_files": 1000}},
+            remaining_files2,
+            db_path=self.db,
+            scope_out=scope3,
+        )
+        self.assertEqual(targets3, [])
+        self.assertTrue(scope3["nothing_changed"])
+
+    async def test_deleted_nested_directory_groups_under_existing_ancestor(self):
+        import main
+
+        real_root = os.path.realpath(self.target)
+        missing_nested = os.path.join(real_root, "removed_dir", "sub", "old.py")
+        groups = main.group_changed_files(
+            [missing_nested], self.target, deleted_files={missing_nested}
+        )
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["dir"], real_root)
+        self.assertEqual(groups[0]["files"], [missing_nested])
+
+    async def test_findings_gate_does_not_skip_reviewer_when_prior_findings_unsettled(self):
+        from types import SimpleNamespace
+        from core import graph_loader as gl
+        from core.context import RunContext, current_run_context
+
+        old = self.seed_old()
+        a_id = int(old["SQLi in a"]["id"])
+        b_id = int(old["traversal in b"]["id"])
+
+        gate_node = gl.create_findings_gate("findings_gate")
+        fake_ctx = SimpleNamespace(state={"db_path": self.db, "run_id": NEW})
+
+        rc = RunContext(
+            jail_dir=self.target,
+            path_root=self.target,
+            db_path=self.db,
+            target_file=self.target,
+            run_id=NEW,
+            scan_mode="changed",
+            campaign_prior_ids=(a_id, b_id),
+        )
+        tok = current_run_context.set(rc)
+        try:
+            # Harness-recorded inconclusive does NOT settle a prior finding: gate must route DEFAULT_ROUTE!
+            record_regression_check(self.db, NEW, a_id, "inconclusive", reason="PoC import failed", evidence="dynamic", node="harness")
+            ev1 = await gate_node._func(fake_ctx, None)
+            self.assertEqual(ev1.actions.route, gl.DEFAULT_ROUTE, "Zero new bugs with unsettled priors must NOT skip reviewer!")
+
+            # Settle a_id as fixed, leave b_id pending -> STILL routes DEFAULT_ROUTE.
+            record_regression_check(self.db, NEW, a_id, "fixed", reason="Parameterized query added", evidence="static", node="researcher")
+            ev2 = await gate_node._func(fake_ctx, None)
+            self.assertEqual(ev2.actions.route, gl.DEFAULT_ROUTE)
+
+            # Settle b_id via agent-recorded 'inconclusive' -> ALL settled -> routes 'clean'!
+            record_regression_check(self.db, NEW, b_id, "inconclusive", reason="Needs manual check", evidence="none", node="researcher")
+            ev3 = await gate_node._func(fake_ctx, None)
+            self.assertEqual(ev3.actions.route, "clean")
+        finally:
+            current_run_context.reset(tok)
+
+    async def test_list_prior_findings_paginates_past_100_lineages_and_fences_output(self):
+        from core.llm_gateway import UNTRUSTED_DATA_END, UNTRUSTED_DATA_START
+        from tools import research_tools as rt
+
+        # Seed 75 distinct confirmed findings across distinct files (exceeds the old 60-item prompt cap!)
+        batch = []
+        for i in range(75):
+            rel = f"mod_{i:02d}.py"
+            Path(self.target, rel).write_text(f"def f_{i}():\n    return {i}\n")
+            batch.append(
+                _finding(rel, f"Distinct SQLi in func_{i}", status="static_confirmed", line=10 + i)
+            )
+        # Plus one on a deleted file
+        batch.append(_finding("gone.py", "Deleted file SSRF", status="dynamic_confirmed", line=5))
+        write_findings(self.db, self.target, batch, run_id=OLD)
+        all_rows = read_findings(self.db, run_id=OLD)
+        all_ids = tuple(int(r["id"]) for r in all_rows)
+        first_id = all_ids[0]
+
+        ctx = self.ctx("reviewer")
+        ctx.scan_mode = "changed"
+        ctx.path_root = self.target
+        ctx.campaign_prior_ids = all_ids
+
+        # Page 1 (0..29)
+        page1 = rt.list_prior_findings(status_filter="unsettled", offset=0, limit=30)
+        self.assertIn("76 total (76 unsettled, 0 settled)", page1)
+        self.assertIn("offset=30", page1)
+        self.assertIn(UNTRUSTED_DATA_START, page1)
+        self.assertIn(UNTRUSTED_DATA_END, page1)
+
+        # Page 3 (60..75) — previously completely invisible behind groups[:60]!
+        page3 = rt.list_prior_findings(status_filter="unsettled", offset=60, limit=30)
+        self.assertIn("showing 16 of 76 (offset=60)", page3)
+        self.assertIn("[FILE DELETED ON DISK]", page3)
+        self.assertIn("Deleted file SSRF", page3)
+
+        # Settle first_id -> unsettled count drops to 75 and filepath filter works.
+        rt.record_regression_check(first_id, "fixed", "Parameterized query in a.py")
+        settled_page = rt.list_prior_findings(status_filter="settled", offset=0, limit=10)
+        self.assertIn("76 total (75 unsettled, 1 settled)", settled_page)
+        self.assertIn(f"#{first_id}", settled_page)
+
+        gone_only = rt.list_prior_findings(status_filter="unsettled", filepath_filter="gone.py")
+        self.assertIn("showing 1 of 1", gone_only)
+        self.assertIn("Deleted file SSRF", gone_only)
+
+    async def test_one_shot_regression_nudge_fires_once_for_researcher_and_reviewer(self):
+        from unittest import mock
+        from google.adk.models.lite_llm import LiteLlm
+        from google.adk.models.llm_request import LlmRequest
+        from google.adk.models.llm_response import LlmResponse
+        from google.genai import types
+        from core import config as cfg_mod
+
+        old = self.seed_old()
+        a_id = int(old["SQLi in a"]["id"])
+
+        # Delete a.py so the nudge tags it as [deleted]
+        os.unlink(os.path.join(self.target, "a.py"))
+
+        ctx = self.ctx("researcher")
+        ctx.scan_mode = "changed"
+        ctx.path_root = self.target
+        ctx.campaign_prior_ids = (a_id,)
+        ctx.node_context = {}
+
+        seen_reqs: list[LlmRequest] = []
+
+        async def _fake_upstream(_self, req, stream=False):
+            seen_reqs.append(req)
+            if len(seen_reqs) == 1:
+                yield LlmResponse(
+                    content=types.Content(role="model", parts=[types.Part.from_text(text="All done, no bugs found.")]),
+                    partial=False,
+                    finish_reason=types.FinishReason.STOP,
+                )
+            else:
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[
+                            types.Part(
+                                function_call=types.FunctionCall(
+                                    name="record_regression_check",
+                                    args={"prior_finding_id": a_id, "outcome": "fixed", "reason": "a.py deleted"},
+                                )
+                            )
+                        ],
+                    ),
+                    partial=False,
+                    finish_reason=types.FinishReason.STOP,
+                )
+
+        llm = cfg_mod.ResilientLiteLlm(model="openai/gpt-test")
+        req = LlmRequest(
+            model="openai/gpt-test",
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text="Check changes")])],
+        )
+        with mock.patch.object(LiteLlm, "generate_content_async", _fake_upstream):
+            out = [r async for r in llm.generate_content_async(req, stream=False)]
+
+        self.assertEqual(len(seen_reqs), 2, "Must nudge once when researcher stops with unsettled priors!")
+        nudge_text = seen_reqs[1].contents[-1].parts[0].text
+        self.assertIn(f"#{a_id} [deleted]", nudge_text)
+        self.assertIn("record_regression_check", nudge_text)
+        self.assertIn("NOT renamed or moved", nudge_text)
+        self.assertIsNotNone(out[0].content.parts[0].function_call)
+
+        # Calling a SECOND time on the same stage visit MUST NOT nudge again (at most once per stage!)
+        seen_reqs2: list[LlmRequest] = []
+
+        async def _fake_stop(_self, req, stream=False):
+            seen_reqs2.append(req)
+            yield LlmResponse(
+                content=types.Content(role="model", parts=[types.Part.from_text(text="Done.")]),
+                partial=False,
+                finish_reason=types.FinishReason.STOP,
+            )
+
+        with mock.patch.object(LiteLlm, "generate_content_async", _fake_stop):
+            _ = [r async for r in llm.generate_content_async(req, stream=False)]
+        self.assertEqual(len(seen_reqs2), 1, "Must NEVER nudge twice on the same stage visit!")
+
+    async def test_settlement_report_lines_and_knowledge_cli_regressions(self):
+        import contextlib
+        import io
+        import main
+        from scripts import knowledge as knowledge_cli
+
+        old = self.seed_old()
+        a_id = int(old["SQLi in a"]["id"])
+        b_id = int(old["traversal in b"]["id"])
+        record_regression_check(
+            self.db, NEW, a_id, "fixed", reason="Parameterized SQL added at a.py:12", evidence="static", node="reviewer"
+        )
+        prior = prior_findings_touching(self.db, NEW, ["a.py", "b.py"], scope_path=self.target, include_untriaged=False)
+        settled = main._settle_regression_checks(self.db, NEW, prior)
+        lines = [txt for _u, txt in main._format_regression_settlement_lines(self.db, NEW, prior, settled)]
+        joined = "\n".join(lines)
+        self.assertIn("Fixed (closed as mitigated)", joined)
+        self.assertIn(f"#{a_id} [CWE-89] a.py: SQLi in a", joined)
+        self.assertIn("Parameterized SQL added at a.py:12", joined)
+        self.assertIn("Unverified (still open)", joined)
+        self.assertNotIn("a whole scan", joined, "Misleading 'whole scan settles them' text must be removed!")
+        self.assertIn("knowledge.py regressions", joined)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = knowledge_cli.main(["regressions", "--db", self.db, "--run-id", NEW])
+        self.assertEqual(rc, 0)
+        cli_out = buf.getvalue()
+        self.assertIn(f"#{a_id} [fixed/static]", cli_out)
+        self.assertIn("Parameterized SQL added at a.py:12", cli_out)
+        self.assertIn(f"#{b_id} [inconclusive/none]", cli_out)
+
+    async def test_list_prior_findings_enforces_cross_target_isolation(self):
+        from core.database import record_run
+        from tools import research_tools as rt
+
+        other_root = os.path.join(self.tmp, "other_repo")
+        os.makedirs(other_root)
+        Path(other_root, "secret.py").write_text("x = 1\n")
+        other_run = "99999999-2222-3333-4444-555555555555"
+        record_run(
+            self.db,
+            other_run,
+            "vertex_ai/gemini-3.8-flash",
+            metadata={"target_root": os.path.realpath(other_root)},
+        )
+        write_findings(
+            self.db,
+            other_root,
+            [_finding("secret.py", "CROSS_REPO_SECRET_TITLE", status="static_confirmed")],
+            run_id=other_run,
+        )
+        other_id = read_findings(self.db, run_id=other_run)[0]["id"]
+        old = self.seed_old()
+        own_id = int(old["SQLi in a"]["id"])
+
+        ctx = self.ctx("reviewer")
+        ctx.path_root = self.target
+        ctx.campaign_prior_ids = (own_id, other_id)
+        out = rt.list_prior_findings(status_filter="all")
+        self.assertIn("SQLi in a", out)
+        self.assertNotIn("CROSS_REPO_SECRET_TITLE", out)
+        self.assertNotIn(f"#{other_id}", out)
 
 
 if __name__ == "__main__":

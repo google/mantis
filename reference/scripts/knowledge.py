@@ -78,7 +78,62 @@ def main(argv=None) -> int:
                     help="no commit known: record the working tree as it is now, asserting nothing was edited since the scans")
     bf.add_argument("--exclude", action="append", default=[], help="exclude pattern, as given to the scan (repeatable)")
     bf.add_argument("--dry-run", action="store_true", help="say what would be recorded; write nothing")
+    rg = sub.add_parser(
+        "regressions",
+        help="show per-finding regression check verdicts recorded by --scan-mode changed",
+    )
+    rg.add_argument("--db", default="knowledge.db", help="knowledge database (default: knowledge.db)")
+    rg.add_argument("--run-id", default="", help="filter to a specific run_id (default: latest run with checks)")
+    rg.add_argument(
+        "--outcome",
+        default="all",
+        choices=("all", "fixed", "still_present", "inconclusive"),
+        help="filter by recorded outcome (default: all)",
+    )
     args = p.parse_args(argv)
+
+    if args.cmd == "regressions":
+        if not os.path.exists(args.db):
+            print(f"error: no database at {args.db}", file=sys.stderr)
+            return 2
+        from core.database import read_findings, read_regression_checks
+        from core.llm_gateway import sanitize_egress_text
+
+        checks = read_regression_checks(args.db, run_id=args.run_id or None)
+        if not checks:
+            print("No regression checks recorded.")
+            return 0
+        target_run = str(args.run_id or "").strip()
+        if not target_run:
+            target_run = str(checks[-1].get("run_id") or "")
+            checks = [c for c in checks if str(c.get("run_id") or "") == target_run]
+        if args.outcome != "all":
+            checks = [c for c in checks if str(c.get("outcome") or "").lower() == args.outcome]
+        findings_by_id = {int(f["id"]): f for f in read_findings(args.db) if f.get("id") is not None}
+        # Show the latest check per prior_finding_id (preferring still_present, then fixed, then inconclusive)
+        latest: dict[int, dict] = {}
+        rank = {"still_present": 3, "fixed": 2, "inconclusive": 1}
+        for c in checks:
+            pid = int(c.get("prior_finding_id") or 0)
+            if pid not in latest or rank.get(str(c.get("outcome") or ""), 0) >= rank.get(str(latest[pid].get("outcome") or ""), 0):
+                latest[pid] = c
+        print(f"Regression checks for run {target_run} ({len(latest)} finding(s)):")
+        for pid in sorted(latest):
+            c = latest[pid]
+            f = findings_by_id.get(pid, {})
+            cwe = sanitize_egress_text(str(f.get("cwe") or "no-CWE"))
+            fp = sanitize_egress_text(str(f.get("filepath") or "?"))
+            status = sanitize_egress_text(str(f.get("status") or "?"))
+            title = sanitize_egress_text(str(f.get("title") or "").replace("\n", " ").strip()[:100])
+            outcome = sanitize_egress_text(str(c.get("outcome") or "?"))
+            evidence = sanitize_egress_text(str(c.get("evidence") or "none"))
+            node = sanitize_egress_text(str(c.get("node") or ""))
+            reason = sanitize_egress_text(str(c.get("reason") or "").replace("\n", " ").strip()[:180])
+            print(f"  - #{pid} [{outcome}/{evidence}] (status={status}, {cwe}) {fp}: {title}")
+            if reason:
+                by_note = f" ({node})" if node else ""
+                print(f"      reason{by_note}: {reason}")
+        return 0
 
     repo = os.path.realpath(args.repo)
     if not os.path.isdir(repo):

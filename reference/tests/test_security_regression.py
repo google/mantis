@@ -695,6 +695,7 @@ class TestUntrustedContentFramingAndScrubbing(unittest.IsolatedAsyncioTestCase):
             "find_callers",
             "find_callees",
             "get_function_boundary",
+            "list_prior_findings",
         }
         returns_harness = {
             "write_file",
