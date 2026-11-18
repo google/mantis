@@ -2603,6 +2603,13 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
+    scan_mode = str(getattr(ctx, "scan_mode", "") or "").strip().lower()
+    if scan_mode and scan_mode != "changed":
+        return (
+            f"Not applicable: record_regression_check is only used during '--scan-mode changed' runs "
+            f"(current scan_mode={scan_mode!r}). Proceed with the independent audit and report findings "
+            "via report_findings."
+        )
     verdict = str(outcome or "").strip().lower()
     if verdict not in REGRESSION_OUTCOMES:
         return f"Error: outcome must be one of {list(REGRESSION_OUTCOMES)}, got {outcome!r}."
@@ -2695,6 +2702,13 @@ def list_prior_findings(
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
+    scan_mode = str(getattr(ctx, "scan_mode", "") or "").strip().lower()
+    if scan_mode and scan_mode != "changed":
+        return (
+            f"Not applicable: this is a '{scan_mode}' scan, not a '--scan-mode changed' regression scan. "
+            "Do not call list_prior_findings or record_regression_check during normal scans; proceed with "
+            "the independent audit."
+        )
     resolved_db = _resolve_context_db(ctx) or ctx.db_path
     if not resolved_db or not os.path.exists(resolved_db):
         return "No prior findings database available."
@@ -2734,6 +2748,11 @@ def list_prior_findings(
                 continue
             allowed_ids.append(int(rid))
         prior_ids = allowed_ids
+    elif scan_mode == "changed":
+        return (
+            "Prior finding lineages in scope: 0 total (0 unsettled, 0 settled). "
+            "No earlier open confirmed findings touch this campaign's changed or deleted files."
+        )
     else:
         roots_map = run_target_roots(resolved_db)
         eff_root = active_target_root(target_root or str(getattr(ctx, "target_file", "") or ""))

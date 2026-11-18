@@ -933,6 +933,60 @@ class ChangedModeSettlementFixesTest(_Base):
         self.assertNotIn("CROSS_REPO_SECRET_TITLE", out)
         self.assertNotIn(f"#{other_id}", out)
 
+    async def test_list_and_record_regression_checks_are_gated_to_changed_mode(self):
+        """Regression tools must not leak prior findings or record unsolicited checks
+        during normal whole/file-by-file/cross-functional scans, nor dump unrelated
+        repo findings when a changed-mode campaign has empty campaign_prior_ids."""
+        from core.database import read_regression_checks
+        from tools import research_tools as rt
+
+        old = self.seed_old()
+        own_id = int(old["SQLi in a"]["id"])
+
+        for mode in ("whole", "file-by-file", "cross-functional", "auto"):
+            ctx = self.ctx("researcher")
+            ctx.scan_mode = mode
+            ctx.campaign_prior_ids = ()
+            out_list = rt.list_prior_findings(status_filter="all")
+            self.assertIn("Not applicable", out_list, mode)
+            self.assertNotIn("SQLi in a", out_list, mode)
+            out_rec = rt.record_regression_check(own_id, "still_present", "unsolicited")
+            self.assertIn("Not applicable", out_rec, mode)
+
+        self.assertEqual(read_regression_checks(self.db, run_id=NEW), [])
+
+        # In changed mode with empty campaign_prior_ids, never fall back to unrelated prior findings.
+        ctx_chg = self.ctx("researcher")
+        ctx_chg.scan_mode = "changed"
+        ctx_chg.campaign_prior_ids = ()
+        out_empty = rt.list_prior_findings(status_filter="all")
+        self.assertIn("0 total", out_empty)
+        self.assertNotIn("SQLi in a", out_empty)
+
+    async def test_format_regression_settlement_lines_adds_ellipsis_on_truncation(self):
+        import main
+        old = self.seed_old()
+        own_id = int(old["SQLi in a"]["id"])
+        long_reason = "Parameterized SQL query replaced string interpolation across " + ("x" * 160)
+        long_title = "Very long title describing SQL injection in login handler " + ("y" * 80)
+        ctx = self.ctx("researcher")
+        ctx.scan_mode = "changed"
+        ctx.campaign_prior_ids = (own_id,)
+        from tools import research_tools as rt
+
+        rt.record_regression_check(own_id, "fixed", long_reason)
+        lines = main._format_regression_settlement_lines(
+            self.db,
+            NEW,
+            [{"id": own_id, "filepath": "a.py", "cwe": "CWE-89", "title": long_title}],
+            {"still_present": [], "fixed": [own_id], "unverified": []},
+        )
+        rendered = "\n".join(text for _, text in lines)
+        self.assertIn("...", rendered)
+        entry_line = next(t for is_untrusted, t in lines if is_untrusted and f"- #{own_id} " in t)
+        self.assertIn("...", entry_line)
+        self.assertTrue(entry_line.endswith("..."), entry_line)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3239,12 +3239,14 @@ def _format_regression_settlement_lines(
             row = by_id.get(int(pid), {})
             cwe = str(row.get("cwe") or "").strip() or "no-CWE"
             fp = str(row.get("filepath") or "?")
-            title = str(row.get("title") or "").replace("\n", " ").strip()[:100]
+            raw_title = str(row.get("title") or "").replace("\n", " ").strip()
+            title = (raw_title[:97].rstrip() + "...") if len(raw_title) > 100 else raw_title
             chks = checks_by_id.get(int(pid), [])
             match = next((c for c in reversed(chks) if c.get("outcome") == want_outcome), chks[-1] if chks else None)
             if match:
                 ev = str(match.get("evidence") or "none")
-                rsn = str(match.get("reason") or "").replace("\n", " ").strip()[:140]
+                raw_rsn = str(match.get("reason") or "").replace("\n", " ").strip()
+                rsn = (raw_rsn[:137].rstrip() + "...") if len(raw_rsn) > 140 else raw_rsn
                 detail = f" — [{ev}] {rsn}" if rsn else f" — [{ev}]"
             else:
                 detail = ""
