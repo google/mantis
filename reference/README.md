@@ -473,6 +473,18 @@ The next run reads it back before it decides what to scan:
 ./run.sh /path/to/repo --import-knowledge /path/to/repo/.mantis/knowledge
 ```
 
+After incremental `--scan-mode changed` runs (where each `run_id` only scans the
+modified/deleted files while closing fixed findings to `mitigated` and archiving
+relocated paths), generate the cumulative full-repository open risk posture
+across all runs (deduplicated by `lineage_id`) with:
+
+```bash
+python3 scripts/knowledge.py report --db knowledge.db --repo /path/to/repo
+python3 scripts/knowledge.py report --db knowledge.db --repo /path/to/repo --format json --out posture.json
+python3 scripts/knowledge.py report --db knowledge.db --repo /path/to/repo --format sarif --out posture.sarif
+python3 scripts/knowledge.py regressions --db knowledge.db --run-id <latest_run_id>
+```
+
 Imported findings keep their lineage ids and statuses, so a re-scan matches what
 it already knows rather than reporting it again and a suppressed finding stays
 suppressed; coverage feeds `auto` depth-batch rotation and

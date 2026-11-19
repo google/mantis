@@ -3114,6 +3114,197 @@ def archive_relocated_finding(
         return False
 
 
+def current_open_findings(
+    db_path: str,
+    *,
+    repo_root: Optional[str] = None,
+    include_patch_verified: bool = False,
+) -> Dict[str, Any]:
+    """Returns the current cumulative open confirmed risk posture across all
+    runs in `db_path`, deduplicated by `lineage_id` so re-reported findings
+    from `--scan-mode changed` runs are never double-counted.
+
+    - Excludes closed statuses (`mitigated`, `archived`, `false_positive`,
+      `non_viable`, `sample_or_test`, `duplicate_merged`, `accepted_risk`) and
+      untriaged `'reported'` rows.
+    - When `include_patch_verified` is True, includes `'patch_verified'` rows
+      (useful when patches were verified in a sandbox and not yet applied to
+      the repository).
+    - When `repo_root` is provided, scopes findings to runs belonging to
+      `repo_root` and resolves each finding's filepath relative to `repo_root`
+      via its producing run's `target_root`, skipping findings outside
+      `repo_root` (e.g. sibling folders during a subfolder report) and
+      preserving dotfiles such as `.github/workflows/ci.yml`.
+    - Elects one representative per open lineage by highest assurance rank,
+      breaking ties by newest `id`, and backfills missing calibration fields
+      (`priority`, `mantis_risk_score`, `cwe`, `remediation`) from siblings.
+    Never raises (INV-6).
+    """
+    empty: Dict[str, Any] = {
+        "risk_posture": {
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "other": 0,
+            "total": 0,
+        },
+        "counts": {
+            "open": 0,
+            "mitigated": 0,
+            "archived": 0,
+            "patch_verified_omitted": 0,
+            "untriaged_omitted": 0,
+            "runs": 0,
+        },
+        "findings": [],
+    }
+    if not db_path or not os.path.exists(db_path):
+        return empty
+    real_root = ""
+    if repo_root:
+        cand_root = os.path.realpath(str(repo_root))
+        if not os.path.isdir(cand_root):
+            return empty
+        real_root = cand_root
+    try:
+        rows = read_findings(db_path)
+    except Exception:
+        return empty
+    if not rows:
+        return empty
+
+    roots_map = run_target_roots(db_path) if real_root else {}
+    allowed_statuses = set(
+        CONFIRMED_LIVE_STATUSES if include_patch_verified else OPEN_CONFIRMED_STATUSES
+    )
+
+    in_scope_rows: List[Dict[str, Any]] = []
+    runs_seen: set[str] = set()
+    for f in rows:
+        f_rid = f.get("run_id")
+        if real_root:
+            if not run_belongs_to_active_target(
+                db_path, f_rid, active_root=real_root, roots_map=roots_map
+            ):
+                continue
+            _, rel = resolve_finding_path_for_root(
+                str(f.get("filepath") or ""), f_rid, real_root, roots_map
+            )
+            if not rel:
+                continue
+            item = dict(f)
+            item["filepath"] = rel
+        else:
+            item = dict(f)
+        in_scope_rows.append(item)
+        if f_rid:
+            runs_seen.add(str(f_rid))
+
+    def _lineage_key(row: Dict[str, Any]) -> tuple[str, str]:
+        lin = str(row.get("lineage_id") or "").strip()
+        return ("lineage", lin) if lin else ("id", str(row.get("id") or ""))
+
+    open_groups: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    for item in in_scope_rows:
+        st = str(item.get("status") or "").strip().lower()
+        if st in allowed_statuses:
+            open_groups.setdefault(_lineage_key(item), []).append(item)
+
+    open_keys = set(open_groups.keys())
+    mitigated_keys: set[tuple[str, str]] = set()
+    archived_keys: set[tuple[str, str]] = set()
+    patch_verified_keys: set[tuple[str, str]] = set()
+    untriaged_keys: set[tuple[str, str]] = set()
+    for item in in_scope_rows:
+        key = _lineage_key(item)
+        if key in open_keys:
+            continue
+        st = str(item.get("status") or "").strip().lower()
+        if st == "mitigated":
+            mitigated_keys.add(key)
+        elif st == ARCHIVED_STATUS:
+            archived_keys.add(key)
+        elif st == "patch_verified" and not include_patch_verified:
+            patch_verified_keys.add(key)
+        elif st in UNTRIAGED_STATUSES:
+            untriaged_keys.add(key)
+    # Exclude lineages that were closed via mitigated/archived/patch_verified from untriaged count.
+    closed_non_open = mitigated_keys | archived_keys | patch_verified_keys
+    untriaged_keys -= closed_non_open
+
+    elected: List[Dict[str, Any]] = []
+    for grp in open_groups.values():
+        rep = dict(
+            max(
+                grp,
+                key=lambda r: (
+                    finding_assurance_rank(r.get("status")),
+                    int(r.get("id") or 0),
+                ),
+            )
+        )
+        # Backfill missing calibration/classification metadata from newest sibling if absent.
+        if len(grp) > 1:
+            newest_first = sorted(grp, key=lambda r: int(r.get("id") or 0), reverse=True)
+            for field in ("priority", "cwe", "remediation"):
+                if not str(rep.get(field) or "").strip():
+                    for sib in newest_first:
+                        if str(sib.get(field) or "").strip():
+                            rep[field] = sib[field]
+                            break
+            if rep.get("mantis_risk_score") is None:
+                for sib in newest_first:
+                    if sib.get("mantis_risk_score") is not None:
+                        rep["mantis_risk_score"] = sib["mantis_risk_score"]
+                        break
+        rep_id = int(rep.get("id") or 0)
+        rep["seen_in_runs"] = sorted(
+            {str(g.get("run_id") or "") for g in grp if g.get("run_id")}
+        )
+        rep["other_ids"] = sorted(
+            int(g["id"])
+            for g in grp
+            if g.get("id") is not None and int(g["id"]) != rep_id
+        )
+        elected.append(rep)
+
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+    def _sort_key(row: Dict[str, Any]) -> tuple[int, int]:
+        sev = str(row.get("severity") or "").strip().upper()
+        return (sev_order.get(sev, 4), int(row.get("id") or 0))
+
+    elected.sort(key=_sort_key)
+
+    posture = {"critical": 0, "high": 0, "medium": 0, "low": 0, "other": 0, "total": len(elected)}
+    for row in elected:
+        sev = str(row.get("severity") or "").strip().upper()
+        if sev == "CRITICAL":
+            posture["critical"] += 1
+        elif sev == "HIGH":
+            posture["high"] += 1
+        elif sev == "MEDIUM":
+            posture["medium"] += 1
+        elif sev == "LOW":
+            posture["low"] += 1
+        else:
+            posture["other"] += 1
+
+    return {
+        "risk_posture": posture,
+        "counts": {
+            "open": len(elected),
+            "mitigated": len(mitigated_keys),
+            "archived": len(archived_keys),
+            "patch_verified_omitted": len(patch_verified_keys),
+            "untriaged_omitted": len(untriaged_keys),
+            "runs": len(runs_seen),
+        },
+        "findings": elected,
+    }
+
+
 def read_findings(
     db_path: str,
     filepath: Optional[str] = None,

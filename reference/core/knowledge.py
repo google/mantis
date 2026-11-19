@@ -1199,3 +1199,127 @@ def describe(counts: Dict[str, Any]) -> str:
         parts.append("summary")
     parts.append(f"coverage for {counts.get('coverage_paths', 0)} path(s)")
     return ", ".join(parts)
+
+
+# --- cumulative risk posture report ----------------------------------------------
+
+
+def _md_table_cell(value: Any, *, max_len: int = 200) -> str:
+    """Sanitizes untrusted text for safe interpolation inside a Markdown table cell."""
+    from core.llm_gateway import safe_markdown_span
+
+    text = safe_markdown_span(str(value if value is not None else ""))
+    text = text.replace("|", "\\|")
+    if len(text) > max_len:
+        text = text[: max_len - 3].rstrip() + "..."
+    return text
+
+
+def build_posture_report(
+    db_path: str,
+    *,
+    repo_root: Optional[str] = None,
+    include_patch_verified: bool = False,
+) -> Dict[str, Any]:
+    """Builds a JSON-safe, egress-sanitized cumulative risk posture payload
+    across all runs in `db_path` (deduplicated by `lineage_id`)."""
+    from core.database import current_open_findings
+    from core.llm_gateway import sanitize_egress_data
+
+    raw = current_open_findings(
+        db_path,
+        repo_root=repo_root,
+        include_patch_verified=include_patch_verified,
+    )
+    findings_out: List[Dict[str, Any]] = []
+    for f in raw.get("findings") or []:
+        score = f.get("mantis_risk_score")
+        try:
+            score_val = float(score) if score is not None else None
+            if score_val is not None and (score_val != score_val or score_val in (float("inf"), float("-inf"))):
+                score_val = None
+        except (TypeError, ValueError):
+            score_val = None
+        findings_out.append({
+            "id": int(f["id"]) if f.get("id") is not None else None,
+            "severity": str(f.get("severity") or "").strip().upper() or "UNKNOWN",
+            "cwe": str(f.get("cwe") or "").strip(),
+            "filepath": str(f.get("filepath") or "").strip(),
+            "line_numbers": list(f.get("line_numbers") or []),
+            "title": str(f.get("title") or "").strip(),
+            "priority": str(f.get("priority") or "").strip().upper(),
+            "status": str(f.get("status") or "").strip().lower(),
+            "mantis_risk_score": score_val,
+            "patch_status": str(f.get("patch_status") or "").strip(),
+            "run_id": str(f.get("run_id") or "").strip(),
+            "lineage_id": str(f.get("lineage_id") or "").strip(),
+            "seen_in_runs": list(f.get("seen_in_runs") or []),
+            "other_ids": list(f.get("other_ids") or []),
+        })
+    payload = {
+        "risk_posture": dict(raw.get("risk_posture") or {}),
+        "counts": dict(raw.get("counts") or {}),
+        "findings": findings_out,
+    }
+    return sanitize_egress_data(payload)
+
+
+def render_posture_markdown(posture: Dict[str, Any]) -> str:
+    """Renders a cumulative risk posture dict (from `current_open_findings` or
+    `build_posture_report`) as a sanitized GitHub-Flavored Markdown report."""
+    rp = posture.get("risk_posture") or {}
+    counts = posture.get("counts") or {}
+    findings = posture.get("findings") or []
+
+    lines: List[str] = [
+        "# Mantis Risk Posture",
+        "",
+        "## Risk posture",
+        "",
+        "| Severity | Count |",
+        "| --- | ---: |",
+        f"| Critical | {int(rp.get('critical', 0))} |",
+        f"| High | {int(rp.get('high', 0))} |",
+        f"| Medium | {int(rp.get('medium', 0))} |",
+        f"| Low | {int(rp.get('low', 0))} |",
+    ]
+    if int(rp.get("other", 0)) > 0:
+        lines.append(f"| Other | {int(rp.get('other', 0))} |")
+    lines.append(f"| **Total** | **{int(rp.get('total', len(findings)))}** |")
+    lines.append("")
+
+    notes: List[str] = [f"across {int(counts.get('runs', 0))} run(s)"]
+    if int(counts.get("mitigated", 0)) > 0:
+        notes.append(f"{int(counts['mitigated'])} mitigated")
+    if int(counts.get("archived", 0)) > 0:
+        notes.append(f"{int(counts['archived'])} archived")
+    if int(counts.get("patch_verified_omitted", 0)) > 0:
+        notes.append(
+            f"{int(counts['patch_verified_omitted'])} patch_verified omitted "
+            "(pass --include-patch-verified to include)"
+        )
+    if int(counts.get("untriaged_omitted", 0)) > 0:
+        notes.append(f"{int(counts['untriaged_omitted'])} untriaged omitted")
+    lines.append(f"_Cumulative open confirmed findings ({', '.join(notes)}; deduplicated by lineage)._")
+    lines.append("")
+
+    if not findings:
+        lines.append("No open confirmed findings.")
+        return "\n".join(lines) + "\n"
+
+    lines.extend([
+        "## Open findings",
+        "",
+        "| ID | Severity | CWE | Component | Title | Priority | Status |",
+        "| ---: | --- | --- | --- | --- | --- | --- |",
+    ])
+    for f in findings:
+        fid = int(f["id"]) if f.get("id") is not None else 0
+        sev = _md_table_cell(str(f.get("severity") or "").strip().upper() or "UNKNOWN", max_len=24)
+        cwe = _md_table_cell(str(f.get("cwe") or "").strip() or "-", max_len=32)
+        comp = _md_table_cell(str(f.get("filepath") or "").strip() or "?", max_len=160)
+        title = _md_table_cell(str(f.get("title") or "").strip(), max_len=160)
+        prio = _md_table_cell(str(f.get("priority") or "").strip().upper() or "-", max_len=24)
+        status = _md_table_cell(str(f.get("status") or "").strip().lower() or "-", max_len=32)
+        lines.append(f"| {fid} | {sev} | {cwe} | `{comp}` | {title} | {prio} | {status} |")
+    return "\n".join(lines) + "\n"
