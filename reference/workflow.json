@@ -71,7 +71,7 @@
       "fork_from": "explorer",
       "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
-      "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check"]
+      "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check", "list_prior_findings"]
     },
     {
       "id": "findings_gate",
@@ -90,7 +90,7 @@
       "fork_from": "explorer",
       "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
-      "tools": ["read_file", "get_findings", "get_threat_model", "get_summary", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check"],
+      "tools": ["read_file", "list_files", "get_findings", "get_threat_model", "get_summary", "find_symbol", "find_callers", "find_callees", "get_function_boundary", "record_regression_check", "list_prior_findings"],
       "output_schema": "ReviewVerdict",
       "output_key": "verdict"
     },
@@ -121,7 +121,7 @@
       "prefix_group": "audit_stem",
       "reasoning_effort": "medium",
       "skip_when_static": true,
-      "tools": ["run_sandbox", "run_sandbox_with_evidence", "get_findings", "get_threat_model", "read_file", "write_file", "get_function_boundary", "find_callers", "get_prior_poc", "record_regression_check"],
+      "tools": ["run_sandbox", "run_sandbox_with_evidence", "get_findings", "get_threat_model", "read_file", "write_file", "get_function_boundary", "find_callers", "get_prior_poc", "record_regression_check", "list_prior_findings"],
       "on_enter_status": "static_confirmed",
       "output_schema": "ReproVerdict",
       "output_key": "verdict"

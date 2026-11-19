@@ -65,7 +65,7 @@ STAGE_CONFIGS = {
         'tools': [
             'read_file', 'write_file', 'list_files', 'get_summary', 'get_threat_model',
             'get_plan', 'report_findings', 'get_findings', 'find_symbol', 'find_callers',
-            'find_callees', 'get_function_boundary', 'record_regression_check',
+            'find_callees', 'get_function_boundary', 'record_regression_check', 'list_prior_findings',
         ],
         'instruction': get_stage_prompt('researcher', 'mantis-researcher'),
     },
@@ -77,8 +77,8 @@ STAGE_CONFIGS = {
     'reviewer': {
         'skill': 'mantis-review',
         'tools': [
-            'read_file', 'get_findings', 'get_threat_model', 'get_summary', 'find_symbol',
-            'find_callers', 'find_callees', 'get_function_boundary', 'record_regression_check',
+            'read_file', 'list_files', 'get_findings', 'get_threat_model', 'get_summary', 'find_symbol',
+            'find_callers', 'find_callees', 'get_function_boundary', 'record_regression_check', 'list_prior_findings',
         ],
         'instruction': get_stage_prompt('reviewer', 'mantis-review'),
     },
@@ -100,7 +100,7 @@ STAGE_CONFIGS = {
         'tools': [
             'run_sandbox', 'run_sandbox_with_evidence', 'get_findings', 'get_threat_model',
             'read_file', 'write_file', 'get_function_boundary', 'find_callers',
-            'get_prior_poc', 'record_regression_check',
+            'get_prior_poc', 'record_regression_check', 'list_prior_findings',
         ],
         'instruction': get_stage_prompt('reproducer', 'mantis-reproduce'),
     },
