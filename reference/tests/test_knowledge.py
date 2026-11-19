@@ -512,5 +512,367 @@ class TestArchived(unittest.TestCase):
         self.assertEqual(recall(fresh)["counts"]["archived"], 1)
 
 
+class TestCumulativeRiskPostureReport(unittest.TestCase):
+    """Cumulative full-repo risk posture across multiple runs (especially after
+    `--scan-mode changed`, where the latest `run_id` only touches changed files)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mantis_posture_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.repo, "sub"), exist_ok=True)
+        os.makedirs(os.path.join(self.repo, "other"), exist_ok=True)
+        os.makedirs(os.path.join(self.repo, ".github", "workflows"), exist_ok=True)
+        for rel in (
+            "sub/unchanged.py",
+            "sub/fixed.py",
+            "sub/still.py",
+            "sub/export_v2.py",
+            "other/extra.py",
+            ".github/workflows/ci.yml",
+        ):
+            Path(self.repo, rel).write_text("x = 1\n", encoding="utf-8")
+        self.db = os.path.join(self.tmp, "k.db")
+        init_db(self.db)
+
+    def _seed_changed_lifecycle(self):
+        from core.database import archive_relocated_finding, mitigate_finding, record_run
+
+        record_run(
+            self.db,
+            "run-1",
+            "vertex_ai/gemini-3.8-flash",
+            metadata={"target_root": os.path.realpath(self.repo), "target": os.path.realpath(self.repo)},
+        )
+        record_run(
+            self.db,
+            "run-2",
+            "vertex_ai/gemini-3.8-flash",
+            metadata={"target_root": os.path.realpath(self.repo), "target": os.path.realpath(self.repo)},
+        )
+        write_findings(
+            self.db,
+            self.repo,
+            [
+                {
+                    "title": "Unchanged buffer bug",
+                    "severity": "HIGH",
+                    "priority": "HIGH",
+                    "cwe": "CWE-129",
+                    "filepath": "sub/unchanged.py",
+                    "line_numbers": [10],
+                    "description": "Unchecked index",
+                    "status": "static_confirmed",
+                },
+                {
+                    "title": "Fixed parser bug",
+                    "severity": "MEDIUM",
+                    "priority": "MEDIUM",
+                    "cwe": "CWE-125",
+                    "filepath": "sub/fixed.py",
+                    "line_numbers": [20],
+                    "description": "OOB read",
+                    "status": "static_confirmed",
+                },
+                {
+                    "title": "Still present command injection",
+                    "severity": "HIGH",
+                    "priority": "",
+                    "cwe": "CWE-88",
+                    "filepath": "sub/still.py",
+                    "line_numbers": [30],
+                    "description": "Shell arg injection",
+                    "status": "dynamic_confirmed",
+                    "lineage_id": "lin-still",
+                },
+                {
+                    "title": "Moved export IDOR",
+                    "severity": "MEDIUM",
+                    "priority": "MEDIUM",
+                    "cwe": "CWE-639",
+                    "filepath": "sub/export.py",
+                    "line_numbers": [15],
+                    "description": "Missing ownership check",
+                    "status": "static_confirmed",
+                },
+                {
+                    "title": "Workflow script injection",
+                    "severity": "LOW",
+                    "priority": "LOW",
+                    "cwe": "CWE-78",
+                    "filepath": ".github/workflows/ci.yml",
+                    "line_numbers": [12],
+                    "description": "Untrusted PR title in run:",
+                    "status": "confirmed",
+                },
+                {
+                    "title": "Other folder bug",
+                    "severity": "HIGH",
+                    "priority": "HIGH",
+                    "cwe": "CWE-89",
+                    "filepath": "other/extra.py",
+                    "line_numbers": [5],
+                    "description": "SQLi in other",
+                    "status": "static_confirmed",
+                },
+                {
+                    "title": "Untriaged draft",
+                    "severity": "CRITICAL",
+                    "cwe": "CWE-94",
+                    "filepath": "sub/unchanged.py",
+                    "line_numbers": [99],
+                    "description": "Not reviewed yet",
+                    "status": "reported",
+                },
+                {
+                    "title": "Dismissed FP",
+                    "severity": "HIGH",
+                    "cwe": "CWE-79",
+                    "filepath": "sub/unchanged.py",
+                    "line_numbers": [50],
+                    "description": "False positive",
+                    "status": "false_positive",
+                },
+                {
+                    "title": "Sandbox patched bug",
+                    "severity": "MEDIUM",
+                    "priority": "MEDIUM",
+                    "cwe": "CWE-22",
+                    "filepath": "sub/unchanged.py",
+                    "line_numbers": [60],
+                    "description": "Patched in sandbox",
+                    "status": "patch_verified",
+                    "patch_status": "VERIFIED_SECURE",
+                },
+            ],
+            run_id="run-1",
+        )
+        r1_by_title = {r["title"]: r for r in read_findings(self.db, run_id="run-1")}
+        # Run 2 (changed mode): close fixed bug, re-report still-present bug (with priority calibrated),
+        # relocate moved bug to export_v2.py, and report one new CRITICAL finding.
+        self.assertTrue(mitigate_finding(self.db, r1_by_title["Fixed parser bug"]["id"], "bounds check added", by_run_id="run-2"))
+        write_findings(
+            self.db,
+            self.repo,
+            [
+                {
+                    "title": "Still present command injection",
+                    "severity": "HIGH",
+                    "priority": "HIGH",
+                    "cwe": "CWE-88",
+                    "filepath": "sub/still.py",
+                    "line_numbers": [31],
+                    "description": "Shell arg injection (re-reported)",
+                    "status": "static_confirmed",
+                    "lineage_id": "lin-still",
+                    "mantis_risk_score": 8.4,
+                },
+                {
+                    "title": "Moved export IDOR",
+                    "severity": "MEDIUM",
+                    "priority": "MEDIUM",
+                    "cwe": "CWE-639",
+                    "filepath": "sub/export_v2.py",
+                    "line_numbers": [15],
+                    "description": "Missing ownership check",
+                    "status": "static_confirmed",
+                },
+                {
+                    "title": "New critical auth bypass",
+                    "severity": "CRITICAL",
+                    "priority": "CRITICAL",
+                    "cwe": "CWE-287",
+                    "filepath": "sub/still.py",
+                    "line_numbers": [8],
+                    "description": "Bypassed token verification",
+                    "status": "confirmed",
+                },
+            ],
+            run_id="run-2",
+        )
+        r2_by_title = {r["title"]: r for r in read_findings(self.db, run_id="run-2")}
+        self.assertTrue(
+            archive_relocated_finding(
+                self.db,
+                r1_by_title["Moved export IDOR"]["id"],
+                "moved to export_v2.py",
+                new_finding_id=r2_by_title["Moved export IDOR"]["id"],
+                new_filepath="sub/export_v2.py",
+                by_run_id="run-2",
+            )
+        )
+        return r1_by_title, r2_by_title
+
+    def test_current_open_findings_deduplicates_across_runs_and_respects_repo_and_subfolder_scope(self):
+        from core.database import current_open_findings, record_run
+
+        r1, _r2 = self._seed_changed_lifecycle()
+
+        # Seed an unrelated repo in the SAME knowledge.db to verify cross-repo isolation.
+        other_repo = os.path.join(self.tmp, "other_repo")
+        os.makedirs(other_repo, exist_ok=True)
+        Path(other_repo, "secret.py").write_text("s = 1\n", encoding="utf-8")
+        record_run(
+            self.db,
+            "run-other-repo",
+            "vertex_ai/gemini-3.8-flash",
+            metadata={"target_root": os.path.realpath(other_repo), "target": os.path.realpath(other_repo)},
+        )
+        write_findings(
+            self.db,
+            other_repo,
+            [
+                {
+                    "title": "OTHER_REPO_LEAK",
+                    "severity": "CRITICAL",
+                    "cwe": "CWE-200",
+                    "filepath": "secret.py",
+                    "line_numbers": [1],
+                    "description": "Must never leak",
+                    "status": "dynamic_confirmed",
+                }
+            ],
+            run_id="run-other-repo",
+        )
+
+        # 1. Full repo posture (default: excludes patch_verified, mitigated, archived, FP, reported, other_repo)
+        posture = current_open_findings(self.db, repo_root=self.repo)
+        self.assertEqual(
+            posture["risk_posture"],
+            {"critical": 1, "high": 3, "medium": 1, "low": 1, "other": 0, "total": 6},
+        )
+        self.assertEqual(posture["counts"]["mitigated"], 1)
+        self.assertEqual(posture["counts"]["archived"], 1)
+        self.assertEqual(posture["counts"]["patch_verified_omitted"], 1)
+        self.assertEqual(posture["counts"]["untriaged_omitted"], 1)
+        self.assertEqual(posture["counts"]["runs"], 2)
+
+        titles = [f["title"] for f in posture["findings"]]
+        self.assertEqual(titles[0], "New critical auth bypass", "Sorted CRITICAL -> HIGH -> MEDIUM -> LOW")
+        self.assertNotIn("OTHER_REPO_LEAK", titles)
+        self.assertNotIn("Fixed parser bug", titles)
+        self.assertNotIn("Untriaged draft", titles)
+        self.assertNotIn("Dismissed FP", titles)
+        self.assertNotIn("Sandbox patched bug", titles)
+        self.assertEqual(titles.count("Still present command injection"), 1, "Deduplicated by lineage_id")
+        self.assertEqual(titles.count("Moved export IDOR"), 1, "Dead path archived; live path kept")
+
+        # Higher-assurance dynamic_confirmed row wins AND inherits calibrated priority/score from sibling!
+        still = next(f for f in posture["findings"] if f["title"] == "Still present command injection")
+        self.assertEqual(still["id"], r1["Still present command injection"]["id"])
+        self.assertEqual(still["status"], "dynamic_confirmed")
+        self.assertEqual(still["priority"], "HIGH")
+        self.assertAlmostEqual(still["mantis_risk_score"], 8.4)
+        self.assertEqual(still["seen_in_runs"], ["run-1", "run-2"])
+
+        # Dotfile preserves leading dot!
+        wf = next(f for f in posture["findings"] if f["title"] == "Workflow script injection")
+        self.assertEqual(wf["filepath"], ".github/workflows/ci.yml")
+
+        # 2. Including patch_verified adds the 1 sandbox-patched MEDIUM finding!
+        with_pv = current_open_findings(self.db, repo_root=self.repo, include_patch_verified=True)
+        self.assertEqual(with_pv["risk_posture"]["medium"], 2)
+        self.assertEqual(with_pv["risk_posture"]["total"], 7)
+
+        # 3. Subfolder scope (`repo/sub`) excludes `other/extra.py` and `.github/...` and strips `sub/` prefix!
+        sub_posture = current_open_findings(self.db, repo_root=os.path.join(self.repo, "sub"))
+        self.assertEqual(sub_posture["risk_posture"]["total"], 4)
+        sub_fps = sorted(f["filepath"] for f in sub_posture["findings"])
+        self.assertEqual(sub_fps, ["export_v2.py", "still.py", "still.py", "unchanged.py"])
+
+    def test_cli_report_markdown_json_sarif_and_security_sanitization(self):
+        import contextlib
+        import io
+        from core.sarif import validate_sarif
+        from scripts import knowledge as knowledge_cli
+
+        self._seed_changed_lifecycle()
+
+        # Add a finding with hostile Markdown/HTML/ANSI/pipe/credential payload to test egress safety.
+        fake_gh_token = "ghp_" + ("A" * 36)
+        write_findings(
+            self.db,
+            self.repo,
+            [
+                {
+                    "title": f"\x1b[31mEvil | col\x1b[0m\n# Fake Heading <script>x</script> `{fake_gh_token}`",
+                    "severity": "HIGH",
+                    "priority": "HIGH",
+                    "cwe": "CWE-79",
+                    "filepath": "sub/unchanged.py",
+                    "line_numbers": [42],
+                    "description": "Hostile title test",
+                    "status": "static_confirmed",
+                }
+            ],
+            run_id="run-2",
+        )
+
+        # 1. Markdown output to stdout
+        buf_md = io.StringIO()
+        with contextlib.redirect_stdout(buf_md):
+            rc = knowledge_cli.main(["report", "--db", self.db, "--repo", self.repo])
+        self.assertEqual(rc, 0)
+        md = buf_md.getvalue()
+        self.assertIn("| Critical | 1 |", md)
+        self.assertIn("| High | 4 |", md)
+        self.assertIn("| Medium | 1 |", md)
+        self.assertIn("| Low | 1 |", md)
+        self.assertIn("| **Total** | **7** |", md)
+        self.assertIn("`.github/workflows/ci.yml`", md)
+        self.assertIn("`sub/export_v2.py`", md)
+        self.assertNotIn("\x1b[", md)
+        self.assertNotIn("<script>", md)
+        self.assertNotIn(fake_gh_token, md)
+        self.assertIn("\\|", md, "Pipe in title must be escaped inside Markdown table cell")
+        self.assertNotIn("\n# Fake Heading", md)
+
+        # 2. JSON output written to --out
+        json_out = os.path.join(self.tmp, "posture.json")
+        buf_j = io.StringIO()
+        with contextlib.redirect_stdout(buf_j):
+            rc = knowledge_cli.main(
+                ["report", "--db", self.db, "--repo", self.repo, "--format", "json", "--out", json_out]
+            )
+        self.assertEqual(rc, 0)
+        data = json.loads(Path(json_out).read_text(encoding="utf-8"))
+        self.assertEqual(data["risk_posture"]["total"], 7)
+        self.assertEqual(len(data["findings"]), 7)
+        raw_json = Path(json_out).read_text(encoding="utf-8")
+        self.assertNotIn("\x1b[", raw_json)
+        self.assertNotIn(fake_gh_token, raw_json)
+
+        # 3. SARIF output validated end-to-end (both file and stdout)
+        sarif_out = os.path.join(self.tmp, "posture.sarif")
+        buf_s = io.StringIO()
+        with contextlib.redirect_stdout(buf_s):
+            rc = knowledge_cli.main(
+                ["report", "--db", self.db, "--repo", self.repo, "--format", "sarif", "--out", sarif_out]
+            )
+        self.assertEqual(rc, 0)
+        sarif_doc = json.loads(Path(sarif_out).read_text(encoding="utf-8"))
+        self.assertEqual(validate_sarif(sarif_doc), [])
+        self.assertEqual(len(sarif_doc["runs"][0]["results"]), 7)
+        self.assertTrue(sarif_doc["runs"][0]["properties"]["cumulative_posture"])
+
+        # 4. Symlink --out target is refused (INV-4)
+        victim = os.path.join(self.tmp, "victim.txt")
+        Path(victim).write_text("UNTOUCHED", encoding="utf-8")
+        link_out = os.path.join(self.tmp, "evil_link.md")
+        os.symlink(victim, link_out)
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            rc_sym = knowledge_cli.main(["report", "--db", self.db, "--repo", self.repo, "--out", link_out])
+        self.assertEqual(rc_sym, 2)
+        self.assertIn("symlink", err_buf.getvalue().lower())
+        self.assertEqual(Path(victim).read_text(encoding="utf-8"), "UNTOUCHED")
+
+        # 5. Missing DB returns exit 2 cleanly
+        err_buf2 = io.StringIO()
+        with contextlib.redirect_stderr(err_buf2):
+            rc_miss = knowledge_cli.main(["report", "--db", os.path.join(self.tmp, "missing.db")])
+        self.assertEqual(rc_miss, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

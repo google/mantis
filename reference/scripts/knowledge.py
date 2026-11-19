@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export the knowledge base to `.mantis/knowledge/`, or read one back.
+"""Export/import the knowledge base, inspect regressions, or render a cumulative risk report.
 
+    scripts/knowledge.py report --db knowledge.db --repo /path/to/repo
+    scripts/knowledge.py regressions --db knowledge.db
     scripts/knowledge.py export --db knowledge.db --repo /path/to/repo
     scripts/knowledge.py import --db knowledge.db --repo /path/to/repo
 
@@ -30,6 +32,7 @@ tools imports at start with `main.py --import-knowledge` instead.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -41,11 +44,32 @@ if str(_REF_ROOT) not in sys.path:
 from core.knowledge import (  # noqa: E402
     KNOWLEDGE_DIR,
     KnowledgeImportError,
+    build_posture_report,
     describe,
     export_knowledge,
     import_knowledge,
     read_head,
+    render_posture_markdown,
 )
+
+
+def _atomic_write_output(path: Path, text: str) -> None:
+    parent = path.parent
+    if parent:
+        parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(f"{path}.{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def main(argv=None) -> int:
@@ -90,7 +114,113 @@ def main(argv=None) -> int:
         choices=("all", "fixed", "still_present", "inconclusive"),
         help="filter by recorded outcome (default: all)",
     )
+    rp = sub.add_parser(
+        "report",
+        help="generate the cumulative open risk posture across all runs (deduplicated by lineage)",
+    )
+    rp.add_argument("--db", default="knowledge.db", help="knowledge database (default: knowledge.db)")
+    rp.add_argument(
+        "--repo",
+        default="",
+        help="optional repository (or subfolder) root to scope findings and normalize paths",
+    )
+    rp.add_argument(
+        "--format",
+        default="markdown",
+        choices=("markdown", "md", "json", "sarif"),
+        help="output format (default: markdown)",
+    )
+    rp.add_argument("--out", default="", help="write output to file instead of stdout")
+    rp.add_argument(
+        "--include-patch-verified",
+        action="store_true",
+        help="include patch_verified findings (e.g. sandbox-verified patches not yet applied to the repo)",
+    )
     args = p.parse_args(argv)
+
+    if args.cmd == "report":
+        if not os.path.exists(args.db):
+            print(f"error: no database at {args.db}", file=sys.stderr)
+            return 2
+        repo_opt = ""
+        if args.repo:
+            repo_opt = os.path.realpath(args.repo)
+            if not os.path.isdir(repo_opt):
+                print(f"error: --repo {args.repo} is not a directory", file=sys.stderr)
+                return 2
+        resolved_out: Path | None = None
+        if args.out:
+            from core.paths import validate_data_path
+
+            resolved_out, out_err = validate_data_path(args.out)
+            if out_err or resolved_out is None:
+                print(f"error: {out_err or 'invalid --out path'}", file=sys.stderr)
+                return 2
+
+        fmt = "markdown" if args.format == "md" else args.format
+        if fmt == "sarif":
+            from core.database import current_open_findings
+            from core.sarif import SarifExportError, build_sarif, validate_sarif, write_sarif
+
+            raw = current_open_findings(
+                args.db,
+                repo_root=repo_opt or None,
+                include_patch_verified=bool(args.include_patch_verified),
+            )
+            counts = raw.get("counts") or {}
+            run_props = {
+                "cumulative_posture": True,
+                "runs_included": int(counts.get("runs", 0)),
+                "mitigated_closed": int(counts.get("mitigated", 0)),
+                "archived_closed": int(counts.get("archived", 0)),
+                "untriaged_omitted": int(counts.get("untriaged_omitted", 0)),
+            }
+            try:
+                if resolved_out is not None:
+                    count, skipped = write_sarif(
+                        str(resolved_out),
+                        raw["findings"],
+                        scan_root=repo_opt,
+                        run_properties=run_props,
+                    )
+                    print(f"Wrote SARIF report ({count} finding(s)) to {resolved_out}")
+                else:
+                    doc, skipped = build_sarif(
+                        raw["findings"],
+                        scan_root=repo_opt,
+                        run_properties=run_props,
+                    )
+                    problems = validate_sarif(doc)
+                    if problems:
+                        raise SarifExportError("Refusing to emit invalid SARIF:\n  " + "\n  ".join(problems))
+                    print(json.dumps(doc, indent=2, allow_nan=False))
+            except (SarifExportError, OSError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            for reason in skipped:
+                print(f"warning: skipped finding in SARIF export: {reason}", file=sys.stderr)
+            return 0
+
+        posture = build_posture_report(
+            args.db,
+            repo_root=repo_opt or None,
+            include_patch_verified=bool(args.include_patch_verified),
+        )
+        if fmt == "json":
+            rendered = json.dumps(posture, indent=2, allow_nan=False) + "\n"
+        else:
+            rendered = render_posture_markdown(posture)
+        if resolved_out is not None:
+            try:
+                _atomic_write_output(resolved_out, rendered)
+            except OSError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            total = int((posture.get("risk_posture") or {}).get("total", 0))
+            print(f"Wrote {fmt} posture report ({total} open finding(s)) to {resolved_out}")
+        else:
+            print(rendered, end="")
+        return 0
 
     if args.cmd == "regressions":
         if not os.path.exists(args.db):

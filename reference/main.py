@@ -6413,6 +6413,25 @@ async def pipeline(
             mark = f" [{st}]" if st else ""
         cprint(f"  - [{f.get('severity', 'Unknown')}] {f.get('filepath')}: {f.get('title')}{lines_str}{mark}")
 
+    if scan_mode == SCAN_MODE_CHANGED:
+        try:
+            from core.database import current_open_findings
+
+            posture_root = str(
+                resolved_path_root
+                or (target_path.parent if target_path.is_file() else target_path)
+            )
+            posture = current_open_findings(db_path, repo_root=posture_root)
+            rp = posture["risk_posture"]
+            other_note = f", Other: {rp['other']}" if rp.get("other") else ""
+            print(
+                f"\n📋 Repository open posture (all runs): {rp['total']} open confirmed finding(s) "
+                f"(Critical: {rp['critical']}, High: {rp['high']}, Medium: {rp['medium']}, Low: {rp['low']}{other_note}). "
+                f"Run 'python3 scripts/knowledge.py report --db {db_path} --repo {posture_root}' for the full report."
+            )
+        except Exception:
+            pass
+
     # Join findings that describe different ends of the same defect.
     #
     # This is the payoff of slicing. Splitting a repository is what lets a large target
