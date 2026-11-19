@@ -246,6 +246,21 @@ def observe(name: str, n: int = 1) -> None:
         pass
 
 
+def observe_max(name: str, value: int) -> None:
+    """Records the maximum integer value observed for a high-water-mark metric
+    (e.g. `stream_max_first_chunk_ms`, `stream_max_chunk_gap_ms`) on the
+    current run's controller. Never raises."""
+    try:
+        from core.context import current_run_context
+
+        ctx = current_run_context.get()
+        controller = getattr(ctx, "budget_controller", None) if ctx is not None else None
+        if controller is not None and hasattr(controller, "observe_max"):
+            controller.observe_max(name, value)
+    except Exception:
+        pass
+
+
 def render_spend_summary(snapshot: Dict[str, Any]) -> list:
     """The spend report as lines for the end-of-run console: tokens with the
     cache share, calls, and whichever context/request counters are nonzero.
@@ -287,6 +302,19 @@ def render_spend_summary(snapshot: Dict[str, Any]) -> list:
             parts.append(f"{cleared:,} input tokens cleared by context editing")
         if parts:
             lines.append("Context: " + "; ".join(parts) + ".")
+        other = dict(snapshot.get("other") or {})
+        max_first_ms = int(other.get("stream_max_first_chunk_ms") or 0)
+        max_gap_ms = int(other.get("stream_max_chunk_gap_ms") or 0)
+        eof_preserved = int(other.get("stream_eof_stalls_preserved") or 0)
+        if max_first_ms > 0 or max_gap_ms > 0 or eof_preserved > 0:
+            timing_parts = []
+            if max_first_ms > 0:
+                timing_parts.append(f"max first chunk {max_first_ms / 1000.0:.2f}s")
+            if max_gap_ms > 0:
+                timing_parts.append(f"max inter-chunk gap {max_gap_ms / 1000.0:.2f}s")
+            if eof_preserved > 0:
+                timing_parts.append(f"{eof_preserved} post-finish EOF stall(s) preserved")
+            lines.append("Stream timing: " + ", ".join(timing_parts) + ".")
     except Exception:
         return lines
     return lines
@@ -428,6 +456,19 @@ class BudgetController:
             if not key:
                 return
             self.observations[key] = int(self.observations.get(key, 0)) + int(n)
+        except (TypeError, ValueError):
+            pass
+
+    def observe_max(self, name: str, value: int) -> None:
+        """Records the maximum integer value observed for `name`. Never raises."""
+        try:
+            key = str(name or "").strip()
+            if not key:
+                return
+            val = max(0, int(value))
+            cur = int(self.observations.get(key, 0))
+            if val > cur:
+                self.observations[key] = val
         except (TypeError, ValueError):
             pass
 
@@ -805,6 +846,11 @@ class CampaignBudgetScope(BudgetController):
         """An observation is the run's: mirrored to the parent like the totals."""
         super().observe(name, n)
         self._parent.observe(name, n)
+
+    def observe_max(self, name: str, value: int) -> None:
+        """High-water-mark observation mirrored to the parent controller."""
+        super().observe_max(name, value)
+        self._parent.observe_max(name, value)
 
     def check_budget(self) -> None:
         """Run-level ceilings against the SHARED totals, campaign guards against OWN.

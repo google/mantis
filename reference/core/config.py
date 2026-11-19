@@ -574,6 +574,81 @@ def is_rate_limit_error(e: Exception) -> bool:
     return False
 
 
+def _is_timeout_error(e: Exception) -> bool:
+    """True when `e` represents a transient request/read/gateway timeout raised
+    by any layer (asyncio, built-in TimeoutError, LiteLLM, httpx, OpenAI/Anthropic
+    SDK, HTTP 408/504, gRPC DEADLINE_EXCEEDED, or chained `__cause__`/`__context__`).
+
+    Never matches auth errors, rate-limit (429) errors, config/validation errors,
+    or deterministic non-retryable 4xx client errors.
+    """
+    if is_auth_error(e) or is_rate_limit_error(e):
+        return False
+    if isinstance(
+        e,
+        (
+            MantisAuthError,
+            ConfigValidationError,
+            PermissionError,
+            FileNotFoundError,
+            ValueError,
+            TypeError,
+        ),
+    ):
+        return False
+    if _is_deterministic_non_retryable_exc(e):
+        return False
+    status_top = _http_status_of(e)
+    if status_top is not None and status_top not in (408, 504):
+        return False
+    seen: set[int] = set()
+    curr: Optional[BaseException] = e
+    while curr is not None and id(curr) not in seen:
+        seen.add(id(curr))
+        if isinstance(curr, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        cls_name = type(curr).__name__.lower()
+        if "timeout" in cls_name and "auth" not in cls_name:
+            return True
+        try:
+            import litellm
+            lt_to = tuple(
+                c
+                for c in (
+                    getattr(litellm, "Timeout", None),
+                    getattr(getattr(litellm, "exceptions", None), "Timeout", None),
+                )
+                if isinstance(c, type)
+            )
+            if lt_to and isinstance(curr, lt_to):
+                return True
+        except Exception:
+            pass
+        if isinstance(curr, Exception):
+            st = _http_status_of(curr)
+            if st in (408, 504):
+                return True
+        msg = str(curr).lower()
+        if any(
+            k in msg
+            for k in (
+                "timed out",
+                "timeout",
+                "sockettimeout",
+                "gateway timeout",
+                "deadline exceeded",
+                "deadline_exceeded",
+            )
+        ):
+            if not (
+                isinstance(curr, Exception)
+                and (is_rate_limit_error(curr) or is_auth_error(curr))
+            ):
+                return True
+        curr = getattr(curr, "__cause__", None) or getattr(curr, "__context__", None)
+    return False
+
+
 def is_retryable_llm_error(e: Exception) -> bool:
     """Detects whether an exception represents a retryable transient error (429, 408, 5xx, timeout, or network reset)."""
     if is_auth_error(e) or isinstance(e, (MantisAuthError, ConfigValidationError, PermissionError, FileNotFoundError)):
@@ -581,6 +656,8 @@ def is_retryable_llm_error(e: Exception) -> bool:
     if _is_deterministic_non_retryable_exc(e):
         return False
     if is_rate_limit_error(e):
+        return True
+    if _is_timeout_error(e):
         return True
     # An empty STOP turn is retried like a 429: same backoff, same patience.
     # Its cost is metered where it is raised (see MantisEmptyResponseError).
@@ -749,6 +826,93 @@ REQUEST_TIMEOUT_BY_EFFORT = {
 }
 REQUEST_TIMEOUT_THINKING_MODEL = 600.0
 _STREAM_CLOSE_TIMEOUT_SECONDS = 5.0
+MAX_STREAM_TIMEOUT_RETRIES = 2
+MAX_STREAM_ESCALATED_TIMEOUT_SECONDS = 1800.0
+_STREAM_EOF_TIMEOUT_SECONDS = 30.0
+_STREAM_TIMING_LOG_THRESHOLD_SECONDS = 10.0
+_TERMINAL_STREAM_FINISH_REASONS = frozenset({
+    "stop",
+    "tool_calls",
+    "end_turn",
+    "function_call",
+    "end_of_turn",
+})
+
+
+def _max_stream_timeout_retries() -> int:
+    val = _parse_env_number(
+        ("MANTIS_STREAM_TIMEOUT_MAX_RETRIES",),
+        as_int=True,
+        default=MAX_STREAM_TIMEOUT_RETRIES,
+        min_val=0,
+    )
+    return MAX_STREAM_TIMEOUT_RETRIES if val is None else int(val)
+
+
+def _resolve_stream_eof_timeout() -> float:
+    val = _parse_env_number(
+        ("MANTIS_STREAM_EOF_TIMEOUT_SECONDS",),
+        default=_STREAM_EOF_TIMEOUT_SECONDS,
+        min_val=0.001,
+    )
+    return float(_STREAM_EOF_TIMEOUT_SECONDS if val is None else val)
+
+
+def _is_explicit_operator_timeout(client: Any = None) -> bool:
+    """True when the operator explicitly configured a request timeout via env
+    (`LLM_TIMEOUT` / `MANTIS_TIMEOUT` / `LLM_REQUEST_TIMEOUT`), CLI `--timeout`,
+    local overlay (`workflow.local.json`), or node-level `timeout`."""
+    if _parse_env_number(("LLM_TIMEOUT", "MANTIS_TIMEOUT", "LLM_REQUEST_TIMEOUT"), min_val=0.001) is not None:
+        return True
+    return bool(getattr(client, "explicit_timeout", False))
+
+
+def _remaining_wall_clock_budget_seconds() -> Optional[float]:
+    """Remaining wall-clock seconds on the active `RunContext.budget_controller`,
+    or `None` when unbounded or no controller is active. Never raises."""
+    try:
+        from core.context import current_run_context
+
+        rc = current_run_context.get()
+        bc = getattr(rc, "budget_controller", None) if rc is not None else None
+        cfg = getattr(bc, "config", None) if bc is not None else None
+        limit = float(getattr(cfg, "max_wall_clock_seconds", 0.0) or 0.0)
+        if limit <= 0.0:
+            return None
+        elapsed = float(getattr(bc, "elapsed_seconds", 0.0) or 0.0)
+        return max(0.0, limit - elapsed)
+    except Exception:
+        return None
+
+
+def _compute_escalated_stream_timeout(
+    base_timeout: float,
+    timeout_retries: int,
+    *,
+    explicit_timeout: bool = False,
+    remaining_patience: Optional[float] = None,
+    remaining_wall_seconds: Optional[float] = None,
+) -> float:
+    """Computes the per-attempt first-chunk timeout for retry #`timeout_retries`.
+
+    - Explicit operator timeouts (`--timeout`, `LLM_TIMEOUT`, `workflow.local.json`)
+      are NEVER escalated past `base_timeout`.
+    - Effort-derived / default timeouts escalate `1x -> 2x -> ...` capped at
+      `max(base_timeout, MAX_STREAM_ESCALATED_TIMEOUT_SECONDS)` (1800s).
+    - On retries (`timeout_retries > 0`), caps against remaining retry patience
+      and remaining wall-clock budget when positive.
+    """
+    if timeout_retries <= 0 or explicit_timeout:
+        attempt_timeout = float(base_timeout)
+    else:
+        cap = max(float(base_timeout), float(MAX_STREAM_ESCALATED_TIMEOUT_SECONDS))
+        attempt_timeout = min(cap, float(base_timeout) * (2.0 ** int(timeout_retries)))
+    if timeout_retries > 0:
+        if remaining_patience is not None and remaining_patience > 0:
+            attempt_timeout = min(attempt_timeout, float(remaining_patience))
+        if remaining_wall_seconds is not None and remaining_wall_seconds > 0:
+            attempt_timeout = min(attempt_timeout, float(remaining_wall_seconds))
+    return max(0.001, float(attempt_timeout))
 
 
 def default_request_timeout(model: str, effort: Optional[str]) -> Optional[float]:
@@ -1099,6 +1263,15 @@ def _observe(name: str, n: int = 1) -> None:
     try:
         from core.budget import observe
         observe(name, n)
+    except Exception:
+        pass
+
+
+def _observe_max(name: str, value: int) -> None:
+    """Records a high-water-mark metric on the run's spend report (core.budget)."""
+    try:
+        from core.budget import observe_max
+        observe_max(name, value)
     except Exception:
         pass
 
@@ -2204,117 +2377,206 @@ class _ContinuationSplicer:
         self.kwargs = kwargs
         self.chunks_yielded = 0
         self.usage_total: Optional[dict] = None
+        self._last_usage_template: Any = None
         self.segments = 1
 
     async def deliver(self, first_chunk: Any, stream_iter: Any, stream_response: Any = None):
         chunk_timeout = _resolve_stream_chunk_timeout(self.kwargs)
-        while True:
-            # --- one segment. Chunks that end a turn -- a finish reason, usage
-            # -- are held until the segment is over, because only then is it
-            # known whether this segment ends the turn or a continuation
-            # follows; LiteLLM may put the finish, the token and the usage on
-            # different chunks, in any order, so none of them is judged alone.
-            pending_token: Optional[str] = None
-            held: list = []
-            chunk = first_chunk
-            first_chunk = None
+        eof_timeout_cap = _resolve_stream_eof_timeout()
+        first_chunk_s = float(getattr(self.client, "_last_first_chunk_s", 0.0) or 0.0)
+        last_chunk_t = time.monotonic()
+        max_gap_s = 0.0
+        try:
             while True:
-                if chunk is not None:
-                    token = continuation_token_of(chunk)
-                    if token:
-                        pending_token = token
-                    usage = getattr(chunk, "usage", None)
-                    if usage is not None:
-                        self.usage_total = _add_usage(self.usage_total, usage)
-                    if usage is not None or _chunk_has_finish(chunk):
-                        held.append(chunk)
-                    else:
-                        if held:
-                            # Content after a finish-bearing chunk: the turn did
-                            # not end there after all. Pass the held chunks on.
-                            for h in held:
-                                yield h
-                                self.chunks_yielded += 1
-                            held = []
-                        yield chunk
-                        self.chunks_yielded += 1
-                timeout_cm = asyncio.timeout(chunk_timeout)
-                try:
-                    async with timeout_cm:
-                        chunk = await stream_iter.__anext__()
-                except StopAsyncIteration:
-                    break
-                except Exception as e:
-                    await _close_stream_quietly(stream_iter, stream_response)
-                    if isinstance(e, TimeoutError) and timeout_cm.expired():
-                        e = TimeoutError(
-                            f"Stream from '{self.model}' timed out after {chunk_timeout:g}s "
-                            "waiting for the next chunk"
-                        )
-                    raise MantisStreamInterruptedError(
-                        f"Stream from '{self.model}' failed after {self.chunks_yielded} chunk(s) were already delivered "
-                        f"({type(e).__name__}: {e}). A transparent retry would re-sample the model and splice "
-                        "two different completions together; the consumer owns the continuation policy.",
-                        chunks_yielded=self.chunks_yielded,
-                        original_exception=e,
-                    ) from e
-            # --- segment over
-            allowed, why = continuation_allowed(self.segments, self.usage_total) if pending_token else (False, "")
-            if pending_token and not allowed:
-                print(
-                    f"\n[CONTINUATION] '{self.model}' stopped mid-thought after {self.segments} segment(s) and is "
-                    f"not continued: {why}. The turn ends here.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            if pending_token and allowed:
-                # A continuation follows: the held chunks' content goes on,
-                # their finish and usage do not (the turn is not over).
-                segment_usage = next((getattr(h, "usage", None) for h in reversed(held) if getattr(h, "usage", None) is not None), None)
-                for h in held:
-                    if _chunk_has_payload(h):
-                        _strip_finish(h)
-                        try:
-                            h.usage = None
-                        except Exception:
-                            pass
-                        yield h
-                        self.chunks_yielded += 1
-                self.segments += 1
-                _observe("thinking_continuations")
-                print(
-                    f"\n[CONTINUATION] '{self.model}' stopped mid-thought; continuing the turn "
-                    f"(segment {self.segments}){_usage_note(segment_usage)}...",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                try:
-                    first_chunk, stream_iter, stream_response = await self.client._open_stream_with_retry(
-                        self.model, self.messages, self.tools, with_continuation_token(self.kwargs, pending_token),
+                # --- one segment. Chunks that end a turn -- a finish reason, usage
+                # -- are held until the segment is over, because only then is it
+                # known whether this segment ends the turn or a continuation
+                # follows; LiteLLM may put the finish, the token and the usage on
+                # different chunks, in any order, so none of them is judged alone.
+                pending_token: Optional[str] = None
+                held: list = []
+                segment_has_usage = False
+                chunk = first_chunk
+                first_chunk = None
+                while True:
+                    if chunk is not None:
+                        token = continuation_token_of(chunk)
+                        if token:
+                            pending_token = token
+                        usage = getattr(chunk, "usage", None)
+                        if usage is not None:
+                            self.usage_total = _add_usage(self.usage_total, usage)
+                            self._last_usage_template = usage
+                            segment_has_usage = True
+                        if usage is not None or _chunk_has_finish(chunk):
+                            held.append(chunk)
+                        else:
+                            if held:
+                                # Content after a finish-bearing chunk: the turn did
+                                # not end there after all. Pass the held chunks on.
+                                for h in held:
+                                    yield h
+                                    self.chunks_yielded += 1
+                                held = []
+                            yield chunk
+                            self.chunks_yielded += 1
+                    has_terminal = bool(not pending_token and _has_terminal_finish(held))
+                    # Only shrink the EOF wait once *this* segment has delivered its
+                    # own usage chunk -- never from an earlier continuation segment's
+                    # `self.usage_total`, or the final segment's trailing usage chunk
+                    # could be dropped by an early `eof_timeout_cap` break.
+                    wait_timeout = (
+                        min(chunk_timeout, eof_timeout_cap)
+                        if (has_terminal and segment_has_usage)
+                        else chunk_timeout
                     )
-                except Exception as e:
-                    raise MantisStreamInterruptedError(
-                        f"Continuation of a turn from '{self.model}' could not be opened after "
-                        f"{self.chunks_yielded} chunk(s) were delivered ({type(e).__name__}: {e}).",
-                        chunks_yielded=self.chunks_yielded,
-                        original_exception=e,
-                    ) from e
-                if first_chunk is None:
-                    held = []
-                    break  # an empty continuation: the turn ends here
-                continue
-            # This segment ends the turn: its held chunks go on as they came,
-            # the usage carrying the whole turn's sum.
-            for h in held:
-                if getattr(h, "usage", None) is not None and self.segments > 1:
-                    _apply_usage(h.usage, self.usage_total)
-                yield h
-                self.chunks_yielded += 1
-            break
+                    timeout_cm = asyncio.timeout(wait_timeout)
+                    try:
+                        async with timeout_cm:
+                            chunk = await stream_iter.__anext__()
+                        now_t = time.monotonic()
+                        gap_s = max(0.0, now_t - last_chunk_t)
+                        if gap_s > max_gap_s:
+                            max_gap_s = gap_s
+                        last_chunk_t = now_t
+                    except StopAsyncIteration:
+                        break
+                    except Exception as e:
+                        await _close_stream_quietly(stream_iter, stream_response)
+                        if isinstance(e, TimeoutError) and timeout_cm.expired():
+                            if has_terminal:
+                                _observe("stream_eof_stalls_preserved")
+                                print(
+                                    f"\n[STREAM RESILIENCE] '{self.model}' timed out after {wait_timeout:g}s "
+                                    "waiting for stream EOF after terminal finish chunk; preserving completed response.",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                break
+                            e = TimeoutError(
+                                f"Stream from '{self.model}' timed out after {wait_timeout:g}s "
+                                "waiting for the next chunk"
+                            )
+                        raise MantisStreamInterruptedError(
+                            f"Stream from '{self.model}' failed after {self.chunks_yielded} chunk(s) were already delivered "
+                            f"({type(e).__name__}: {e}). A transparent retry would re-sample the model and splice "
+                            "two different completions together; the consumer owns the continuation policy.",
+                            chunks_yielded=self.chunks_yielded,
+                            original_exception=e,
+                        ) from e
+                # --- segment over
+                allowed, why = continuation_allowed(self.segments, self.usage_total) if pending_token else (False, "")
+                if pending_token and not allowed:
+                    print(
+                        f"\n[CONTINUATION] '{self.model}' stopped mid-thought after {self.segments} segment(s) and is "
+                        f"not continued: {why}. The turn ends here.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if pending_token and allowed:
+                    # A continuation follows: the held chunks' content goes on,
+                    # their finish and usage do not (the turn is not over).
+                    segment_usage = next((getattr(h, "usage", None) for h in reversed(held) if getattr(h, "usage", None) is not None), None)
+                    for h in held:
+                        if _chunk_has_payload(h):
+                            _strip_finish(h)
+                            try:
+                                h.usage = None
+                            except Exception:
+                                pass
+                            yield h
+                            self.chunks_yielded += 1
+                    self.segments += 1
+                    _observe("thinking_continuations")
+                    print(
+                        f"\n[CONTINUATION] '{self.model}' stopped mid-thought; continuing the turn "
+                        f"(segment {self.segments}){_usage_note(segment_usage)}...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    try:
+                        first_chunk, stream_iter, stream_response = await self.client._open_stream_with_retry(
+                            self.model, self.messages, self.tools, with_continuation_token(self.kwargs, pending_token),
+                        )
+                        last_chunk_t = time.monotonic()
+                    except Exception as e:
+                        raise MantisStreamInterruptedError(
+                            f"Continuation of a turn from '{self.model}' could not be opened after "
+                            f"{self.chunks_yielded} chunk(s) were delivered ({type(e).__name__}: {e}).",
+                            chunks_yielded=self.chunks_yielded,
+                            original_exception=e,
+                        ) from e
+                    if first_chunk is None:
+                        held = []
+                        break  # an empty continuation: the turn ends here
+                    continue
+                # This segment ends the turn: its held chunks go on as they came,
+                # the usage carrying the whole turn's sum. If a multi-segment turn
+                # ended (or hit a post-finish EOF stall) without a usage chunk on
+                # the final segment, attach the accumulated `usage_total` onto the
+                # last held chunk so earlier segments' token counts are not lost.
+                if (
+                    self.segments > 1
+                    and self.usage_total is not None
+                    and not segment_has_usage
+                    and held
+                    and not any(getattr(h, "usage", None) is not None for h in held)
+                ):
+                    try:
+                        import copy as _copy
+                        import types as _types
+                        synth_usage = (
+                            _copy.deepcopy(self._last_usage_template)
+                            if self._last_usage_template is not None
+                            else _types.SimpleNamespace()
+                        )
+                        _apply_usage(synth_usage, self.usage_total)
+                        held[-1].usage = synth_usage
+                    except Exception:
+                        pass
+                for h in held:
+                    if getattr(h, "usage", None) is not None and self.segments > 1:
+                        _apply_usage(h.usage, self.usage_total)
+                    yield h
+                    self.chunks_yielded += 1
+                break
+        finally:
+            try:
+                self.client._last_max_chunk_gap_s = max_gap_s
+                if max_gap_s > 0:
+                    _observe_max("stream_max_chunk_gap_ms", int(round(max_gap_s * 1000.0)))
+                log_always = str(os.environ.get("MANTIS_LOG_STREAM_TIMING", "") or "").strip().lower() in (
+                    "1", "true", "yes", "on",
+                )
+                if log_always or first_chunk_s >= _STREAM_TIMING_LOG_THRESHOLD_SECONDS or max_gap_s >= _STREAM_TIMING_LOG_THRESHOLD_SECONDS:
+                    print(
+                        f"\n[STREAM TIMING] '{self.model}': first_chunk={first_chunk_s:.2f}s, "
+                        f"max_chunk_gap={max_gap_s:.2f}s (chunks={self.chunks_yielded}, segments={self.segments})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except Exception:
+                pass
 
 
 def _chunk_has_finish(chunk: Any) -> bool:
     return any(getattr(choice, "finish_reason", None) for choice in (getattr(chunk, "choices", None) or []))
+
+
+def _has_terminal_finish(held: Sequence[Any]) -> bool:
+    """True when `held` carries a clean terminal finish chunk (`stop`,
+    `tool_calls`, `end_turn`, `function_call`, `end_of_turn`), NOT truncation
+    (`length`/`MAX_TOKENS`) or safety block."""
+    for chunk in held or ():
+        for choice in getattr(chunk, "choices", None) or ():
+            fr = getattr(choice, "finish_reason", None)
+            if not fr:
+                continue
+            val = getattr(fr, "value", fr)
+            norm = str(val).strip().rsplit(".", 1)[-1].lower()
+            if norm in _TERMINAL_STREAM_FINISH_REASONS:
+                return True
+    return False
 
 
 def _strip_empty_injection_points(kwargs: dict[str, Any]) -> None:
@@ -3005,17 +3267,40 @@ class ResilientLiteLLMClient(LiteLLMClient):
         max_patience, initial_delay, max_delay, min_offset, backoff_factor = _llm_retry_params()
         if _is_discard_loopback_api_base(kwargs.get("api_base")):
             max_patience = 0.0
-        chunk_timeout = _resolve_stream_chunk_timeout(kwargs)
+        base_chunk_timeout = _resolve_stream_chunk_timeout(kwargs)
+        explicit_op_timeout = _is_explicit_operator_timeout(self)
+        max_timeout_retries = _max_stream_timeout_retries()
 
         start_time = time.time()
         attempt = 0
+        timeout_retries = 0
         auth_refreshed = False
         while True:
             response = None
             stream_iter = None
+            is_first_chunk_timeout = False
+            rem_patience = (max_patience - (time.time() - start_time)) if max_patience > 0 else None
+            attempt_timeout = _compute_escalated_stream_timeout(
+                base_chunk_timeout,
+                timeout_retries,
+                explicit_timeout=explicit_op_timeout,
+                remaining_patience=rem_patience,
+                remaining_wall_seconds=_remaining_wall_clock_budget_seconds(),
+            )
+            attempt_kwargs = dict(kwargs)
+            if timeout_retries > 0 and not explicit_op_timeout:
+                try:
+                    cur_to = float(attempt_kwargs.get("timeout") or 0.0)
+                except (TypeError, ValueError):
+                    cur_to = 0.0
+                if attempt_timeout > cur_to:
+                    attempt_kwargs["timeout"] = attempt_timeout
+                    if "stream_timeout" in attempt_kwargs:
+                        attempt_kwargs["stream_timeout"] = attempt_timeout
+            attempt_t0 = time.monotonic()
             try:
                 empty_stream = False
-                timeout_cm = asyncio.timeout(chunk_timeout)
+                timeout_cm = asyncio.timeout(attempt_timeout)
                 try:
                     async with timeout_cm:
                         response = await litellm.acompletion(
@@ -3023,7 +3308,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
                             messages=messages,
                             tools=tools,
                             stream=True,
-                            **kwargs,
+                            **attempt_kwargs,
                         )
                         stream_iter = response.__aiter__()
                         try:
@@ -3032,11 +3317,15 @@ class ResilientLiteLLMClient(LiteLLMClient):
                             empty_stream = True
                 except TimeoutError as exc:
                     if timeout_cm.expired():
+                        is_first_chunk_timeout = True
                         raise TimeoutError(
-                            f"Stream from '{model}' timed out after {chunk_timeout:g}s "
+                            f"Stream from '{model}' timed out after {attempt_timeout:g}s "
                             "waiting for the first chunk"
                         ) from exc
                     raise
+                first_chunk_s = max(0.0, time.monotonic() - attempt_t0)
+                self._last_first_chunk_s = first_chunk_s
+                _observe_max("stream_max_first_chunk_ms", int(round(first_chunk_s * 1000.0)))
                 if empty_stream:
                     # An empty stream is a successfully completed (if silent) response.
                     await _close_stream_quietly(stream_iter, response)
@@ -3055,7 +3344,15 @@ class ResilientLiteLLMClient(LiteLLMClient):
                         original_exception=e,
                     ) from None
                 elapsed = time.time() - start_time
-                if not is_retryable_llm_error(e) or elapsed >= max_patience:
+                # Count ANY pre-first-chunk timeout (our asyncio.timeout OR an
+                # upstream client/LiteLLM/httpx/504 cutoff such as LiteLLM's
+                # internal 600s Vertex/Gemini streaming timeout) toward
+                # `max_timeout_retries` so repeated cutoffs stop cleanly.
+                if is_first_chunk_timeout or _is_timeout_error(e):
+                    if timeout_retries >= max_timeout_retries or elapsed >= max_patience:
+                        raise
+                    timeout_retries += 1
+                elif not is_retryable_llm_error(e) or elapsed >= max_patience:
                     raise
                 remaining = max_patience - elapsed
                 retry_after = extract_retry_after(e)
@@ -3360,6 +3657,7 @@ class ResilientLiteLlm(LiteLlm):
     def __init__(self, model: str, **kwargs: Any) -> None:
         output_schema_override = kwargs.pop("output_schema_override", None)
         preserve_system_prefix = bool(kwargs.pop("preserve_system_prefix", False))
+        explicit_timeout = bool(kwargs.pop("explicit_timeout", False))
         if LiteLlm is not object:
             super().__init__(model=model, **kwargs)
         else:
@@ -3368,6 +3666,10 @@ class ResilientLiteLlm(LiteLlm):
         self._preserve_system_prefix = preserve_system_prefix
         if getattr(self, "llm_client", None) is None:
             self.llm_client = ResilientLiteLLMClient()
+        try:
+            self.llm_client.explicit_timeout = explicit_timeout
+        except Exception:
+            pass
         if "gemini" in str(model).lower():
             try:
                 import litellm
@@ -4746,7 +5048,7 @@ def get_run_llm_kwargs(
         or cfg.get("_local_reasoning_effort")
         or None
     )
-    return get_llm_kwargs(
+    resolved, llm_kwargs = get_llm_kwargs(
         model_id=model_id,
         default_model=str(cfg.get("default_model") or DEFAULT_MODEL),
         api_base=eff_api_base,
@@ -4759,4 +5061,12 @@ def get_run_llm_kwargs(
         config=cfg,
         explicit_reasoning_effort=bool(reasoning_effort or cfg.get("_cli_reasoning_effort")),
     )
+    if (
+        timeout is not None
+        or cfg.get("_cli_timeout") is not None
+        or cfg.get("_explicit_timeout")
+        or (cfg.get("timeout") is not None and "_explicit_timeout" not in cfg)
+    ):
+        llm_kwargs["explicit_timeout"] = True
+    return resolved, llm_kwargs
 

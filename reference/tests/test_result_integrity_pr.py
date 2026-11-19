@@ -289,6 +289,220 @@ class FindingIdentityAndConsolidationIntegrityTest(unittest.IsolatedAsyncioTestC
         self.assertIn("filepath", res)
         self.assertEqual(read_findings(self.db, run_id="r_batch"), [])
 
+    def test_lineage_step1_verifies_prose_signature_and_blocks_legacy_method_collision(self):
+        """Regression test for r4-lineage-fallback:
+        1. Dead guard `if prose_sig: return str(row[0])` used to return a row
+           matched via `bare_sig` even when `row.qualified_symbol` conflicted
+           AND `row.prose_signature` did not match!
+        2. Even against a pre-migration legacy row with empty `qualified_symbol`,
+           once `UserView.get` adopts that lineage, `OrderView.get` must NOT
+           steal the same lineage through the legacy row!
+        """
+        from core.database import resolve_ancestor_lineage
+
+        tmp = tempfile.mkdtemp(prefix="mantis_lin_fb_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        db = os.path.join(tmp, "lin.db")
+        init_db(db)
+
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        # Scenario 1 (with real CWE set, hitting BOTH Step 1 signature AND Step 2
+        # filepath+cwe+bare-symbol matching): UserView.get vs OrderView.get in views.py
+        cur.execute(
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
+                                     signature, prose_signature, lineage_id, target_symbol,
+                                     symbol_source, qualified_symbol, line_numbers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "r1", "views.py", "Missing auth in UserView.get", "desc", "HIGH", "confirmed", "CWE-862",
+                "bare_get_sig", "prose_user_get", "lin-user-get", "get",
+                "", "UserView.get", "[12]",
+            ),
+        )
+        conn.commit()
+        lin_order = resolve_ancestor_lineage(
+            cur,
+            "views.py",
+            signature="sig_order_get",
+            cwe="CWE-862",
+            symbol="get",
+            db_path=db,
+            bare_signature="bare_get_sig",
+            prose_signature="prose_order_get",
+            symbol_source="catalog",
+            qualified_symbol="OrderView.get",
+        )
+        self.assertNotEqual(
+            lin_order, "lin-user-get",
+            "OrderView.get MUST NOT collide onto UserView.get via Step 1 or Step 2 when CWE matches!",
+        )
+
+        # Positive control: re-reporting the SAME method (UserView.get) with CWE-862 still links.
+        lin_same = resolve_ancestor_lineage(
+            cur,
+            "views.py",
+            signature="sig_user_get_v2",
+            cwe="CWE-862",
+            symbol="get",
+            db_path=db,
+            bare_signature="different_bare_sig",
+            prose_signature="different_prose",
+            symbol_source="catalog",
+            qualified_symbol="UserView.get",
+        )
+        self.assertEqual(
+            lin_same, "lin-user-get",
+            "Same qualified_symbol UserView.get with CWE-862 must still resolve to its lineage!",
+        )
+
+        # Scenario 2 (with real CWE set): legacy pre-migration row (empty qualified_symbol)
+        # adopted by UserView.get must NOT let OrderView.get steal lin-legacy via Step 1 or Step 2.
+        cur.execute(
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
+                                     signature, prose_signature, lineage_id, target_symbol,
+                                     symbol_source, qualified_symbol, line_numbers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "r0", "legacy.py", "Missing auth in get", "desc", "HIGH", "confirmed", "CWE-862",
+                "legacy_bare_sig", "legacy_prose", "lin-legacy", "get",
+                "", "", "[10]",
+            ),
+        )
+        cur.execute(
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
+                                     signature, prose_signature, lineage_id, target_symbol,
+                                     symbol_source, qualified_symbol, line_numbers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "r1", "legacy.py", "Missing auth in UserView.get", "desc", "HIGH", "confirmed", "CWE-862",
+                "sig_uv_get", "legacy_prose", "lin-legacy", "get",
+                "catalog", "UserView.get", "[10]",
+            ),
+        )
+        conn.commit()
+        lin_ov = resolve_ancestor_lineage(
+            cur,
+            "legacy.py",
+            signature="sig_ov_get",
+            cwe="CWE-862",
+            symbol="get",
+            db_path=db,
+            bare_signature="legacy_bare_sig",
+            prose_signature="legacy_prose",
+            symbol_source="catalog",
+            qualified_symbol="OrderView.get",
+        )
+        self.assertNotEqual(
+            lin_ov, "lin-legacy",
+            "OrderView.get MUST NOT join a legacy lineage (with CWE-862) already claimed by UserView.get!",
+        )
+
+        # Scenario 3: pure Step 2 match (empty cwe='' legacy row adopted by UserView.get)
+        # with completely distinct signature so Step 1 yields 0 rows.
+        cur.execute(
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
+                                     signature, prose_signature, lineage_id, target_symbol,
+                                     symbol_source, qualified_symbol, line_numbers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "r0", "step2.py", "Old finding in get", "desc", "HIGH", "confirmed", "",
+                "sig_old_0", "prose_old_0", "lin-step2", "get",
+                "", "", "[15]",
+            ),
+        )
+        cur.execute(
+            """INSERT INTO findings (run_id, filepath, title, description, severity, status, cwe,
+                                     signature, prose_signature, lineage_id, target_symbol,
+                                     symbol_source, qualified_symbol, line_numbers)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "r1", "step2.py", "UserView.get", "desc", "HIGH", "confirmed", "CWE-862",
+                "sig_old_1", "prose_old_1", "lin-step2", "get",
+                "", "UserView.get", "[15]",
+            ),
+        )
+        conn.commit()
+        lin_step2_ov = resolve_ancestor_lineage(
+            cur,
+            "step2.py",
+            signature="completely_unrelated_sig",
+            cwe="CWE-862",
+            symbol="get",
+            db_path=db,
+            bare_signature="",
+            prose_signature="",
+            symbol_source="catalog",
+            qualified_symbol="OrderView.get",
+        )
+        self.assertNotEqual(
+            lin_step2_ov, "lin-step2",
+            "Step 2 MUST NOT match bare symbol `get` when qualified_symbol conflicts!",
+        )
+        conn.close()
+
+    def test_tier1_consolidation_blocks_transitive_line_chaining(self):
+        """Regression test for findings-lifecycle-2:
+        Three findings at lines 10, 16, and 22 (each 6 lines from neighbor, but
+        10 and 22 are 12 lines apart > 8-line window) MUST NOT transitively chain
+        into a single merged bucket under Tier-1 deterministic consolidation.
+        """
+        from core.consolidator import _tier1_exact_groups
+
+        findings = [
+            {
+                "id": 1,
+                "filepath": "api.py",
+                "cwe": "CWE-89",
+                "title": "SQL injection in search query builder",
+                "description": "Untrusted query parameter concatenated into SQL query in search_items",
+                "line_numbers": [10],
+                "status": "confirmed",
+                "mantis_risk_score": 8.0,
+                "qualified_symbol": "search_items",
+                "code_paths": ["api.py:10"],
+            },
+            {
+                "id": 2,
+                "filepath": "api.py",
+                "cwe": "CWE-89",
+                "title": "SQL injection in search query builder",
+                "description": "Untrusted query parameter concatenated into SQL query in search_items",
+                "line_numbers": [16],
+                "status": "confirmed",
+                "mantis_risk_score": 7.0,
+                "qualified_symbol": "search_items",
+                "code_paths": ["api.py:16"],
+            },
+            {
+                "id": 3,
+                "filepath": "api.py",
+                "cwe": "CWE-89",
+                "title": "SQL injection in search query builder",
+                "description": "Untrusted query parameter concatenated into SQL query in search_items",
+                "line_numbers": [22],
+                "status": "confirmed",
+                "mantis_risk_score": 6.0,
+                "qualified_symbol": "search_items",
+                "code_paths": ["api.py:22"],
+            },
+        ]
+        groups = _tier1_exact_groups(findings, idx=None)
+        self.assertEqual(len(groups), 1)
+        primary_id, dup_ids, _reason = groups[0]
+        self.assertEqual(primary_id, 1)
+        self.assertEqual(dup_ids, [2])
+        self.assertNotIn(3, dup_ids, "Line 22 must NOT transitively chain onto line 10!")
+
+        clique = [dict(f) for f in findings]
+        clique[1]["line_numbers"] = [14]
+        clique[2]["line_numbers"] = [17]
+        c_groups = _tier1_exact_groups(clique, idx=None)
+        self.assertEqual(len(c_groups), 1)
+        self.assertEqual(c_groups[0][0], 1)
+        self.assertEqual(sorted(c_groups[0][1]), [2, 3])
+
 
 class StageAndVerdictIntegrityTest(unittest.IsolatedAsyncioTestCase):
     async def test_resumable_end_of_agent_does_not_clear_stage_model_error(self):

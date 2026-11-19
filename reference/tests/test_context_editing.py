@@ -523,6 +523,133 @@ class ClientSideEditingTest(unittest.TestCase):
             self.assertIsNotNone(ceiling, f"{name}: no ceiling callback")
             self.assertLess(editing, ceiling, f"{name}: the ceiling must measure the request as cleared")
 
+    def test_forked_stage_lifts_shipped_180k_trigger_relative_to_midsize_stem(self):
+        """Regression test for r4-stem-budget-vs-trigger:
+        On a 1M Gemini window with shipped `context_editing_trigger_tokens: 180000`,
+        a forked stage inheriting a ~300k-token stem must lift its effective trigger
+        above the stem (`stem + own_margin`, capped below the 80% ceiling) so the
+        model is not blinded down to its newest 5 tool results on every single turn!
+        """
+        from google.adk.models import LlmRequest
+        from google.genai import types
+        import core.graph_loader as gl
+        from core.prompts import PREFIX_GROUP_BASE_INSTRUCTION
+
+        with patch.object(C, "resolve_context_limit", return_value=1_048_576):
+            # Shipped default config from workflow.json (`explicit_trigger=False`)
+            cfg = {"context_editing_trigger_tokens": 180_000}
+            cb = gl._make_client_context_editing_before_model_callback(
+                "researcher",
+                model=GEMINI,
+                config=cfg,
+                preserve_system_prefix=True,
+                explicit_trigger=False,
+            )
+
+            # Build forked request: ~250k-token inherited stem (750k chars) + 8 own read results (~40k tokens)
+            # Total ~290k tokens >> 180k shipped trigger, yet well below lifted trigger (~250k + 108k = ~358k)!
+            req = LlmRequest()
+            req.config.system_instruction = PREFIX_GROUP_BASE_INSTRUCTION
+            req.contents = [
+                types.Content(role="user", parts=[types.Part.from_text(text="architect start")]),
+                types.Content(role="model", parts=[
+                    types.Part(function_call=types.FunctionCall(name="read_file", id="inh0", args={}))
+                ]),
+                types.Content(role="user", parts=[
+                    types.Part(function_response=types.FunctionResponse(
+                        name="read_file", id="inh0", response={"result": "s" * 750_000}
+                    ))
+                ]),
+                types.Content(role="model", parts=[types.Part.from_text(text="explorer done")]),
+                types.Content(role="user", parts=[
+                    types.Part.from_text(text=f"{gl.ACTIVE_STAGE_HEADER_PREFIX}researcher]\nAudit.")
+                ]),
+            ]
+            for i in range(8):
+                req.contents.extend([
+                    types.Content(role="model", parts=[
+                        types.Part(function_call=types.FunctionCall(name="read_file", id=f"own{i}", args={"i": i}))
+                    ]),
+                    types.Content(role="user", parts=[
+                        types.Part(function_response=types.FunctionResponse(
+                            name="read_file", id=f"own{i}", response={"result": f"own{i}:" + "y" * 15_000}
+                        ))
+                    ]),
+                ])
+
+            asyncio.run(cb(callback_context=None, llm_request=req))
+            res = self._results(req)
+            self.assertEqual(len(res), 9)
+            self.assertTrue(
+                all(r.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in res),
+                "With lifted trigger (~358k), 290k total must NOT churn-clear on turn 1!",
+            )
+
+            # Explicit override via MANTIS_CONTEXT_EDITING_TRIGGER_TOKENS MUST keep strict 180k trigger!
+            with patch.dict(os.environ, {"MANTIS_CONTEXT_EDITING_TRIGGER_TOKENS": "180000"}):
+                self.ctx.node_context.clear()
+                req_env = LlmRequest()
+                req_env.config.system_instruction = PREFIX_GROUP_BASE_INSTRUCTION
+                req_env.contents = [c.model_copy(deep=True) for c in req.contents]
+                cb_env = gl._make_client_context_editing_before_model_callback(
+                    "researcher",
+                    model=GEMINI,
+                    config=cfg,
+                    preserve_system_prefix=True,
+                    explicit_trigger=False,
+                )
+                asyncio.run(cb_env(callback_context=None, llm_request=req_env))
+                res_env = self._results(req_env)
+                self.assertNotEqual(res_env[0].response, {"result": gl.CLEARED_TOOL_RESULT_TEXT}, "inherited stem protected")
+                self.assertTrue(
+                    any(r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in res_env[1:]),
+                    "Explicit env var override must NOT be lifted!",
+                )
+
+            # Explicit override via workflow.local.json (`explicit_trigger=True`) MUST also stay strict!
+            self.ctx.node_context.clear()
+            req_loc = LlmRequest()
+            req_loc.config.system_instruction = PREFIX_GROUP_BASE_INSTRUCTION
+            req_loc.contents = [c.model_copy(deep=True) for c in req.contents]
+            cb_loc = gl._make_client_context_editing_before_model_callback(
+                "researcher",
+                model=GEMINI,
+                config=cfg,
+                preserve_system_prefix=True,
+                explicit_trigger=True,
+            )
+            asyncio.run(cb_loc(callback_context=None, llm_request=req_loc))
+            res_loc = self._results(req_loc)
+            self.assertNotEqual(res_loc[0].response, {"result": gl.CLEARED_TOOL_RESULT_TEXT}, "inherited stem protected")
+            self.assertTrue(
+                any(r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in res_loc[1:]),
+                "Explicit workflow.local.json trigger override must NOT be lifted!",
+            )
+
+    def test_load_raw_workflow_distinguishes_shipped_vs_local_trigger(self):
+        import json
+        import shutil
+        import tempfile
+        from core.graph_loader import load_raw_workflow_with_overlay
+
+        tmp = tempfile.mkdtemp(prefix="mantis_trigger_meta_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        wf_src = _REF_ROOT / "workflow.json"
+        wf_dst = Path(tmp) / "workflow.json"
+        wf_dst.write_text(wf_src.read_text(encoding="utf-8"), encoding="utf-8")
+
+        raw1, _ = load_raw_workflow_with_overlay(str(wf_dst), load_local=True)
+        meta1 = raw1.get("_overlay_meta") or {}
+        self.assertTrue(meta1.get("base_trigger_was_shipped_default"))
+        self.assertFalse(meta1.get("local_context_editing_trigger_set"))
+
+        (Path(tmp) / "workflow.local.json").write_text(
+            json.dumps({"config": {"context_editing_trigger_tokens": 180000}}), encoding="utf-8"
+        )
+        raw2, _ = load_raw_workflow_with_overlay(str(wf_dst), load_local=True)
+        meta2 = raw2.get("_overlay_meta") or {}
+        self.assertTrue(meta2.get("local_context_editing_trigger_set"))
+
 
 if __name__ == "__main__":
     unittest.main()
