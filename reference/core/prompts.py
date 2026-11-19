@@ -177,7 +177,12 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "- Prefer the structural navigation tools when they are available: find_symbol to locate definitions, get_function_boundary to read one function instead of a whole file, and find_callers/find_callees to walk call chains across files. Fall back to read_file when they report the index is unavailable.\n"
         "- Before reporting a finding, verify the claim structurally: confirm the sink is reachable by walking callers, and read the enclosing function rather than reasoning from memory.\n"
         "- Audit universal security invariants across whatever domain this target implements: untrusted-input-to-sink injection (SQL/NoSQL/command/code/SSTI/XXE/CI-CD/shell), DOM/stored/reflected XSS, traversal, broken auth/authz/IDOR/policy bypass, unsafe deserialization (including ML model loaders), SSRF, crypto/secret/config/IaC/K8s/IAM misconfigurations, memory & FFI safety (C/C++/Rust unsafe/firmware/eBPF), mobile IPC/WebView/storage flaws, smart-contract/ZK reentrancy/access/arithmetic flaws, desktop/Electron/extension sandbox escapes, AI/agentic tool-boundary violations, and hardware/RTL security (CSR/lock/privilege bypass, JTAG/debug/lifecycle escapes, unzeroized secrets, bus/FSM isolation).\n"
-        "- Report all candidate findings in batch using report_findings with complete title, description, severity, filepath, and line_numbers (or code_paths entries as file:line)."
+        "- Report all candidate findings in batch using report_findings with complete title, description, severity, filepath, and line_numbers (or code_paths entries as file:line).\n"
+        "- CHANGE-SCOPED REGRESSION CHECKS (ONLY when the campaign directive includes a `PRIOR FINDINGS IN THE CHANGED FILES` section during `--scan-mode changed`; NEVER call list_prior_findings or record_regression_check in normal whole/file-by-file/cross-functional/auto scans): inspect EVERY listed finding (use list_prior_findings(status_filter='unsettled') to page past large lists). Do NOT leave fixed findings unverified:\n"
+        "  - Still vulnerable -> report it via report_findings and/or call record_regression_check(id, 'still_present', '<reason citing code>').\n"
+        "  - Fixed by a guard/edit -> call record_regression_check(id, 'fixed', '<reason citing the exact guard/file:line>').\n"
+        "  - Deleted code or `[FILE DELETED ON DISK]` -> first verify via list_files / find_symbol that the vulnerable code was NOT renamed or moved to another file! If moved and still vulnerable, report it at its new location and record 'still_present'; if genuinely deleted with no relocated copy, call record_regression_check(id, 'fixed', '<reason confirming deletion and rename check>').\n"
+        "  - Ambiguous / cannot prove -> call record_regression_check(id, 'inconclusive', '<reason>'); never guess 'fixed'."
     ),
     "deduplicator": (
         "You are the Finding Deduplicator stage in the Mantis security review pipeline.\n"
@@ -192,6 +197,10 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "- Use get_findings, get_threat_model, and read_file to verify whether the flaw is reachable and lacks effective sanitization.\n"
         "- Check each finding mechanically before trusting it: use get_function_boundary to re-read the enclosing function and confirm the cited guard or missing check is quoted correctly, and find_callers to confirm the sink is actually reachable from the claimed source.\n"
         "- In C/C++ targets, use find_symbol on suspicious identifiers to check whether a macro definition changes the semantics the finding relies on.\n"
+        "- CHANGE-SCOPED REGRESSION CHECKS (ONLY when the campaign directive includes a `PRIOR FINDINGS IN THE CHANGED FILES` section during `--scan-mode changed`; skip completely in normal scans): even if this run recorded zero new findings, call list_prior_findings(status_filter='unsettled') and verify every remaining unsettled prior finding BEFORE emitting your final ReviewVerdict:\n"
+        "  - Call record_regression_check(id, 'fixed', '<reason citing guard or confirmed deletion>') when verified fixed or when deleted code/files are verified via list_files/find_symbol not to have been renamed/moved elsewhere.\n"
+        "  - Call record_regression_check(id, 'still_present', '<reason>', new_finding_id=<new_id if re-reported>) when the flaw remains or moved and stayed vulnerable.\n"
+        "  - Call record_regression_check(id, 'inconclusive', '<reason>') only when truly unverifiable.\n"
         + TRUNCATION_RULE
         + INHERITED_STEM_NEUTRALITY_RULE
         + "- Conclude by emitting a structured ReviewVerdict with one finding_verdicts entry per finding:\n"

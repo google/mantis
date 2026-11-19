@@ -596,7 +596,7 @@ cut still counts; only silence from a cut trace is refused.
 
 ## Custom Tools
 
-The 31 built-in tools are a closed set, and a workflow naming anything else
+The 32 built-in tools are a closed set, and a workflow naming anything else
 fails validation. Without a way in, a site with an internal taint engine or a
 house SAST tool has exactly one option: fork. A fork never receives the next
 security fix, so leaving the set closed does not prevent custom tools — it makes
@@ -604,7 +604,7 @@ the unsafe way the only way.
 
 ### Why a declared tool inherits no trust
 
-The built-in 31 are not safe because they are confined. Most run on the host
+The built-in 32 are not safe because they are confined. Most run on the host
 with the host's full privilege: nothing in the process stops `read_file` from
 opening `~/.ssh/id_rsa`. They are safe because they **are** the enforcement —
 `read_file` is the containment for reads, `run_sandbox` for execution,
@@ -1076,6 +1076,9 @@ strictly-typed domain tools backed by Pydantic models and SQLite persistence:
 - **`report_findings(report)`**: Validates `VulnerabilityReport` and writes
   findings.
 - **`get_findings()`**: Retrieves recorded findings for the current target file.
+- **`list_prior_findings(status_filter, offset, limit, filepath_filter)`**:
+  Pages through prior findings in scope during `--scan-mode changed` runs with
+  current settlement status (`unsettled`, `settled`, or `all`).
 - **`dedupe_findings(primary_title, duplicate_titles, reason)`**: Merges
   duplicates.
 - **`record_plan(plan)`**: Validates `ReviewPlan` and records

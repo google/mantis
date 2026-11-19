@@ -2603,6 +2603,13 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
+    scan_mode = str(getattr(ctx, "scan_mode", "") or "").strip().lower()
+    if scan_mode and scan_mode != "changed":
+        return (
+            f"Not applicable: record_regression_check is only used during '--scan-mode changed' runs "
+            f"(current scan_mode={scan_mode!r}). Proceed with the independent audit and report findings "
+            "via report_findings."
+        )
     verdict = str(outcome or "").strip().lower()
     if verdict not in REGRESSION_OUTCOMES:
         return f"Error: outcome must be one of {list(REGRESSION_OUTCOMES)}, got {outcome!r}."
@@ -2659,6 +2666,174 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
         return "Error: the check could not be recorded."
     return (f"SUCCESS: recorded {verdict} for earlier finding {pid} ('{str(prior.get('title') or '')[:80]}') "
             f"with {evidence} evidence.")
+
+
+def list_prior_findings(
+    status_filter: str = "unsettled",
+    offset: int = 0,
+    limit: int = 30,
+    filepath_filter: str = "",
+) -> str:
+    """Paginates through open confirmed findings from EARLIER runs touching this
+    campaign's changed or deleted files, collapsed by lineage_id.
+
+    Use this when a `--scan-mode changed` campaign has more prior finding
+    lineages than fit inline in the directive, or to see which prior findings
+    still need a `record_regression_check(...)` verdict in the current run.
+
+    Args:
+        status_filter: 'unsettled' (default; pending or harness-inconclusive
+            lineages not yet decided by an agent in this run), 'settled', or
+            'all'.
+        offset: Zero-based lineage offset for pagination (default 0).
+        limit: Max lineages to return per call (1..100, default 30).
+        filepath_filter: Optional case-insensitive substring matching filepath.
+    """
+    from core.database import (
+        OPEN_CONFIRMED_STATUSES,
+        active_target_root,
+        read_findings,
+        run_belongs_to_active_target,
+        run_target_roots,
+        unsettled_prior_findings_summary,
+    )
+    from core.llm_gateway import SecretScrubber, wrap_untrusted_content
+
+    ctx = current_run_context.get()
+    if ctx is None or not ctx.db_path:
+        return "Error: No active execution context or database path."
+    scan_mode = str(getattr(ctx, "scan_mode", "") or "").strip().lower()
+    if scan_mode and scan_mode != "changed":
+        return (
+            f"Not applicable: this is a '{scan_mode}' scan, not a '--scan-mode changed' regression scan. "
+            "Do not call list_prior_findings or record_regression_check during normal scans; proceed with "
+            "the independent audit."
+        )
+    resolved_db = _resolve_context_db(ctx) or ctx.db_path
+    if not resolved_db or not os.path.exists(resolved_db):
+        return "No prior findings database available."
+
+    filt = str(status_filter or "unsettled").strip().lower()
+    if filt not in ("unsettled", "settled", "all"):
+        return f"Error: status_filter must be 'unsettled', 'settled', or 'all', got {status_filter!r}."
+    try:
+        off = max(0, int(offset))
+    except (TypeError, ValueError):
+        off = 0
+    try:
+        lim = max(1, min(100, int(limit)))
+    except (TypeError, ValueError):
+        lim = 30
+    fp_sub = str(filepath_filter or "").strip().lower()
+
+    target_root = str(
+        getattr(ctx, "path_root", "") or getattr(ctx, "jail_dir", "") or ""
+    )
+    prior_ids = list(getattr(ctx, "campaign_prior_ids", None) or ())
+    if prior_ids:
+        # Enforce cross-target isolation on every ID even if explicitly listed.
+        roots_map = run_target_roots(resolved_db)
+        eff_root = active_target_root(target_root or str(getattr(ctx, "target_file", "") or ""))
+        allowed_ids: list[int] = []
+        id_set = {int(i) for i in prior_ids}
+        for row in read_findings(resolved_db):
+            rid = row.get("id")
+            if rid is None or int(rid) not in id_set:
+                continue
+            if str(row.get("run_id") or "") == str(ctx.run_id or ""):
+                continue
+            if not run_belongs_to_active_target(
+                resolved_db, row.get("run_id"), active_root=eff_root, roots_map=roots_map
+            ):
+                continue
+            allowed_ids.append(int(rid))
+        prior_ids = allowed_ids
+    elif scan_mode == "changed":
+        return (
+            "Prior finding lineages in scope: 0 total (0 unsettled, 0 settled). "
+            "No earlier open confirmed findings touch this campaign's changed or deleted files."
+        )
+    else:
+        roots_map = run_target_roots(resolved_db)
+        eff_root = active_target_root(target_root or str(getattr(ctx, "target_file", "") or ""))
+        scope = str(getattr(ctx, "target_file", "") or "") or None
+        rows = read_findings(resolved_db, scope_path=scope)
+        allowed = set(OPEN_CONFIRMED_STATUSES)
+        prior_ids = [
+            int(r["id"])
+            for r in rows
+            if r.get("id") is not None
+            and str(r.get("run_id") or "") != str(ctx.run_id or "")
+            and str(r.get("status") or "").lower() in allowed
+            and run_belongs_to_active_target(
+                resolved_db, r.get("run_id"), active_root=eff_root, roots_map=roots_map
+            )
+        ]
+
+    summary = unsettled_prior_findings_summary(
+        resolved_db,
+        str(ctx.run_id or ""),
+        prior_ids,
+        target_root=target_root,
+        check_poc=True,
+    )
+    all_groups = summary["groups"]
+    unsettled_n = len(summary["unsettled"])
+    settled_n = len(summary["settled"])
+
+    if filt == "unsettled":
+        pool = list(summary["unsettled"])
+    elif filt == "settled":
+        pool = list(summary["settled"])
+    else:
+        pool = list(all_groups)
+
+    if fp_sub:
+        pool = [
+            g for g in pool
+            if fp_sub in str((g.get("representative") or {}).get("filepath") or "").lower()
+        ]
+
+    total_matching = len(pool)
+    page = pool[off : off + lim]
+    next_offset = off + len(page)
+    has_more = next_offset < total_matching
+
+    header = (
+        f"Prior finding lineages in scope: {len(all_groups)} total "
+        f"({unsettled_n} unsettled, {settled_n} settled). "
+        f"Filter='{filt}'"
+        + (f", filepath~'{fp_sub}'" if fp_sub else "")
+        + f": showing {len(page)} of {total_matching} (offset={off})."
+    )
+    if has_more:
+        header += f" Call list_prior_findings(status_filter={filt!r}, offset={next_offset}, limit={lim}) for more."
+
+    if not page:
+        return header + "\nNo matching prior finding lineages on this page."
+
+    lines: list[str] = []
+    for g in page:
+        rep = g["representative"]
+        cwe = str(rep.get("cwe") or "").strip() or "no-CWE"
+        title = str(rep.get("title") or "").replace("\n", " ").strip()[:140]
+        desc = str(rep.get("description") or "").replace("\n", " ").strip()[:200]
+        others = g.get("other_ids") or []
+        also = f", also {', '.join(f'#{oid}' for oid in others[:6])}" + (f" (+{len(others) - 6})" if len(others) > 6 else "") if others else ""
+        del_tag = " [FILE DELETED ON DISK]" if g.get("deleted_on_disk") else ""
+        state = str(g.get("state") or "pending")
+        note = f" — {g['reason'][:120]}" if g.get("reason") else ""
+        lines.append(
+            f"#{g['id']} [{rep.get('status')}] [{cwe}]{del_tag} "
+            f"{rep.get('filepath')}:{rep.get('line_numbers') or '?'} | "
+            f"check={state}{note} | PoC={'yes' if g.get('has_poc') else 'no'}{also}\n"
+            f"  title: {title}"
+            + (f"\n  summary: {desc}" if desc else "")
+        )
+    fenced = wrap_untrusted_content(
+        SecretScrubber.scrub("\n".join(lines)), filename="prior_findings"
+    )
+    return f"{header}\n{fenced}"
 
 
 async def get_prior_poc(prior_finding_id: int) -> str:

@@ -3149,7 +3149,7 @@ REPO_DOCS_DIRECTIVE_MARKER = "[REPOSITORY DOCUMENTATION INVENTORY"
 MAX_CAMPAIGN_CONTEXT_CHARS = 8000
 #: Characters of campaign directive appended per node: the change-scoped
 #: file list, the prior-findings brief and the PoC re-run note together.
-MAX_CAMPAIGN_DIRECTIVE_CHARS = 12000
+MAX_CAMPAIGN_DIRECTIVE_CHARS = 24000
 #: Stages that receive the deterministic slice sink/entrypoint checklist so
 #: planning and vulnerability discovery cover indexed sinks systematically
 #: without biasing independent downstream review/critic stages.
@@ -4208,6 +4208,38 @@ def create_findings_gate(node_id: str):
         target_file = (getattr(rc, "target_file", None) or "")
 
         if campaign_has_findings_to_triage(db_path, run_id, target_file) is False:
+            prior_ids = tuple(getattr(rc, "campaign_prior_ids", None) or ()) if rc is not None else ()
+            if prior_ids and db_path and run_id:
+                try:
+                    from core.database import unsettled_prior_findings_summary
+
+                    summary = unsettled_prior_findings_summary(
+                        db_path,
+                        run_id,
+                        prior_ids,
+                        target_root=str(getattr(rc, "path_root", "") or getattr(rc, "jail_dir", "") or ""),
+                    )
+                    unsettled = summary.get("unsettled") or []
+                    if unsettled:
+                        sample = ", ".join(f"#{g['id']}" for g in unsettled[:15])
+                        extra = f" (+{len(unsettled) - 15} more)" if len(unsettled) > 15 else ""
+                        print(
+                            f"[{node_id}] Zero new findings recorded, but {len(unsettled)} prior "
+                            f"finding lineage(s) remain unsettled ({sample}{extra}); routing to "
+                            "reviewer for regression verification.",
+                            flush=True,
+                        )
+                        return adk.Event(
+                            output=(
+                                f"Zero new vulnerabilities reported in this campaign, but {len(unsettled)} "
+                                f"prior finding lineage(s) remain unsettled ({sample}{extra}). "
+                                "Review each unsettled prior finding using list_prior_findings(status_filter='unsettled') "
+                                "and record 'fixed', 'still_present', or 'inconclusive' via record_regression_check."
+                            ),
+                            route=DEFAULT_ROUTE,
+                        )
+                except Exception:
+                    pass
             print(f"[{node_id}] Zero findings recorded for this campaign; skipping triage stages.", flush=True)
             return adk.Event(output="No findings recorded for this campaign.", route="clean")
         return adk.Event(output=node_input, route=DEFAULT_ROUTE)

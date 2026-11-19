@@ -4189,6 +4189,83 @@ class ResilientLiteLlm(LiteLlm):
         self._additional_args = copied
         return True
 
+    def _maybe_build_regression_nudge(self, response: Any) -> Optional[str]:
+        """In `--scan-mode changed`, returns a one-shot reminder message when
+        `researcher` or `reviewer` attempts to finish without calling
+        `record_regression_check` for unsettled prior findings in scope.
+
+        Marks `node_context[active_node]["regression_nudged"] = True` on the
+        first trigger so each stage visit is nudged at most once (cannot loop).
+        """
+        if getattr(self, "_skip_structured_sanitizer", False) or _HANDOFF_PLAIN_TEXT_TURN.get():
+            return None
+        if getattr(response, "partial", False) or getattr(response, "error_code", None):
+            return None
+        fr_raw = getattr(response, "finish_reason", None)
+        fr_name = str(getattr(fr_raw, "value", fr_raw) or "").strip().rsplit(".", 1)[-1].upper()
+        if fr_name in ("SAFETY", "MAX_TOKENS", "MALFORMED_FUNCTION_CALL"):
+            return None
+        resp_parts = getattr(getattr(response, "content", None), "parts", None) or []
+        if any(getattr(p, "function_call", None) is not None for p in resp_parts):
+            return None
+        try:
+            from core.context import current_run_context
+            from core.database import unsettled_prior_findings_summary
+
+            rc = current_run_context.get()
+            if rc is None:
+                return None
+            if str(getattr(rc, "scan_mode", "") or "").strip().lower() != "changed":
+                return None
+            prior_ids = tuple(getattr(rc, "campaign_prior_ids", None) or ())
+            if not prior_ids or not getattr(rc, "db_path", "") or not getattr(rc, "run_id", ""):
+                return None
+            active_node = str(getattr(rc, "active_node", "") or "").strip()
+            is_target_stage = (
+                active_node == "researcher"
+                or active_node == "reviewer"
+                or (
+                    (active_node.startswith("researcher_") or active_node.startswith("reviewer_"))
+                    and "classifier" not in active_node
+                )
+            )
+            if not is_target_stage:
+                return None
+            slot_map = getattr(rc, "node_context", None)
+            if not isinstance(slot_map, dict):
+                return None
+            slot = slot_map.setdefault(active_node, {})
+            if slot.get("regression_nudged"):
+                return None
+            target_root = str(getattr(rc, "path_root", "") or getattr(rc, "jail_dir", "") or "")
+            summary = unsettled_prior_findings_summary(
+                rc.db_path,
+                rc.run_id,
+                prior_ids,
+                target_root=target_root,
+            )
+            unsettled = summary.get("unsettled") or []
+            if not unsettled:
+                return None
+            slot["regression_nudged"] = True
+            sample_items = [
+                f"#{g['id']}" + (" [deleted]" if g.get("deleted_on_disk") else "")
+                for g in unsettled[:20]
+            ]
+            more = f" (+{len(unsettled) - 20} more)" if len(unsettled) > 20 else ""
+            return (
+                f"WAIT — {len(unsettled)} prior finding lineage(s) in this `--scan-mode changed` "
+                f"campaign are still unsettled: {', '.join(sample_items)}{more}. "
+                "Before finishing, inspect them using list_prior_findings(status_filter='unsettled') "
+                "and call record_regression_check(prior_finding_id, 'fixed' | 'still_present' | 'inconclusive', reason) "
+                "for each one. For any deleted file or deleted function (`[deleted]`), check via "
+                "list_files / find_symbol that the vulnerable code was NOT renamed or moved elsewhere "
+                "before marking it 'fixed' (if moved and still vulnerable, report it at the new path and "
+                "record 'still_present'). Only emit your final response/verdict once settled."
+            )
+        except Exception:
+            return None
+
     async def generate_content_async(
         self, llm_request: Any, stream: bool = False
     ) -> Any:
@@ -4448,6 +4525,25 @@ class ResilientLiteLlm(LiteLlm):
                                     retry_req.contents = appended
                                     active_request = retry_req
                                     break
+                        nudge_msg = self._maybe_build_regression_nudge(response)
+                        if nudge_msg:
+                            meter_response_usage(response)
+                            retry_schema_turn = True
+                            current_stream = False
+                            retry_req = active_request.model_copy()
+                            appended = list(getattr(active_request, "contents", None) or [])
+                            resp_parts_n = getattr(getattr(response, "content", None), "parts", None) or []
+                            if getattr(response, "content", None) is not None and resp_parts_n:
+                                appended.append(response.content)
+                            appended.append(
+                                genai_types.Content(
+                                    role="user",
+                                    parts=[genai_types.Part.from_text(text=nudge_msg)],
+                                )
+                            )
+                            retry_req.contents = appended
+                            active_request = retry_req
+                            break
                         if response_has_meaningful_content(response):
                             streamed_content = True
                         yielded_any = True
