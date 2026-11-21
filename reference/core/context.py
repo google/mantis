@@ -150,8 +150,14 @@ class RunContext:
     bare_sandbox_crash_seen: bool = False
     # In `--scan-mode changed`, IDs of open confirmed prior findings touching
     # this campaign's scope (for `list_prior_findings`, `findings_gate`, and
-    # one-shot completion nudge).
-    campaign_prior_ids: tuple[int, ...] = ()
+    # ownership checks in `record_regression_check`). `None` outside active
+    # changed-mode campaigns; an empty tuple `()` means zero priors are in scope.
+    campaign_prior_ids: Optional[tuple[int, ...]] = None
+    # Subset of `campaign_prior_ids` whose cited file(s) actually changed or
+    # were deleted on disk (None outside active changed-mode campaigns for
+    # INV-6 backward compatibility). Only findings in this subset may be marked
+    # `fixed` via `record_regression_check`.
+    campaign_mutable_prior_ids: Optional[tuple[int, ...]] = None
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

@@ -776,8 +776,9 @@ class TestP2McpCiEvals(unittest.TestCase):
             "-c",
             (
                 f"import sys; sys.path.insert(0, {str(_REF_ROOT)!r}); "
-                "from core.cost import record_spend; "
-                f"record_spend({state.db_path!r}, 'r', {target!r}, 'changed', tokens=10)"
+                "from core.cost import record_coverage_files, record_spend, scope_identities; "
+                f"record_spend({state.db_path!r}, 'r', {target!r}, 'changed', tokens=10); "
+                f"record_coverage_files({state.db_path!r}, 'r', {target!r}, scope_identities([{str(repo / 'app.py')!r}]))"
             ),
         ]
 

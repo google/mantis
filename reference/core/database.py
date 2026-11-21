@@ -69,7 +69,8 @@ def db_timeout() -> float:
 
 
 def connect(db_path: str, timeout: Optional[float] = None,
-            readonly: bool = False) -> sqlite3.Connection:
+            readonly: bool = False,
+            immutable_snapshot: bool = False) -> sqlite3.Connection:
     """The one way to open the knowledge database for reading or writing.
 
     Sets the busy timeout (see db_timeout) and, once per path per process,
@@ -87,9 +88,35 @@ def connect(db_path: str, timeout: Optional[float] = None,
     if readonly:
         # mode=ro: SQLite will neither create the file nor write to it; the
         # journal pragmas below are skipped because they would be writes.
+        # SECURITY / INTEGRITY: NEVER silently fall back to `immutable=1`,
+        # which bypasses locking and journal replay and can read torn data on a
+        # hot rollback journal or live writer. `immutable=1` is used ONLY when
+        # explicitly requested via `immutable_snapshot=True` for an offline
+        # read-only snapshot with zero sidecar files (-wal, -journal, -shm).
         from urllib.parse import quote
 
-        return sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True, timeout=wait)
+        qpath = quote(str(db_path))
+        if immutable_snapshot:
+            sidecars = [
+                suffix for suffix in ("-wal", "-journal", "-shm")
+                if os.path.exists(f"{db_path}{suffix}")
+            ]
+            if sidecars:
+                raise sqlite3.OperationalError(
+                    f"refusing immutable snapshot read on '{db_path}': active SQLite sidecar "
+                    f"file(s) present ({', '.join(sidecars)}); checkpoint the database first "
+                    "or read without --snapshot"
+                )
+            return sqlite3.connect(
+                f"file:{qpath}?mode=ro&immutable=1", uri=True, timeout=wait
+            )
+        conn = sqlite3.connect(f"file:{qpath}?mode=ro", uri=True, timeout=wait)
+        try:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            return conn
+        except sqlite3.OperationalError:
+            conn.close()
+            raise
     conn = sqlite3.connect(db_path, timeout=wait)
     if db_path != ":memory:":
         try:
@@ -183,12 +210,13 @@ _migrated_additive_dbs: set = set()
 
 
 @contextmanager
-def _db(db_path: str, check_version: bool = True):
+def _db(db_path: str, check_version: bool = True, readonly: bool = False,
+        immutable_snapshot: bool = False):
     # SECURITY (INV-4): every knowledge-database operation funnels through here, so this
     # is where the path is anchored to the installation and refused if it is (or traverses)
     # a symlink. See core.paths.resolve_db_path.
     db_path = resolve_db_path(db_path)
-    conn = connect(db_path)
+    conn = connect(db_path, readonly=readonly, immutable_snapshot=immutable_snapshot)
     conn.row_factory = sqlite3.Row
     try:
         if check_version:
@@ -203,17 +231,19 @@ def _db(db_path: str, check_version: bool = True):
                         f"Database schema version mismatch in '{db_path}' (found version {v}, expected {CURRENT_SCHEMA_VERSION}). "
                         f"Schema changed: please delete '{db_path}' before running."
                     )
-                if db_path == ":memory:" or db_path not in _migrated_additive_dbs:
+                if not readonly and (db_path == ":memory:" or db_path not in _migrated_additive_dbs):
                     _ensure_findings_additive_schema(cursor)
                     if db_path != ":memory:":
                         _migrated_additive_dbs.add(db_path)
         yield conn
-        conn.commit()
+        if not readonly:
+            conn.commit()
     except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        if not readonly:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
     finally:
         conn.close()
@@ -2964,6 +2994,17 @@ def unsettled_prior_findings_summary(
                 if c.get("outcome") == "inconclusive"
                 and str(c.get("node") or "").strip().lower() == "harness"
             ]
+            deleted_on_disk = False
+            if real_root:
+                abs_path = resolve_finding_abs_path(
+                    str(rep.get("filepath") or ""),
+                    rep.get("run_id"),
+                    real_root,
+                    roots_map,
+                )
+                if abs_path:
+                    deleted_on_disk = not os.path.lexists(abs_path) and not os.path.exists(abs_path)
+
             rereported_id = current_lineages.get(lin) if lin else None
             if present_checks or rereported_id is not None:
                 state = "still_present"
@@ -2974,9 +3015,30 @@ def unsettled_prior_findings_summary(
                     else f"re-reported as #{rereported_id}"
                 )
             elif fixed_checks:
-                state = "fixed"
-                settled = True
-                reason = str(fixed_checks[0].get("reason") or "")
+                has_dynamic_prior = any(
+                    str(g.get("status") or "").strip().lower() in ("dynamic_confirmed", "reproduced")
+                    for g in grp
+                )
+                has_dyn_fixed = any(str(c.get("evidence") or "") == "dynamic" for c in fixed_checks)
+                distinct_nodes = {
+                    str(c.get("node") or "").strip().lower()
+                    for c in fixed_checks
+                    if str(c.get("node") or "").strip()
+                }
+                if has_dynamic_prior and not deleted_on_disk and not has_dyn_fixed and len(distinct_nodes) < 2:
+                    # One stage's static 'fixed' on an existing dynamically confirmed
+                    # finding will be deferred at settlement; keep it unsettled so
+                    # findings_gate routes to reviewer / reproducer for corroboration.
+                    state = "needs_corroboration"
+                    settled = False
+                    reason = (
+                        f"static fixed from {', '.join(sorted(distinct_nodes)) or 'one stage'} "
+                        "needs independent second-stage or dynamic PoC corroboration"
+                    )
+                else:
+                    state = "fixed"
+                    settled = True
+                    reason = str(fixed_checks[0].get("reason") or "")
             elif agent_inc:
                 state = "inconclusive"
                 settled = True
@@ -2989,17 +3051,6 @@ def unsettled_prior_findings_summary(
                 state = "pending"
                 settled = False
                 reason = ""
-
-            deleted_on_disk = False
-            if real_root:
-                abs_path = resolve_finding_abs_path(
-                    str(rep.get("filepath") or ""),
-                    rep.get("run_id"),
-                    real_root,
-                    roots_map,
-                )
-                if abs_path:
-                    deleted_on_disk = not os.path.lexists(abs_path) and not os.path.exists(abs_path)
 
             entry = {
                 "representative": rep,
@@ -3114,84 +3165,218 @@ def archive_relocated_finding(
         return False
 
 
+def _read_run_target_roots_from_conn(conn: sqlite3.Connection) -> Dict[str, str]:
+    """Reads `{run_id: target_root}` from an open connection (no error swallowing)."""
+    has_runs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+    ).fetchone()
+    if not has_runs:
+        return {}
+    out: Dict[str, str] = {}
+    for r in conn.execute("SELECT run_id, metadata_json FROM runs").fetchall():
+        rid = str(r[0] or "")
+        if not rid:
+            continue
+        try:
+            meta = json.loads(r[1] or "{}")
+        except Exception:
+            meta = {}
+        if isinstance(meta, dict) and meta.get("target_root"):
+            out[rid] = str(meta["target_root"])
+    return out
+
+
+def distinct_run_target_roots(db_path: str, *, immutable_snapshot: bool = False) -> List[str]:
+    """Returns sorted unique top-level `target_root` directories recorded across
+    runs in `db_path`, opened strictly read-only. Subfolder/file roots nested
+    under an ancestor repository root are collapsed via `run_targets_compatible`
+    so scanning `repo/` and `repo/src` does not look like two repositories.
+    Raises on unreadable/invalid DB."""
+    if not db_path or not os.path.exists(resolve_db_path(db_path)):
+        return []
+    with _db(db_path, readonly=True, immutable_snapshot=immutable_snapshot) as conn:
+        roots_map = _read_run_target_roots_from_conn(conn)
+    normed: set[str] = set()
+    for root in roots_map.values():
+        raw = str(root or "").strip()
+        if not raw:
+            continue
+        normed.add(os.path.realpath(raw).rstrip(os.sep) or raw)
+    # Collapse ancestor/descendant paths belonging to the same repository:
+    # inspect shortest (shallowest) paths first so `repo/` absorbs `repo/src`.
+    collapsed: List[str] = []
+    for cand in sorted(normed, key=lambda p: (len(p), p)):
+        if any(run_targets_compatible(cand, kept) for kept in collapsed):
+            continue
+        collapsed.append(cand)
+    return sorted(collapsed)
+
+
+def _read_all_findings_from_conn(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Reads all finding rows from an already-open connection without writing.
+
+    Raises `sqlite3.OperationalError` if the database has no `findings` table so
+    pointing a posture report at a non-Mantis SQLite database (such as Mantis's
+    adjacent `sessions.db`) never silently produces a clean zero-finding report.
+    """
+    has_findings = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'findings'"
+    ).fetchone()
+    if not has_findings:
+        raise sqlite3.OperationalError(
+            "database has no 'findings' table (not a Mantis knowledge database?)"
+        )
+    rows: List[Dict[str, Any]] = []
+    for r in conn.execute("SELECT * FROM findings ORDER BY id ASC").fetchall():
+        row_dict = dict(r)
+        if row_dict.get("line_numbers"):
+            try:
+                parsed = json.loads(row_dict["line_numbers"])
+                row_dict["line_numbers"] = parsed if parsed else None
+            except Exception:
+                row_dict["line_numbers"] = None
+        else:
+            row_dict["line_numbers"] = None
+        if "embedding" in row_dict:
+            row_dict["embedding"] = None
+        if row_dict.get("code_paths"):
+            try:
+                parsed_cp = json.loads(row_dict["code_paths"])
+                row_dict["code_paths"] = parsed_cp if isinstance(parsed_cp, list) else None
+            except Exception:
+                row_dict["code_paths"] = None
+        else:
+            row_dict["code_paths"] = None
+        rows.append(row_dict)
+    return rows
+
+
 def current_open_findings(
     db_path: str,
     *,
     repo_root: Optional[str] = None,
-    include_patch_verified: bool = False,
+    include_patch_verified: bool = True,
+    include_unrooted: bool = False,
+    strict: bool = False,
+    immutable_snapshot: bool = False,
 ) -> Dict[str, Any]:
     """Returns the current cumulative open confirmed risk posture across all
     runs in `db_path`, deduplicated by `lineage_id` so re-reported findings
     from `--scan-mode changed` runs are never double-counted.
 
+    - Opens the database strictly read-only (`mode=ro`, no WAL switch or schema writes).
     - Excludes closed statuses (`mitigated`, `archived`, `false_positive`,
       `non_viable`, `sample_or_test`, `duplicate_merged`, `accepted_risk`) and
       untriaged `'reported'` rows.
-    - When `include_patch_verified` is True, includes `'patch_verified'` rows
-      (useful when patches were verified in a sandbox and not yet applied to
-      the repository).
-    - When `repo_root` is provided, scopes findings to runs belonging to
-      `repo_root` and resolves each finding's filepath relative to `repo_root`
-      via its producing run's `target_root`, skipping findings outside
-      `repo_root` (e.g. sibling folders during a subfolder report) and
-      preserving dotfiles such as `.github/workflows/ci.yml`.
+    - Includes `'patch_verified'` rows by default because Mantis never applies
+      patches to the host repository checkout (INV-4); set
+      `include_patch_verified=False` to exclude sandbox-verified patches.
+    - When `repo_root` is provided, scopes findings to runs whose recorded
+      `target_root` matches `repo_root`, resolves filepaths relative to
+      `repo_root`, and omits legacy runs with no recorded `target_root` unless
+      `include_unrooted=True` (recording their count in `counts.unrooted_omitted`).
+    - Classifies each non-open lineage once by its newest row (`max(id)`).
     - Elects one representative per open lineage by highest assurance rank,
       breaking ties by newest `id`, and backfills missing calibration fields
       (`priority`, `mantis_risk_score`, `cwe`, `remediation`) from siblings.
-    Never raises (INV-6).
+    - When `strict=True`, database/path read errors raise instead of returning an
+      empty clean report; when `strict=False`, returns `error=<message>` so
+      callers never confuse a read failure with zero open findings.
     """
-    empty: Dict[str, Any] = {
-        "risk_posture": {
-            "critical": 0,
-            "high": 0,
-            "medium": 0,
-            "low": 0,
-            "other": 0,
-            "total": 0,
-        },
-        "counts": {
-            "open": 0,
-            "mitigated": 0,
-            "archived": 0,
-            "patch_verified_omitted": 0,
-            "untriaged_omitted": 0,
-            "runs": 0,
-        },
-        "findings": [],
-    }
-    if not db_path or not os.path.exists(db_path):
-        return empty
+    def _empty(error: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "risk_posture": {
+                "critical": 0,
+                "high": 0,
+                "medium": 0,
+                "low": 0,
+                "other": 0,
+                "total": 0,
+            },
+            "counts": {
+                "open": 0,
+                "patch_verified": 0,
+                "mitigated": 0,
+                "archived": 0,
+                "patch_verified_omitted": 0,
+                "unrooted_omitted": 0,
+                "other_repo_omitted": 0,
+                "untriaged_omitted": 0,
+                "total_db_findings": 0,
+                "runs": 0,
+            },
+            "findings": [],
+            "error": error,
+        }
+
+    if not db_path:
+        msg = "database path is required"
+        if strict:
+            raise ValueError(msg)
+        return _empty(error=msg)
+    try:
+        resolved_db = resolve_db_path(db_path)
+    except Exception as exc:
+        if strict:
+            raise
+        return _empty(error=f"{type(exc).__name__}: {exc}")
+    if not os.path.exists(resolved_db):
+        msg = f"database not found: {resolved_db}"
+        if strict:
+            raise FileNotFoundError(msg)
+        return _empty(error=msg)
+
     real_root = ""
     if repo_root:
         cand_root = os.path.realpath(str(repo_root))
         if not os.path.isdir(cand_root):
-            return empty
+            msg = f"repo_root is not a directory: {repo_root}"
+            if strict:
+                raise ValueError(msg)
+            return _empty(error=msg)
         real_root = cand_root
-    try:
-        rows = read_findings(db_path)
-    except Exception:
-        return empty
-    if not rows:
-        return empty
 
-    roots_map = run_target_roots(db_path) if real_root else {}
+    try:
+        with _db(resolved_db, readonly=True, immutable_snapshot=immutable_snapshot) as conn:
+            rows = _read_all_findings_from_conn(conn)
+            roots_map = _read_run_target_roots_from_conn(conn) if real_root else {}
+    except Exception as exc:
+        if strict:
+            raise
+        return _empty(error=f"{type(exc).__name__}: {exc}")
+
+    if not rows:
+        return _empty(error=None)
+
     allowed_statuses = set(
         CONFIRMED_LIVE_STATUSES if include_patch_verified else OPEN_CONFIRMED_STATUSES
     )
 
+    def _lineage_key(row: Dict[str, Any]) -> tuple[str, str]:
+        lin = str(row.get("lineage_id") or "").strip()
+        return ("lineage", lin) if lin else ("id", str(row.get("id") or ""))
+
     in_scope_rows: List[Dict[str, Any]] = []
     runs_seen: set[str] = set()
+    unrooted_keys: set[tuple[str, str]] = set()
+    other_repo_rows = 0
     for f in rows:
         f_rid = f.get("run_id")
         if real_root:
-            if not run_belongs_to_active_target(
-                db_path, f_rid, active_root=real_root, roots_map=roots_map
-            ):
+            rid_str = str(f_rid or "").strip()
+            recorded_root = str(roots_map.get(rid_str, "") or "").strip()
+            if not recorded_root:
+                if not include_unrooted:
+                    unrooted_keys.add(_lineage_key(f))
+                    continue
+            elif not run_targets_compatible(real_root, recorded_root):
+                other_repo_rows += 1
                 continue
             _, rel = resolve_finding_path_for_root(
                 str(f.get("filepath") or ""), f_rid, real_root, roots_map
             )
             if not rel:
+                other_repo_rows += 1
                 continue
             item = dict(f)
             item["filepath"] = rel
@@ -3201,10 +3386,6 @@ def current_open_findings(
         if f_rid:
             runs_seen.add(str(f_rid))
 
-    def _lineage_key(row: Dict[str, Any]) -> tuple[str, str]:
-        lin = str(row.get("lineage_id") or "").strip()
-        return ("lineage", lin) if lin else ("id", str(row.get("id") or ""))
-
     open_groups: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
     for item in in_scope_rows:
         st = str(item.get("status") or "").strip().lower()
@@ -3212,26 +3393,31 @@ def current_open_findings(
             open_groups.setdefault(_lineage_key(item), []).append(item)
 
     open_keys = set(open_groups.keys())
-    mitigated_keys: set[tuple[str, str]] = set()
-    archived_keys: set[tuple[str, str]] = set()
-    patch_verified_keys: set[tuple[str, str]] = set()
-    untriaged_keys: set[tuple[str, str]] = set()
+    non_open_groups: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
     for item in in_scope_rows:
         key = _lineage_key(item)
         if key in open_keys:
             continue
-        st = str(item.get("status") or "").strip().lower()
+        non_open_groups.setdefault(key, []).append(item)
+
+    # Classify each non-open lineage once by its newest row (`max(id)`) so a
+    # re-detected `reported` row after an older `mitigated` row is never hidden
+    # as mitigated, and mitigated+archived histories are never double-counted.
+    mitigated_keys: set[tuple[str, str]] = set()
+    archived_keys: set[tuple[str, str]] = set()
+    patch_verified_omitted_keys: set[tuple[str, str]] = set()
+    untriaged_keys: set[tuple[str, str]] = set()
+    for key, grp in non_open_groups.items():
+        newest = max(grp, key=lambda r: int(r.get("id") or 0))
+        st = str(newest.get("status") or "").strip().lower()
         if st == "mitigated":
             mitigated_keys.add(key)
         elif st == ARCHIVED_STATUS:
             archived_keys.add(key)
         elif st == "patch_verified" and not include_patch_verified:
-            patch_verified_keys.add(key)
+            patch_verified_omitted_keys.add(key)
         elif st in UNTRIAGED_STATUSES:
             untriaged_keys.add(key)
-    # Exclude lineages that were closed via mitigated/archived/patch_verified from untriaged count.
-    closed_non_open = mitigated_keys | archived_keys | patch_verified_keys
-    untriaged_keys -= closed_non_open
 
     elected: List[Dict[str, Any]] = []
     for grp in open_groups.values():
@@ -3278,7 +3464,10 @@ def current_open_findings(
     elected.sort(key=_sort_key)
 
     posture = {"critical": 0, "high": 0, "medium": 0, "low": 0, "other": 0, "total": len(elected)}
+    patch_verified_included = 0
     for row in elected:
+        if str(row.get("status") or "").strip().lower() == "patch_verified":
+            patch_verified_included += 1
         sev = str(row.get("severity") or "").strip().upper()
         if sev == "CRITICAL":
             posture["critical"] += 1
@@ -3295,13 +3484,18 @@ def current_open_findings(
         "risk_posture": posture,
         "counts": {
             "open": len(elected),
+            "patch_verified": patch_verified_included,
             "mitigated": len(mitigated_keys),
             "archived": len(archived_keys),
-            "patch_verified_omitted": len(patch_verified_keys),
+            "patch_verified_omitted": len(patch_verified_omitted_keys),
+            "unrooted_omitted": len(unrooted_keys),
+            "other_repo_omitted": other_repo_rows,
             "untriaged_omitted": len(untriaged_keys),
+            "total_db_findings": len(rows),
             "runs": len(runs_seen),
         },
         "findings": elected,
+        "error": None,
     }
 
 

@@ -735,15 +735,18 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
             run_id="run-other-repo",
         )
 
-        # 1. Full repo posture (default: excludes patch_verified, mitigated, archived, FP, reported, other_repo)
+        # 1. Full repo posture (default includes patch_verified because patches are not applied to host checkout;
+        # excludes mitigated, archived, FP, reported, other_repo)
         posture = current_open_findings(self.db, repo_root=self.repo)
+        self.assertIsNone(posture["error"])
         self.assertEqual(
             posture["risk_posture"],
-            {"critical": 1, "high": 3, "medium": 1, "low": 1, "other": 0, "total": 6},
+            {"critical": 1, "high": 3, "medium": 2, "low": 1, "other": 0, "total": 7},
         )
+        self.assertEqual(posture["counts"]["patch_verified"], 1)
         self.assertEqual(posture["counts"]["mitigated"], 1)
         self.assertEqual(posture["counts"]["archived"], 1)
-        self.assertEqual(posture["counts"]["patch_verified_omitted"], 1)
+        self.assertEqual(posture["counts"]["patch_verified_omitted"], 0)
         self.assertEqual(posture["counts"]["untriaged_omitted"], 1)
         self.assertEqual(posture["counts"]["runs"], 2)
 
@@ -753,7 +756,7 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
         self.assertNotIn("Fixed parser bug", titles)
         self.assertNotIn("Untriaged draft", titles)
         self.assertNotIn("Dismissed FP", titles)
-        self.assertNotIn("Sandbox patched bug", titles)
+        self.assertIn("Sandbox patched bug", titles)
         self.assertEqual(titles.count("Still present command injection"), 1, "Deduplicated by lineage_id")
         self.assertEqual(titles.count("Moved export IDOR"), 1, "Dead path archived; live path kept")
 
@@ -769,16 +772,18 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
         wf = next(f for f in posture["findings"] if f["title"] == "Workflow script injection")
         self.assertEqual(wf["filepath"], ".github/workflows/ci.yml")
 
-        # 2. Including patch_verified adds the 1 sandbox-patched MEDIUM finding!
-        with_pv = current_open_findings(self.db, repo_root=self.repo, include_patch_verified=True)
-        self.assertEqual(with_pv["risk_posture"]["medium"], 2)
-        self.assertEqual(with_pv["risk_posture"]["total"], 7)
+        # 2. Explicitly excluding patch_verified drops the 1 sandbox-patched MEDIUM finding.
+        without_pv = current_open_findings(self.db, repo_root=self.repo, include_patch_verified=False)
+        self.assertEqual(without_pv["risk_posture"]["medium"], 1)
+        self.assertEqual(without_pv["risk_posture"]["total"], 6)
+        self.assertEqual(without_pv["counts"]["patch_verified_omitted"], 1)
+        self.assertNotIn("Sandbox patched bug", [f["title"] for f in without_pv["findings"]])
 
         # 3. Subfolder scope (`repo/sub`) excludes `other/extra.py` and `.github/...` and strips `sub/` prefix!
         sub_posture = current_open_findings(self.db, repo_root=os.path.join(self.repo, "sub"))
-        self.assertEqual(sub_posture["risk_posture"]["total"], 4)
+        self.assertEqual(sub_posture["risk_posture"]["total"], 5)
         sub_fps = sorted(f["filepath"] for f in sub_posture["findings"])
-        self.assertEqual(sub_fps, ["export_v2.py", "still.py", "still.py", "unchanged.py"])
+        self.assertEqual(sub_fps, ["export_v2.py", "still.py", "still.py", "unchanged.py", "unchanged.py"])
 
     def test_cli_report_markdown_json_sarif_and_security_sanitization(self):
         import contextlib
@@ -788,14 +793,14 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
 
         self._seed_changed_lifecycle()
 
-        # Add a finding with hostile Markdown/HTML/ANSI/pipe/credential payload to test egress safety.
+        # Add a finding with hostile Markdown/HTML/ANSI/pipe/backslash-pipe/credential payload to test egress safety.
         fake_gh_token = "ghp_" + ("A" * 36)
         write_findings(
             self.db,
             self.repo,
             [
                 {
-                    "title": f"\x1b[31mEvil | col\x1b[0m\n# Fake Heading <script>x</script> `{fake_gh_token}`",
+                    "title": f"\x1b[31mEvil \\| col | two\x1b[0m\n# Fake Heading <script>x</script> `{fake_gh_token}`",
                     "severity": "HIGH",
                     "priority": "HIGH",
                     "cwe": "CWE-79",
@@ -808,7 +813,7 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
             run_id="run-2",
         )
 
-        # 1. Markdown output to stdout
+        # 1. Markdown output to stdout (includes patch_verified by default -> 8 open findings)
         buf_md = io.StringIO()
         with contextlib.redirect_stdout(buf_md):
             rc = knowledge_cli.main(["report", "--db", self.db, "--repo", self.repo])
@@ -816,23 +821,28 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
         md = buf_md.getvalue()
         self.assertIn("| Critical | 1 |", md)
         self.assertIn("| High | 4 |", md)
-        self.assertIn("| Medium | 1 |", md)
+        self.assertIn("| Medium | 2 |", md)
         self.assertIn("| Low | 1 |", md)
-        self.assertIn("| **Total** | **7** |", md)
+        self.assertIn("| **Total** | **8** |", md)
+        self.assertIn("1 with unapplied verified patch(es)", md)
         self.assertIn("`.github/workflows/ci.yml`", md)
         self.assertIn("`sub/export_v2.py`", md)
         self.assertNotIn("\x1b[", md)
         self.assertNotIn("<script>", md)
         self.assertNotIn(fake_gh_token, md)
+        self.assertIn("\\\\\\|", md, "Backslash-pipe must escape backslash before pipe")
         self.assertIn("\\|", md, "Pipe in title must be escaped inside Markdown table cell")
         self.assertNotIn("\n# Fake Heading", md)
 
-        # 2. JSON output written to --out
+        # 2. JSON output written to --out (with --exclude-patch-verified -> 7 open findings)
         json_out = os.path.join(self.tmp, "posture.json")
         buf_j = io.StringIO()
         with contextlib.redirect_stdout(buf_j):
             rc = knowledge_cli.main(
-                ["report", "--db", self.db, "--repo", self.repo, "--format", "json", "--out", json_out]
+                [
+                    "report", "--db", self.db, "--repo", self.repo,
+                    "--exclude-patch-verified", "--format", "json", "--out", json_out,
+                ]
             )
         self.assertEqual(rc, 0)
         data = json.loads(Path(json_out).read_text(encoding="utf-8"))
@@ -852,7 +862,7 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
         self.assertEqual(rc, 0)
         sarif_doc = json.loads(Path(sarif_out).read_text(encoding="utf-8"))
         self.assertEqual(validate_sarif(sarif_doc), [])
-        self.assertEqual(len(sarif_doc["runs"][0]["results"]), 7)
+        self.assertEqual(len(sarif_doc["runs"][0]["results"]), 8)
         self.assertTrue(sarif_doc["runs"][0]["properties"]["cumulative_posture"])
 
         # 4. Symlink --out target is refused (INV-4)
@@ -872,6 +882,268 @@ class TestCumulativeRiskPostureReport(unittest.TestCase):
         with contextlib.redirect_stderr(err_buf2):
             rc_miss = knowledge_cli.main(["report", "--db", os.path.join(self.tmp, "missing.db")])
         self.assertEqual(rc_miss, 2)
+
+    def test_posture_hardening_readonly_strict_rootless_newest_and_multirepo(self):
+        import contextlib
+        import io
+        import sqlite3
+        from core.database import current_open_findings, record_run
+        from scripts import knowledge as knowledge_cli
+
+        self._seed_changed_lifecycle()
+
+        # A. Rootless legacy finding (no target_root in runs table) is omitted from --repo posture by default
+        write_findings(
+            self.db,
+            self.repo,
+            [
+                {
+                    "title": "Legacy unrooted bug",
+                    "severity": "HIGH",
+                    "cwe": "CWE-20",
+                    "filepath": "sub/unchanged.py",
+                    "line_numbers": [3],
+                    "description": "From pre-root run",
+                    "status": "static_confirmed",
+                }
+            ],
+            run_id="legacy-no-root",
+        )
+        # Simulate pre-2026-11-08 database where `runs` had no recorded target_root.
+        _c = sqlite3.connect(self.db)
+        _c.execute("DELETE FROM runs WHERE run_id = ?", ("legacy-no-root",))
+        _c.commit()
+        _c.close()
+        p_default = current_open_findings(self.db, repo_root=self.repo)
+        self.assertEqual(p_default["counts"]["unrooted_omitted"], 1)
+        self.assertNotIn("Legacy unrooted bug", [f["title"] for f in p_default["findings"]])
+
+        p_with_unrooted = current_open_findings(self.db, repo_root=self.repo, include_unrooted=True)
+        self.assertEqual(p_with_unrooted["counts"]["unrooted_omitted"], 0)
+        self.assertIn("Legacy unrooted bug", [f["title"] for f in p_with_unrooted["findings"]])
+
+        # B. Non-open lineage classified by NEWEST row: older mitigated + newer reported -> untriaged_omitted (not mitigated!)
+        write_findings(
+            self.db,
+            self.repo,
+            [
+                {
+                    "title": "Re-detected race",
+                    "severity": "HIGH",
+                    "cwe": "CWE-362",
+                    "filepath": "sub/still.py",
+                    "line_numbers": [77],
+                    "description": "Old closed row",
+                    "status": "mitigated",
+                    "lineage_id": "lin-redetected",
+                }
+            ],
+            run_id="run-1",
+        )
+        write_findings(
+            self.db,
+            self.repo,
+            [
+                {
+                    "title": "Re-detected race",
+                    "severity": "HIGH",
+                    "cwe": "CWE-362",
+                    "filepath": "sub/still.py",
+                    "line_numbers": [77],
+                    "description": "Newer reported row awaiting review",
+                    "status": "reported",
+                    "lineage_id": "lin-redetected",
+                }
+            ],
+            run_id="run-2",
+        )
+        p_newest = current_open_findings(self.db, repo_root=self.repo)
+        # Only "Fixed parser bug" is mitigated; "lin-redetected" is untriaged_omitted (+1 -> 2 total).
+        self.assertEqual(p_newest["counts"]["mitigated"], 1)
+        self.assertEqual(p_newest["counts"]["untriaged_omitted"], 2)
+
+        # C. Multi-repo DB without --repo refuses (exit 2) unless --all-repos is passed
+        other_repo = os.path.join(self.tmp, "other_repo_multi")
+        os.makedirs(other_repo, exist_ok=True)
+        record_run(
+            self.db,
+            "run-other",
+            "vertex_ai/gemini-3.8-flash",
+            metadata={"target_root": os.path.realpath(other_repo)},
+        )
+        err_multi = io.StringIO()
+        with contextlib.redirect_stderr(err_multi):
+            rc_multi = knowledge_cli.main(["report", "--db", self.db])
+        self.assertEqual(rc_multi, 2)
+        self.assertIn("multiple repositories", err_multi.getvalue())
+
+        out_all = io.StringIO()
+        with contextlib.redirect_stdout(out_all):
+            rc_all = knowledge_cli.main(["report", "--db", self.db, "--all-repos"])
+        self.assertEqual(rc_all, 0)
+
+        # D. Relocated / unmatched --repo warns on stderr when DB has findings but 0 match
+        empty_repo = os.path.join(self.tmp, "moved_repo")
+        os.makedirs(empty_repo, exist_ok=True)
+        err_warn = io.StringIO()
+        out_warn = io.StringIO()
+        with contextlib.redirect_stderr(err_warn), contextlib.redirect_stdout(out_warn):
+            rc_warn = knowledge_cli.main(["report", "--db", self.db, "--repo", empty_repo])
+        self.assertEqual(rc_warn, 0)
+        self.assertIn("warning: database holds", err_warn.getvalue())
+
+        # E. Read-only snapshot semantics (Pass 7 Defect A):
+        #    - Clean non-WAL read-only copy opens via plain mode=ro (no immutable=1 needed)
+        #    - WAL-mode copy in a 0555 dir fails without --snapshot (never silently falls back
+        #      to torn-read immutable=1), succeeds with --snapshot when no sidecars exist, and
+        #      REFUSES --snapshot when a hot -journal or -wal sidecar exists!
+        ro_dir = os.path.join(self.tmp, "ro_snap")
+        os.makedirs(ro_dir, exist_ok=True)
+        ro_db = os.path.join(ro_dir, "snap.db")
+        src_conn = sqlite3.connect(self.db)
+        dst_conn = sqlite3.connect(ro_db)
+        src_conn.backup(dst_conn)
+        dst_conn.execute("PRAGMA journal_mode=DELETE")
+        dst_conn.commit()
+        dst_conn.close()
+        src_conn.close()
+        os.chmod(ro_db, 0o444)
+        os.chmod(ro_dir, 0o555)
+        try:
+            p_ro = current_open_findings(ro_db, repo_root=self.repo, strict=True)
+            self.assertIsNone(p_ro["error"])
+            self.assertEqual(p_ro["risk_posture"]["total"], 7)
+            self.assertEqual(sorted(os.listdir(ro_dir)), ["snap.db"])
+        finally:
+            os.chmod(ro_dir, 0o755)
+            os.chmod(ro_db, 0o644)
+
+        # WAL-mode copy in a 0555 dir: strict default refuses (no silent immutable=1); --snapshot works when clean.
+        wal_ro_dir = os.path.join(self.tmp, "wal_ro_snap")
+        os.makedirs(wal_ro_dir, exist_ok=True)
+        wal_ro_db = os.path.join(wal_ro_dir, "wal_snap.db")
+        src_conn = sqlite3.connect(self.db)
+        dst_conn = sqlite3.connect(wal_ro_db)
+        src_conn.backup(dst_conn)
+        dst_conn.execute("PRAGMA journal_mode=WAL")
+        dst_conn.commit()
+        dst_conn.close()
+        src_conn.close()
+        for sidecar in (f"{wal_ro_db}-wal", f"{wal_ro_db}-shm"):
+            if os.path.exists(sidecar):
+                os.unlink(sidecar)
+        os.chmod(wal_ro_db, 0o444)
+        os.chmod(wal_ro_dir, 0o555)
+        try:
+            # Running as root bypasses POSIX directory mode 0555; only assert
+            # the read-only-directory OperationalError under non-root UIDs.
+            if not hasattr(os, "geteuid") or os.geteuid() != 0:
+                with self.assertRaises(sqlite3.OperationalError):
+                    current_open_findings(wal_ro_db, repo_root=self.repo, strict=True)
+            p_snap = current_open_findings(wal_ro_db, repo_root=self.repo, strict=True, immutable_snapshot=True)
+            self.assertEqual(p_snap["risk_posture"]["total"], 7)
+        finally:
+            os.chmod(wal_ro_dir, 0o755)
+            os.chmod(wal_ro_db, 0o644)
+
+        # Hot -journal or -wal sidecar is strictly refused under --snapshot (prevents torn reads).
+        hot_journal = Path(f"{wal_ro_db}-journal")
+        hot_journal.write_bytes(b"hot-journal-bytes")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                current_open_findings(wal_ro_db, repo_root=self.repo, strict=True, immutable_snapshot=True)
+        finally:
+            hot_journal.unlink(missing_ok=True)
+
+        # C2. Subfolder scan (`repo/sub`) recorded alongside `repo` does NOT falsely trigger multi-repo refusal!
+        sub_only_db = os.path.join(self.tmp, "sub_roots.db")
+        init_db(sub_only_db)
+        record_run(sub_only_db, "r-root", "m", metadata={"target_root": os.path.realpath(self.repo)})
+        record_run(sub_only_db, "r-sub", "m", metadata={"target_root": os.path.realpath(os.path.join(self.repo, "sub"))})
+        from core.database import distinct_run_target_roots
+        self.assertEqual(distinct_run_target_roots(sub_only_db), [os.path.realpath(self.repo)])
+
+        # B2. Untrusted `knowledge.db` in CWD is NOT picked up by default `--db knowledge.db`!
+        fake_cwd = os.path.join(self.tmp, "untrusted_checkout")
+        os.makedirs(fake_cwd, exist_ok=True)
+        cwd_db = os.path.join(fake_cwd, "knowledge.db")
+        init_db(cwd_db)
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(fake_cwd)
+            from core.paths import resolve_db_path
+            self.assertNotEqual(os.path.realpath(resolve_db_path("knowledge.db")), os.path.realpath(cwd_db))
+            # Pass a relative filename that ONLY exists in fake_cwd (not in install root) -> must fail exit 2!
+            only_cwd_name = "attacker_cwd_only.db"
+            init_db(os.path.join(fake_cwd, only_cwd_name))
+            err_cwd = io.StringIO()
+            out_cwd = io.StringIO()
+            with contextlib.redirect_stderr(err_cwd), contextlib.redirect_stdout(out_cwd):
+                rc_cwd = knowledge_cli.main(["report", "--db", only_cwd_name, "--format", "json"])
+            self.assertEqual(rc_cwd, 2)
+            self.assertEqual(out_cwd.getvalue(), "")
+        finally:
+            os.chdir(prev_cwd)
+
+        # D2. Markdown cells do not emit stray `\-` on empty placeholders or double-encoded `&amp;lt;`,
+        # and neutralize `https://` and `www.` autolinks!
+        from core.knowledge import render_posture_markdown
+        md_clean = render_posture_markdown({
+            "risk_posture": {"critical": 0, "high": 1, "medium": 0, "low": 0, "other": 0, "total": 1},
+            "counts": {"runs": 1},
+            "findings": [{
+                "id": 9,
+                "severity": "HIGH",
+                "cwe": "",
+                "filepath": "a&b.py",
+                "title": "Visit https://evil.example and www.evil.example <script>x</script>",
+                "priority": "",
+                "status": "static_confirmed",
+            }],
+        })
+        self.assertNotIn("\\-", md_clean)
+        self.assertNotIn("&amp;lt;", md_clean)
+        self.assertIn("&lt;script&gt;", md_clean)
+        self.assertNotIn("https://evil.example", md_clean)
+        self.assertNotIn("www.evil.example", md_clean)
+        self.assertIn("`a&b.py`", md_clean)
+
+        # F. Schema-version mismatch / unreadable DB fails loudly (strict raises, CLI exits 2 even for SARIF)
+        bad_db = os.path.join(self.tmp, "bad_schema.db")
+        init_db(bad_db)
+        conn = sqlite3.connect(bad_db)
+        conn.execute("PRAGMA user_version = 9999")
+        conn.commit()
+        conn.close()
+        p_bad = current_open_findings(bad_db, repo_root=self.repo, strict=False)
+        self.assertIsNotNone(p_bad["error"])
+        with self.assertRaises(RuntimeError):
+            current_open_findings(bad_db, repo_root=self.repo, strict=True)
+        for fmt in ("markdown", "json", "sarif"):
+            err_b = io.StringIO()
+            out_b = io.StringIO()
+            with contextlib.redirect_stderr(err_b), contextlib.redirect_stdout(out_b):
+                rc_b = knowledge_cli.main(["report", "--db", bad_db, "--repo", self.repo, "--format", fmt])
+            self.assertEqual(rc_b, 2, f"corrupt/mismatched DB must exit 2 for format={fmt}")
+            self.assertEqual(out_b.getvalue(), "", f"must not emit clean empty {fmt} on DB error")
+
+        # G. Non-Mantis SQLite DB (e.g. sessions.db missing the `findings` table) fails loudly instead of reporting 0
+        wrong_db = os.path.join(self.tmp, "sessions.db")
+        wconn = sqlite3.connect(wrong_db)
+        wconn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+        wconn.commit()
+        wconn.close()
+        p_wrong = current_open_findings(wrong_db, strict=False)
+        self.assertIsNotNone(p_wrong["error"])
+        with self.assertRaises(sqlite3.OperationalError):
+            current_open_findings(wrong_db, strict=True)
+        err_w = io.StringIO()
+        out_w = io.StringIO()
+        with contextlib.redirect_stderr(err_w), contextlib.redirect_stdout(out_w):
+            rc_w = knowledge_cli.main(["report", "--db", wrong_db, "--format", "json"])
+        self.assertEqual(rc_w, 2)
+        self.assertEqual(out_w.getvalue(), "")
+        self.assertIn("findings", err_w.getvalue())
 
 
 if __name__ == "__main__":

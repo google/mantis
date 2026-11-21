@@ -523,13 +523,13 @@ def _coverage_runs(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
             if has_runs:
                 rows = conn.execute(
-                    "SELECT s.target, s.metadata_json, s.run_id FROM campaign_spend s "
+                    "SELECT s.target, s.metadata_json, s.run_id, s.scan_mode FROM campaign_spend s "
                     "LEFT JOIN runs r ON r.run_id = s.run_id "
                     "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
                     (str(model),)).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT target, metadata_json, run_id FROM campaign_spend WHERE target IS NOT NULL"
+                    "SELECT target, metadata_json, run_id, scan_mode FROM campaign_spend WHERE target IS NOT NULL"
                 ).fetchall()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
@@ -544,9 +544,14 @@ def _coverage_runs(
         conn.close()
     targets: dict = {}
     depth_floor = int(min_depth) if min_depth is not None else None
-    for target, metadata_json, run in rows:
+    for target, metadata_json, run, scan_mode in rows:
         t = str(target or "").rstrip("/")
-        if not (t and run and not _row_failed(metadata_json) and not _row_unexamined(metadata_json)):
+        if not (t and run and not _row_failed(metadata_json) and not _row_unexamined(metadata_json) and not _row_deleted_only(metadata_json)):
+            continue
+        # A `changed`-mode campaign never predates content recording; if it
+        # recorded zero `coverage_files` rows (e.g. a deleted-only campaign in
+        # an older ledger), it must not cover the directory and mask future files.
+        if str(scan_mode or "").strip().lower() == "changed" and str(run) not in recorded:
             continue
         if depth_floor is not None:
             row_depth = _row_depth(metadata_json)
@@ -645,6 +650,14 @@ def _row_unexamined(metadata_json: Any) -> bool:
     return isinstance(meta, dict) and bool(meta.get("unexamined"))
 
 
+def _row_deleted_only(metadata_json: Any) -> bool:
+    try:
+        meta = json.loads(metadata_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(meta, dict) and bool(meta.get("deleted_only"))
+
+
 def _row_depth(metadata_json: Any) -> Optional[int]:
     """Extracts recorded audit depth (`1..100`) from a spend row's `metadata_json`,
     or `None` for legacy/pre-depth rows (which count as full-depth covered under INV-6)."""
@@ -694,27 +707,42 @@ def _completed_coverage(
             if has_runs:
                 # Rows of this model, and rows of no known model.
                 rows = conn.execute(
-                    f"SELECT s.target, s.metadata_json, {fp_col} FROM campaign_spend s "
+                    f"SELECT s.target, s.metadata_json, {fp_col}, s.run_id, s.scan_mode FROM campaign_spend s "
                     "LEFT JOIN runs r ON r.run_id = s.run_id "
                     "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
                     (str(model),)
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    f"SELECT s.target, s.metadata_json, {fp_col} FROM campaign_spend s "
+                    f"SELECT s.target, s.metadata_json, {fp_col}, s.run_id, s.scan_mode FROM campaign_spend s "
                     "WHERE s.target IS NOT NULL"
                 ).fetchall()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return None  # Ledger never written: genuine first run.
             raise
+        recorded: set = set()
+        if has_coverage_files_table(conn):
+            recorded = {
+                str(r[4]) for r in _content_rows(conn, model, min_depth=min_depth) if r[4]
+            }
     finally:
         conn.close()
     targets: dict = {}
     depth_floor = int(min_depth) if min_depth is not None else None
-    for target, metadata_json, fingerprint in rows:
+    for target, metadata_json, fingerprint, run, scan_mode in rows:
         t = str(target or "").rstrip("/")
-        if not (t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json)):
+        if not (
+            t
+            and not _row_failed(metadata_json)
+            and not _row_unexamined(metadata_json)
+            and not _row_deleted_only(metadata_json)
+        ):
+            continue
+        # Mirror `_coverage_runs`: a `changed`-mode campaign never predates
+        # content recording; a pre-fix deleted-only `changed` row with zero
+        # `coverage_files` entries must not mask new files under a per-file baseline.
+        if str(scan_mode or "").strip().lower() == "changed" and str(run or "") not in recorded:
             continue
         if depth_floor is not None:
             row_depth = _row_depth(metadata_json)
@@ -736,25 +764,37 @@ def _completed_coverage_depths(db_path: str, model: str = "") -> Optional[dict]:
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
             if has_runs:
                 rows = conn.execute(
-                    "SELECT s.target, s.metadata_json FROM campaign_spend s "
+                    "SELECT s.target, s.metadata_json, s.run_id, s.scan_mode FROM campaign_spend s "
                     "LEFT JOIN runs r ON r.run_id = s.run_id "
                     "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
                     (str(model),),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT target, metadata_json FROM campaign_spend WHERE target IS NOT NULL"
+                    "SELECT target, metadata_json, run_id, scan_mode FROM campaign_spend WHERE target IS NOT NULL"
                 ).fetchall()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return None
             raise
+        recorded: set = set()
+        if has_coverage_files_table(conn):
+            recorded = {
+                str(r[4]) for r in _content_rows(conn, model) if r[4]
+            }
     finally:
         conn.close()
     targets: dict = {}
-    for target, metadata_json in rows:
+    for target, metadata_json, run, scan_mode in rows:
         t = str(target or "").rstrip("/")
-        if t and not _row_failed(metadata_json) and not _row_unexamined(metadata_json):
+        if (
+            t
+            and not _row_failed(metadata_json)
+            and not _row_unexamined(metadata_json)
+            and not _row_deleted_only(metadata_json)
+        ):
+            if str(scan_mode or "").strip().lower() == "changed" and str(run or "") not in recorded:
+                continue
             targets.setdefault(t, set()).add(_row_depth(metadata_json))
     return targets
 
@@ -1354,6 +1394,8 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
                 }
                 if _row_unexamined(metadata_json):
                     entry["unexamined"] = True
+                if _row_deleted_only(metadata_json):
+                    entry["deleted_only"] = True
                 _attach_fallback_meta(entry, metadata_json)
                 out[t] = entry
         return out
@@ -1396,6 +1438,8 @@ def run_pass_ledger(db_path: str, run_id: str) -> Optional[dict[tuple[str, int],
                 }
                 if _row_unexamined(metadata_json):
                     entry["unexamined"] = True
+                if _row_deleted_only(metadata_json):
+                    entry["deleted_only"] = True
                 _attach_fallback_meta(entry, metadata_json)
                 out[(t, p_idx)] = entry
         return out

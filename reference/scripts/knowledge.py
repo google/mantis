@@ -134,45 +134,116 @@ def main(argv=None) -> int:
     rp.add_argument(
         "--include-patch-verified",
         action="store_true",
-        help="include patch_verified findings (e.g. sandbox-verified patches not yet applied to the repo)",
+        default=True,
+        help="include patch_verified findings (default: on, since sandbox-verified patches are not applied to the host checkout)",
+    )
+    rp.add_argument(
+        "--exclude-patch-verified",
+        action="store_true",
+        help="exclude patch_verified findings from the open posture",
+    )
+    rp.add_argument(
+        "--include-unrooted",
+        action="store_true",
+        help="include legacy findings from runs with no recorded target_root when --repo is given",
+    )
+    rp.add_argument(
+        "--all-repos",
+        action="store_true",
+        help="allow mixing findings across multiple repositories when --repo is omitted",
+    )
+    rp.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="read an offline read-only database snapshot with SQLite immutable=1 (refuses if -wal/-journal/-shm exists)",
     )
     args = p.parse_args(argv)
 
     if args.cmd == "report":
-        if not os.path.exists(args.db):
+        import sqlite3
+        from core.database import distinct_run_target_roots
+        from core.paths import resolve_db_path, validate_data_path
+
+        # Anchor relative --db paths strictly to the Mantis install directory
+        # via resolve_db_path (matching `regressions` and `database.py`), never
+        # preferring an untrusted `knowledge.db` sitting in the current working directory.
+        try:
+            resolved_db = resolve_db_path(str(args.db or ""))
+        except (PermissionError, ValueError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not os.path.exists(resolved_db):
             print(f"error: no database at {args.db}", file=sys.stderr)
             return 2
+        immutable_snap = bool(args.snapshot)
         repo_opt = ""
         if args.repo:
             repo_opt = os.path.realpath(args.repo)
             if not os.path.isdir(repo_opt):
                 print(f"error: --repo {args.repo} is not a directory", file=sys.stderr)
                 return 2
+        elif not args.all_repos:
+            try:
+                recorded_roots = distinct_run_target_roots(resolved_db, immutable_snapshot=immutable_snap)
+            except (RuntimeError, PermissionError, ValueError, OSError, sqlite3.Error) as exc:
+                print(f"error: failed to read database {resolved_db}: {exc}", file=sys.stderr)
+                return 2
+            if len(recorded_roots) > 1:
+                print(
+                    "error: database contains runs for multiple repositories; pass --repo <path> "
+                    "to scope to one repository (or --all-repos to combine them):\n  "
+                    + "\n  ".join(recorded_roots),
+                    file=sys.stderr,
+                )
+                return 2
         resolved_out: Path | None = None
         if args.out:
-            from core.paths import validate_data_path
-
             resolved_out, out_err = validate_data_path(args.out)
             if out_err or resolved_out is None:
                 print(f"error: {out_err or 'invalid --out path'}", file=sys.stderr)
                 return 2
 
+        include_pv = not bool(args.exclude_patch_verified)
+        include_unrooted = bool(args.include_unrooted)
         fmt = "markdown" if args.format == "md" else args.format
         if fmt == "sarif":
             from core.database import current_open_findings
             from core.sarif import SarifExportError, build_sarif, validate_sarif, write_sarif
 
-            raw = current_open_findings(
-                args.db,
-                repo_root=repo_opt or None,
-                include_patch_verified=bool(args.include_patch_verified),
-            )
+            try:
+                raw = current_open_findings(
+                    resolved_db,
+                    repo_root=repo_opt or None,
+                    include_patch_verified=include_pv,
+                    include_unrooted=include_unrooted,
+                    strict=True,
+                    immutable_snapshot=immutable_snap,
+                )
+            except (RuntimeError, PermissionError, ValueError, OSError, sqlite3.Error) as exc:
+                print(f"error: failed to read database {resolved_db}: {exc}", file=sys.stderr)
+                return 2
             counts = raw.get("counts") or {}
+            if (
+                repo_opt
+                and int(counts.get("total_db_findings", 0)) > 0
+                and int(counts.get("open", 0)) == 0
+                and int(counts.get("mitigated", 0)) == 0
+                and int(counts.get("archived", 0)) == 0
+            ):
+                print(
+                    f"warning: database holds {int(counts['total_db_findings'])} finding(s), but none "
+                    f"matched --repo {repo_opt} ({int(counts.get('other_repo_omitted', 0))} from other "
+                    f"repos, {int(counts.get('unrooted_omitted', 0))} unrooted legacy). Verify the "
+                    "checkout path or pass --include-unrooted.",
+                    file=sys.stderr,
+                )
             run_props = {
                 "cumulative_posture": True,
                 "runs_included": int(counts.get("runs", 0)),
                 "mitigated_closed": int(counts.get("mitigated", 0)),
                 "archived_closed": int(counts.get("archived", 0)),
+                "patch_verified_included": int(counts.get("patch_verified", 0)),
+                "unrooted_omitted": int(counts.get("unrooted_omitted", 0)),
                 "untriaged_omitted": int(counts.get("untriaged_omitted", 0)),
             }
             try:
@@ -201,11 +272,33 @@ def main(argv=None) -> int:
                 print(f"warning: skipped finding in SARIF export: {reason}", file=sys.stderr)
             return 0
 
-        posture = build_posture_report(
-            args.db,
-            repo_root=repo_opt or None,
-            include_patch_verified=bool(args.include_patch_verified),
-        )
+        try:
+            posture = build_posture_report(
+                resolved_db,
+                repo_root=repo_opt or None,
+                include_patch_verified=include_pv,
+                include_unrooted=include_unrooted,
+                strict=True,
+                immutable_snapshot=immutable_snap,
+            )
+        except (RuntimeError, PermissionError, ValueError, OSError, sqlite3.Error) as exc:
+            print(f"error: failed to read database {resolved_db}: {exc}", file=sys.stderr)
+            return 2
+        counts = posture.get("counts") or {}
+        if (
+            repo_opt
+            and int(counts.get("total_db_findings", 0)) > 0
+            and int(counts.get("open", 0)) == 0
+            and int(counts.get("mitigated", 0)) == 0
+            and int(counts.get("archived", 0)) == 0
+        ):
+            print(
+                f"warning: database holds {int(counts['total_db_findings'])} finding(s), but none "
+                f"matched --repo {repo_opt} ({int(counts.get('other_repo_omitted', 0))} from other "
+                f"repos, {int(counts.get('unrooted_omitted', 0))} unrooted legacy). Verify the "
+                "checkout path or pass --include-unrooted.",
+                file=sys.stderr,
+            )
         if fmt == "json":
             rendered = json.dumps(posture, indent=2, allow_nan=False) + "\n"
         else:
