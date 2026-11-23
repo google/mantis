@@ -152,6 +152,38 @@ class RefreshOpensPullRequestsPolitelyTest(unittest.TestCase):
         self.assertIn(f"The {len(TOOLS)} built-in tools", readme)
         self.assertIn(f"The built-in {len(TOOLS)}", readme)
 
+    def test_sandbox_base_and_fallback_images_are_digest_pinned_and_in_sync(self):
+        ref_root = str(_REPO / "reference")
+        if ref_root not in sys.path:
+            sys.path.insert(0, ref_root)
+        from scripts.configure import MICROSANDBOX_FALLBACK_IMAGES
+
+        dockerfile = (_REPO / "reference" / "sandbox" / "Dockerfile").read_text(encoding="utf-8")
+        from_match = re.search(r"^FROM\s+(\S+)\s*$", dockerfile, re.MULTILINE)
+        self.assertIsNotNone(from_match, "sandbox/Dockerfile must declare a FROM image")
+        base_ref = from_match.group(1)
+        self.assertRegex(
+            base_ref,
+            r"^python:[0-9][A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$",
+            f"sandbox/Dockerfile base image must be version- and digest-pinned: {base_ref}",
+        )
+        expected = (
+            f"mirror.gcr.io/library/{base_ref}",
+            f"docker.io/library/{base_ref}",
+        )
+        self.assertEqual(
+            MICROSANDBOX_FALLBACK_IMAGES,
+            expected,
+            "MICROSANDBOX_FALLBACK_IMAGES in configure.py must match sandbox/Dockerfile",
+        )
+        install_sh = (_REPO / "reference" / "install.sh").read_text(encoding="utf-8")
+        self.assertNotIn("library/python:3-slim", install_sh)
+        idx_gcr = install_sh.find(f'"{expected[0]}"')
+        idx_hub = install_sh.find(f'"{expected[1]}"')
+        self.assertGreaterEqual(idx_gcr, 0, f"install.sh missing {expected[0]}")
+        self.assertGreaterEqual(idx_hub, 0, f"install.sh missing {expected[1]}")
+        self.assertLess(idx_gcr, idx_hub, "install.sh must try mirror.gcr.io before docker.io")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,11 +56,11 @@ from core.config import (
 # image from ./install.sh (sandbox/Dockerfile); the fallbacks are the pinned
 # base images install.sh pulls directly when no container builder is present
 # (mirror.gcr.io first because some networks block Docker Hub). Keep this list
-# in sync with the FALLBACK_IMAGES list in install.sh.
+# in sync with install.sh and the pinned FROM image in sandbox/Dockerfile.
 MICROSANDBOX_DEFAULT_IMAGE = "mantis-sandbox:latest"
 MICROSANDBOX_FALLBACK_IMAGES = (
-    "mirror.gcr.io/library/python:3-slim",
-    "docker.io/library/python:3-slim",
+    "mirror.gcr.io/library/python:3.13.18-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90",
+    "docker.io/library/python:3.13.18-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90",
 )
 
 
