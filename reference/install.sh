@@ -98,10 +98,13 @@ else
         # machine). Pull a pinned base image straight into the microsandbox
         # cache instead. This is the only time a pull happens -- the runtime
         # always boots with PullPolicy.NEVER. Keep this list in sync with
-        # MICROSANDBOX_FALLBACK_IMAGES in scripts/configure.py.
+        # MICROSANDBOX_FALLBACK_IMAGES in scripts/configure.py and the pinned
+        # FROM image in sandbox/Dockerfile.
         # mirror.gcr.io first: some networks block Docker Hub.
         PULL_SUCCESS=0
-        for img in "mirror.gcr.io/library/python:3-slim" "docker.io/library/python:3-slim"; do
+        for img in \
+            "mirror.gcr.io/library/python:3.13.18-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90" \
+            "docker.io/library/python:3.13.18-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90"; do
             echo "No container builder found; pulling base image '$img' into the sandbox cache..."
             if .venv/bin/msb image pull "$img"; then
                 PULL_SUCCESS=1
