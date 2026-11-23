@@ -1,11 +1,11 @@
 google-adk==2.14.0
-litellm==1.103.10
-pydantic>=2.4.0
-microsandbox==0.7.13
+litellm==1.108.3
+pydantic>=2.14.3
+microsandbox==0.7.14
 pyyaml==6.0.3
 google-cloud-aiplatform==2.8.0
 anthropic
-tree-sitter==0.26.0
+tree-sitter==0.26.1
 # Keep tree-sitter-language-pack pinned to 1.20.0: 1.21+ dropped bundled
 # offline grammars and fetches unhashed parser binaries from GitHub at runtime.
 tree-sitter-language-pack==1.20.0
