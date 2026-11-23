@@ -1,0 +1,75 @@
+version: 2
+updates:
+  # GitHub Actions in .github/workflows/ and the composite action in action/action.yml.
+  # Dependabot preserves SHA pinning and updates the trailing `# vX.Y.Z` comments.
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+      - "/action"
+    schedule:
+      interval: "monthly"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    cooldown:
+      default-days: 14
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Reference harness Python deps (pip-compile with --generate-hashes).
+  - package-ecosystem: "pip"
+    directory: "/reference"
+    schedule:
+      interval: "monthly"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    cooldown:
+      default-days: 14
+    ignore:
+      # 1.21+ dropped bundled offline grammars and fetches unhashed parser
+      # binaries from GitHub at runtime (see reference/requirements.in).
+      - dependency-name: "tree-sitter-language-pack"
+    groups:
+      python-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Sandbox Python deps (pip-compile with --generate-hashes).
+  - package-ecosystem: "pip"
+    directory: "/reference/sandbox"
+    schedule:
+      interval: "monthly"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    cooldown:
+      default-days: 14
+    groups:
+      sandbox-python:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Sandbox base image (reference/sandbox/Dockerfile).
+  - package-ecosystem: "docker"
+    directory: "/reference/sandbox"
+    schedule:
+      interval: "monthly"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "chore(deps)"
