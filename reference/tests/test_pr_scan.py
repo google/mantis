@@ -1910,7 +1910,7 @@ class TestArchivingByFinder(KnowledgeCase):
 _FAKE_ONE_PROCESS = """\
 import json, sys, time
 sys.path.insert(0, {ref_root!r})
-from core.cost import record_spend
+from core.cost import record_coverage_files, record_spend, scope_identities
 from core.database import record_run
 argv = sys.argv[1:]
 listed = [a.split("=", 1)[1] for a in argv if a.startswith("--changed-files=")]
@@ -1923,7 +1923,10 @@ for rel in listed:
     p = plan.get(rel)
     if p is None:
         continue
-    record_spend({db!r}, "run-pr", {repo!r} + "/" + rel, "changed", tokens=5)
+    abs_target = {repo!r} + "/" + rel
+    record_spend({db!r}, "run-pr", abs_target, "changed", tokens=5)
+    if p["status"] == "done":
+        record_coverage_files({db!r}, "run-pr", abs_target, scope_identities([abs_target]))
     campaigns.append({{"target": {repo!r} + "/" + rel, "files": [{repo!r} + "/" + rel],
                       "status": p["status"], "pause_trigger": p.get("trigger", ""),
                       "tokens": p["tokens"], "fresh_tokens": p["tokens"] - p.get("cached", 0),

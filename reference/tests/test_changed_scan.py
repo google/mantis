@@ -791,5 +791,65 @@ class ExportImportTest(_Repo):
         self.assertGreaterEqual(counts["coverage_paths"], 1)
 
 
+class DeletedOnlyCoverageHoleTest(_Repo):
+    """Regression test for r5-deleted-only-coverage-hole."""
+
+    def test_deleted_only_changed_campaign_does_not_mask_future_added_files(self):
+        # 1. Baseline whole-repo scan records content for a.py, b.py, pkg/c.py
+        self.cover("a", "b", "pkg/c")
+
+        # 2. Delete b.py and record BOTH:
+        #    - a new-style deleted-only changed campaign (unexamined=True, deleted_only=True)
+        #    - a legacy deleted-only changed campaign (failed=False, 0 coverage_files rows)
+        os.unlink(self.files["b"])
+        record_spend(
+            self.db,
+            "33333333-3333-3333-3333-333333333333",
+            self.repo,
+            "changed",
+            tokens=10,
+            metadata={"failed": False, "unexamined": True, "deleted_only": True},
+        )
+        record_spend(
+            self.db,
+            "44444444-4444-4444-4444-444444444444",
+            self.repo,
+            "changed",
+            tokens=10,
+            metadata={"failed": False},
+        )
+
+        # 3. A brand-new file added later under the same repo MUST still be uncovered!
+        brand_new = os.path.join(self.repo, "pkg", "brand_new.py")
+        Path(brand_new).write_text("def fresh():\n    return 42\n")
+        current_files = [self.files["a"], self.files["pkg/c"], brand_new]
+        self.assertEqual(uncovered_files(self.db, current_files), [brand_new])
+
+    def test_legacy_deleted_only_row_with_per_file_baseline_does_not_mask_new_files(self):
+        # Pass 7 regression: per-file baseline (only a.py and pkg/c.py recorded
+        # individually with file targets, NOT whole-repo) + a legacy pre-fix
+        # deleted-only changed row targeting `pkg` with zero `coverage_files`
+        # rows must NOT cover newly added files under `pkg/` via `_completed_coverage`.
+        self.cover("a", run="11111111-1111-1111-1111-111111111111", target=self.files["a"])
+        self.cover("pkg/c", run="22222222-2222-2222-2222-222222222222", target=self.files["pkg/c"])
+        pkg_dir = os.path.join(self.repo, "pkg")
+        record_spend(
+            self.db,
+            "55555555-5555-5555-5555-555555555555",
+            pkg_dir,
+            "changed",
+            tokens=10,
+            metadata={"failed": False},
+        )
+        new1 = os.path.join(pkg_dir, "new1.py")
+        deep_dir = os.path.join(pkg_dir, "deep")
+        os.makedirs(deep_dir, exist_ok=True)
+        new2 = os.path.join(deep_dir, "new2.py")
+        Path(new1).write_text("def n1():\n    return 1\n")
+        Path(new2).write_text("def n2():\n    return 2\n")
+        unc = uncovered_files(self.db, [self.files["a"], self.files["pkg/c"], new1, new2])
+        self.assertEqual(sorted(unc), sorted([new1, new2]))
+
+
 if __name__ == "__main__":
     unittest.main()
