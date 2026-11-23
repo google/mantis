@@ -232,12 +232,15 @@ def _install_gemini_continuation_patch() -> None:
                 if holder is None:
                     continue
                 fields = dict(getattr(holder, "provider_specific_fields", None) or {})
-                if fields.get(CONTINUATION_TOKEN_FIELD):
-                    continue  # LiteLLM surfaced it itself
-                if token:
+                changed = False
+                if token and not fields.get(CONTINUATION_TOKEN_FIELD):
                     fields[CONTINUATION_TOKEN_FIELD] = token
-                if raw:
+                    changed = True
+                if raw and not fields.get(CONTINUATION_RAW_FINISH_FIELD):
                     fields[CONTINUATION_RAW_FINISH_FIELD] = str(raw)
+                    changed = True
+                if not changed:
+                    continue
                 try:
                     holder.provider_specific_fields = fields
                 except Exception:
@@ -2217,7 +2220,18 @@ def continuation_token_of(response_or_chunk: Any) -> Optional[str]:
             if not isinstance(fields, dict):
                 continue
             token = fields.get(CONTINUATION_TOKEN_FIELD)
-            raw = str(fields.get(CONTINUATION_RAW_FINISH_FIELD) or "").upper()
+            choice_fields = getattr(choice, "provider_specific_fields", None)
+            raw_val = (
+                fields.get(CONTINUATION_RAW_FINISH_FIELD)
+                or fields.get("native_finish_reason")
+                or (
+                    choice_fields.get("native_finish_reason")
+                    or choice_fields.get(CONTINUATION_RAW_FINISH_FIELD)
+                    if isinstance(choice_fields, dict)
+                    else None
+                )
+            )
+            raw = str(raw_val or "").upper()
             if token and raw == CONTINUATION_FINISH_REASON:
                 return str(token)
     except Exception:
@@ -2346,6 +2360,14 @@ def merge_continued_response(first: Any, continued: Any) -> Any:
         if getattr(c_msg, "tool_calls", None):
             f_msg.tool_calls = c_msg.tool_calls
         f_msg.provider_specific_fields = dict(getattr(c_msg, "provider_specific_fields", None) or {})
+        if hasattr(f_choice, "provider_specific_fields"):
+            c_choice_psf = getattr(c_choice, "provider_specific_fields", None)
+            try:
+                f_choice.provider_specific_fields = (
+                    dict(c_choice_psf) if isinstance(c_choice_psf, dict) else c_choice_psf
+                )
+            except Exception:
+                pass
         f_choice.finish_reason = c_choice.finish_reason
         total = _add_usage(_add_usage(None, getattr(first, "usage", None)), getattr(continued, "usage", None))
         if getattr(first, "usage", None) is not None:

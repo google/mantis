@@ -108,6 +108,37 @@ class HelpersTest(unittest.TestCase):
         self.assertEqual(continuation_token_of(resp), "QUJD")
         self.assertEqual(resp.choices[0].finish_reason, "length", "CONTINUATION is mapped like a length stop")
 
+        # Streaming chunk also surfaces CONTINUATION token and ignores MAX_TOKENS token
+        # even when LiteLLM natively populates continuation_token on the delta.
+        stream_cont = ModelResponseStream(choices=[])
+        vg.VertexGeminiConfig._process_candidates(candidates, stream_cont, {})
+        self.assertEqual(continuation_token_of(stream_cont), "QUJD")
+
+        stream_max = ModelResponseStream(choices=[])
+        max_candidates = [{"content": {"role": "model", "parts": [{"text": "", "thought": True}]},
+                           "finishReason": "MAX_TOKENS", "continuationToken": "QUJD", "index": 0}]
+        vg.VertexGeminiConfig._process_candidates(max_candidates, stream_max, {})
+        self.assertIsNone(continuation_token_of(stream_max))
+
+    def test_native_litellm_choice_native_finish_reason_is_recognized_and_cleared_on_merge(self):
+        # LiteLLM 1.108+ populates continuation_token on Message and native_finish_reason on Choices.
+        msg = Message(content=None, role="assistant")
+        msg.provider_specific_fields = {C.CONTINUATION_TOKEN_FIELD: "NATIVE_TOK"}
+        choice_cont = Choices(finish_reason="length", index=0, message=msg)
+        choice_cont.provider_specific_fields = {"native_finish_reason": "CONTINUATION"}
+        resp_cont = ModelResponse(choices=[choice_cont])
+        self.assertEqual(continuation_token_of(resp_cont), "NATIVE_TOK")
+
+        choice_max = Choices(finish_reason="length", index=0, message=msg)
+        choice_max.provider_specific_fields = {"native_finish_reason": "MAX_TOKENS"}
+        self.assertIsNone(continuation_token_of(ModelResponse(choices=[choice_max])))
+
+        final = whole(text="done", finish="stop")
+        final.choices[0].provider_specific_fields = {"native_finish_reason": "STOP"}
+        merged = merge_continued_response(resp_cont, final)
+        self.assertIsNone(continuation_token_of(merged))
+        self.assertEqual(merged.choices[0].provider_specific_fields, {"native_finish_reason": "STOP"})
+
 
 class WholeResponseTest(unittest.TestCase):
     def setUp(self):
