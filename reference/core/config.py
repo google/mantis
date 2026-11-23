@@ -211,6 +211,30 @@ def _install_gemini_continuation_patch() -> None:
             fmap.setdefault(CONTINUATION_FINISH_REASON, "length")
     except Exception:
         pass
+    try:
+        from litellm.llms.vertex_ai.gemini import long_decode as _ld
+    except Exception:
+        _ld = None
+    if _ld is not None or hasattr(_vg, "continuation_cap_of"):
+        # LiteLLM 1.108+ auto-continues Gemini turns internally whenever
+        # `max_output_tokens` is set, bypassing MANTIS_MAX_CONTINUATIONS,
+        # mid-turn BudgetController token/wall-clock checks, and per-hop retry
+        # / auth refresh. Returning None from `continuation_cap_of` disables
+        # LiteLLM's internal hop loop (both unary and streaming) while keeping
+        # LiteLLM's `url_for()` /v1/ -> /v1beta1/ rewrite and native
+        # continuation_token extraction intact for Mantis's own loop.
+        def _disable_litellm_internal_hops(_request_body: Any) -> None:
+            return None
+
+        _disable_litellm_internal_hops._mantis_continuation = True  # type: ignore[attr-defined]
+        if _ld is not None and hasattr(_ld, "continuation_cap_of") and not getattr(
+            _ld.continuation_cap_of, "_mantis_continuation", False
+        ):
+            _ld.continuation_cap_of = _disable_litellm_internal_hops
+        if hasattr(_vg, "continuation_cap_of") and not getattr(
+            _vg.continuation_cap_of, "_mantis_continuation", False
+        ):
+            _vg.continuation_cap_of = _disable_litellm_internal_hops
     config_cls = getattr(_vg, "VertexGeminiConfig", None)
     original = getattr(config_cls, "_process_candidates", None)
     if config_cls is None or original is None or getattr(original, "_mantis_continuation", False):

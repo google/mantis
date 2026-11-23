@@ -139,6 +139,46 @@ class HelpersTest(unittest.TestCase):
         self.assertIsNone(continuation_token_of(merged))
         self.assertEqual(merged.choices[0].provider_specific_fields, {"native_finish_reason": "STOP"})
 
+    def test_litellm_internal_long_decode_auto_hopping_is_disabled(self):
+        from litellm.llms.vertex_ai.gemini import vertex_and_google_ai_studio_gemini as vg
+
+        req_body = {"generationConfig": {"max_output_tokens": 65536}}
+        try:
+            from litellm.llms.vertex_ai.gemini import long_decode as ld
+        except ImportError:
+            ld = None
+
+        if ld is not None:
+            # Real LiteLLM 1.108+: internal auto-hopping must be disabled on both modules
+            # so MANTIS_MAX_CONTINUATIONS and mid-turn budget/deadline checks are never bypassed.
+            self.assertIsNone(ld.continuation_cap_of(req_body))
+            self.assertIsNone(vg.continuation_cap_of(req_body))
+            first = {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "", "thought": True}]},
+                    "finishReason": "CONTINUATION",
+                    "continuationToken": "QUJD",
+                    "index": 0,
+                }],
+                "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10, "thoughtsTokenCount": 20},
+            }
+
+            async def _forbid_post(_body):
+                raise AssertionError("LiteLLM must not issue internal continuation hops")
+
+            hops = asyncio.run(ld.collect_hops_async(first, req_body, _forbid_post))
+            self.assertEqual(hops, (first,))
+        else:
+            # Older LiteLLM without long_decode: verify the installer still patches both hooks
+            # if a long_decode module is present.
+            fake_ld = type(sys)("litellm.llms.vertex_ai.gemini.long_decode")
+            fake_ld.continuation_cap_of = lambda body: 65536
+            with mock.patch.dict(sys.modules, {"litellm.llms.vertex_ai.gemini.long_decode": fake_ld}), \
+                    mock.patch.object(vg, "continuation_cap_of", lambda body: 65536, create=True):
+                C._install_gemini_continuation_patch()
+                self.assertIsNone(fake_ld.continuation_cap_of(req_body))
+                self.assertIsNone(vg.continuation_cap_of(req_body))
+
 
 class WholeResponseTest(unittest.TestCase):
     def setUp(self):
