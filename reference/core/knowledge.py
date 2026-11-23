@@ -1204,14 +1204,38 @@ def describe(counts: Dict[str, Any]) -> str:
 # --- cumulative risk posture report ----------------------------------------------
 
 
-def _md_table_cell(value: Any, *, max_len: int = 200) -> str:
-    """Sanitizes untrusted text for safe interpolation inside a Markdown table cell."""
-    from core.llm_gateway import safe_markdown_span
+_POSTURE_AUTOLINK_RE = re.compile(r"(?i)\b(https?|ftp)://")
+_POSTURE_WWW_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])(www)\.")
 
-    text = safe_markdown_span(str(value if value is not None else ""))
+
+def _md_table_cell(value: Any, *, max_len: int = 200, code_span: bool = False) -> str:
+    """Sanitizes untrusted text for safe interpolation inside a Markdown table cell.
+
+    Scrubs credentials and terminal control sequences BEFORE truncation, escapes
+    backslashes before pipes (so literal `\\|` cannot end a cell), avoids
+    double-encoding HTML entities or stranding `\\-` on empty `-` placeholders,
+    and breaks autolinks (`https://`, `ftp://`, `www.`) and `@mentions`.
+    """
+    from core.llm_gateway import SecretScrubber, strip_terminal_control
+
+    raw = str(value if value is not None else "")
+    collapsed = " ".join(strip_terminal_control(raw).split())
+    scrubbed = SecretScrubber.scrub(collapsed)
+    if len(scrubbed) > max_len:
+        scrubbed = scrubbed[: max_len - 3].rstrip() + "..."
+    if code_span:
+        # Inside inline backticks `` `...` ``, HTML is already literal; only
+        # neutralize backticks, backslashes before pipes, and pipes.
+        text = scrubbed.replace("`", "'").replace("\\", "\\\\").replace("|", "\\|")
+        return text
+    text = scrubbed.replace("\\", "\\\\")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for ch, repl in (("`", "'"), ("[", "("), ("]", ")"), ("*", "\u2217")):
+        text = text.replace(ch, repl)
+    text = _POSTURE_AUTOLINK_RE.sub("\\1\u200b://", text)
+    text = _POSTURE_WWW_RE.sub("\\1\u200b.", text)
+    text = text.replace("@", "@\u200b")
     text = text.replace("|", "\\|")
-    if len(text) > max_len:
-        text = text[: max_len - 3].rstrip() + "..."
     return text
 
 
@@ -1219,7 +1243,10 @@ def build_posture_report(
     db_path: str,
     *,
     repo_root: Optional[str] = None,
-    include_patch_verified: bool = False,
+    include_patch_verified: bool = True,
+    include_unrooted: bool = False,
+    strict: bool = False,
+    immutable_snapshot: bool = False,
 ) -> Dict[str, Any]:
     """Builds a JSON-safe, egress-sanitized cumulative risk posture payload
     across all runs in `db_path` (deduplicated by `lineage_id`)."""
@@ -1230,6 +1257,9 @@ def build_posture_report(
         db_path,
         repo_root=repo_root,
         include_patch_verified=include_patch_verified,
+        include_unrooted=include_unrooted,
+        strict=strict,
+        immutable_snapshot=immutable_snapshot,
     )
     findings_out: List[Dict[str, Any]] = []
     for f in raw.get("findings") or []:
@@ -1256,11 +1286,13 @@ def build_posture_report(
             "seen_in_runs": list(f.get("seen_in_runs") or []),
             "other_ids": list(f.get("other_ids") or []),
         })
-    payload = {
+    payload: Dict[str, Any] = {
         "risk_posture": dict(raw.get("risk_posture") or {}),
         "counts": dict(raw.get("counts") or {}),
         "findings": findings_out,
     }
+    if raw.get("error"):
+        payload["error"] = str(raw["error"])
     return sanitize_egress_data(payload)
 
 
@@ -1289,6 +1321,8 @@ def render_posture_markdown(posture: Dict[str, Any]) -> str:
     lines.append("")
 
     notes: List[str] = [f"across {int(counts.get('runs', 0))} run(s)"]
+    if int(counts.get("patch_verified", 0)) > 0:
+        notes.append(f"{int(counts['patch_verified'])} with unapplied verified patch(es)")
     if int(counts.get("mitigated", 0)) > 0:
         notes.append(f"{int(counts['mitigated'])} mitigated")
     if int(counts.get("archived", 0)) > 0:
@@ -1296,7 +1330,12 @@ def render_posture_markdown(posture: Dict[str, Any]) -> str:
     if int(counts.get("patch_verified_omitted", 0)) > 0:
         notes.append(
             f"{int(counts['patch_verified_omitted'])} patch_verified omitted "
-            "(pass --include-patch-verified to include)"
+            "(included by default; omit --exclude-patch-verified to include)"
+        )
+    if int(counts.get("unrooted_omitted", 0)) > 0:
+        notes.append(
+            f"{int(counts['unrooted_omitted'])} unrooted legacy omitted "
+            "(pass --include-unrooted to include)"
         )
     if int(counts.get("untriaged_omitted", 0)) > 0:
         notes.append(f"{int(counts['untriaged_omitted'])} untriaged omitted")
@@ -1317,7 +1356,7 @@ def render_posture_markdown(posture: Dict[str, Any]) -> str:
         fid = int(f["id"]) if f.get("id") is not None else 0
         sev = _md_table_cell(str(f.get("severity") or "").strip().upper() or "UNKNOWN", max_len=24)
         cwe = _md_table_cell(str(f.get("cwe") or "").strip() or "-", max_len=32)
-        comp = _md_table_cell(str(f.get("filepath") or "").strip() or "?", max_len=160)
+        comp = _md_table_cell(str(f.get("filepath") or "").strip() or "?", max_len=160, code_span=True)
         title = _md_table_cell(str(f.get("title") or "").strip(), max_len=160)
         prio = _md_table_cell(str(f.get("priority") or "").strip().upper() or "-", max_len=24)
         status = _md_table_cell(str(f.get("status") or "").strip().lower() or "-", max_len=32)

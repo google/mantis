@@ -2630,6 +2630,19 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
                 "run reported; this run's own findings are judged by review and reproduction.")
     if str(prior.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
         return f"Error: finding {pid} is already closed ({prior.get('status')}); nothing to check."
+    scoped_priors = getattr(ctx, "campaign_prior_ids", None)
+    if scoped_priors is not None and pid not in scoped_priors:
+        return (
+            f"Error: finding {pid} is outside this campaign's in-scope prior findings "
+            "(each campaign may only settle prior findings touching its own files)."
+        )
+    mutable_priors = getattr(ctx, "campaign_mutable_prior_ids", None)
+    if verdict == "fixed" and mutable_priors is not None and pid not in mutable_priors:
+        return (
+            f"Error: none of finding {pid}'s files changed or were deleted since it was recorded; "
+            "an unchanged file cannot be marked 'fixed' (record 'inconclusive' instead, or "
+            "re-report and record 'still_present' only if you verified it is still vulnerable)."
+        )
 
     # The evidence is the harness's, not the caller's word. A re-run of the
     # prior PoC under this finding id is on the per-finding ledger; a
@@ -2664,6 +2677,50 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
                      new_finding_id=int(new_finding_id) if new_finding_id else None)
     if row_id is None:
         return "Error: the check could not be recorded."
+    if (
+        verdict == "fixed"
+        and evidence == "static"
+        and str(prior.get("status") or "").strip().lower() in ("dynamic_confirmed", "reproduced")
+    ):
+        from core.database import (
+            read_regression_checks,
+            resolve_finding_abs_path,
+            run_target_roots,
+        )
+
+        root_dir = str(getattr(ctx, "path_root", "") or getattr(ctx, "jail_dir", "") or "")
+        roots_map = run_target_roots(resolved_db) if root_dir else {}
+        p_abs = (
+            resolve_finding_abs_path(str(prior.get("filepath") or ""), prior.get("run_id"), root_dir, roots_map)
+            if root_dir
+            else ""
+        )
+        file_still_exists = not p_abs or os.path.lexists(p_abs) or os.path.exists(p_abs)
+        if file_still_exists:
+            lin = str(prior.get("lineage_id") or "").strip()
+            sibling_ids = {pid}
+            if lin:
+                for row in read_findings(resolved_db):
+                    if str(row.get("lineage_id") or "").strip() == lin and row.get("id") is not None:
+                        sibling_ids.add(int(row["id"]))
+            run_checks = [
+                c for c in read_regression_checks(resolved_db, run_id=ctx.run_id or "")
+                if c.get("prior_finding_id") in sibling_ids and c.get("outcome") == "fixed"
+            ]
+            has_dyn = any(str(c.get("evidence") or "") == "dynamic" for c in run_checks)
+            distinct_nodes = {
+                str(c.get("node") or "").strip().lower()
+                for c in run_checks
+                if str(c.get("node") or "").strip()
+            }
+            if not has_dyn and len(distinct_nodes) < 2:
+                return (
+                    f"SUCCESS (corroboration required): recorded fixed for earlier finding {pid} "
+                    f"('{str(prior.get('title') or '')[:80]}') with static evidence from stage "
+                    f"'{str(getattr(ctx, 'active_node', '') or 'unknown')}'. Because finding {pid} was "
+                    "dynamically confirmed and its file still exists on disk, a second independent stage "
+                    "(e.g. reviewer) or a dynamic PoC check is required before settlement will close it as mitigated."
+                )
     return (f"SUCCESS: recorded {verdict} for earlier finding {pid} ('{str(prior.get('title') or '')[:80]}') "
             f"with {evidence} evidence.")
 

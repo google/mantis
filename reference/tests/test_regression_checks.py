@@ -741,10 +741,17 @@ class ChangedModeSettlementFixesTest(_Base):
             ev2 = await gate_node._func(fake_ctx, None)
             self.assertEqual(ev2.actions.route, gl.DEFAULT_ROUTE)
 
-            # Settle b_id via agent-recorded 'inconclusive' -> ALL settled -> routes 'clean'!
+            # Settle b_id via agent-recorded 'inconclusive': a_id is dynamic_confirmed
+            # with only 1 static 'fixed' from researcher, so it STILL requires second-stage
+            # corroboration and must route DEFAULT_ROUTE (to reviewer)!
             record_regression_check(self.db, NEW, b_id, "inconclusive", reason="Needs manual check", evidence="none", node="researcher")
             ev3 = await gate_node._func(fake_ctx, None)
-            self.assertEqual(ev3.actions.route, "clean")
+            self.assertEqual(ev3.actions.route, gl.DEFAULT_ROUTE)
+
+            # Once reviewer corroborates a_id as fixed -> ALL settled -> routes 'clean'!
+            record_regression_check(self.db, NEW, a_id, "fixed", reason="Confirmed parameterized query", evidence="static", node="reviewer")
+            ev4 = await gate_node._func(fake_ctx, None)
+            self.assertEqual(ev4.actions.route, "clean")
         finally:
             current_run_context.reset(tok)
 
@@ -1374,6 +1381,179 @@ class ChangedModeSettlementFixesTest(_Base):
         )
         self.assertEqual([r["title"] for r in confirmed], ["Confirmed bug"])
         self.assertEqual(skipped, 1)
+
+    async def test_fixed_check_gated_by_campaign_scope_file_change_completion_and_corroboration(self):
+        """Regression test for r5-fixed-check-ungated:
+        1. A campaign cannot settle prior findings outside its own campaign_prior_ids.
+        2. An unchanged file (e.g. first changed run under a new model) cannot be marked fixed.
+        3. Settlement blocks closure for incomplete campaigns, unchanged files, and
+           single-stage static checks on dynamically confirmed findings whose files exist."""
+        import main
+        import tools.research_tools as rt
+
+        old = self.seed_old()
+        pid_a = old["SQLi in a"]["id"]          # dynamic_confirmed, a.py exists
+        pid_b = old["traversal in b"]["id"]     # dynamic_confirmed, b.py exists
+        pid_c = old["ssrf in c"]["id"]          # static_confirmed, pkg/c.py exists
+
+        # 1. Tool-level gating on campaign_prior_ids and campaign_mutable_prior_ids
+        ctx = self.ctx("researcher")
+        ctx.scan_mode = "changed"
+        ctx.campaign_prior_ids = (pid_a,)
+        ctx.campaign_mutable_prior_ids = ()  # a.py did NOT change on disk
+
+        out_other = rt.record_regression_check(pid_b, "fixed", "wrong campaign")
+        self.assertIn("outside this campaign", out_other)
+        out_unchanged = rt.record_regression_check(pid_a, "fixed", "unchanged file")
+        self.assertIn("unchanged file cannot be marked 'fixed'", out_unchanged)
+        # still_present and inconclusive remain permitted on unchanged files
+        self.assertTrue(rt.record_regression_check(pid_a, "inconclusive", "checking").startswith("SUCCESS"))
+
+        # 2. Settlement refuses closure when campaign did not complete (`allowed_prior_ids=set()`)
+        record_regression_check(self.db, NEW, pid_c, "fixed", reason="guarded", evidence="static", node="reviewer")
+        prior_c = prior_findings_touching(self.db, NEW, ["pkg/c.py"], scope_path=self.target)
+        settled_incomplete = main._settle_regression_checks(
+            self.db, NEW, prior_c, target_root=self.target,
+            allowed_prior_ids=set(), eligible_fixed_ids={pid_c},
+        )
+        self.assertEqual(settled_incomplete["fixed"], [])
+        self.assertEqual(settled_incomplete["unverified"], [pid_c])
+
+        # 3. Settlement refuses closure when file was not mutated (`eligible_fixed_ids=set()`)
+        settled_unmutated = main._settle_regression_checks(
+            self.db, NEW, prior_c, target_root=self.target,
+            allowed_prior_ids={pid_c}, eligible_fixed_ids=set(),
+        )
+        self.assertEqual(settled_unmutated["fixed"], [])
+        self.assertEqual(settled_unmutated["unverified"], [pid_c])
+
+        # 4. Single-stage static fixed does NOT close a dynamic_confirmed finding on an existing file
+        record_regression_check(self.db, NEW, pid_b, "fixed", reason="looks fixed", evidence="static", node="researcher")
+        prior_b = prior_findings_touching(self.db, NEW, ["b.py"], scope_path=self.target)
+        prior_b_only = [p for p in prior_b if p["id"] == pid_b]
+        settled_uncorrob = main._settle_regression_checks(
+            self.db, NEW, prior_b_only, target_root=self.target,
+            allowed_prior_ids={pid_b}, eligible_fixed_ids={pid_b},
+            require_corroborated_static_fixed=True,
+        )
+        self.assertEqual(settled_uncorrob["fixed"], [])
+        self.assertEqual(settled_uncorrob["unverified"], [pid_b])
+        row_b = next(f for f in read_findings(self.db, run_id=OLD) if f["id"] == pid_b)
+        self.assertEqual(row_b["status"], "dynamic_confirmed")
+
+        # Adding a second distinct stage corroborates static fixed -> closes cleanly!
+        record_regression_check(self.db, NEW, pid_b, "fixed", reason="reviewer confirmed fix", evidence="static", node="reviewer")
+        settled_corrob = main._settle_regression_checks(
+            self.db, NEW, prior_b_only, target_root=self.target,
+            allowed_prior_ids={pid_b}, eligible_fixed_ids={pid_b},
+            require_corroborated_static_fixed=True,
+        )
+        self.assertEqual(settled_corrob["fixed"], [pid_b])
+        row_b2 = next(f for f in read_findings(self.db, run_id=OLD) if f["id"] == pid_b)
+        self.assertEqual(row_b2["status"], "mitigated")
+
+        # 5. Deleted file CAN still be closed with a single static check (no PoC possible on removed file)
+        os.unlink(os.path.join(self.target, "a.py"))
+        record_regression_check(self.db, NEW, pid_a, "fixed", reason="deleted and not relocated", evidence="static", node="researcher")
+        prior_a = prior_findings_touching(self.db, NEW, ["a.py"], scope_path=self.target)
+        settled_del = main._settle_regression_checks(
+            self.db, NEW, prior_a, target_root=self.target,
+            allowed_prior_ids={pid_a}, eligible_fixed_ids={pid_a},
+            require_corroborated_static_fixed=True,
+        )
+        self.assertEqual(settled_del["fixed"], [pid_a])
+
+    def test_pass7_corroboration_notice_empty_scope_resume_seeding_and_model_switch(self):
+        import main
+        from core.context import RunContext, current_run_context
+        from core.cost import file_identity, record_coverage_files, record_spend
+        from core.database import unsettled_prior_findings_summary
+        from tools import research_tools as rt
+
+        old = self.seed_old()
+        pid_a = int(old["SQLi in a"]["id"])     # dynamic_confirmed on a.py
+        pid_c = int(old["ssrf in c"]["id"])     # static_confirmed on pkg/c.py
+        # Record OLD's file identity on a.py, then mutate a.py on disk -> model-switch check sees mutation!
+        old_ident = file_identity(os.path.join(self.target, "a.py"))
+        record_coverage_files(self.db, OLD, self.target, [(os.path.join(self.target, "a.py"), *old_ident)])
+        Path(self.target, "a.py").write_text("def a(x):\n    return int(x)\n", encoding="utf-8")
+        self.assertTrue(
+            main._prior_is_mutable_on_disk(
+                {"id": pid_a, "run_id": OLD, "filepath": "a.py"},
+                set(),  # empty changed_rel (e.g. first run under a new model)
+                self.target,
+                db_path=self.db,
+            )
+        )
+
+        # N6: campaign with zero priors (`campaign_prior_ids=()`) MUST refuse even still_present on another campaign's prior!
+        ctx_empty = RunContext(
+            run_id=NEW,
+            db_path=self.db,
+            jail_dir=self.target,
+            path_root=self.target,
+            target_file=os.path.join(self.target, "b.py"),
+            active_node="researcher",
+            campaign_prior_ids=(),
+            campaign_mutable_prior_ids=(),
+        )
+        tok_e = current_run_context.set(ctx_empty)
+        try:
+            res_empty = rt.record_regression_check(pid_c, "still_present", "cross-campaign veto")
+        finally:
+            current_run_context.reset(tok_e)
+        self.assertIn("outside this campaign's in-scope prior findings", res_empty)
+
+        # N2: single-stage static 'fixed' on dynamic_confirmed existing file notifies model AND stays unsettled!
+        ctx_r = RunContext(
+            run_id=NEW,
+            db_path=self.db,
+            jail_dir=self.target,
+            path_root=self.target,
+            target_file=os.path.join(self.target, "a.py"),
+            active_node="researcher",
+            campaign_prior_ids=(pid_a,),
+            campaign_mutable_prior_ids=(pid_a,),
+        )
+        tok_r = current_run_context.set(ctx_r)
+        try:
+            msg_first = rt.record_regression_check(pid_a, "fixed", "parameterized query")
+        finally:
+            current_run_context.reset(tok_r)
+        self.assertIn("corroboration required", msg_first.lower())
+        summ1 = unsettled_prior_findings_summary(self.db, NEW, [pid_a], target_root=self.target)
+        self.assertEqual(len(summ1["unsettled"]), 1)
+        self.assertEqual(summ1["unsettled"][0]["state"], "needs_corroboration")
+
+        # Second distinct stage (`reviewer`) corroborates -> tool returns plain SUCCESS and summary marks settled!
+        ctx_rev = RunContext(
+            run_id=NEW,
+            db_path=self.db,
+            jail_dir=self.target,
+            path_root=self.target,
+            target_file=os.path.join(self.target, "a.py"),
+            active_node="reviewer",
+            campaign_prior_ids=(pid_a,),
+            campaign_mutable_prior_ids=(pid_a,),
+        )
+        tok_rev = current_run_context.set(ctx_rev)
+        try:
+            msg_second = rt.record_regression_check(pid_a, "fixed", "verified parameterized")
+        finally:
+            current_run_context.reset(tok_rev)
+        self.assertTrue(msg_second.startswith("SUCCESS: recorded fixed"), msg_second)
+        summ2 = unsettled_prior_findings_summary(self.db, NEW, [pid_a], target_root=self.target)
+        self.assertEqual(summ2["unsettled"], [])
+        self.assertEqual(len(summ2["settled"]), 1)
+
+        # N1: --resume recovers settled_campaign_prior_ids from completed campaigns before abnormal stop,
+        # while excluding failed or unexamined campaigns.
+        record_spend(self.db, NEW, os.path.join(self.target, "a.py"), "changed", tokens=50, metadata={"failed": False})
+        record_spend(self.db, NEW, os.path.join(self.target, "pkg"), "changed", tokens=10, metadata={"failed": True})
+        priors_both = prior_findings_touching(self.db, NEW, ["a.py", "pkg/c.py"], scope_path=self.target)
+        seeded = main._seed_settled_priors_from_resume(self.db, NEW, priors_both, target_root=self.target)
+        self.assertIn(pid_a, seeded)
+        self.assertNotIn(pid_c, seeded)
 
 
 if __name__ == "__main__":

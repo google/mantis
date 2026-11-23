@@ -2626,11 +2626,17 @@ def resolve_scan_targets(
             )
             edited = changed_files(db_path, discovered_files, model=run_model) or {"files": []}
             known = content_recorded_for(db_path, discovered_files, model=run_model)
+            del_root = str(config.get("path_root") or target_path)
             missing_rels, _del_findings = prior_findings_on_deleted_files(
-                db_path, "", str(target_path), scope_path=str(target_path), include_untriaged=False
+                db_path, "", del_root, scope_path=str(target_path), include_untriaged=False
             )
-            real_root = os.path.realpath(str(target_path))
-            deleted_abs = [os.path.join(real_root, rel) for rel in missing_rels]
+            real_root = os.path.realpath(del_root)
+            real_target = os.path.realpath(str(target_path)).rstrip(os.sep)
+            deleted_abs = []
+            for rel in missing_rels:
+                cand_abs = os.path.normpath(os.path.join(real_root, rel))
+                if cand_abs == real_target or cand_abs.startswith(real_target + os.sep):
+                    deleted_abs.append(cand_abs)
         except Exception as exc:
             print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
             focus = None
@@ -3217,10 +3223,13 @@ def _regression_brief(
         "new finding's id>).\n"
         "- fixed: whoever establishes it calls record_regression_check(<id>, 'fixed', <reason naming the code "
         "that now stops the path>) -- the researcher when it finds the path closed and reports nothing there, "
-        "the reviewer otherwise. For deleted code or `[FILE DELETED ON DISK]`, first verify via list_files and "
-        "find_symbol that the vulnerable code was NOT renamed or moved into another file! If relocated and still "
-        "vulnerable, report it at the new path and call record_regression_check(<id>, 'still_present', ...); if "
-        "genuinely removed with no vulnerable copy remaining, call record_regression_check(<id>, 'fixed', ...).\n"
+        "the reviewer otherwise. NOTE: for a finding previously marked `dynamic_confirmed` whose file still "
+        "exists on disk, a single stage's static 'fixed' will be deferred until corroborated by either a "
+        "second independent stage (e.g. reviewer) or a dynamic PoC check! For deleted code or `[FILE DELETED ON DISK]`, "
+        "first verify via list_files and find_symbol that the vulnerable code was NOT renamed or moved into another "
+        "file! If relocated and still vulnerable, report it at the new path and call record_regression_check(<id>, "
+        "'still_present', ...); if genuinely removed with no vulnerable copy remaining, call "
+        "record_regression_check(<id>, 'fixed', ...).\n"
         "- dynamic PoC: the reproducer, for a finding with PoC: yes that the harness did not already "
         "settle, calls get_prior_poc(<id>) and runs the PoC UNCHANGED with run_sandbox_with_evidence("
         "finding_id=<id>, ...): evidence present means still present; absent, when the PoC ran, means fixed; a "
@@ -3236,12 +3245,150 @@ def _regression_brief(
     return prior, text
 
 
+def _prior_is_mutable_on_disk(
+    finding: dict,
+    changed_rel: set,
+    target_root: str,
+    roots_map: Optional[dict] = None,
+    *,
+    db_path: str = "",
+) -> bool:
+    """True when at least one file referenced by `finding` actually changed on
+    disk (`changed_rel`, or differs from the content hash recorded by the
+    finding's own run in `coverage_files`, so switching models still recognizes
+    a real edit) or its primary filepath no longer exists on disk."""
+    from core.database import resolve_finding_abs_path
+
+    real_root = os.path.realpath(str(target_root)) if target_root else ""
+    abs_fp = ""
+    if real_root:
+        abs_fp = resolve_finding_abs_path(
+            str(finding.get("filepath") or ""),
+            finding.get("run_id"),
+            real_root,
+            roots_map,
+        )
+        if abs_fp and not os.path.lexists(abs_fp) and not os.path.exists(abs_fp):
+            return True
+    if changed_rel:
+        if _finding_files(finding, current_root=real_root, roots_map=roots_map) & changed_rel:
+            return True
+    # Model-switch fallback: when the finding's own run recorded a file content
+    # hash in `coverage_files`, compare the current file against THAT hash so
+    # the first changed-mode run under a new model can still close genuine fixes.
+    f_run = str(finding.get("run_id") or "").strip()
+    if db_path and f_run and abs_fp and os.path.isfile(abs_fp):
+        try:
+            from core.cost import file_identity
+            from core.database import connect
+
+            ident = file_identity(abs_fp)
+            if ident is not None:
+                cur_hash = str(ident[0])
+                conn = connect(db_path, readonly=True)
+                try:
+                    has_tbl = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='coverage_files'"
+                    ).fetchone()
+                    if has_tbl:
+                        rel_fp = str(finding.get("filepath") or "").replace("\\", "/").strip("/")
+                        lexical_abs_fp = (
+                            os.path.normpath(os.path.join(str(target_root), rel_fp))
+                            if target_root and rel_fp
+                            else ""
+                        )
+                        candidates = list(dict.fromkeys(p for p in (abs_fp, lexical_abs_fp, rel_fp) if p))
+                        placeholders = ",".join("?" for _ in candidates)
+                        rows = conn.execute(
+                            f"SELECT content_hash FROM coverage_files WHERE run_id = ? AND path IN ({placeholders})",
+                            (f_run, *candidates),
+                        ).fetchall()
+                        if not rows:
+                            # Fallback when `coverage_files.path` used an alternate symlink
+                            # spelling of the same file (e.g. `/var/...` vs `/private/var/...`).
+                            all_run_rows = conn.execute(
+                                "SELECT path, content_hash FROM coverage_files WHERE run_id = ?",
+                                (f_run,),
+                            ).fetchall()
+                            rows = [
+                                (r_hash,)
+                                for r_path, r_hash in all_run_rows
+                                if r_path and os.path.realpath(str(r_path)) == abs_fp
+                            ]
+                        if rows and all(str(r[0] or "") and str(r[0]) != cur_hash for r in rows):
+                            return True
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+    return False
+
+
+def _seed_settled_priors_from_resume(
+    db_path: str,
+    run_id: str,
+    prior_in_scope: list[dict],
+    *,
+    target_root: str = "",
+    roots_map: Optional[dict] = None,
+) -> set[int]:
+    """Recovers `settled_campaign_prior_ids` for campaigns that already completed
+    cleanly in an earlier process of `run_id` before an abnormal stop (auth error,
+    Ctrl-C, crash) so `--resume` does not permanently defer their `fixed` checks."""
+    if not db_path or not run_id or not prior_in_scope:
+        return set()
+    try:
+        from core.cost import run_ledger
+        from core.database import resolve_finding_abs_path
+
+        ledger = run_ledger(db_path, run_id)
+        if not ledger:
+            return set()
+        clean_targets: list[str] = []
+        for t, row in ledger.items():
+            if row.get("failed"):
+                continue
+            if row.get("terminal_reviewer_fallback") or row.get("review_incomplete"):
+                continue
+            if row.get("unexamined") and not row.get("deleted_only"):
+                continue
+            clean_targets.append(os.path.realpath(str(t)).rstrip(os.sep))
+        if not clean_targets:
+            return set()
+        real_root = os.path.realpath(str(target_root)) if target_root else ""
+        seeded: set[int] = set()
+        for p in prior_in_scope:
+            pid = p.get("id")
+            if pid is None:
+                continue
+            abs_fp = resolve_finding_abs_path(
+                str(p.get("filepath") or ""),
+                p.get("run_id"),
+                real_root,
+                roots_map,
+            ) if real_root else ""
+            cand_paths = [os.path.normpath(abs_fp)] if abs_fp else []
+            for rel_f in _finding_files(p, current_root=real_root, roots_map=roots_map):
+                if real_root:
+                    cand_paths.append(os.path.normpath(os.path.join(real_root, rel_f)))
+            for cp in cand_paths:
+                if any(cp == ct or cp.startswith(ct + os.sep) for ct in clean_targets):
+                    seeded.add(int(pid))
+                    break
+        return seeded
+    except Exception:
+        return set()
+
+
 def _settle_regression_checks(
     db_path: str,
     run_id: str,
     prior: list[dict],
     *,
     target_root: str = "",
+    allowed_prior_ids: Optional[set[int]] = None,
+    eligible_fixed_ids: Optional[set[int]] = None,
+    require_corroborated_static_fixed: bool = False,
 ) -> dict:
     """After a change-scoped campaign: one decision per prior finding (grouped
     by non-empty `lineage_id` when multiple earlier runs reported the same
@@ -3418,26 +3565,84 @@ def _settle_regression_checks(
                                 by_run_id=run_id,
                             )
         elif fixed:
-            c = fixed[0]
-            src_pid = int(c["prior_finding_id"])
-            for p in grp:
-                pid = int(p["id"])
-                own_fixed = [chk for chk in own_checks[pid] if chk["outcome"] == "fixed"]
-                if not own_fixed:
-                    _record(
-                        db_path, run_id, pid, "fixed",
-                        reason=f"settled via lineage #{src_pid}: {c.get('reason') or ''}",
-                        evidence=c["evidence"], node="harness",
-                    )
-                mit_reason = (
-                    f"{c['evidence']} evidence: {c.get('reason') or ''}"
-                    if src_pid == pid
-                    else f"{c['evidence']} evidence (via #{src_pid}): {c.get('reason') or ''}"
+            grp_ids = {int(p["id"]) for p in grp if p.get("id") is not None}
+            campaign_completed = (
+                allowed_prior_ids is None or bool(grp_ids & allowed_prior_ids)
+            )
+            file_mutable = (
+                eligible_fixed_ids is None or bool(grp_ids & eligible_fixed_ids)
+            )
+            # For a dynamically confirmed finding whose file still exists on
+            # disk, a single stage's static reading is not enough to permanently
+            # close it as mitigated: require either dynamic evidence or
+            # corroboration from at least two distinct stages.
+            needs_corroboration = False
+            if require_corroborated_static_fixed:
+                has_dynamic_prior = any(
+                    str(p.get("status") or "").strip().lower() in ("dynamic_confirmed", "reproduced")
+                    for p in grp
                 )
-                if mitigate_finding(db_path, pid, mit_reason, by_run_id=run_id):
-                    summary["fixed"].append(pid)
+                if has_dynamic_prior:
+                    any_exists = False
+                    for p in grp:
+                        p_abs = resolve_finding_abs_path(
+                            str(p.get("filepath") or ""),
+                            p.get("run_id"),
+                            fallback_root,
+                            roots_map,
+                        )
+                        if not p_abs or os.path.lexists(p_abs) or os.path.exists(p_abs):
+                            any_exists = True
+                            break
+                    if any_exists:
+                        has_dyn_fixed = any(str(c.get("evidence") or "") == "dynamic" for c in fixed)
+                        distinct_nodes = {
+                            str(c.get("node") or "").strip().lower()
+                            for c in fixed
+                            if str(c.get("node") or "").strip()
+                        }
+                        if not has_dyn_fixed and len(distinct_nodes) < 2:
+                            needs_corroboration = True
+
+            if not campaign_completed or not file_mutable or needs_corroboration:
+                if not campaign_completed:
+                    block_why = "campaign did not complete cleanly; deferring fixed closure"
+                elif not file_mutable:
+                    block_why = "none of this finding's files changed or were deleted; static fixed check refused"
                 else:
+                    block_why = (
+                        "dynamically confirmed finding requires dynamic evidence or multi-stage "
+                        "corroboration before static fixed closure"
+                    )
+                for p in grp:
+                    pid = int(p["id"])
                     summary["unverified"].append(pid)
+                    _record(
+                        db_path, run_id, pid, "inconclusive",
+                        reason=block_why,
+                        evidence="none", node="harness",
+                    )
+            else:
+                c = fixed[0]
+                src_pid = int(c["prior_finding_id"])
+                for p in grp:
+                    pid = int(p["id"])
+                    own_fixed = [chk for chk in own_checks[pid] if chk["outcome"] == "fixed"]
+                    if not own_fixed:
+                        _record(
+                            db_path, run_id, pid, "fixed",
+                            reason=f"settled via lineage #{src_pid}: {c.get('reason') or ''}",
+                            evidence=c["evidence"], node="harness",
+                        )
+                    mit_reason = (
+                        f"{c['evidence']} evidence: {c.get('reason') or ''}"
+                        if src_pid == pid
+                        else f"{c['evidence']} evidence (via #{src_pid}): {c.get('reason') or ''}"
+                    )
+                    if mitigate_finding(db_path, pid, mit_reason, by_run_id=run_id):
+                        summary["fixed"].append(pid)
+                    else:
+                        summary["unverified"].append(pid)
         else:
             for p in grp:
                 pid = int(p["id"])
@@ -4576,7 +4781,12 @@ async def pipeline(
                 file=sys.stderr,
             )
     scan_scope: dict = {}
-    config = {**config, "depth": resolved_depth, "_depth_explicit": depth is not None}
+    config = {
+        **config,
+        "depth": resolved_depth,
+        "_depth_explicit": depth is not None,
+        **({"path_root": str(resolved_path_root)} if resolved_path_root else {}),
+    }
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
         target_path,
         config,
@@ -4928,7 +5138,10 @@ async def pipeline(
             unexamined_pairs = {
                 pair
                 for pair, row in norm_pass_ledger.items()
-                if not row.get("failed") and row.get("unexamined") and pair not in terminal_fb_pairs
+                if not row.get("failed")
+                and row.get("unexamined")
+                and not row.get("deleted_only")
+                and pair not in terminal_fb_pairs
             }
             if terminal_fb_pairs and not retry_unexamined:
                 print(
@@ -5027,7 +5240,10 @@ async def pipeline(
             unexamined_completed = {
                 _key(t)
                 for t, row in ledger.items()
-                if not row.get("failed") and row.get("unexamined") and _key(t) not in terminal_fb_completed
+                if not row.get("failed")
+                and row.get("unexamined")
+                and not row.get("deleted_only")
+                and _key(t) not in terminal_fb_completed
             }
             if terminal_fb_completed and not retry_unexamined:
                 print(
@@ -5561,6 +5777,28 @@ async def pipeline(
     replan_lock = asyncio.Lock()
     started_targets: set = set()
     pause_banner_shown = False
+    # Prior finding IDs eligible for end-of-run regression closure: only priors
+    # from campaigns that completed cleanly (`settled_campaign_prior_ids`) and
+    # whose files actually changed or were deleted on disk (`mutable_prior_ids`).
+    settled_campaign_prior_ids: set[int] = set()
+    mutable_prior_ids: set[int] = set()
+    try:
+        from core.database import run_target_roots as _run_target_roots_for_settle
+
+        _prior_roots_map = _run_target_roots_for_settle(db_path) if prior_in_scope else {}
+    except Exception:
+        _prior_roots_map = {}
+    if resume_run_id and prior_in_scope:
+        settled_campaign_prior_ids.update(
+            _seed_settled_priors_from_resume(
+                db_path, run_id, prior_in_scope, target_root=_rel_root, roots_map=_prior_roots_map
+            )
+        )
+    for _p in prior_in_scope:
+        if _p.get("id") is not None and _prior_is_mutable_on_disk(
+            _p, changed_rel, _rel_root, _prior_roots_map, db_path=db_path
+        ):
+            mutable_prior_ids.add(int(_p["id"]))
     # Set once the campaign whose prefix the others reuse has been told the
     # run's other changed files (_render_shared_prefix_note).
     shared_prefix = {"briefed": False}
@@ -5657,8 +5895,24 @@ async def pipeline(
                     total_passes=total_passes,
                     batch_file_count=len(group.get("targets") or ()),
                 ),
-                campaign_prior_ids=tuple(
-                    int(p["id"]) for p in (campaign_priors or ()) if p.get("id") is not None
+                campaign_prior_ids=(
+                    tuple(
+                        int(p["id"]) for p in (campaign_priors or ()) if p.get("id") is not None
+                    )
+                    if scan_mode == SCAN_MODE_CHANGED
+                    else None
+                ),
+                campaign_mutable_prior_ids=(
+                    tuple(
+                        int(p["id"])
+                        for p in (campaign_priors or ())
+                        if p.get("id") is not None
+                        and _prior_is_mutable_on_disk(
+                            p, changed_rel, _rel_root, _prior_roots_map, db_path=db_path
+                        )
+                    )
+                    if (scan_mode == SCAN_MODE_CHANGED and settle_priors)
+                    else None
                 ),
             )
             if resume_run_id:
@@ -5766,12 +6020,14 @@ async def pipeline(
             # before the graph runs, and written to the ledger only if the
             # campaign earns coverage credit below.
             scope_content: list = []
+            deleted_only_campaign = False
             try:
                 from core.cost import scope_identities
                 # A change-scoped campaign examined its changed files; the
                 # rest of the tree keeps the content it was covered as.
                 if scan_mode == SCAN_MODE_CHANGED and group.get("focus"):
                     scope_files = [f for f in (group.get("focus") or []) if os.path.exists(str(f))]
+                    deleted_only_campaign = not scope_files
                 else:
                     scope_files = _campaign_scope_files(group, scan_item, discovered_files)
                 scope_content = scope_identities(scope_files)
@@ -5879,7 +6135,7 @@ async def pipeline(
                         )
                 earned_coverage = (
                     False
-                    if review_incomplete_terminal
+                    if (review_incomplete_terminal or deleted_only_campaign)
                     else should_credit_coverage(task_failed, code_reads)
                 )
                 # What this campaign actually cost. Recorded for completed campaigns
@@ -5889,6 +6145,9 @@ async def pipeline(
                 # costs, and averaging truncated runs in would bias every future
                 # estimate downward, making the next run plan a scan it cannot finish.
                 spend_meta: dict[str, Any] = {"failed": bool(task_failed), "depth": int(resolved_depth)}
+                if deleted_only_campaign:
+                    spend_meta["deleted_only"] = True
+                    spend_meta["unexamined"] = True
                 if fb_outcome["triggered"]:
                     spend_meta["reviewer_fallback"] = True
                     spend_meta["fallback_attempts"] = int(fb_outcome["attempt_num"])
@@ -5954,6 +6213,10 @@ async def pipeline(
                     # Recording either as examined would tell every later run
                     # that ground is covered when nobody looked -- a silent
                     # permanent blind spot, strictly worse than no ledger.
+                    if not review_incomplete_terminal and (earned_coverage or deleted_only_campaign):
+                        for _cp in campaign_priors or ():
+                            if _cp.get("id") is not None:
+                                settled_campaign_prior_ids.add(int(_cp["id"]))
                     if earned_coverage:
                         examined_areas.append(scan_item)
                         # Member stamps live behind the SAME gate as the
@@ -5977,6 +6240,12 @@ async def pipeline(
                             record_coverage_files(db_path, run_id, scan_item, scope_content)
                         except Exception as exc:
                             print(f"[CONTENT LEDGER WARNING] {exc}", file=sys.stderr)
+                    elif deleted_only_campaign:
+                        # A deleted-only changed campaign verifies removed files
+                        # for regression settlement, and deliberately withholds
+                        # directory coverage so future files added here are
+                        # never masked as already covered.
+                        pass
                     elif review_incomplete_terminal:
                         print(
                             f"[COVERAGE GUARD] '{scan_item}': withholding examined-area credit because "
@@ -6315,7 +6584,13 @@ async def pipeline(
     if prior_in_scope:
         try:
             settled = _settle_regression_checks(
-                db_path, run_id, prior_in_scope, target_root=str(resolved_path_root or target_path)
+                db_path,
+                run_id,
+                prior_in_scope,
+                target_root=str(resolved_path_root or target_path),
+                allowed_prior_ids=settled_campaign_prior_ids,
+                eligible_fixed_ids=mutable_prior_ids,
+                require_corroborated_static_fixed=True,
             )
             for is_untrusted, line in _format_regression_settlement_lines(
                 db_path, run_id, prior_in_scope, settled
@@ -6421,16 +6696,34 @@ async def pipeline(
                 resolved_path_root
                 or (target_path.parent if target_path.is_file() else target_path)
             )
-            posture = current_open_findings(db_path, repo_root=posture_root)
-            rp = posture["risk_posture"]
-            other_note = f", Other: {rp['other']}" if rp.get("other") else ""
-            print(
-                f"\n📋 Repository open posture (all runs): {rp['total']} open confirmed finding(s) "
-                f"(Critical: {rp['critical']}, High: {rp['high']}, Medium: {rp['medium']}, Low: {rp['low']}{other_note}). "
-                f"Run 'python3 scripts/knowledge.py report --db {db_path} --repo {posture_root}' for the full report."
+            posture = current_open_findings(
+                db_path, repo_root=posture_root, include_patch_verified=True
             )
-        except Exception:
-            pass
+            if posture.get("error"):
+                print(
+                    f"\n📋 Repository open posture (all runs): unavailable ({posture['error']})."
+                )
+            else:
+                rp = posture["risk_posture"]
+                cnt = posture.get("counts") or {}
+                other_note = f", Other: {rp['other']}" if rp.get("other") else ""
+                extras: list[str] = []
+                if int(cnt.get("patch_verified", 0)) > 0:
+                    extras.append(f"{int(cnt['patch_verified'])} patch_verified awaiting merge")
+                if int(cnt.get("unrooted_omitted", 0)) > 0:
+                    extras.append(f"{int(cnt['unrooted_omitted'])} unrooted omitted")
+                if int(cnt.get("untriaged_omitted", 0)) > 0:
+                    extras.append(f"{int(cnt['untriaged_omitted'])} untriaged omitted")
+                extra_note = f" [{', '.join(extras)}]" if extras else ""
+                print(
+                    f"\n📋 Repository open posture (all runs): {rp['total']} open confirmed finding(s) "
+                    f"(Critical: {rp['critical']}, High: {rp['high']}, Medium: {rp['medium']}, Low: {rp['low']}{other_note}){extra_note}. "
+                    f"Run 'python3 scripts/knowledge.py report --db {db_path} --repo {posture_root}' for the full report."
+                )
+        except Exception as exc:
+            print(
+                f"\n📋 Repository open posture (all runs): unavailable ({type(exc).__name__}: {exc})."
+            )
 
     # Join findings that describe different ends of the same defect.
     #
