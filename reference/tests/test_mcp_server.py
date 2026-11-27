@@ -279,6 +279,15 @@ class TestGateVerdicts(unittest.TestCase):
         self.assertEqual(out["verdict"], "BLOCK")
         self.assertEqual(out["findings"][0]["relationship"], "direct")
 
+    def test_block_on_open_high_in_c_quoted_path(self):
+        (self.repo / "caf\u00e9.py").write_text(APP_PY, encoding="utf-8")
+        mcp_server.reindex(self.state)
+        self._write_finding("HIGH", filepath="caf\u00e9.py")
+        diff = DIFF_IN_HELPER.replace("a/app.py", '"a/caf\\303\\251.py"').replace(
+            "b/app.py", '"b/caf\\303\\251.py"')
+        out = mcp_server.check_change(self.state, diff=diff)
+        self.assertEqual(out["verdict"], "BLOCK", out["reasons"])
+
     def test_unrelated_finding_in_same_file_reviews_not_blocks(self):
         # A HIGH finding at line 20 (outside helper's 1..2 extent and past
         # the diff hunk proximity window) is pre-existing file debt: the gate
