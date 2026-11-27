@@ -857,10 +857,7 @@ def parse_unified_diff(diff_text: str) -> Dict[str, List[int]]:
                 new_left -= 1
             continue
         if raw.startswith("+++ "):
-            path = raw[4:].strip()
-            path = path.split("\t")[0]
-            if path.startswith("b/"):
-                path = path[2:]
+            path = _unescape_git_path(raw[4:], strip_prefix=True)
             current = "" if path == "/dev/null" else path
             if current:
                 changed.setdefault(current, [])
