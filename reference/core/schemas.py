@@ -61,9 +61,15 @@ class HistoryEntrySchema(BaseModel):
 class TriageRuleEvaluationSchema(BaseModel):
     """Schema for triage_rule_evaluation"""
     model_config = ConfigDict(extra="forbid")
-    passes: bool = Field(description="DEPRECATED: True if the finding satisfies this validity constraint.")
-    outcome: Literal["PASS", "FAIL", "UNKNOWN", "NOT_APPLICABLE"] = Field(description="The evaluation outcome of the constraint.")
+    passes: Optional[bool] = Field(default=None, exclude_if=lambda v: v is None, description="DEPRECATED: True if the finding satisfies this validity constraint.")
+    outcome: Optional[Literal["PASS", "FAIL", "UNKNOWN", "NOT_APPLICABLE"]] = Field(default=None, exclude_if=lambda v: v is None, description="The evaluation outcome of the constraint.")
     reason: Optional[str] = Field(default="", description="The reasoning for the evaluation.")
+
+    @model_validator(mode="after")
+    def _has_verdict(self):
+        if self.passes is None and self.outcome is None:
+            raise ValueError("one of 'outcome' or 'passes' is required")
+        return self
 
 class TriageChecklistSchema(BaseModel):
     """Triage Checklist (13 Negative Constraints)"""
@@ -85,9 +91,15 @@ class TriageChecklistSchema(BaseModel):
 class CalibrationRuleEvaluationSchema(BaseModel):
     """Schema for calibration_rule_evaluation"""
     model_config = ConfigDict(extra="forbid")
-    fires: bool = Field(description="DEPRECATED: True if this sanity cap rule applies (fires) to this finding.")
-    outcome: Literal['APPLIES', 'DOES_NOT_APPLY', 'UNKNOWN'] = Field()
+    fires: Optional[bool] = Field(default=None, exclude_if=lambda v: v is None, description="DEPRECATED: True if this sanity cap rule applies (fires) to this finding.")
+    outcome: Optional[Literal['APPLIES', 'DOES_NOT_APPLY', 'UNKNOWN']] = Field(default=None, exclude_if=lambda v: v is None)
     reason: Optional[str] = Field(default="")
+
+    @model_validator(mode="after")
+    def _has_verdict(self):
+        if self.fires is None and self.outcome is None:
+            raise ValueError("one of 'outcome' or 'fires' is required")
+        return self
 
 class CalibrationChecklistSchema(BaseModel):
     """Calibration Checklist (Sanity Caps)"""
