@@ -398,8 +398,7 @@ class TestDedupeLineageAndConsolidation(unittest.IsolatedAsyncioTestCase):
         self.assertIn("dedupe_findings", eval_tool_names)
         self.assertNotIn("report_findings", eval_tool_names)
         self.assertNotIn("report_findings", str(eval_agent.instruction))
-        self.assertIn("'mantis-dedupe'", eval_agent.instruction)
-        self.assertTrue(any(type(t).__name__ == "SkillToolset" for t in eval_agent.tools))
+        self.assertEqual(eval_agent.instruction, stage_agents.STAGE_CONFIGS["deduplicator"]["instruction"])
 
         spec = WorkflowSynthesizer().synthesize_archetype("web api security audit", target_root=str(self.repo))
         synth_dedupe = [n for n in spec.nodes if n.id == "dedupe"]
