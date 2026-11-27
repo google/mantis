@@ -17,6 +17,7 @@ from pathlib import Path
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.skills import load_skill_from_dir
+from google.adk.tools.skill_toolset import SkillToolset
 
 from core.config import get_llm_kwargs, ResilientLiteLlm
 
@@ -32,23 +33,14 @@ def build_deduplicator_agent():
         reasoning_effort=eval_effort,
     )
 
-    skill_path = Path(__file__).resolve().parent.parent.parent / 'mantis-dedupe'
+    skill = load_skill_from_dir(str(Path(__file__).resolve().parents[3] / 'skills' / 'mantis-dedupe'))
     tools_list = [TOOLS[t] for t in ['read_file', 'write_file', 'get_findings', 'dedupe_findings'] if t in TOOLS]
-
-    if skill_path.is_dir() and (skill_path / 'SKILL.md').exists():
-        skill_obj = load_skill_from_dir(str(skill_path))
-        agent_tools = tools_list + [skill_obj]
-        instruction = (
-            "You are the 'deduplicator' stage in the Mantis vulnerability review pipeline.\n"
-            f"Execute your assigned skill '{skill_obj.frontmatter.name}' using your available tools.\n"
-            "Retrieve findings using get_findings, analyze duplicates, and merge duplicate findings using dedupe_findings."
-        )
-    else:
-        agent_tools = tools_list
-        instruction = (
-            "You are the 'deduplicator' stage in the Mantis vulnerability review pipeline.\n"
-            "Retrieve findings using get_findings, analyze duplicates, and merge duplicate findings using dedupe_findings."
-        )
+    agent_tools = tools_list + [SkillToolset(skills=[skill])]
+    instruction = (
+        "You are the 'deduplicator' stage in the Mantis vulnerability review pipeline.\n"
+        f"Execute your assigned skill '{skill.frontmatter.name}' using your available tools.\n"
+        "Retrieve findings using get_findings, analyze duplicates, and merge duplicate findings using dedupe_findings."
+    )
 
     return Agent(
         name='deduplicator',
