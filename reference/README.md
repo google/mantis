@@ -25,7 +25,7 @@ gcloud auth application-default login        # Vertex AI ADC (+ active gcloud pr
 
 # Non-Vertex providers other than GEMINI_API_KEY require an explicit --model:
 # .venv/bin/python3 scripts/configure.py --model gemini-3.8-flash
-# .venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-4-5
+# .venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-5-5
 # .venv/bin/python3 scripts/configure.py --model openai/gpt-4o --api-base https://api.openai.com/v1
 
 # 2. Fast Preflight Validation (~1s) & Live Reachability Probe
