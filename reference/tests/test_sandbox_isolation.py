@@ -334,6 +334,26 @@ class GceHardeningTest(unittest.IsolatedAsyncioTestCase):
 class GvisorHardeningTest(unittest.IsolatedAsyncioTestCase):
     """gVisor containers validate runtime, drop capabilities, block new privileges, and bound lifetime."""
 
+    async def test_gvisor_list_files_reaches_deep_trees(self):
+        import subprocess
+        import tempfile
+        from core.environments import gvisor_env
+
+        with tempfile.TemporaryDirectory() as root:
+            rel = "a/b/c/d/e/f/g/Deep.java"
+            deep = Path(root, rel)
+            deep.parent.mkdir(parents=True)
+            deep.touch()
+            with mock.patch("shutil.which", return_value="/usr/bin/docker"):
+                gv = gvisor_env.GvisorEnvironment(container_tool="docker", workdir=root)
+
+            def _on_host(argv):  # drop "docker exec <name>"
+                p = subprocess.run(argv[3:], capture_output=True, text=True)
+                return p.returncode, p.stdout
+
+            with mock.patch.object(gv, "_ensure"), mock.patch.object(gv, "_run_cmd", _on_host):
+                self.assertEqual(await gv.list_files(), [rel])
+
     async def test_gvisor_validates_runtime_and_hardens_container_create(self):
         import subprocess
         from core.environments import gvisor_env

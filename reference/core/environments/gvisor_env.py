@@ -378,7 +378,7 @@ class GvisorEnvironment(BaseEnvironment):
         def _list():
             find_cmd = [
                 self.tool, "exec", self.container_name,
-                "find", resolved_dir, "-maxdepth", "5", "-not", "-path", "*/.*", "-type", "f"
+                "find", resolved_dir, "-maxdepth", "25", "-not", "-path", "*/.*", "-type", "f"
             ]
             rc, out = self._run_cmd(find_cmd)
             if rc != 0:
