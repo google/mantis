@@ -218,6 +218,30 @@ class RefreshWorkflowModelsTest(unittest.TestCase):
         self.assertIn('--model "$m"', sweep)
         self.assertIn("import_flag=()", sweep.split("for m in")[1], "the import happens once")
 
+    def test_the_sweep_does_not_swallow_a_failed_scan(self):
+        import subprocess
+        import tempfile
+        import yaml
+        path = _REF_ROOT.parent / ".github" / "workflows" / "mantis-knowledge-refresh.yml"
+        spec = yaml.safe_load(path.read_text(encoding="utf-8"))
+        steps = {st.get("name"): st for st in spec["jobs"]["refresh"]["steps"] if st.get("name")}
+        sweep = steps["Sweep files no scan has covered"]["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp, "python")
+            stub.write_text('#!/bin/sh\ncase "$1" in\n  main.py) exit "$SCAN_RC" ;;\n'
+                            '  scripts/knowledge.py) echo exported ;;\nesac\n')
+            stub.chmod(0o755)
+            for scan_rc, step_rc, warns in ((0, 0, False), (2, 0, False), (1, 0, True),
+                                            (4, 4, False), (64, 64, False)):
+                env = {"PATH": f"{tmp}:/usr/bin:/bin", "SCAN_RC": str(scan_rc),
+                       "MANTIS_MODELS": "m1", "GITHUB_WORKSPACE": tmp, "RUNNER_TEMP": tmp}
+                p = subprocess.run(["bash", "-eo", "pipefail", "-c", sweep], env=env,
+                                   cwd=tmp, capture_output=True, text=True)
+                with self.subTest(scan_rc=scan_rc):
+                    self.assertEqual(p.returncode, step_rc, p.stderr)
+                    self.assertEqual("exported" in p.stdout, step_rc == 0)
+                    self.assertEqual("::warning" in p.stdout, warns)
+
 
 if __name__ == "__main__":
     unittest.main()

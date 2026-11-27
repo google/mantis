@@ -178,19 +178,23 @@ jobs:
           # only the files THIS model has not covered (regardless of repository
           # size), so each model works through the repository on its own
           # schedule within its own budget without re-scanning small repos.
-          rc=0
           for m in $MANTIS_MODELS; do
             env $(python -c 'import sys; sys.path.insert(0, "."); from scripts.pr_scan import _STRIPPED_ENV; print(" ".join("-u " + k for k in sorted(_STRIPPED_ENV)))') \
               python main.py "$GITHUB_WORKSPACE" --scan-mode uncovered --yes --sandbox static-only \
               --model "$m" --max-tokens 20M --cache-discount 1 \
               --exclude tests --db "$RUNNER_TEMP/knowledge.db" "${import_flag[@]}"
             this=$?
-            [ "$this" -eq 4 ] && { rc=4; break; }
+            # 2 is a pause at the budget, which is the plan; 1 keeps what the
+            # sweep learned but says so; anything else (usage, credentials,
+            # killed) stops the job.
+            case "$this" in
+              0|2) ;;
+              1) echo "::warning title=Mantis knowledge sweep::$m finished with failures" ;;
+              *) exit "$this" ;;
+            esac
             # After the first model the knowledge is in the database already.
             import_flag=()
           done
-          # 2 is a pause at the budget, which is the plan; 4 is rejected credentials.
-          [ "$rc" -eq 4 ] && exit 4
           set -e
           python scripts/knowledge.py export --db "$RUNNER_TEMP/knowledge.db" \
             --repo "$GITHUB_WORKSPACE" --preserve-head
