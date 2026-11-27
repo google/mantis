@@ -570,7 +570,7 @@ def _non_vertex_model_hint(
     if has_anthropic:
         return (
             "Detected ANTHROPIC_API_KEY; select an Anthropic model explicitly, e.g.: "
-            ".venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-4-5"
+            ".venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-5-5"
         )
     has_openai = (
         bool(caps.get("openai_api_key"))

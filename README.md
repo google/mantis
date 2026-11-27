@@ -71,7 +71,7 @@ no container/VM tooling is available, Mantis falls back cleanly to
 
 # Non-Vertex providers: set --model explicitly (required for Anthropic, OpenAI, and --api-base)
 # Gemini API:    .venv/bin/python3 scripts/configure.py --model gemini-3.8-flash
-# Anthropic:     .venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-4-5
+# Anthropic:     .venv/bin/python3 scripts/configure.py --model anthropic/claude-sonnet-5-5
 # OpenAI/custom: .venv/bin/python3 scripts/configure.py --model openai/gpt-4o --api-base https://api.openai.com/v1
 
 # Optional: force static-only mode (zero VM/container requirements)
