@@ -2488,10 +2488,12 @@ def record_patch(
     if not str(patch_diff or "").strip():
         return "Error: patch_diff must be a non-empty unified diff."
     norm_reattack = str(reattack_status or "failed_to_bypass").strip().lower()
-    if norm_reattack not in ("failed_to_bypass", "bypassed", "not_attempted"):
+    if norm_reattack == "bypassed_patch":  # schema.json spelling
+        norm_reattack = "bypassed"
+    if norm_reattack not in ("failed_to_bypass", "bypassed", "inconclusive_baseline_changed", "not_attempted"):
         return (
-            f"Error: reattack_status must be 'failed_to_bypass', 'bypassed', or "
-            f"'not_attempted', got {reattack_status!r}."
+            f"Error: reattack_status must be 'failed_to_bypass', 'bypassed_patch', "
+            f"'inconclusive_baseline_changed', or 'not_attempted', got {reattack_status!r}."
         )
     has_dynamic_sb = (
         getattr(ctx, "sandbox", None) is not None

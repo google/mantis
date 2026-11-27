@@ -645,6 +645,28 @@ class TestSynthesizerPromotionGateAndPatchGuard(unittest.IsolatedAsyncioTestCase
         finally:
             current_run_context.reset(tok)
 
+    def test_record_patch_accepts_the_schema_reattack_values(self):
+        schema = json.loads((Path(__file__).resolve().parents[2] / "schema.json").read_text(encoding="utf-8"))
+        values = schema["$defs"]["finding"]["properties"]["reattack_status"]["enum"]
+        write_findings(
+            self.db,
+            self.tmp,
+            [{"title": "t", "severity": "HIGH", "filepath": "app.py", "line_numbers": [1]}],
+            run_id="r_enum",
+        )
+        fid = int(read_findings(self.db, run_id="r_enum")[0]["id"])
+        rc = RunContext(jail_dir=self.tmp, db_path=self.db, target_file=self.tmp, run_id="r_enum")
+        tok = current_run_context.set(rc)
+        try:
+            for value in values:
+                with self.subTest(value=value):
+                    msg = record_patch(fid, "--- a/app.py\n+++ b/app.py\n", reattack_status=value)
+                    self.assertIn("SUCCESS", msg)
+        finally:
+            current_run_context.reset(tok)
+        row = read_findings(self.db, run_id="r_enum")[0]
+        self.assertNotEqual(row["patch_status"], "VERIFIED_SECURE")
+
 
 if __name__ == "__main__":
     unittest.main()
