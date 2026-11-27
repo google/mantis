@@ -354,6 +354,21 @@ class GvisorHardeningTest(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(gv, "_ensure"), mock.patch.object(gv, "_run_cmd", _on_host):
                 self.assertEqual(await gv.list_files(), [rel])
 
+    async def test_gvisor_preflight_works_on_podman(self):
+        from core.environments import gvisor_env
+
+        with mock.patch("shutil.which", return_value="/usr/bin/podman"):
+            gv = gvisor_env.GvisorEnvironment(container_tool="podman")
+
+        def _podman(argv, **kwargs):  # as podman 6 answers
+            if "{{json .Runtimes}}" in argv:
+                return mock.MagicMock(returncode=125, stdout="", stderr="can't evaluate field Runtimes")
+            out = "runsc\n" if "--runtime=runsc" in argv else ""
+            return mock.MagicMock(returncode=0, stdout=out, stderr="")
+
+        with mock.patch("subprocess.run", side_effect=_podman):
+            await gv.preflight()
+
     async def test_gvisor_validates_runtime_and_hardens_container_create(self):
         import subprocess
         from core.environments import gvisor_env
