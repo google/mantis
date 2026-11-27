@@ -13,14 +13,13 @@
 # limitations under the License.
 
 import os
-from pathlib import Path
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
-from google.adk.skills import load_skill_from_dir
 
 from core.config import get_llm_kwargs, ResilientLiteLlm
 
 LiteLlm = ResilientLiteLlm
+from core.prompts import get_stage_prompt
 from tools import TOOLS
 
 def build_deduplicator_agent():
@@ -32,29 +31,13 @@ def build_deduplicator_agent():
         reasoning_effort=eval_effort,
     )
 
-    skill_path = Path(__file__).resolve().parent.parent.parent / 'mantis-dedupe'
     tools_list = [TOOLS[t] for t in ['read_file', 'write_file', 'get_findings', 'dedupe_findings'] if t in TOOLS]
-
-    if skill_path.is_dir() and (skill_path / 'SKILL.md').exists():
-        skill_obj = load_skill_from_dir(str(skill_path))
-        agent_tools = tools_list + [skill_obj]
-        instruction = (
-            "You are the 'deduplicator' stage in the Mantis vulnerability review pipeline.\n"
-            f"Execute your assigned skill '{skill_obj.frontmatter.name}' using your available tools.\n"
-            "Retrieve findings using get_findings, analyze duplicates, and merge duplicate findings using dedupe_findings."
-        )
-    else:
-        agent_tools = tools_list
-        instruction = (
-            "You are the 'deduplicator' stage in the Mantis vulnerability review pipeline.\n"
-            "Retrieve findings using get_findings, analyze duplicates, and merge duplicate findings using dedupe_findings."
-        )
 
     return Agent(
         name='deduplicator',
         model=LiteLlm(**llm_kwargs),
-        instruction=instruction,
-        tools=agent_tools,
+        instruction=get_stage_prompt('deduplicator', 'mantis-dedupe'),
+        tools=tools_list,
     )
 
 async def get_agent_async():
