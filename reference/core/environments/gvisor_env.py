@@ -50,6 +50,13 @@ ALLOWED_GVISOR_RUNTIMES = frozenset({
 })
 
 
+def runtime_probe_argv(tool: str, runtime: str = "runsc") -> list[str]:
+    # podman's `info` lists no runtimes; it only resolves the one asked for.
+    if tool == "podman":
+        return [tool, f"--runtime={runtime}", "info", "--format", "{{.Host.OCIRuntime.Name}}"]
+    return [tool, "info", "--format", "{{json .Runtimes}}"]
+
+
 class GvisorEnvironment(BaseEnvironment):
     """OCI container sandbox executed under gVisor runtime (docker/podman --runtime=runsc).
 
@@ -441,20 +448,28 @@ class GvisorEnvironment(BaseEnvironment):
     async def preflight(self) -> None:
         def _check():
             out = subprocess.run(
-                [self.tool, "info", "--format", "{{json .Runtimes}}"],
+                runtime_probe_argv(self.tool, self.runtime),
                 capture_output=True, text=True, timeout=10,
             )
             if out.returncode != 0:
                 err_msg = (out.stderr or "").strip() or f"{self.tool} daemon not reachable"
+                if self.tool == "podman":
+                    raise RuntimeError(
+                        f"podman cannot use runtime '{self.runtime}' ({err_msg}). "
+                        "Install runsc on PATH, or set sandbox.type to 'static-only'."
+                    )
                 raise RuntimeError(
                     f"Could not connect to {self.tool} daemon ({err_msg}). "
                     f"Ensure {self.tool} is running, or set sandbox.type to 'static-only'."
                 )
 
-            try:
-                runtimes = json.loads(out.stdout or "{}")
-            except json.JSONDecodeError:
-                runtimes = {}
+            if self.tool == "podman":
+                runtimes = [out.stdout.strip()]
+            else:
+                try:
+                    runtimes = json.loads(out.stdout or "{}")
+                except json.JSONDecodeError:
+                    runtimes = {}
 
             if self.runtime not in runtimes:
                 raise RuntimeError(

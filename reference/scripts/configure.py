@@ -422,8 +422,10 @@ def detect_capabilities() -> dict:
 
             # Check runsc runtime
             try:
+                from core.environments.gvisor_env import runtime_probe_argv
+
                 out = subprocess.run(
-                    [tool, "info", "--format", "{{json .Runtimes}}"],
+                    runtime_probe_argv(tool),
                     capture_output=True,
                     text=True,
                     timeout=3,
@@ -708,8 +710,10 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
         if not tool or not shutil.which(tool):
             return False, "Docker or Podman not installed for gVisor sandbox."
         try:
+            from core.environments.gvisor_env import runtime_probe_argv
+
             p = subprocess.run(
-                [tool, "info", "--format", "{{json .Runtimes}}"],
+                runtime_probe_argv(tool),
                 capture_output=True,
                 text=True,
                 timeout=5,
