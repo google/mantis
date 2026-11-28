@@ -911,6 +911,23 @@ class ChangedModeSettlementFixesTest(_Base):
         self.assertIn("Parameterized SQL added at a.py:12", cli_out)
         self.assertIn(f"#{b_id} [inconclusive/none]", cli_out)
 
+    def test_cli_regressions_defaults_to_the_latest_run_and_check(self):
+        import contextlib
+        import io
+        from scripts import knowledge as knowledge_cli
+
+        a_id = int(self.seed_old()["SQLi in a"]["id"])
+        record_regression_check(self.db, OLD, a_id, "fixed", reason="from the old run")
+        record_regression_check(self.db, NEW, a_id, "still_present", reason="first look")
+        record_regression_check(self.db, NEW, a_id, "still_present", reason="second look")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = knowledge_cli.main(["regressions", "--db", self.db])
+        self.assertEqual(rc, 0)
+        self.assertIn(f"run {NEW}", buf.getvalue())
+        self.assertIn("second look", buf.getvalue())
+
     async def test_list_prior_findings_enforces_cross_target_isolation(self):
         from core.database import record_run
         from tools import research_tools as rt
