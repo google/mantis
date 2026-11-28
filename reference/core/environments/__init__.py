@@ -40,6 +40,10 @@ def build_environment(cfg: dict, target_path: str = "") -> BaseEnvironment:
     for k, v in cfg.items():
         if k not in ("type", "options") and v is not None:
             kwargs[k] = v
+    if kind != "gce":
+        # `configure.py --project/--zone/--subnet` stores these for any sandbox type.
+        for k in ("project", "zone", "subnet"):
+            kwargs.pop(k, None)
     return ENVIRONMENTS[kind](target_path, **kwargs)
 
 

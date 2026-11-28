@@ -1478,5 +1478,17 @@ class SandboxGateInvariantsTest(IsolatedAsyncioTestCase):
                 current_run_context.reset(tok3)
 
 
+class TestGceOnlyOptions(unittest.TestCase):
+    def test_gvisor_builds_with_gce_options_in_the_config(self):
+        from unittest import mock
+
+        from core.environments import GvisorEnvironment, build_environment
+
+        with mock.patch("core.environments.gvisor_env.shutil.which", return_value="/usr/bin/docker"):
+            env = build_environment(
+                {"type": "gvisor", "options": {"project": "p", "zone": "z", "subnet": "s"}})
+        self.assertIsInstance(env, GvisorEnvironment)
+
+
 if __name__ == "__main__":
     unittest.main()
