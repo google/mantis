@@ -773,7 +773,9 @@ async def _run_sandbox_internal(command: str, *, note_evidence: bool = True) -> 
 
         res = await ctx.sandbox.execute(command)
         if isinstance(res, ExecutionResult):
-            raw_output = f"{res.stdout}{res.stderr}".strip()
+            # The crash detectors are line-anchored: stderr must start on its own line.
+            sep = "\n" if res.stdout and not res.stdout.endswith("\n") else ""
+            raw_output = f"{res.stdout}{sep}{res.stderr}".strip()
             is_unavail = "SANDBOX-UNAVAILABLE" in raw_output or "SANDBOX-UNAVAILABLE" in res.stderr
             if is_unavail:
                 ctx.static_sandbox_attempts = getattr(ctx, "static_sandbox_attempts", 0) + 1

@@ -40,7 +40,12 @@ from google.adk.environment import ExecutionResult  # noqa: E402
 from core.context import RunContext, current_run_context  # noqa: E402
 from core.database import init_db, read_findings, update_status, write_findings  # noqa: E402
 from core.graph_loader import apply_completion_stamp, stamp_finding_ids  # noqa: E402
-from tools.sandbox_tools import finding_id_from_sentinel_path, run_sandbox_with_evidence  # noqa: E402
+from tools.sandbox_tools import (  # noqa: E402
+    check_reached_sink_evidence,
+    finding_id_from_sentinel_path,
+    run_sandbox,
+    run_sandbox_with_evidence,
+)
 
 TOKEN = "MANTIS_REACHED_ENTRYPOINT"
 
@@ -103,6 +108,20 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
     def _statuses(self) -> dict:
         return {r["id"]: r["status"] for r in read_findings(self.db, run_id="run-1")}
+
+
+class StderrStartsOnItsOwnLineTest(_Base):
+    async def test_unterminated_stdout_does_not_hide_a_go_panic(self):
+        class _Panics(_ScriptedSandbox):
+            async def execute(self, command, *, timeout=None):
+                return ExecutionResult(
+                    stdout="starting", exit_code=2, timed_out=False,
+                    stderr="panic: boom\n\ngoroutine 1 [running]:\nmain.parse(0x0)\n\t/w/main.go:7 +0x1\n")
+
+        self._ctx(_Panics())
+        out = await run_sandbox("./poc")
+        present, reason = check_reached_sink_evidence(out, 2, sink_symbol="main.parse")
+        self.assertTrue(present, reason)
 
 
 class EvidenceIsRecordedPerFindingTest(_Base):
