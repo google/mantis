@@ -1461,6 +1461,16 @@ class KnowledgeCase(DriverCase):
 
 
 class TestKnowledgeInTheRun(KnowledgeCase):
+    def test_ignored_changes_do_not_hide_a_deleted_known_finding(self):
+        (self.repo / "app.py").unlink()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "drop app")
+        rc, _ = self.run_main("--ignore", "*.md,new.py", "--fail-on", "review", scan=fake_scan())
+        rep = self.report()
+        self.assertEqual(rep["findings_verdict"], "REVIEW", rep["reasons"])
+        self.assertTrue(any("app.py" in r and "deletes" in r for r in rep["reasons"]), rep["reasons"])
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+
     def test_base_knowledge_feeds_the_gate_and_the_scans(self):
         probe = Path(self.tmp) / "child.json"
         dumping = lambda *a, **k: [sys.executable, "-c",
