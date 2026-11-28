@@ -328,7 +328,7 @@ def main(argv=None) -> int:
             return 0
         target_run = str(args.run_id or "").strip()
         if not target_run:
-            target_run = str(checks[-1].get("run_id") or "")
+            target_run = str(checks[0].get("run_id") or "")  # newest first
             checks = [c for c in checks if str(c.get("run_id") or "") == target_run]
         if args.outcome != "all":
             checks = [c for c in checks if str(c.get("outcome") or "").lower() == args.outcome]
@@ -338,7 +338,7 @@ def main(argv=None) -> int:
         rank = {"still_present": 3, "fixed": 2, "inconclusive": 1}
         for c in checks:
             pid = int(c.get("prior_finding_id") or 0)
-            if pid not in latest or rank.get(str(c.get("outcome") or ""), 0) >= rank.get(str(latest[pid].get("outcome") or ""), 0):
+            if pid not in latest or rank.get(str(c.get("outcome") or ""), 0) > rank.get(str(latest[pid].get("outcome") or ""), 0):
                 latest[pid] = c
         print(f"Regression checks for run {target_run} ({len(latest)} finding(s)):")
         for pid in sorted(latest):
