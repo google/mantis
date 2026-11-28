@@ -903,6 +903,26 @@ class GenericDomainsAndRepoDocsTest(unittest.TestCase):
             self.assertIn(cat, cl, cl)
         self.assertTrue(("[ai_ml_deser]" in cl) or ("[ai_ml_security]" in cl), cl)
 
+    def test_surveyor_detects_login_required_decorator_as_authz(self):
+        # A decorator starts a line, so nothing before "@" can satisfy a leading \b.
+        (self.repo / "views").mkdir()
+        for i in range(3):
+            (self.repo / "views" / f"account_{i}.py").write_text(
+                "from flask_login import login_required\n\n\n"
+                "@login_required\n"
+                f"def show_account_{i}(account_id):\n"
+                "    return account_id\n\n\n"
+                f"class AccountView{i}:\n"
+                "    @login_required\n"
+                "    def get(self, account_id):\n"
+                "        return account_id\n",
+                encoding="utf-8",
+            )
+
+        astm = survey(self.repo, include_churn=False)
+        by_root = {tuple(s["root_paths"]): s for s in astm["slices"]}
+        self.assertEqual(by_root[("views",)]["domain_archetype"], "authorization_audit")
+
     def test_structural_index_extracts_symbols_and_calls_for_13_new_bundled_grammars(self):
         cases = [
             ("a.swift", "swift", b"class Bridge {\n  func openUrl(u: String) {\n    if u.isEmpty { return }\n    webView.evaluateJavaScript(u)\n  }\n}\n", "Bridge.openUrl", ("webView", "evaluateJavaScript")),

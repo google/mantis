@@ -295,7 +295,7 @@ _SURFACE_PATTERNS: tuple[tuple[re.Pattern, float, str], ...] = (
     (re.compile(r"\bos\.path\.join\s*\(|\bopen\s*\(\s*(?:os\.path\.join|request|req)"), 1.5, "path_handling"),
     # --- AuthN / AuthZ ---
     (re.compile(r"\bjsonwebtoken\b|\bjwt\.(?:sign|verify|decode)\b|\bpassport\b|\bbcrypt\b"), 2.0, "authn"),
-    (re.compile(r"\b(?:authorize|isAuthenticated|checkPermission|require_role|@login_required)\b"), 2.0, "authz"),
+    (re.compile(r"(?:\b(?:authorize|isAuthenticated|checkPermission|require_role)|@login_required)\b"), 2.0, "authz"),
     # --- Outbound / SSRF ---
     (re.compile(r"\baxios\.(?:get|post|request)\s*\(|\brequests\.(?:get|post)\s*\(|\burllib\.request\b|\bhttp\.(?:Get|Post|NewRequest(?:WithContext)?)\s*\(|\bcurl_exec\s*\("), 1.5, "outbound_request"),
     # --- Crypto ---
