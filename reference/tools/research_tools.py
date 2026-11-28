@@ -1930,7 +1930,7 @@ async def list_files(directory: str = "") -> str:
         return "Error: Permission denied. Refusing to list version-control metadata or credential files."
 
     clean_dir = directory.replace("\\", "/").strip("./").strip("/")
-    if clean_dir.startswith("workspace") or clean_dir == "findings":
+    if clean_dir in ("workspace", "findings") or clean_dir.startswith("workspace/"):
         items = set()
         resolved_db = _resolve_context_db(ctx)
         if resolved_db and os.path.exists(resolved_db):

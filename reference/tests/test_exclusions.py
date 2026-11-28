@@ -171,6 +171,19 @@ class TestDiscovery(unittest.TestCase):
         finally:
             current_run_context.reset(token)
 
+    def test_listing_a_real_dir_named_like_the_workspace_reads_the_disk(self):
+        from core.context import RunContext, current_run_context
+        from tools.research_tools import list_files
+
+        repo = Path(self.tmp) / "ws_repo"
+        (repo / "workspaces").mkdir(parents=True)
+        (repo / "workspaces" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        token = current_run_context.set(RunContext(jail_dir=str(repo), db_path=""))
+        try:
+            self.assertIn("workspaces/app.py", asyncio.run(list_files("workspaces")))
+        finally:
+            current_run_context.reset(token)
+
     def test_discover_files_rejects_symlink_dirs_hardlinks_env_and_bad_git_jail(self):
         import main as main_mod
 
