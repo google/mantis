@@ -2460,7 +2460,9 @@ def _main_body(
         except Exception as exc:
             knowledge["error"] = (knowledge.get("error") or "") + f" export failed: {exc}"
 
-    if changed_all and not changed:
+    # Deleting or renaming a file the list does not ignore still needs the gate.
+    moved = [*(moves.get("deleted") or []), *(moves.get("renamed") or {})]
+    if changed_all and not changed and all(is_ignored(f, patterns) for f in moved):
         report = {
             "verdict": VERDICT_PASS,
             "reasons": [f"All {len(ignored)} changed file(s) match the ignore patterns; "
